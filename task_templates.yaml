@@ -1,0 +1,256 @@
+# Task template library for the prompt assembler.
+#
+# Each template is a recipe the assembler instantiates deterministically from
+# (workbook taxonomy tags, dependency graph, level cutoff x). FinanceBench's
+# taxonomy maps onto ours as:
+#
+#   metrics-generated  -> extract_* / compute_* templates: mechanical questions
+#                         built from a metric library, with the definition and
+#                         rounding rule stated in the prompt (clear-cut, gradable)
+#   domain-relevant    -> judge_* templates: canonical analyst judgments
+#                         (liquidity, capital intensity, margin trajectory)
+#                         resolved by a stated deterministic decision rule
+#   novel-generated    -> whatif_* / trace_* templates: one-off questions bound
+#                         to a specific workbook feature (scenario switch,
+#                         driver cell, segment breakdown)
+#
+#   reasoning: information extraction   = answer is one blanked cell's value
+#              numerical reasoning      = answer combines several cells
+#              logical (on numerical)   = numeric result passed through a
+#                                         stated threshold/comparison rule
+#
+# Shared assembly rules (apply to every template):
+#
+# label_resolution:
+#   row_label:    nearest static text cell to the LEFT of the target, same row
+#   period_label: nearest static text/date cell ABOVE the target, same column
+#   qualified_name: "<sheet> / <row_label> / <period_label>"  e.g.
+#                   "Projected IS / EBITDA / FY2027"
+#   A target is "nameable" when both labels resolve unambiguously; only
+#   nameable cells may fill metric slots. Unnameable cells stay reachable via
+#   the full-reconstruction templates, so no coverage is lost.
+#
+# eligibility (evaluated per (workbook, cutoff x) pair):
+#   tags_any:        workbook taxonomy tags from taxonomy_out/workbooks.json
+#   metrics_any:     metric lexicon hits from the same file
+#   answer_above_cutoff: every cell the answer depends on that is a formula
+#                    cell must sit at level > x (i.e. blanked in Lx), otherwise
+#                    the answer is readable off the artifact and tests nothing
+#   excludes:        cells in cycles, unparsed formulas, volatile ancestors
+#                    (NOW/TODAY/RAND/INDIRECT), error-valued cells in LN
+#
+# grading kinds:
+#   cell_value:   compare to LN cached value (numeric tolerance / exact string)
+#   derived:      grader evaluates answer_expr over LN cached values
+#   boolean+value: verdict must match rule verdict AND supporting number must
+#                  match within tolerance
+#   recalc:       ground truth produced by headless recalculation of LN with a
+#                  modified input (soffice); pipeline caches the recalc result
+#                  into the answer key at build time, grading stays offline
+#
+# difficulty: every instantiated task records depth = max level of answer
+#   cells minus x. depth 1 = frontier (one derivation step), larger = deeper
+#   chains the model must reconstruct before it can answer.
+
+templates:
+
+  # ------------------------------------------------------------------
+  # Family A: full / partial reconstruction (the base task; no analog in
+  # FinanceBench, this is the "metrics-generated" spirit applied wholesale)
+  # ------------------------------------------------------------------
+
+  - id: recon_full
+    financebench: {question_type: metrics-generated, reasoning: numerical reasoning}
+    eligibility: {tags_any: [any]}
+    slots: {}
+    prompt: |
+      The attached workbook is a partially completed financial model. Every
+      computed cell past a certain calculation depth has been blanked; all
+      typed inputs, labels and shallower results are intact. Reconstruct the
+      value of every blanked computed cell.
+      Return a JSON object mapping "Sheet!A1" references to values.
+    answer: {kind: cell_value, target: all_blanked_gradable_cells}
+
+  - id: recon_frontier
+    financebench: {question_type: metrics-generated, reasoning: numerical reasoning}
+    eligibility: {tags_any: [any]}
+    slots:
+      frontier_refs: "cells at level x+1, listed explicitly in the prompt"
+    prompt: |
+      In the attached model the following computed cells are blank:
+      {frontier_refs}. Every value they depend on is present in the workbook.
+      Determine each blank cell's value and return a JSON object mapping
+      "Sheet!A1" references to values.
+    answer: {kind: cell_value, target: frontier_cells}
+
+  # ------------------------------------------------------------------
+  # Family B: targeted extraction (metrics-generated / information extraction)
+  # ------------------------------------------------------------------
+
+  - id: extract_named_metric
+    financebench: {question_type: metrics-generated, reasoning: information extraction}
+    eligibility:
+      tags_any: [any]
+      requires: nameable blanked cell
+    slots:
+      metric: row_label of chosen target        # e.g. EBITDA
+      period: period_label of chosen target     # e.g. FY2027
+      sheet: sheet of chosen target
+    prompt: |
+      Using the attached model, determine the {period} {metric} shown on the
+      "{sheet}" sheet. The cell holding it is currently blank; reconstruct it
+      from the rest of the workbook. Report the number exactly as the model
+      computes it (same units and scale as the sheet).
+    answer: {kind: cell_value, target: chosen_cell}
+
+  # ------------------------------------------------------------------
+  # Family C: metric computation (metrics-generated / numerical reasoning)
+  # Ratio library mirrors FinanceBench's metric set; the definition is always
+  # stated in the prompt so the task stays clear-cut.
+  # ------------------------------------------------------------------
+
+  - id: compute_ratio
+    financebench: {question_type: metrics-generated, reasoning: numerical reasoning}
+    eligibility:
+      tags_any: [three_statement, budget_reporting]
+      requires: both operand rows nameable, at least one operand blanked
+    ratio_library:
+      operating_margin:     {num: [operating income, ebit], den: [revenue, sales, turnover]}
+      gross_margin:         {num: [gross profit], den: [revenue, sales]}
+      capex_intensity:      {num: [capex, capital expenditure], den: [revenue, sales]}
+      inventory_turnover:   {num: [cogs, cost of goods, cost of sales], den: [inventory]}
+      fixed_asset_turnover: {num: [revenue, sales], den: [pp&e, fixed assets]}
+      current_ratio:        {num: [current assets], den: [current liabilities]}
+      interest_coverage:    {num: [ebit, operating income], den: [interest expense]}
+      net_debt_to_ebitda:   {num: [net debt], den: [ebitda]}
+    slots:
+      ratio_name: chosen library entry
+      definition: rendered from num/den labels of the entry
+      period: shared period_label of the operand cells
+    prompt: |
+      Using the attached model, calculate the {period} {ratio_name}, defined
+      as: {definition}. Some of the required line items are blank in the file
+      and must be reconstructed first. Round your answer to two decimal
+      places.
+    answer: {kind: derived, expr: num_cell / den_cell, tolerance: 0.005}
+
+  - id: compute_growth
+    financebench: {question_type: metrics-generated, reasoning: numerical reasoning}
+    eligibility:
+      requires: nameable row with >= 2 consecutive period columns, later one blanked
+    slots:
+      metric: row_label
+      period_a: earlier period_label
+      period_b: later period_label
+    prompt: |
+      Using the attached model, what is the growth rate of {metric} from
+      {period_a} to {period_b}? Express it as a percentage rounded to one
+      decimal place. Note that the {period_b} figure is blank in the file and
+      must be reconstructed.
+    answer: {kind: derived, expr: (cell_b - cell_a) / abs(cell_a), tolerance: 0.001}
+
+  # ------------------------------------------------------------------
+  # Family D: analyst judgment (domain-relevant / logical reasoning based on
+  # numerical reasoning). Decision rule is stated in the prompt, so the
+  # verdict is deterministic and gradable while still reading like the
+  # FinanceBench domain questions.
+  # ------------------------------------------------------------------
+
+  - id: judge_threshold
+    financebench: {question_type: domain-relevant, reasoning: logical reasoning (based on numerical reasoning)}
+    eligibility:
+      tags_any: [three_statement]
+      requires: compute_ratio eligibility for the underlying metric
+    judgment_library:
+      capital_intensity:  {ratio: capex_intensity,    rule: "> 0.10", verdict_true: capital-intensive}
+      liquidity_health:   {ratio: current_ratio,      rule: ">= 1.0", verdict_true: adequately liquid}
+      leverage_health:    {ratio: net_debt_to_ebitda, rule: "<= 3.0", verdict_true: conservatively levered}
+      coverage_health:    {ratio: interest_coverage,  rule: ">= 2.0", verdict_true: comfortable coverage}
+    slots:
+      question_frame: rendered from judgment entry (metric, rule, period)
+    prompt: |
+      Based on the attached model: {question_frame} Treat the stated threshold
+      as the decision rule. Answer yes or no, and report the supporting metric
+      value you computed. Some inputs to the metric are blank in the file and
+      must be reconstructed first.
+    answer: {kind: boolean+value, tolerance: 0.005}
+
+  - id: judge_trajectory
+    financebench: {question_type: domain-relevant, reasoning: logical reasoning (based on numerical reasoning)}
+    eligibility:
+      requires: nameable margin/ratio row across >= 3 periods, latest blanked
+    slots:
+      metric: row_label
+      periods: the period range
+    prompt: |
+      Is {metric} improving or deteriorating over {periods} in the attached
+      model? The most recent value is blank and must be reconstructed. Answer
+      "improving" or "deteriorating" and report the first and last values.
+    answer: {kind: boolean+value, tolerance: 0.005}
+
+  - id: judge_hurdle
+    financebench: {question_type: domain-relevant, reasoning: logical reasoning (based on numerical reasoning)}
+    eligibility:
+      tags_any: [lbo_returns, dcf_valuation, real_estate_pf]
+      requires: blanked cell whose row_label matches irr|moic|npv|dscr
+    slots:
+      metric: row_label (IRR / MOIC / NPV / DSCR)
+      hurdle: "drawn deterministically from: IRR 15%, MOIC 2.0x, NPV 0, DSCR 1.2x"
+    prompt: |
+      Does the deal in the attached model clear a {hurdle} {metric} hurdle?
+      The {metric} cell is blank and must be reconstructed from the model.
+      Answer yes or no and report the computed {metric}.
+    answer: {kind: boolean+value, tolerance: 0.005}
+
+  # ------------------------------------------------------------------
+  # Family E: workbook-specific probes (novel-generated). Bound to features
+  # only some workbooks have; this is where scenario_driven and merger_ma
+  # workbooks earn their diversity.
+  # ------------------------------------------------------------------
+
+  - id: whatif_input_shift
+    financebench: {question_type: novel-generated, reasoning: numerical reasoning}
+    eligibility:
+      requires: level-0 input cell with resolvable label feeding >= 5 blanked cells
+    slots:
+      input_label: qualified_name of the input cell
+      shift: "one of: +10%, -10%, or a stated absolute change"
+      metric: nameable downstream blanked cell
+    prompt: |
+      In the attached model, suppose {input_label} changes by {shift} and
+      everything else stays as modeled. What would {metric} become? Reconstruct
+      the calculation chain to answer; report the new value.
+    answer: {kind: recalc, tolerance: 0.005}
+
+  - id: whatif_scenario
+    financebench: {question_type: novel-generated, reasoning: numerical reasoning}
+    eligibility:
+      tags_any: [scenario_driven]
+      requires: identified scenario switch cell (level-0 integer/label input
+                feeding CHOOSE/INDEX/IF chains) and a nameable downstream metric
+    slots:
+      scenario: target scenario name from the switch's label list
+      metric: nameable downstream blanked cell
+    prompt: |
+      The attached model is currently set to one scenario via its scenario
+      switch. If the model were switched to the "{scenario}" case, what would
+      {metric} be? Reconstruct the scenario logic to answer.
+    answer: {kind: recalc, tolerance: 0.005}
+
+  - id: trace_driver
+    financebench: {question_type: novel-generated, reasoning: logical reasoning (based on numerical reasoning)}
+    eligibility:
+      requires: blanked cell that is a SUM over >= 3 nameable sibling rows
+                (segment/line-item breakdown), siblings visible or shallower
+    slots:
+      metric: row_label of the aggregate
+      period_a: earlier period
+      period_b: later period
+    prompt: |
+      In the attached model, {metric} changes between {period_a} and
+      {period_b}. Which single component line item contributes most to that
+      change? Name the line item and give its change.
+    answer:
+      kind: derived
+      expr: argmax over sibling deltas, matched by resolved row_label
+      grading: label must match answer key (case-insensitive), delta within tolerance

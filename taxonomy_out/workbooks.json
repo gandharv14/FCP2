@@ -1,0 +1,3890 @@
+{
+ "0233.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "net income",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "wacc",
+   "terminal value",
+   "dscr",
+   "arr",
+   "leverage",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "scenario_driven",
+  "scores": {
+   "budget_reporting": 1,
+   "dcf_valuation": 6,
+   "lbo_returns": 9,
+   "merger_ma": 4,
+   "multiples_comps": 1,
+   "real_estate_pf": 2,
+   "scenario_driven": 13,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Cover",
+   "Control",
+   "Model",
+   "FF",
+   "Contribution",
+   "Case>>>",
+   "Downside case",
+   "Lender base case",
+   "Management case",
+   "Valorisation>>>",
+   "DCF",
+   "DDM",
+   "Other>>>",
+   "Group Tax",
+   "Output>>",
+   "Key financials",
+   "BP",
+   "Capital structure",
+   "Term facilities",
+   "Case comparison"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "merger_ma",
+   "scenario_driven"
+  ]
+ },
+ "0248.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 2,
+   "lbo_returns": 1,
+   "merger_ma": 1,
+   "real_estate_pf": 2,
+   "scenario_driven": 1,
+   "three_statement": 6
+  },
+  "sheets": [
+   "Dashboard",
+   "Historicals",
+   "Valuation",
+   "Calculations",
+   "Financial Statements"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0251.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross margin",
+   "occupancy",
+   "depreciation"
+  ],
+  "primary": "budget_reporting",
+  "scores": {
+   "budget_reporting": 20,
+   "merger_ma": 1,
+   "real_estate_pf": 2,
+   "three_statement": 1
+  },
+  "sheets": [
+   "_TM_Feuil1",
+   "Index",
+   "Important notice",
+   "Management reporting >",
+   "Summary Management reporting",
+   "From reporting to PF >",
+   "E&I - From Management to PF",
+   "O&M - From Management to PF",
+   "Proforma >",
+   "Summary Pro Forma",
+   "PF Rfcst vs. Bud FY16",
+   "Nogent >",
+   "Rfcst FY16 Nogent",
+   "Mayotte >",
+   "Rfcst FY16 Mayotte",
+   "Source >",
+   "Reforecast V1 >",
+   "FORECAST",
+   "D&A IFRIC 12",
+   "Reforecast R\u00e9vis\u00e9 >",
+   "D2",
+   "AGI",
+   "LRL",
+   "CB1",
+   "CB2",
+   "TCI",
+   "LED",
+   "FG",
+   "REO",
+   "REF",
+   "GRT",
+   "Others financials >",
+   "D&A O&M",
+   "QoE",
+   "E&I From Mgmt to PF FY13141516b",
+   "O&M From Mgmt to PF FY13141516b",
+   "PF V290316"
+  ],
+  "tags": [
+   "budget_reporting"
+  ]
+ },
+ "0255.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "capex",
+   "working capital",
+   "fcf",
+   "receivable",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "budget_reporting": 1,
+   "real_estate_pf": 4,
+   "three_statement": 4
+  },
+  "sheets": [
+   "Cover",
+   "Assumptions",
+   "R assumptions",
+   "Calculations",
+   "FS",
+   "valuation"
+  ],
+  "tags": [
+   "real_estate_pf",
+   "three_statement"
+  ]
+ },
+ "0256.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "free cash flow",
+   "irr",
+   "npv",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 1,
+   "scenario_driven": 4,
+   "three_statement": 4
+  },
+  "sheets": [
+   "Summary",
+   "Sc",
+   "InpT",
+   "CalcS",
+   "CalcA",
+   "FS"
+  ],
+  "tags": [
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0258.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross margin",
+   "capex",
+   "working capital",
+   "occupancy",
+   "leverage",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "real_estate_pf": 1,
+   "scenario_driven": 5,
+   "three_statement": 6
+  },
+  "sheets": [
+   "Scenario",
+   "InputT",
+   "InputH",
+   "Calculation",
+   "WC",
+   "FS"
+  ],
+  "tags": [
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0261.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "capex",
+   "working capital",
+   "mrr",
+   "receivable",
+   "payable",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "fund_pe": 7,
+   "lbo_returns": 1,
+   "merger_ma": 1,
+   "multiples_comps": 3,
+   "real_estate_pf": 2,
+   "scenario_driven": 1,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Conso FS",
+   "IS",
+   "BS",
+   "Use of Inv Funds",
+   "Investment Fund Analysis",
+   "Monthly CF",
+   "CF",
+   "Rev",
+   "Soft Inc",
+   "Product Cost & Sales Volume",
+   "FA",
+   "Staff Exp",
+   "OPEX",
+   "IT Service Costs",
+   "B S Comps",
+   "Inventory Calculation",
+   "Presentation - Growth",
+   "Tier Discounts"
+  ],
+  "tags": [
+   "fund_pe",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0262.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "irr",
+   "moic",
+   "equity value",
+   "leverage",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "scenario_driven",
+  "scores": {
+   "lbo_returns": 1,
+   "real_estate_pf": 2,
+   "scenario_driven": 5,
+   "three_statement": 3
+  },
+  "sheets": [
+   "Dashboard",
+   "Scenario",
+   "InputH",
+   "OpCo",
+   "Investment",
+   "OpCo_FS"
+  ],
+  "tags": [
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0342.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "capex",
+   "working capital",
+   "occupancy",
+   "arr",
+   "net debt",
+   "quick ratio",
+   "current ratio",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "lbo_returns": 1,
+   "merger_ma": 1,
+   "real_estate_pf": 2,
+   "three_statement": 3
+  },
+  "sheets": [
+   "Revenue Build",
+   "MSR Build",
+   "Operating Model"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0344.xlsx": {
+  "metrics_found": [],
+  "primary": "fund_pe",
+  "scores": {
+   "fund_pe": 6
+  },
+  "sheets": [
+   "PE Distributions"
+  ],
+  "tags": [
+   "fund_pe"
+  ]
+ },
+ "0349.xlsm": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "operating margin",
+   "arr",
+   "cac",
+   "receivable",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "lbo_returns": 1,
+   "merger_ma": 1,
+   "three_statement": 10
+  },
+  "sheets": [
+   "Projections --->",
+   "IS",
+   "BS",
+   "CFS",
+   "Assumptions --->",
+   "IS - Build Up",
+   "Retail Assumptions",
+   "BS - Build Up"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0350.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "irr",
+   "moic",
+   "noi",
+   "cap rate",
+   "ltv",
+   "amortization"
+  ],
+  "primary": "lbo_returns",
+  "scores": {
+   "fund_pe": 1,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "real_estate_pf": 2
+  },
+  "sheets": [
+   "Summary",
+   "Assumptions",
+   "Cashflows"
+  ],
+  "tags": [
+   "lbo_returns"
+  ]
+ },
+ "0351.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "irr",
+   "moic",
+   "noi",
+   "cap rate",
+   "ltv",
+   "amortization"
+  ],
+  "primary": "real_estate_pf",
+  "scores": {
+   "fund_pe": 1,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "real_estate_pf": 9,
+   "three_statement": 3
+  },
+  "sheets": [
+   "Summary",
+   "Rent Roll",
+   "Other Assumptions",
+   "Monthly CFs"
+  ],
+  "tags": [
+   "lbo_returns",
+   "real_estate_pf",
+   "three_statement"
+  ]
+ },
+ "0352.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "irr",
+   "moic"
+  ],
+  "primary": "lbo_returns",
+  "scores": {
+   "budget_reporting": 1,
+   "fund_pe": 1,
+   "lbo_returns": 10,
+   "merger_ma": 1,
+   "real_estate_pf": 5,
+   "three_statement": 3
+  },
+  "sheets": [
+   "Summary",
+   "Monthly CFs",
+   "Equity Waterfall",
+   "Assumptions ",
+   "Revenue Working",
+   "Expenses Working"
+  ],
+  "tags": [
+   "lbo_returns",
+   "real_estate_pf",
+   "three_statement"
+  ]
+ },
+ "0353.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "net income",
+   "irr",
+   "moic",
+   "noi",
+   "cap rate",
+   "ltv",
+   "amortization"
+  ],
+  "primary": "lbo_returns",
+  "scores": {
+   "budget_reporting": 3,
+   "fund_pe": 1,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "real_estate_pf": 5,
+   "three_statement": 3
+  },
+  "sheets": [
+   "Summary",
+   "Assumptions",
+   "Monthly CFs",
+   "Actuals"
+  ],
+  "tags": [
+   "budget_reporting",
+   "lbo_returns",
+   "real_estate_pf",
+   "three_statement"
+  ]
+ },
+ "0354.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "capex",
+   "irr",
+   "npv",
+   "terminal value",
+   "dscr",
+   "noi",
+   "occupancy",
+   "arr",
+   "depreciation",
+   "amortization"
+  ],
+  "primary": "real_estate_pf",
+  "scores": {
+   "dcf_valuation": 7,
+   "fund_pe": 2,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "real_estate_pf": 10,
+   "startup_saas": 7,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Executive Summary",
+   "Global Control",
+   "Buildout",
+   "Seed Funding",
+   "Revenue",
+   "Matrix",
+   "OPEX",
+   "CAPEX",
+   "FTE",
+   "Term Loan",
+   "Op Loan 1",
+   "Op Loan 2",
+   "Cap Table",
+   "Startup Costs",
+   "Terminal Value",
+   "IS- M",
+   "IS- A",
+   "BS- M",
+   "BS- A",
+   "CF- M",
+   "CF- A",
+   "DCF Analysis",
+   "Monthly Detail",
+   "Annual Detail"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "real_estate_pf",
+   "startup_saas"
+  ]
+ },
+ "0438.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "irr",
+   "receivable",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "real_estate_pf",
+  "scores": {
+   "lbo_returns": 3,
+   "real_estate_pf": 6,
+   "three_statement": 2
+  },
+  "sheets": [
+   "MODEL",
+   "DRIVERS",
+   "LOAN AMORT.",
+   "RETURNS",
+   "DATA VALIDATION"
+  ],
+  "tags": [
+   "lbo_returns",
+   "real_estate_pf"
+  ]
+ },
+ "0441.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "equity value",
+   "leverage",
+   "net debt",
+   "depreciation",
+   "amortization"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "lbo_returns": 1,
+   "real_estate_pf": 2,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Model"
+  ],
+  "tags": []
+ },
+ "0445.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "capex",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "depreciation",
+   "amortization",
+   "share price"
+  ],
+  "primary": "lbo_returns",
+  "scores": {
+   "budget_reporting": 1,
+   "lbo_returns": 5,
+   "real_estate_pf": 2,
+   "three_statement": 1
+  },
+  "sheets": [
+   "MT LBO"
+  ],
+  "tags": [
+   "lbo_returns"
+  ]
+ },
+ "0449.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "terminal value",
+   "enterprise value",
+   "occupancy",
+   "arr"
+  ],
+  "primary": "dcf_valuation",
+  "scores": {
+   "dcf_valuation": 5,
+   "fund_pe": 1,
+   "lbo_returns": 1,
+   "merger_ma": 3,
+   "multiples_comps": 4,
+   "scenario_driven": 1,
+   "three_statement": 4
+  },
+  "sheets": [
+   "Cover",
+   "Outputs",
+   "IS",
+   "CoE",
+   "Comps",
+   "DCF",
+   "Trxn Structure",
+   "Backup >",
+   "Input & Assumptions",
+   "Revenue & Expense Build"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "merger_ma",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0450.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross margin",
+   "net income",
+   "capex",
+   "working capital",
+   "irr",
+   "moic",
+   "enterprise value",
+   "equity value",
+   "leverage",
+   "net debt",
+   "receivable",
+   "payable",
+   "amortization"
+  ],
+  "primary": "lbo_returns",
+  "scores": {
+   "fund_pe": 1,
+   "lbo_returns": 6,
+   "real_estate_pf": 2,
+   "scenario_driven": 4,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Assumptions",
+   "Case Comparison",
+   "Historical Financials & KPIs",
+   "Financial Projections",
+   "LBO",
+   "SOFR Curve",
+   "Historical Output",
+   "Projection Output",
+   "Return Output"
+  ],
+  "tags": [
+   "lbo_returns",
+   "scenario_driven"
+  ]
+ },
+ "0451.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "net income",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "irr",
+   "moic",
+   "enterprise value",
+   "equity value",
+   "leverage",
+   "net debt",
+   "interest coverage",
+   "receivable",
+   "payable",
+   "amortization"
+  ],
+  "primary": "lbo_returns",
+  "scores": {
+   "lbo_returns": 14,
+   "real_estate_pf": 3,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Project Moon_ATP",
+   "Project Moon_Contrib",
+   "LBO",
+   "Equity Waterfall"
+  ],
+  "tags": [
+   "lbo_returns",
+   "real_estate_pf"
+  ]
+ },
+ "0453.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "churn"
+  ],
+  "primary": "startup_saas",
+  "scores": {
+   "startup_saas": 1
+  },
+  "sheets": [
+   "SUMMARY",
+   "BUILD >",
+   "DRIVERS",
+   "Platform Ads",
+   "Off Platform Ads"
+  ],
+  "tags": []
+ },
+ "0461.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "operating margin",
+   "capex",
+   "free cash flow",
+   "irr",
+   "equity value",
+   "occupancy",
+   "arr",
+   "leverage",
+   "net debt",
+   "depreciation",
+   "amortization",
+   "payback"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "budget_reporting": 1,
+   "lbo_returns": 4,
+   "merger_ma": 1,
+   "multiples_comps": 1,
+   "real_estate_pf": 2,
+   "three_statement": 5
+  },
+  "sheets": [
+   "Cover",
+   "Outputs >>>",
+   "AVP",
+   "Returns",
+   "P&L",
+   "PSM Page 1 Output",
+   "Inputs >>>",
+   "Model",
+   "P&L Driver",
+   "Source >>>",
+   "P&L Summary",
+   "Consolidating P&L - Adjusted",
+   "SOFR Curve",
+   "PB_CACHE_JS",
+   "CACHE_CHARTS_JS"
+  ],
+  "tags": [
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0462.xlsx": {
+  "metrics_found": [
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "fcf",
+   "irr",
+   "moic",
+   "equity value",
+   "arr",
+   "leverage",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "share price",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "lbo_returns": 3,
+   "merger_ma": 1,
+   "real_estate_pf": 3,
+   "three_statement": 4
+  },
+  "sheets": [
+   "MODEL",
+   "AVP",
+   "DRIVERS",
+   "BROKER INPUTS",
+   "OUTPUT",
+   "SOFR",
+   "FILINGS >",
+   "SEGMENT FINANCIALS",
+   "IS 10Q",
+   "CFS (10Q)",
+   "BS 10Q",
+   "OPTIONS (10Q)",
+   "RSUs (10Q)",
+   "PRSUs (10Q)",
+   "IS FY24 10K",
+   "BS FY24 10K",
+   "CFS FY24 10K",
+   "EMPLOYEE RETIREMENT PLANS"
+  ],
+  "tags": [
+   "lbo_returns",
+   "real_estate_pf",
+   "three_statement"
+  ]
+ },
+ "0463.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "fcf",
+   "irr",
+   "moic",
+   "equity value",
+   "dscr",
+   "arr",
+   "ltv",
+   "leverage",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization"
+  ],
+  "primary": "lbo_returns",
+  "scores": {
+   "budget_reporting": 1,
+   "fund_pe": 1,
+   "lbo_returns": 13,
+   "merger_ma": 1,
+   "real_estate_pf": 4,
+   "three_statement": 5
+  },
+  "sheets": [
+   "S&U Matrix",
+   "EBITDA Walk",
+   "Mgt EBITDA Add Backs",
+   "Legacy>>>",
+   "MODEL",
+   "CAP TABLE",
+   "WATERFALL",
+   "INVOICE DETAIL",
+   "MONTHLY P&L",
+   "SOFR",
+   "CIM DATA"
+  ],
+  "tags": [
+   "lbo_returns",
+   "real_estate_pf",
+   "three_statement"
+  ]
+ },
+ "0468.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "working capital",
+   "irr",
+   "moic",
+   "enterprise value",
+   "equity value",
+   "arr",
+   "leverage",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "lbo_returns": 6,
+   "multiples_comps": 5,
+   "real_estate_pf": 2,
+   "three_statement": 8
+  },
+  "sheets": [
+   "Returns ->",
+   "Returns",
+   "Comps",
+   "Financials ->",
+   "P&L",
+   "BS",
+   "SCF",
+   "Source Files ->",
+   "Summary P&L",
+   "Historical P&L",
+   "Sales Database ->",
+   "Data_MC",
+   "Data_MC _Annual"
+  ],
+  "tags": [
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0469.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "fcf",
+   "arr",
+   "mrr",
+   "churn",
+   "ltv",
+   "cac",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization"
+  ],
+  "primary": "startup_saas",
+  "scores": {
+   "budget_reporting": 4,
+   "dcf_valuation": 1,
+   "merger_ma": 1,
+   "real_estate_pf": 2,
+   "startup_saas": 15,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Traction",
+   "Op_Plan",
+   "Charts_SeriesB",
+   "5Yr_Fcst",
+   "SUMMARY",
+   "MODEL",
+   "DRIVERS",
+   "REVENUE_BUILD",
+   "EXPENSE_BUILD",
+   "COHORT ANALYSIS",
+   "HEADCOUNT_BUILD",
+   "OUTPUT",
+   "SELL-SIDE MODEL >",
+   "CF",
+   "IS",
+   "BS",
+   "_HeadCount",
+   "L&E",
+   "Expenses",
+   "Summary P&L",
+   "Transaction CoR",
+   "Subs CoR",
+   "Subs Revenue",
+   "Payout Revenue",
+   "Analysis>>>",
+   "IS BvA",
+   "Expense BvA",
+   "Inputs>>>",
+   "Assets",
+   "CustomerRevenue",
+   "CustomerRevenueOld",
+   "Enterprise Deals",
+   "Acceptance Revenue",
+   "Software 2024 Input",
+   "Dashboard",
+   "Closed_Wons",
+   "Cohorts>>>",
+   "Acceptance Cohort Monthly",
+   "Payout Cohort Monthly",
+   "Xero>>>",
+   "HIS",
+   "HBS"
+  ],
+  "tags": [
+   "budget_reporting",
+   "startup_saas",
+   "three_statement"
+  ]
+ },
+ "0514.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "working capital",
+   "irr",
+   "npv",
+   "terminal value",
+   "receivable",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "real_estate_pf": 1,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Inputs",
+   "NPV IRR",
+   "P&L",
+   "BS",
+   "CFS",
+   "Supporting Schedules"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0515.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "irr",
+   "npv",
+   "terminal value",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "real_estate_pf": 2,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Inputs",
+   "NPV IRR",
+   "P&L",
+   "BS",
+   "CFS",
+   "Supporting Schedules"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0517.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "payback"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 3,
+   "multiples_comps": 5,
+   "real_estate_pf": 1,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples",
+   "IRR & Payback"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0518.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "irr",
+   "npv",
+   "terminal value",
+   "arr",
+   "receivable",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "budget_reporting": 1,
+   "dcf_valuation": 5,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "real_estate_pf": 1,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Inputs",
+   "NPV IRR",
+   "P&L",
+   "BS",
+   "CFS",
+   "Supporting Schedules",
+   "Sheet1"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0519.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "working capital",
+   "fcf",
+   "irr",
+   "npv",
+   "terminal value",
+   "noi",
+   "receivable",
+   "payable",
+   "depreciation",
+   "payback"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "real_estate_pf": 1,
+   "scenario_driven": 1,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Inputs",
+   "NPV IRR",
+   "P&L",
+   "BS",
+   "CFS",
+   "Supporting Schedules",
+   "Market Size"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0520.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "payback"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 3,
+   "multiples_comps": 8,
+   "real_estate_pf": 1,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples (Comps)",
+   "IRR & Payback"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0521.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "multiples_comps": 4,
+   "real_estate_pf": 2,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Summary",
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0522.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "dcf_valuation",
+  "scores": {
+   "dcf_valuation": 12,
+   "lbo_returns": 3,
+   "multiples_comps": 4,
+   "real_estate_pf": 2,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "NPV & IRR",
+   "UFCF",
+   "Multiples",
+   "Cashflow Graph",
+   "EV"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0523.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 9,
+   "lbo_returns": 3,
+   "multiples_comps": 4,
+   "real_estate_pf": 1,
+   "three_statement": 10
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples",
+   "NPV & IRR"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0524.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "payback"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "fund_pe": 1,
+   "lbo_returns": 3,
+   "multiples_comps": 5,
+   "real_estate_pf": 2,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "IRR & Payback",
+   "Multiples"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0525.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "working capital",
+   "irr",
+   "npv",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "churn",
+   "cac",
+   "receivable",
+   "payable",
+   "depreciation",
+   "payback"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 8,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "multiples_comps": 4,
+   "real_estate_pf": 1,
+   "startup_saas": 1,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Inputs",
+   "Valuation",
+   "Discount Rates",
+   "Comparable Companies",
+   "NPV IRR",
+   "P&L",
+   "BS",
+   "CFS",
+   "Supporting Schedules"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0526.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "irr",
+   "npv",
+   "terminal value",
+   "receivable",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Inputs",
+   "NPV IRR",
+   "P&L",
+   "BS",
+   "CFS",
+   "Supporting Schedules"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0527.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "payback"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 3,
+   "multiples_comps": 8,
+   "real_estate_pf": 1,
+   "three_statement": 14
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples (Comps)",
+   "IRR & Payback",
+   "Inhouse PL",
+   "Inhouse Balance Sheet",
+   "MTP 2027-2030 Final "
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0528.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "working capital",
+   "fcf",
+   "irr",
+   "npv",
+   "terminal value",
+   "churn",
+   "receivable",
+   "payable",
+   "depreciation",
+   "payback"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "real_estate_pf": 1,
+   "scenario_driven": 1,
+   "startup_saas": 1,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Inputs",
+   "NPV IRR",
+   "P&L",
+   "BS",
+   "CFS",
+   "Supporting Schedules",
+   "Market Size"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0529.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "payback",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 3,
+   "multiples_comps": 5,
+   "real_estate_pf": 2,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples",
+   "IRR & Payback",
+   "GROUP",
+   "Group 6 YRs"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0530.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 3,
+   "multiples_comps": 4,
+   "real_estate_pf": 1,
+   "three_statement": 16
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples",
+   "IRR",
+   "BS",
+   "P&L",
+   "BS (old)",
+   "P&L (old)"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0531.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "irr",
+   "npv",
+   "terminal value",
+   "receivable",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Inputs",
+   "NPV IRR",
+   "P&L",
+   "BS",
+   "CFS",
+   "Supporting Schedules"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0532.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "payback"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 3,
+   "merger_ma": 1,
+   "multiples_comps": 5,
+   "real_estate_pf": 1,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples",
+   "IRR & Payback"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0533.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "payback",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 3,
+   "merger_ma": 1,
+   "multiples_comps": 5,
+   "real_estate_pf": 2,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples",
+   "IRR & Payback"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0534.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "payback",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 3,
+   "merger_ma": 1,
+   "multiples_comps": 5,
+   "real_estate_pf": 2,
+   "three_statement": 14
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples",
+   "IRR & Payback",
+   "BS2022",
+   "LLC P&L2022",
+   "BS2024",
+   "LLC P&L2024"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0535.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "working capital",
+   "irr",
+   "npv",
+   "terminal value",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "lbo_returns": 5,
+   "merger_ma": 1,
+   "real_estate_pf": 2,
+   "scenario_driven": 1,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Inputs",
+   "NPV IRR",
+   "P&L",
+   "BS",
+   "CFS",
+   "Supporting Schedules",
+   "UAE"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0536.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 9,
+   "lbo_returns": 3,
+   "multiples_comps": 4,
+   "three_statement": 10
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples",
+   "NPV & IRR"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0537.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "payback",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 3,
+   "multiples_comps": 9,
+   "real_estate_pf": 1,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Projected IS",
+   "Projected BS",
+   "Projected Cashflow",
+   "UFCF",
+   "Multiples (Comps)",
+   "Multiples (Transactions)",
+   "IRR & Payback"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0594.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "free cash flow",
+   "irr",
+   "npv",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 1,
+   "scenario_driven": 4,
+   "three_statement": 4
+  },
+  "sheets": [
+   "Summary",
+   "Sc",
+   "InpT",
+   "CalcS",
+   "CalcA",
+   "FS"
+  ],
+  "tags": [
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0595.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross margin",
+   "net income",
+   "capex",
+   "working capital",
+   "fcf",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "arr",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "share price"
+  ],
+  "primary": "merger_ma",
+  "scores": {
+   "dcf_valuation": 6,
+   "merger_ma": 10,
+   "real_estate_pf": 1,
+   "scenario_driven": 5,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Dashboard",
+   "Scenarios",
+   "Inputs_Target",
+   "Inputs_Acquirer",
+   "Inputs_NewCo",
+   "Historicals",
+   "Calc_Target",
+   "Calc_Acquirer",
+   "Calc_NewCo",
+   "DCF_Target",
+   "FS_Target",
+   "FS_Acquirer"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "merger_ma",
+   "scenario_driven"
+  ]
+ },
+ "0596.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross margin",
+   "capex",
+   "working capital",
+   "fcf",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "arr",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "share price"
+  ],
+  "primary": "multiples_comps",
+  "scores": {
+   "dcf_valuation": 6,
+   "merger_ma": 2,
+   "multiples_comps": 7,
+   "real_estate_pf": 1,
+   "scenario_driven": 5,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Dashboard",
+   "Sc",
+   "InpT",
+   "InpH",
+   "Calc",
+   "DCF",
+   "Comps",
+   "TComps",
+   "Graphs"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "multiples_comps",
+   "scenario_driven"
+  ]
+ },
+ "0598.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "working capital",
+   "fcf",
+   "irr",
+   "moic",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 1,
+   "real_estate_pf": 2,
+   "scenario_driven": 5,
+   "three_statement": 6
+  },
+  "sheets": [
+   "Dashboard",
+   "Scenario",
+   "InputT",
+   "InputH",
+   "Calculation",
+   "DCF",
+   "FS"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0599.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "irr",
+   "moic",
+   "equity value",
+   "occupancy",
+   "ltv",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "lbo_returns": 1,
+   "real_estate_pf": 1,
+   "scenario_driven": 2,
+   "three_statement": 3
+  },
+  "sheets": [
+   "Dashboard",
+   "Outputs",
+   "Inputs HoldCo",
+   "Inputs Care Home",
+   "HoldCo Calc",
+   "Care Home Calc",
+   "Audit"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0600.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross margin",
+   "capex",
+   "working capital",
+   "occupancy",
+   "leverage",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "real_estate_pf": 1,
+   "scenario_driven": 5,
+   "three_statement": 6
+  },
+  "sheets": [
+   "Scenario",
+   "InputT",
+   "InputH",
+   "Calculation",
+   "WC",
+   "FS"
+  ],
+  "tags": [
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0603.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "capex",
+   "fcf",
+   "enterprise value",
+   "leverage",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 3,
+   "lbo_returns": 3,
+   "merger_ma": 1,
+   "real_estate_pf": 7,
+   "scenario_driven": 1,
+   "three_statement": 12
+  },
+  "sheets": [
+   "Assumptions",
+   "Revenue",
+   "Income Statement ",
+   "Balance Sheet",
+   "Cash Flow Statement",
+   "Debt Schedule",
+   "DCFLBO"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "real_estate_pf",
+   "three_statement"
+  ]
+ },
+ "0605.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "moic",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "dscr",
+   "noi",
+   "cap rate",
+   "occupancy",
+   "receivable",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "scenario_driven",
+  "scores": {
+   "dcf_valuation": 3,
+   "fund_pe": 1,
+   "lbo_returns": 1,
+   "real_estate_pf": 3,
+   "scenario_driven": 8,
+   "three_statement": 4
+  },
+  "sheets": [
+   "Cover",
+   "Dashboard",
+   "Graphs",
+   "Scenarios",
+   "InpT",
+   "FS_H",
+   "Flags",
+   "Calc",
+   "Investment",
+   "Valuation",
+   "FS_M",
+   "FS_A",
+   "Checks"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "real_estate_pf",
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0608.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "capex",
+   "working capital",
+   "mrr",
+   "receivable",
+   "payable",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "fund_pe": 7,
+   "lbo_returns": 1,
+   "merger_ma": 1,
+   "multiples_comps": 3,
+   "real_estate_pf": 2,
+   "scenario_driven": 1,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Conso FS",
+   "IS",
+   "BS",
+   "Use of Inv Funds",
+   "Investment Fund Analysis",
+   "Monthly CF",
+   "CF",
+   "Rev",
+   "Soft Inc",
+   "Product Cost & Sales Volume",
+   "FA",
+   "Staff Exp",
+   "OPEX",
+   "IT Service Costs",
+   "B S Comps",
+   "Inventory Calculation",
+   "Presentation - Growth",
+   "Tier Discounts"
+  ],
+  "tags": [
+   "fund_pe",
+   "multiples_comps",
+   "three_statement"
+  ]
+ },
+ "0609.xlsm": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "working capital",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "dscr",
+   "arr",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "scenario_driven",
+  "scores": {
+   "dcf_valuation": 2,
+   "fund_pe": 1,
+   "lbo_returns": 3,
+   "real_estate_pf": 3,
+   "scenario_driven": 4,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Model Cover",
+   "Inputs",
+   "Scenario",
+   "Timing",
+   "Operations",
+   "Cons",
+   "T&A",
+   "Debt",
+   "IFS",
+   "Output",
+   "Valuation",
+   "Copy",
+   "Names",
+   "Checks"
+  ],
+  "tags": [
+   "lbo_returns",
+   "real_estate_pf",
+   "scenario_driven"
+  ]
+ },
+ "0613.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "irr",
+   "dscr",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "real_estate_pf": 2,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Cover",
+   "Assumptions",
+   "Calculations",
+   "Results",
+   "Sheet5"
+  ],
+  "tags": []
+ },
+ "0614.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "wacc",
+   "terminal value",
+   "receivable",
+   "payable",
+   "depreciation"
+  ],
+  "primary": "dcf_valuation",
+  "scores": {
+   "dcf_valuation": 6,
+   "three_statement": 1
+  },
+  "sheets": [
+   "Assumptions",
+   "Revenue & Cost Build",
+   "Operating Model",
+   "DCF",
+   "Dashboard"
+  ],
+  "tags": [
+   "dcf_valuation"
+  ]
+ },
+ "0618.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "leverage",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "real_estate_pf": 2,
+   "scenario_driven": 5,
+   "three_statement": 6
+  },
+  "sheets": [
+   "Dashboard",
+   "Scenario",
+   "InputH",
+   "OpCo",
+   "Investment",
+   "DCF",
+   "FS"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0620.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "dscr",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 4,
+   "real_estate_pf": 1,
+   "scenario_driven": 2,
+   "three_statement": 5
+  },
+  "sheets": [
+   "Inputs",
+   "Calc",
+   "FS",
+   "DCF",
+   "Graphs"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "three_statement"
+  ]
+ },
+ "0621.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "irr",
+   "dscr",
+   "arr",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "real_estate_pf": 2,
+   "three_statement": 5
+  },
+  "sheets": [
+   "Inputs",
+   "Calc",
+   "FS"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0622.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "working capital",
+   "irr",
+   "dscr",
+   "receivable",
+   "payable",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "real_estate_pf": 1,
+   "three_statement": 8
+  },
+  "sheets": [
+   "Assumptions",
+   "Calculations",
+   "P&L",
+   "Cash Flow",
+   "Balance Sheet",
+   "Ratios",
+   "Graphs"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0624.xlsm": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "working capital",
+   "irr",
+   "equity value",
+   "dscr",
+   "leverage",
+   "dividend"
+  ],
+  "primary": "real_estate_pf",
+  "scores": {
+   "real_estate_pf": 1,
+   "scenario_driven": 1
+  },
+  "sheets": [
+   "Inputs",
+   "Calc",
+   "Results"
+  ],
+  "tags": []
+ },
+ "0626.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "irr",
+   "receivable",
+   "payable",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "three_statement": 2
+  },
+  "sheets": [
+   "Cover",
+   "Dashboard",
+   "Inputs",
+   "Calc",
+   "Graph",
+   "FS_M",
+   "FS_A",
+   "Get Open"
+  ],
+  "tags": []
+ },
+ "0630.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "churn",
+   "receivable",
+   "payable",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "scenario_driven": 5,
+   "startup_saas": 1,
+   "three_statement": 6
+  },
+  "sheets": [
+   "Dashboard",
+   "Scenario",
+   "Inputs",
+   "Calc",
+   "DCF",
+   "FS"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0632.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "share price",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 5,
+   "real_estate_pf": 2,
+   "scenario_driven": 5,
+   "three_statement": 6
+  },
+  "sheets": [
+   "Dashboard",
+   "Scenario",
+   "InputH",
+   "Calc",
+   "DCF",
+   "FS"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0635.xlsm": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "net income",
+   "capex",
+   "working capital",
+   "fcf",
+   "irr",
+   "equity value",
+   "receivable",
+   "payable",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "fund_pe": 1,
+   "merger_ma": 1,
+   "real_estate_pf": 1,
+   "scenario_driven": 5,
+   "three_statement": 6
+  },
+  "sheets": [
+   "Dashboard",
+   "Scenario Manager",
+   "Inputs",
+   "Caclulation",
+   "FS",
+   "Investment",
+   "Check"
+  ],
+  "tags": [
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0636.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "working capital",
+   "fcf",
+   "irr",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "share price",
+   "dividend"
+  ],
+  "primary": "dcf_valuation",
+  "scores": {
+   "dcf_valuation": 6,
+   "lbo_returns": 4,
+   "multiples_comps": 1,
+   "real_estate_pf": 3,
+   "scenario_driven": 4,
+   "three_statement": 5
+  },
+  "sheets": [
+   "Dashboard",
+   "Sc",
+   "InpT",
+   "LBO",
+   "FS",
+   "Calc",
+   "DCF"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "real_estate_pf",
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0638.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "irr",
+   "dscr",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "real_estate_pf",
+  "scores": {
+   "real_estate_pf": 1
+  },
+  "sheets": [
+   "Inputs",
+   "CalcM",
+   "CalcA"
+  ],
+  "tags": []
+ },
+ "0639.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "churn",
+   "cac"
+  ],
+  "primary": "startup_saas",
+  "scores": {
+   "startup_saas": 1
+  },
+  "sheets": [
+   "Cover",
+   "Dashboard",
+   "Inputs",
+   "Calc"
+  ],
+  "tags": []
+ },
+ "0640.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "working capital",
+   "fcf",
+   "irr",
+   "moic",
+   "equity value",
+   "occupancy",
+   "ltv",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "fund_pe": 1,
+   "lbo_returns": 4,
+   "real_estate_pf": 1,
+   "three_statement": 6
+  },
+  "sheets": [
+   "LBO",
+   "Raw Data -->",
+   "IS Adjusted",
+   "BS"
+  ],
+  "tags": [
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0642.xlsm": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "irr",
+   "equity value",
+   "dscr",
+   "ltv",
+   "leverage",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "real_estate_pf",
+  "scores": {
+   "budget_reporting": 1,
+   "fund_pe": 1,
+   "real_estate_pf": 3,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Cover",
+   "Dashboard",
+   "Inp-Corporate",
+   "Calc-Corporate",
+   "Inp-LT2",
+   "Calc-LT2",
+   "Inp-VPP",
+   "Calc-VPP",
+   "Inp-H2",
+   "Calc-H2",
+   "Inp-P6",
+   "Calc-P6",
+   "Inp-P7",
+   "Calc-P7",
+   "Inp-P8",
+   "Calc-P8",
+   "Audit"
+  ],
+  "tags": [
+   "real_estate_pf"
+  ]
+ },
+ "0643.xlsm": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "working capital",
+   "irr",
+   "dscr",
+   "arr",
+   "receivable",
+   "payable",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "real_estate_pf": 2,
+   "three_statement": 6
+  },
+  "sheets": [
+   "Cover",
+   "Inputs",
+   "Dashboard",
+   "Calculations",
+   "Ratios",
+   "FS",
+   "Audit"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0644.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "capex",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "moic",
+   "equity value",
+   "net debt",
+   "receivable",
+   "payable",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "fund_pe": 1,
+   "lbo_returns": 5,
+   "real_estate_pf": 2,
+   "scenario_driven": 4,
+   "three_statement": 6
+  },
+  "sheets": [
+   "Info",
+   "Financial Statements",
+   "Flags Calculations and Returns",
+   "Checks"
+  ],
+  "tags": [
+   "lbo_returns",
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0646.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "npv",
+   "wacc",
+   "terminal value",
+   "equity value",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 3,
+   "scenario_driven": 4,
+   "three_statement": 4
+  },
+  "sheets": [
+   "Summary",
+   "Scenarios",
+   "InpT",
+   "Calc",
+   "Valuation",
+   "FS",
+   "Audit"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0648.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "capex",
+   "working capital",
+   "irr",
+   "npv",
+   "enterprise value",
+   "equity value",
+   "ltv",
+   "receivable",
+   "payable",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "budget_reporting": 1,
+   "dcf_valuation": 3,
+   "lbo_returns": 3,
+   "multiples_comps": 1,
+   "scenario_driven": 1,
+   "three_statement": 4
+  },
+  "sheets": [
+   "Financial Statements",
+   "IRR-NPV Calculations",
+   "Workings",
+   "Sensitivity Dashboard"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "three_statement"
+  ]
+ },
+ "0649.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "net income",
+   "capex",
+   "working capital",
+   "occupancy",
+   "ltv",
+   "payable"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "merger_ma": 1,
+   "scenario_driven": 1,
+   "three_statement": 11
+  },
+  "sheets": [
+   "Historicals",
+   "Assumptions",
+   "Calculations",
+   "Financial Statements",
+   "IS",
+   "BS"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0650.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "capex",
+   "free cash flow",
+   "irr",
+   "dscr",
+   "ltv"
+  ],
+  "primary": "real_estate_pf",
+  "scores": {
+   "dcf_valuation": 1,
+   "fund_pe": 1,
+   "real_estate_pf": 2,
+   "three_statement": 1
+  },
+  "sheets": [
+   "Assumptions",
+   "OFSW CF",
+   "Dev Pipe CF",
+   "Portfolio"
+  ],
+  "tags": []
+ },
+ "0651.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "arr",
+   "leverage",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "lbo_returns": 1,
+   "real_estate_pf": 2,
+   "scenario_driven": 5,
+   "startup_saas": 1,
+   "three_statement": 5
+  },
+  "sheets": [
+   "Scenario",
+   "InputH",
+   "Calculation",
+   "CapStr",
+   "FS",
+   "Workings",
+   "Assumptions justification"
+  ],
+  "tags": [
+   "scenario_driven",
+   "three_statement"
+  ]
+ },
+ "0652.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross margin",
+   "net income",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "irr",
+   "moic",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "net debt",
+   "depreciation",
+   "amortization",
+   "share price",
+   "dividend"
+  ],
+  "primary": "lbo_returns",
+  "scores": {
+   "dcf_valuation": 1,
+   "lbo_returns": 3,
+   "real_estate_pf": 1,
+   "three_statement": 1
+  },
+  "sheets": [
+   "Calculation",
+   "Assumptions"
+  ],
+  "tags": [
+   "lbo_returns"
+  ]
+ },
+ "0654.xlsm": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "irr",
+   "equity value",
+   "dscr",
+   "arr",
+   "ltv",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "budget_reporting": 1,
+   "fund_pe": 1,
+   "real_estate_pf": 2,
+   "three_statement": 5
+  },
+  "sheets": [
+   "Cover",
+   "Dashboard",
+   "Inputs",
+   "Estimates-H2",
+   "Calculation",
+   "FS",
+   "Audit"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0656.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "arr",
+   "leverage",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "share price",
+   "dividend"
+  ],
+  "primary": "dcf_valuation",
+  "scores": {
+   "dcf_valuation": 9,
+   "lbo_returns": 4,
+   "merger_ma": 1,
+   "multiples_comps": 9,
+   "real_estate_pf": 4,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Dashboard",
+   "FS_H",
+   "Assumptions",
+   "DCF",
+   "WACC",
+   "LBO",
+   "Txn Comps",
+   "FF"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps",
+   "real_estate_pf"
+  ]
+ },
+ "0657.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross margin",
+   "capex",
+   "receivable",
+   "payable",
+   "depreciation",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "three_statement": 6
+  },
+  "sheets": [
+   "Cover",
+   "Dashboard",
+   "Inputs",
+   "Calc",
+   "Financial Statements",
+   "Analysis"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0658.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "net income",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "fcf",
+   "irr",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value",
+   "arr",
+   "leverage",
+   "net debt",
+   "receivable",
+   "payable",
+   "depreciation",
+   "share price",
+   "eps"
+  ],
+  "primary": "multiples_comps",
+  "scores": {
+   "dcf_valuation": 10,
+   "lbo_returns": 4,
+   "merger_ma": 5,
+   "multiples_comps": 12,
+   "real_estate_pf": 3,
+   "scenario_driven": 2,
+   "three_statement": 8
+  },
+  "sheets": [
+   "Dashboard",
+   "Manager Tab",
+   "Asumptions",
+   "DCF",
+   "LBO",
+   "FF",
+   "Accretion Analysis",
+   "Trading Comps",
+   "WACC",
+   "Txn Comps",
+   "P&L",
+   "BS",
+   "CF"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "merger_ma",
+   "multiples_comps",
+   "real_estate_pf",
+   "three_statement"
+  ]
+ },
+ "0660.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "capex",
+   "working capital",
+   "irr",
+   "equity value",
+   "dscr",
+   "ltv",
+   "leverage"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "fund_pe": 1,
+   "real_estate_pf": 1,
+   "scenario_driven": 1,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Inputs",
+   "Calc OpCo",
+   "Calc HoldCo",
+   "FS_OpCo"
+  ],
+  "tags": []
+ },
+ "0661.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "net income",
+   "capex",
+   "working capital",
+   "fcf",
+   "irr",
+   "moic",
+   "enterprise value",
+   "equity value",
+   "arr",
+   "leverage",
+   "net debt",
+   "depreciation",
+   "amortization",
+   "payback",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "lbo_returns": 1,
+   "real_estate_pf": 2,
+   "scenario_driven": 1,
+   "three_statement": 5
+  },
+  "sheets": [
+   "Assumptions",
+   "Calculation",
+   "3-statements model"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ },
+ "0663.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "noi",
+   "cap rate",
+   "ltv",
+   "leverage",
+   "amortization"
+  ],
+  "primary": "real_estate_pf",
+  "scores": {
+   "lbo_returns": 1,
+   "real_estate_pf": 11,
+   "scenario_driven": 1
+  },
+  "sheets": [
+   "Inputs",
+   "Rent Roll",
+   "Trailing-12 & Pro Forma",
+   "Calculations",
+   "Description",
+   "Projection",
+   "Amort. Schedule"
+  ],
+  "tags": [
+   "real_estate_pf"
+  ]
+ },
+ "0665.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "capex",
+   "irr",
+   "dscr",
+   "noi",
+   "cap rate",
+   "leverage"
+  ],
+  "primary": "real_estate_pf",
+  "scores": {
+   "fund_pe": 1,
+   "lbo_returns": 1,
+   "merger_ma": 1,
+   "real_estate_pf": 3,
+   "scenario_driven": 1
+  },
+  "sheets": [
+   "Dashboard",
+   "Inputs",
+   "Calculations",
+   "Financing"
+  ],
+  "tags": [
+   "real_estate_pf"
+  ]
+ },
+ "0666.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "working capital",
+   "wacc",
+   "terminal value",
+   "arr",
+   "mrr",
+   "churn",
+   "ltv",
+   "cac",
+   "payable",
+   "payback",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "dcf_valuation": 2,
+   "real_estate_pf": 1,
+   "scenario_driven": 1,
+   "startup_saas": 3,
+   "three_statement": 3
+  },
+  "sheets": [
+   "Cover",
+   "Dashboard",
+   "Assumptions",
+   "Calc_M",
+   "FS_M",
+   "FS_A",
+   "Mistakes"
+  ],
+  "tags": [
+   "startup_saas",
+   "three_statement"
+  ]
+ },
+ "0668.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "operating margin",
+   "irr",
+   "moic",
+   "equity value",
+   "arr",
+   "share price"
+  ],
+  "primary": "lbo_returns",
+  "scores": {
+   "budget_reporting": 1,
+   "lbo_returns": 5,
+   "real_estate_pf": 1,
+   "three_statement": 1
+  },
+  "sheets": [
+   "Inc Stmt",
+   "Cap table",
+   "Customer Revenue"
+  ],
+  "tags": [
+   "lbo_returns"
+  ]
+ },
+ "0669.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "capex",
+   "depreciation"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "lbo_returns": 1,
+   "three_statement": 2
+  },
+  "sheets": [
+   "Cover",
+   "Assumptions",
+   "Historicals",
+   "Calculations",
+   "Monthly FS",
+   "Annual FS"
+  ],
+  "tags": []
+ },
+ "0671.xlsm": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "gross margin",
+   "net income",
+   "operating margin",
+   "capex",
+   "working capital",
+   "free cash flow",
+   "irr",
+   "moic",
+   "wacc",
+   "enterprise value",
+   "equity value",
+   "leverage",
+   "receivable",
+   "payable",
+   "depreciation",
+   "amortization",
+   "eps",
+   "dividend"
+  ],
+  "primary": "merger_ma",
+  "scores": {
+   "dcf_valuation": 1,
+   "lbo_returns": 4,
+   "merger_ma": 6,
+   "real_estate_pf": 2,
+   "three_statement": 3
+  },
+  "sheets": [
+   "Valuation",
+   "Calculation",
+   "Merger Analysis",
+   "LBO"
+  ],
+  "tags": [
+   "lbo_returns",
+   "merger_ma",
+   "three_statement"
+  ]
+ },
+ "0672.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "net income",
+   "capex",
+   "working capital",
+   "fcf",
+   "irr",
+   "moic",
+   "wacc",
+   "terminal value",
+   "enterprise value",
+   "equity value"
+  ],
+  "primary": "multiples_comps",
+  "scores": {
+   "dcf_valuation": 5,
+   "lbo_returns": 6,
+   "merger_ma": 2,
+   "multiples_comps": 8,
+   "three_statement": 1
+  },
+  "sheets": [
+   "LDN",
+   "Valuation Summary",
+   "LBO",
+   "DCF",
+   "Public Comps",
+   "Precedent Transactions"
+  ],
+  "tags": [
+   "dcf_valuation",
+   "lbo_returns",
+   "multiples_comps"
+  ]
+ },
+ "0677.xlsx": {
+  "metrics_found": [
+   "revenue",
+   "ebitda",
+   "ebit",
+   "gross profit",
+   "net income",
+   "capex",
+   "receivable",
+   "payable",
+   "depreciation",
+   "eps",
+   "dividend"
+  ],
+  "primary": "three_statement",
+  "scores": {
+   "real_estate_pf": 1,
+   "three_statement": 3
+  },
+  "sheets": [
+   "Ratios and Assumptions",
+   "Financial Model"
+  ],
+  "tags": [
+   "three_statement"
+  ]
+ }
+}

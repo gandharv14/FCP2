@@ -1,0 +1,8 @@
+# Stage 0 parses .xlsx with openpyxl; the evaluator reads cached values back
+# through it as well. Everything else in the pipeline is standard library.
+openpyxl>=3.1.5
+
+# Optional. Only needed for `xl_segment.py --adjudicate`, which asks an LLM to
+# name and rank output candidates. Without it the pipeline falls back to the
+# scoring heuristic and `curation.toml`.
+# (uses urllib against the Anthropic HTTP API directly, so no SDK is required)

@@ -1,0 +1,20 @@
+# Client workbooks and credentials must never be committed.
+*.xlsx
+*.xlsm
+.env
+**/.env
+**/config/*sa-*.json
+**/config/*lb-*.json
+**/config/*secret*.json
+**/config/.env.secrets.gen
+
+# Derived artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+ast_out/
+seg_out/
+inputs_out/
+tasks_outputs*/
+jobs/
+runs/

@@ -227,11 +227,23 @@ def cmd_smoke(args):
 
     async def run():
         from fastmcp import Client
+
+        async def query_all(client, args, max_pages=40):
+            rows, cursor = [], 0
+            for _ in range(max_pages):
+                result = await client.call_tool(
+                    "query_records", {**args, "limit": 5, "cursor": cursor})
+                rows.extend(result.data["rows"])
+                cursor = result.data.get("next_cursor")
+                if cursor is None:
+                    break
+            return rows
+
         async with Client(server) as client:
             tools = sorted(tool.name for tool in await client.list_tools())
             datasets = await client.call_tool("list_datasets", {"limit": 100})
             checks = {"tools": tools, "datasets": len(datasets.data), "resolved": 0,
-                      "broad_conflicts": 0, "failures": []}
+                      "broad_conflicts": 0, "chains_seen": 0, "failures": []}
             tasks = [json.loads(line) for line in
                      (bundle / "eval" / "tasks.jsonl").read_text(
                          encoding="utf-8").splitlines() if line.strip()]
@@ -239,26 +251,27 @@ def cmd_smoke(args):
                 wanted = task["required_dimensions"]
                 evidence = task["evidence"]
                 metric = wanted["metric"]
-                result = await client.call_tool("query_records", {
+                rows = await query_all(client, {
                     "dataset_id": evidence["dataset_id"], "metric": metric,
                     "entity": wanted["entity"], "period": str(wanted["period"]),
                     "scenario": wanted["scenario"], "basis": wanted["basis"],
                     "unit": wanted["unit"], "status": wanted["status"],
-                    "limit": 100,
                 })
-                rows = result.data["rows"]
-                exact = [row for row in rows if row["id"] == evidence["record_id"]]
-                if len(exact) == 1 and \
-                        exact[0]["value"] == task["answer"]["value"]:
+                current = [row for row in rows if not row.get("superseded_by")]
+                if len(rows) > 1:
+                    checks["chains_seen"] += 1
+                if len(current) == 1 and \
+                        current[0]["id"] == evidence["record_id"] and \
+                        current[0]["value"] == task["answer"]["value"]:
                     checks["resolved"] += 1
                 else:
                     checks["failures"].append(task["task_id"])
-                broad = await client.call_tool("query_records", {
+                broad = await query_all(client, {
                     "dataset_id": evidence["dataset_id"], "metric": metric,
-                    "limit": 100,
+                    "entity": wanted["entity"],
                 })
                 values = {json.dumps(row["value"], sort_keys=True)
-                          for row in broad.data["rows"]}
+                          for row in broad}
                 if len(values) > 1:
                     checks["broad_conflicts"] += 1
             return checks

@@ -124,6 +124,9 @@ def alternate_period(period: str, index: int) -> str:
 
 
 def alternate_unit(unit: str, index: int) -> str:
+    """A plausible wrong unit that never contains the true unit as a token
+    substring; the server matches dimensions by token containment, so a
+    colliding alternate would make a fully-filtered query ambiguous."""
     lower = unit.casefold()
     if lower in {"percent", "%"}:
         return "basis points" if index % 2 else "decimal fraction"
@@ -131,7 +134,17 @@ def alternate_unit(unit: str, index: int) -> str:
         return "GBP million"
     if "gbp" in lower or "\u00a3" in lower:
         return "EUR million"
-    return "alternate %s" % unit
+    if "year" in lower:
+        return "months"
+    if "date" in lower:
+        return "period index"
+    if "mw" in lower:
+        return "GW"
+    if "ebitda" in lower:
+        return "x EBIT"
+    if "method" in lower:
+        return "profile code"
+    return "nonstandard measure"
 
 
 def source_id(source: dict[str, Any]) -> str:
@@ -150,7 +163,9 @@ def display_value(value: Any, unit: str) -> str:
 
 
 def make_record(dataset_id: str, source: str, document: str,
-                variable: dict[str, Any], value: Any, row_key: str) -> dict[str, Any]:
+                variable: dict[str, Any], value: Any, row_key: str,
+                release: str, published_at: str,
+                superseded_by: str | None) -> dict[str, Any]:
     return {
         "id": stable_id("row", dataset_id, row_key),
         "dataset_id": dataset_id,
@@ -164,12 +179,25 @@ def make_record(dataset_id: str, source: str, document: str,
         "basis": variable["basis"],
         "unit": variable["unit"],
         "status": variable["status"],
+        "release": release,
+        "published_at": published_at,
+        "superseded_by": superseded_by,
         "value": value,
     }
 
 
 def make_document(doc_id: str, source: dict[str, Any], row: dict[str, Any],
-                  kind: str, published: str) -> dict[str, Any]:
+                  kind: str, published: str, supersedes: str | None = None,
+                  superseded_by: str | None = None) -> dict[str, Any]:
+    if superseded_by:
+        lineage = ("SUPERSEDED: this release has been replaced by release %s. "
+                   "Do not use it for current work." % superseded_by)
+    elif supersedes:
+        lineage = ("This release supersedes release %s and is the "
+                   "authoritative figure." % supersedes)
+    else:
+        lineage = ("Use this observation only when every dimension matches "
+                   "the research question.")
     return {
         "id": doc_id,
         "source_id": source_id(source),
@@ -179,16 +207,16 @@ def make_document(doc_id: str, source: dict[str, Any], row: dict[str, Any],
         "published_at": published,
         "url": "mock://%s/documents/%s" % (source_id(source), doc_id),
         "content": (
-            "%s | %s release\n\n"
+            "%s | %s release %s\n\n"
             "Entity: %s\nMetric: %s\nPeriod: %s\n"
             "Scenario: %s\nBasis: %s\nUnit: %s\n"
             "Status: %s\nReported value: %s\n\n"
-            "Use this observation only when every dimension matches the "
-            "research question. Related releases may contain nearby values "
-            "that are not interchangeable."
-            % (source["name"], row["status"], row["entity"], row["metric"],
-               row["period"], row["scenario"], row["basis"], row["unit"],
-               row["status"], display_value(row["value"], row["unit"]))
+            "%s Related releases may contain nearby values that are not "
+            "interchangeable."
+            % (source["name"], row["status"], row["release"], row["entity"],
+               row["metric"], row["period"], row["scenario"], row["basis"],
+               row["unit"], row["status"],
+               display_value(row["value"], row["unit"]), lineage)
         ),
         "related_dataset_id": row["dataset_id"],
     }
@@ -241,17 +269,48 @@ def build(spec: dict[str, Any], output: Path) -> dict[str, Any]:
             "source_id": sid,
             "name": "%s versioned indicators" % primary["name"],
             "description": ("Records vary by entity, metric, period, scenario, "
-                            "basis, unit, and status. Filter all relevant dimensions."),
+                            "basis, unit, and status, and exist in multiple "
+                            "releases. Filter all relevant dimensions, then use "
+                            "only the release whose superseded_by is null."),
             "dimensions": ["entity", "metric", "period", "scenario", "basis",
                            "unit", "status"],
         })
 
+        # Provenance chain: stale releases share every dimension with the
+        # supported record and are distinguishable only by their supersession
+        # links. Exactly one release per dimension tuple is unsuperseded.
+        n_stale = max(0, min(int(spec.get("provenance_releases_per_variable", 2)), 6))
+        release_ids = [stable_id("rel", spec["environment_id"], variable["id"], k)
+                       for k in range(n_stale + 1)]  # last one is the supported release
+        stale_dates = ["%d-06-30" % (2017 + k) for k in range(n_stale)]
+
         doc_id = stable_id("doc", spec["environment_id"], variable["id"], "supported")
-        supported = make_record(dataset_id, sid, doc_id, variable,
-                                variable["value"], "%s-supported" % variable["id"])
+        supported = make_record(
+            dataset_id, sid, doc_id, variable, variable["value"],
+            "%s-supported" % variable["id"],
+            release=release_ids[-1],
+            published_at=variable.get("published_at", "2019-12-18"),
+            superseded_by=None)
         records.append(supported)
-        documents.append(make_document(doc_id, primary, supported, "data-release",
-                                       variable.get("published_at", "2019-12-18")))
+        documents.append(make_document(
+            doc_id, primary, supported, "data-release",
+            variable.get("published_at", "2019-12-18"),
+            supersedes=release_ids[-2] if n_stale else None))
+
+        for k in range(n_stale):
+            successor = release_ids[k + 1]
+            stale_doc = stable_id("doc", spec["environment_id"], variable["id"],
+                                  "release", k)
+            stale = make_record(
+                dataset_id, sid, stale_doc, variable,
+                perturb(variable, [1, 3, 0, 5, 2, 4][k % 6]),
+                "%s-release-%d" % (variable["id"], k),
+                release=release_ids[k], published_at=stale_dates[k],
+                superseded_by=successor)
+            records.append(stale)
+            documents.append(make_document(
+                stale_doc, primary, stale, "assumption-book", stale_dates[k],
+                superseded_by=successor))
 
         tasks.append({
             "task_id": variable["id"],
@@ -264,8 +323,11 @@ def build(spec: dict[str, Any], output: Path) -> dict[str, Any]:
                    for field in ["entity", "period", "scenario",
                                  "basis", "unit", "status"]},
             },
+            "resolution_rule": "match all required dimensions, then use the "
+                               "release whose superseded_by is null",
             "evidence": {"source_id": sid, "dataset_id": dataset_id,
-                         "record_id": supported["id"], "document_id": doc_id},
+                         "record_id": supported["id"], "document_id": doc_id,
+                         "release": release_ids[-1]},
             "workbook": variable.get("workbook", {}),
         })
 
@@ -294,23 +356,33 @@ def build(spec: dict[str, Any], output: Path) -> dict[str, Any]:
             alt_sid = source_id(alt_source)
             alt_doc = stable_id("doc", spec["environment_id"], variable["id"],
                                 "alternative", index)
-            alt_record = make_record(dataset_id, alt_sid, alt_doc, altered,
-                                     perturb(variable, index),
-                                     "%s-alternative-%d" % (variable["id"], index))
+            alt_published = "%d-06-30" % (2017 + index % 8)
+            alt_record = make_record(
+                dataset_id, alt_sid, alt_doc, altered, perturb(variable, index),
+                "%s-alternative-%d" % (variable["id"], index),
+                release=stable_id("rel", spec["environment_id"], variable["id"],
+                                  "alt", index),
+                published_at=alt_published, superseded_by=None)
             records.append(alt_record)
             documents.append(make_document(
                 alt_doc, alt_source, alt_record,
                 ["archive", "market-note", "technical-annex", "data-release"][index % 4],
-                "%d-06-30" % (2017 + index % 8)))
+                alt_published))
 
     rng.shuffle(documents)
     rng.shuffle(records)
     server_config = {
         "name": "%s-research-service" % spec["environment_id"],
-        "version": "1.0.0",
+        "version": "2.0.0",
         "instructions": ("Discover sources and datasets, search and fetch evidence, "
                          "then filter records by every dimension relevant to the "
-                         "question. Broad queries can return conflicting values."),
+                         "question. Broad queries can return conflicting values. "
+                         "Records exist in multiple releases: a row whose "
+                         "superseded_by field is set has been replaced by the "
+                         "named later release and must not be used; only the "
+                         "unsuperseded release is authoritative. query_records "
+                         "requires at least two filter dimensions and returns at "
+                         "most 5 rows per page (follow next_cursor)."),
     }
     write_json(runtime / "server.json", server_config)
     write_json(runtime / "sources.json",

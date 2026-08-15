@@ -406,12 +406,16 @@ exposes five tools:
   scenario, basis, unit and status
 
 Records vary across those dimensions and broad queries return conflicting
-candidate values from adjacent periods, other scenario cases and superseded
-releases. Filter every dimension that matters to your question and rely only
-on records whose status is `final`. Convert each retrieved value into the
-units and scale of the sheet it belongs on (rates are reported in percent
-while sheets may store decimal fractions; monetary amounts state their unit
-on the record).
+candidate values from adjacent periods, other scenario cases and earlier
+releases. `query_records` requires at least two filter dimensions and returns
+at most 5 rows per page; follow the returned `next_cursor` to page through
+larger result sets. Records exist in multiple releases: a row whose
+`superseded_by` field names a later release has been replaced and must not be
+used - only the unsuperseded release of a record is authoritative. Filter
+every dimension that matters to your question. Convert each retrieved value
+into the units and scale of the sheet it belongs on (rates are reported in
+percent while sheets may store decimal fractions; monetary amounts state
+their unit on the record).
 
 Any MCP client works, for example from Python:
 

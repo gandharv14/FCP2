@@ -35,6 +35,15 @@ python3 xl_segment.py 0248 0262 0449 0450 --source "4-10 100" -o seg_out
 
 # Optional: seg_out/<id> -> a copy of the workbook holding only its inputs
 python3 xl_input_mask.py 0248 0262 0449 0450 -o inputs_out
+
+# Optional: mask externally-sourced inputs and serve them through a mock MCP
+# research sidecar instead (full walkthrough in section 23)
+python3 xl_variable_mcp.py build runs/0233-variable-sources/normalized.json \
+    runs/0233-variable-sources/mcp --workbook 0233 --source "4-10 100"
+python3 xl_input_mask.py 0233 --source "4-10 100" -o inputs_out_mcp \
+    --mask-cells runs/0233-variable-sources/mcp/mask_cells.json
+python3 xl_output_task.py 0233 --source "4-10 100" --inputs-root inputs_out_mcp \
+    --mcp runs/0233-variable-sources/mcp -o tasks_outputs
 ```
 
 `xl_segment.py` takes workbook ids rather than paths: it reads the graph from
@@ -1799,7 +1808,8 @@ folder, or a workbook id such as `0256`.
    inputs, not the golden workbook
 
 Default output is `tasks_outputs/<WB>-outputs/`. Optional variants when asked:
-`--hints` → `tasks_outputs_hinted/`; `--semantic-hints` → needs a `primary`
+`--mcp <bundle>` → mask externally-sourced inputs behind the research sidecar
+(section 23); `--hints` → `tasks_outputs_hinted/`; `--semantic-hints` → needs a `primary`
 family in `taxonomy_out/workbooks.json`.
 
 Naturalized instructions need LiteLLM credentials in `.env`. Use
@@ -1872,8 +1882,10 @@ contractual terms, opening balances — and serves them through a mock MCP
 research service running as a docker-compose sidecar next to the agent
 container. The agent has to research the missing assumptions with generic
 retrieval tools before it can rebuild the model. Broad queries return
-plausible distractors; only a query that pins down every dimension (entity,
-metric, period, scenario, basis, unit, status) resolves the true value.
+plausible distractors; resolving a value takes a query that pins down every
+dimension (entity, metric, period, scenario, basis, unit, status) *and*, as
+of the v2 hardening below, picking the unsuperseded release from a provenance
+chain of otherwise identical records, five paginated rows at a time.
 
 The design is adapted from the `build-variable-source-mcp` skill and follows
 the [Harbor MCP server task pattern](https://www.harborframework.com/docs/tutorials/mcp-server-task).
@@ -1916,6 +1928,14 @@ python3 xl_output_task.py 0233 --source "4-10 100" \
 
 # 7. Re-apply formula hints as usual (the clone carries the sidecar through)
 python3 xl_formula_hint_tasks.py --source tasks_outputs -o tasks_outputs_hinted
+
+# 8. Oracle-check the shipped bundle against the live sidecar container
+docker build -t mcp-0233-oracle tasks_outputs_hinted/0233-outputs/environment/mcp-server
+docker run -d --name mcp-0233-oracle-run -p 18233:8000 mcp-0233-oracle
+uv run --python 3.12 --with fastmcp --with openpyxl \
+    python runs/0233-variable-sources/oracle_check.py \
+    --bundle tasks_outputs_hinted/0233-outputs \
+    --mcp runs/0233-variable-sources/mcp --url http://127.0.0.1:18233/mcp
 ```
 
 ### What `build` emits
@@ -1930,21 +1950,39 @@ runs/<wb>-variable-sources/mcp/
   masked_inputs.json  audit map: variable -> refs, raw value, MCP evidence
 ```
 
-Each variable produces one supported record plus ~18 distractors that each
-differ on at least one meaningful dimension (adjacent period, another scenario
-case, another basis or unit, a superseded status). No distractor shares every
-required dimension with *any* supported record, so a fully-disambiguated
-`query_records` call resolves to exactly one row — the generator enforces this
-globally, and `validate` re-proves it per task. Values are exact raw workbook
-values (the grader tolerance is 1e-6, so the service must serve exactly what
-the masked cells held); the golden-value check makes a mismatched spec
-impossible to build.
+Each variable produces one supported record plus two layers of noise, both
+seed-controlled:
+
+- **~18 dimension distractors** (`distractors_per_variable`) that each differ
+  on at least one meaningful dimension — adjacent period, another scenario
+  case, another basis or unit, another status. No *unsuperseded* distractor
+  shares every dimension with any supported record; the generator enforces
+  this globally, and `alternate_unit` is careful to emit wrong units that do
+  not contain the true unit as a token (the server matches dimensions by
+  token containment, so "alternate years" would have made queries for
+  "years" ambiguous).
+- **2 stale provenance releases** (`provenance_releases_per_variable`) that
+  share *every* dimension with the supported record — even `status: final` —
+  and differ only in `release`, `published_at`, and a `superseded_by` link
+  naming the successor. Their values are perturbed, so dimension filters
+  alone return several conflicting rows; the deterministic rule is *use the
+  release whose* `superseded_by` *is null*.
+
+`validate` re-proves per task, using the live server's matching semantics:
+the dimension filter plus the supersession rule select exactly the evidence
+record, every chain is acyclic and ends at it, no stale release carries the
+current value, and no evaluation key leaks into the runtime. Supported values
+are exact raw workbook values (the grader tolerance is 1e-6, so the service
+must serve exactly what the masked cells held); the golden-value check makes
+a mismatched spec impossible to build.
 
 The server exposes one generic tool surface across all domains —
 `list_sources`, `list_datasets`, `search_documents`, `fetch_document`,
 `query_records` — with no target-named tools, no truth flags, and `mock://`
 document URLs so synthetic documents cannot be mistaken for genuine
 publications. Real source URLs survive only as `origin_url` metadata.
+`query_records` requires at least two filter dimensions and pages at five
+rows per `next_cursor`, so harvesting the corpus wholesale costs many calls.
 
 ### Masking
 
@@ -1990,14 +2028,51 @@ inputs surface as wrong outputs.
 ### Verification before rollout
 
 `runs/0233-variable-sources/oracle_check.py` runs against the live sidecar
-container exactly as the agent reaches it and asserts: every masked variable
-resolves over streamable HTTP through a fully-disambiguated query; every broad
-metric query returns conflicting candidates; every masked cell is blank in the
-shipped workbook; no surviving cell leaks a masked value (numeric, string, or
-date representation); and neither the golden workbook nor `eval/` is in
-`environment/`. For 0233: 70/70 resolved, 70/70 broad conflicts, 0 leaks
-beyond documented axis-header coincidences and the excluded Group Tax rate
-rows.
+container exactly as the agent reaches it — paginating through `next_cursor`
+and applying the supersession rule — and asserts: every masked variable
+resolves over streamable HTTP to its evidence record; every variable's
+provenance chain is visible; every broad metric query returns conflicting
+candidates; every masked cell is blank in the shipped workbook; no surviving
+cell leaks a masked value (numeric, string, or date representation); and
+neither the golden workbook nor `eval/` is in `environment/`. For 0233:
+70/70 resolved, 70/70 chains seen, 70/70 broad conflicts, 0 leaks beyond
+documented axis-header coincidences and the excluded Group Tax rate rows
+(reports in `runs/0233-variable-sources/oracle_report*.json`).
+
+### Difficulty hardening (v2): pagination caps and provenance chains
+
+Trajectory analysis of the first rerun showed the retrieval layer was too
+cheap: agents dumped whole datasets with one broad `query_records` call
+(limit 200-300) and disambiguated the distractors locally by reading the
+dimension labels off each row. Two changes close that route:
+
+**Capped, filter-gated, paginated queries.** `query_records` now requires at
+least two non-empty filter dimensions and returns at most 5 rows per page
+with an opaque `next_cursor`. Bulk dumps stop working; the agent has to issue
+one deliberately-filtered query per variable (or page through many screens).
+
+**Provenance release chains.** Each variable's supported record now ships
+with stale releases that share *every* dimension - entity, metric, period,
+scenario, basis, unit, even status `final` - and differ only in provenance:
+`release`, `published_at`, and a `superseded_by` link naming the successor
+release. Stale releases carry perturbed values, so a fully-filtered query
+legitimately returns several conflicting rows and the dimension labels no
+longer decide. The deterministic resolution rule - *use the release whose*
+`superseded_by` *is null* - is stated in the server instructions, every
+dataset description, the document text ("SUPERSEDED: replaced by release X"),
+and the task instruction, so the environment stays fair: exactly one record
+survives the rule, and no judgment call is required.
+
+Determinism is enforced mechanically, not hoped for. The validator replays
+the *live server's* token-containment matching semantics (a lesson from the
+first build of v2: a generic "alternate years" distractor unit substring-
+matched queries for "years" and made 18 tasks ambiguous until
+`alternate_unit` was taught to emit non-colliding units) and asserts per
+task: the dimension filter plus the supersession rule select exactly the
+evidence record, every stale chain is acyclic and terminates at it, and no
+stale release accidentally carries the current value. The smoke test and
+oracle check resolve every variable the same way over real streamable HTTP,
+paginating like an agent would.
 
 ### 0233 rerun: opus-5, formula hints, 5 attempts
 
@@ -2011,34 +2086,54 @@ per-trial compose sidecar (`runs/llm-proxy-compose.yaml`, layered in through
 the job config's `environment.extra_docker_compose`) and the agent points at
 `http://llm-proxy:8019`.
 
-All five attempts completed without errors, every attempt used the research
-tools (11-19 `query_records` invocations plus document search/fetch per
-attempt, often batch-retrieving variables from scripts), and coverage stayed
-at 100%.
+The task was evaluated three times with the same harness: the baseline with
+every input on the sheet, MCP v1 (70 variables masked, unlimited queries),
+and MCP v2 (same masking plus pagination caps and provenance chains). All
+runs: 5 attempts, no errors, coverage 100%.
 
-| metric (0233-outputs) | baseline (inputs on sheet) | MCP (70 vars masked) | delta |
+| metric (0233-outputs) | baseline | MCP v1 | MCP v2 (hardened) |
 | --- | --- | --- | --- |
-| continuous score mean | 0.8159 | 0.7964 | -0.0196 |
-| pass@5 (all 8 cells exact) | 0% | 0% | = |
-| mean cells exact | 30.0% | 30.0% | = |
-| best attempt exact | 50% | 50% | = |
-| mean within 1% | 45.0% | 45.0% | = |
-| cost | $37.37 | $32.10 | |
+| continuous score mean | 0.8159 | 0.7964 | 0.8469 |
+| continuous score variance | 0.00216 | 0.00316 | 0.00409 |
+| pass@5 (all 8 cells exact) | 0% | 0% | 0% |
+| mean cells exact | 30.0% | 30.0% | 25.0% |
+| best attempt exact | 50% | 50% | 25% |
+| mean within 1% | 45.0% | 45.0% | 50.0% |
+| agent steps per attempt | 59-90 | 55-91 | 82-123 |
+| cost | $37.37 | $32.10 | $43.72 |
 
-Per-cell continuous means (baseline -> MCP): DSCR 2022 `'Term facilities'!E88`
-0.982 -> 0.766 (the largest drop - the debt terms feeding it now have to be
-researched), DCF Implied EV `DCF!H71` 0.789 -> 0.685, DDM Valuation `DDM!H81`
-1.000 -> 0.955 (solved 5/5 -> 4/5), FCF After Debt Service `Model!H185` 0.969
--> 0.927; DCF Terminal Value `DCF!BB45` improved 0.000 -> 0.200 (one attempt
-now exact), DCF Valuation `DCF!H90` and Implied Equity `DCF!H85` edged up, and
-Dividends `Model!H335` stayed at 1.000 (solved 5/5 in both). Full numbers:
-`runs/opus5-mcp-hinted-0233/percell_comparison.json`, with the scorer outputs
-in `runs/opus5-mcp-hinted-0233/` next to the baseline in
-`runs/opus5-hinted-pass5/`.
+Per-cell continuous means and the full attempt detail are in
+`runs/opus5-mcp-hinted-0233/` and `runs/opus5-mcp2-hinted-0233/`
+(`percell_comparison.json` in the latter holds the three-way table) next to
+the baseline in `runs/opus5-hinted-pass5/`.
 
-The headline: masking 70 externally-sourced assumptions behind a
-distractor-dense research service cost opus-5 only about 2 continuous points
-(0.816 -> 0.796) on this task - the model reliably disambiguated scenario,
-period, basis, unit and status to recover the masked inputs, and the residual
-errors sit in the same deep calculation chains that were already failing with
-the inputs on the sheet.
+What the three runs say, from the trajectories:
+
+- **v1 made retrieval too cheap.** Agents dumped whole datasets in 1-5 broad
+  `query_records` calls and read the dimension labels locally; zero failed
+  queries, zero distractor values used, but attempts skipped 0-13 of the 28
+  hard-to-guess values as not worth retrieving (the H2 2021 capex was skipped
+  in 4/5 attempts). Mean fell ~2 points to 0.796.
+- **v2 forced engagement and got it.** Every attempt wrote a pagination-aware
+  helper (looping `next_cursor` with entity+metric filters), paged through
+  each metric, and explicitly kept only unsuperseded releases. Zero stale
+  release values appear in any attempt's model code. Retrieval got *more*
+  thorough - all five attempts recovered 28/28 distinctive masked values -
+  at the price of ~30 more steps and ~$2 more per attempt.
+- **The continuous mean rose above the baseline (0.847 vs 0.816)** because
+  the forced thoroughness fixed v1's skipped-variable losses (DSCR 0.77 ->
+  0.88, Implied EV 0.68 -> 0.90 per-cell means), while exact solves narrowed
+  (best attempt 25% exact vs 50%): more inputs were right, but small unit
+  and convention slips in the longer research pipeline kept cells just
+  outside the 1e-6 exact band - within-1% rose to 50%. Variance roughly
+  doubled versus baseline (0.0022 -> 0.0041), driven by one 0.75 and one
+  0.95 attempt.
+
+Net: the hardened environment measurably raises the cost of research (steps,
+tokens, dollars) and defeats bulk-dump shortcuts without making the task
+unfair - the supersession rule was applied correctly 5/5 times. On this task
+the binding constraint remains the deep calculation chains (DSCR, FCF after
+debt service, enterprise value bridge), not retrieval. One residual softness
+to tighten next: `search_documents` snippets can expose a document's reported
+value without its supersession notice; no agent exploited it, but trimming
+the snippet before the value line would close it.

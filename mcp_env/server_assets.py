@@ -95,9 +95,20 @@ class Store:
             raise KeyError("Unknown document_id: %s" % document_id)
         return self.documents_by_id[document_id]
 
-    def query(self, dataset_id: str, limit: int = 20, **filters: str) -> dict[str, Any]:
+    MAX_ROWS_PER_PAGE = 5
+    MIN_FILTER_DIMENSIONS = 2
+
+    def query(self, dataset_id: str, limit: int = 5, cursor: int = 0,
+              **filters: str) -> dict[str, Any]:
         if dataset_id not in self.dataset_ids:
             raise KeyError("Unknown dataset_id: %s" % dataset_id)
+        active = [field for field, expected in filters.items() if expected]
+        if len(active) < self.MIN_FILTER_DIMENSIONS:
+            raise ValueError(
+                "query_records requires at least %d filter dimensions "
+                "(got %d: %s). Specify the dimensions that identify the "
+                "record you need, e.g. metric and period."
+                % (self.MIN_FILTER_DIMENSIONS, len(active), active or "none"))
         rows = [row for row in self.records if row["dataset_id"] == dataset_id]
         for field, expected in filters.items():
             if not expected:
@@ -109,8 +120,15 @@ class Store:
                                for alias in row.get("metric_aliases", []))]
             else:
                 rows = [row for row in rows if matches(row.get(field), expected)]
-        capped = rows[: max(1, min(limit, 100))]
-        return {"rows": capped, "returned": len(capped), "total_matches": len(rows)}
+        start = max(0, int(cursor))
+        page = rows[start:start + max(1, min(limit, self.MAX_ROWS_PER_PAGE))]
+        next_cursor = start + len(page)
+        return {
+            "rows": page,
+            "returned": len(page),
+            "total_matches": len(rows),
+            "next_cursor": next_cursor if next_cursor < len(rows) else None,
+        }
 
 
 def build_server(runtime: Path = RUNTIME) -> FastMCP:
@@ -141,11 +159,17 @@ def build_server(runtime: Path = RUNTIME) -> FastMCP:
     @server.tool()
     def query_records(dataset_id: str, entity: str = "", metric: str = "",
                       period: str = "", scenario: str = "", basis: str = "",
-                      unit: str = "", status: str = "", limit: int = 20) -> dict:
-        """Filter records explicitly. Empty dimensions may produce multiple conflicting values."""
-        return store.query(dataset_id, limit, entity=entity, metric=metric,
-                           period=period, scenario=scenario, basis=basis,
-                           unit=unit, status=status)
+                      unit: str = "", status: str = "", limit: int = 5,
+                      cursor: int = 0) -> dict:
+        """Filter records explicitly (at least two dimensions required; results
+        are paginated, max 5 rows per page, continue with the returned
+        next_cursor). Records can exist in multiple releases: a row whose
+        superseded_by field is set has been replaced by a later release and
+        must not be used. Empty dimensions may produce multiple conflicting
+        values."""
+        return store.query(dataset_id, limit, cursor, entity=entity,
+                           metric=metric, period=period, scenario=scenario,
+                           basis=basis, unit=unit, status=status)
 
     return server
 

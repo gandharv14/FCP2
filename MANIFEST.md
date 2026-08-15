@@ -32,7 +32,7 @@ run the pipeline against your own source folder.
 | File | Role |
 | --- | --- |
 | `xl_variable_mcp.py` | CLI: Markdown table -> draft -> MCP bundle (build/validate) -> smoke test; emits `mask_cells.json` and the `masked_inputs.json` audit map. |
-| `mcp_env/` | Vendored generator: importer, distractor builder, isolation validator, and the FastMCP sidecar server/Dockerfile/compose assets. |
+| `mcp_env/` | Vendored generator: importer, distractor builder (dimension distractors + provenance release chains), isolation validator, and the FastMCP sidecar server (paginated, filter-gated `query_records`) with Dockerfile/compose assets. |
 | `xl_input_mask.py --mask-cells` | Blanks the served variables from the inputs workbook (deny-set hook). |
 | `xl_output_task.py --mcp` | Packages the sidecar into the Harbor bundle: `environment/mcp-server/`, `docker-compose.yaml`, `[[environment.mcp_servers]]`, research instruction section. |
 

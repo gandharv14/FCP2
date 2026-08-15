@@ -33,7 +33,11 @@ except ImportError:  # pragma: no cover
 
 from xl_task_build import (Instance, PROD_ENDPOINT, naturalize, read_env_key,
                            toml_table)
-from xl_harbor_prep import DOCKERFILE
+from xl_harbor_prep import (
+    AGENT_MAX_ITERATIONS,
+    AGENT_TIMEOUT_SCALE,
+    DOCKERFILE,
+)
 from mcp_env.server_assets import COMPOSE_YAML
 
 PIPELINE_VERSION = "1.0.0"
@@ -496,9 +500,11 @@ TIMEOUT_PER_MCP_VARIABLE_SEC = 15.0
 
 
 def agent_timeout(n_cells, n_mcp_variables=0):
-    return min(TIMEOUT_MAX_SEC,
-               TIMEOUT_BASE_SEC + TIMEOUT_PER_TARGET_SEC * n_cells
-               + TIMEOUT_PER_MCP_VARIABLE_SEC * n_mcp_variables)
+    return AGENT_TIMEOUT_SCALE * min(
+        TIMEOUT_MAX_SEC,
+        TIMEOUT_BASE_SEC + TIMEOUT_PER_TARGET_SEC * n_cells
+        + TIMEOUT_PER_MCP_VARIABLE_SEC * n_mcp_variables,
+    )
 
 
 def mcp_variable_count(mcp_dir):
@@ -567,6 +573,8 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
             if hinted else ""
         ),
         "pipeline_version": PIPELINE_VERSION,
+        "agent_max_iterations": AGENT_MAX_ITERATIONS,
+        "agent_timeout_scale": AGENT_TIMEOUT_SCALE,
         "created_at": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     if mcp_dir is not None:

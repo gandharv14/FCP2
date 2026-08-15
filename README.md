@@ -2137,3 +2137,52 @@ debt service, enterprise value bridge), not retrieval. One residual softness
 to tighten next: `search_documents` snippets can expose a document's reported
 value without its supersession notice; no agent exploited it, but trimming
 the snippet before the value line would close it.
+
+### 0233 rerun: Gemini 3.5 Flash, formula hints, 5 attempts
+
+Gemini 3.5 Flash was evaluated on the same hardened MCP v2 task with
+openhands-sdk, 300 maximum iterations, and five concurrent attempts. The only
+official historical 0233 Gemini result is one successful baseline attempt
+(`runs/gemini35-hinted-pass1/`): score 0.6004, 1/8 exact, 2/8 within 1%, 197
+steps, $10.67. Its reported variance is zero only because `n=1`; it is not an
+estimate of model stability. Before that selected result, two historical
+replacement attempts produced no answer, so the raw baseline retry sequence
+was `[0, 0, 0.6004]`.
+
+The hardened run produced answers in two of five attempts:
+
+| metric | historical selected (`n=1`) | historical raw retries (`n=3`) | hardened, completed outputs (`n=2`) | hardened, all attempts (`n=5`) |
+| --- | ---: | ---: | ---: | ---: |
+| continuous mean | 0.6004 | 0.2001 | 0.6139 | 0.2455 |
+| population variance | n/a (`0` at `n=1`) | 0.08010 | 0.000899 | 0.09080 |
+| output completion rate | 100% (selected result) | 33% | 100% (conditional) | 40% |
+| mean exact cells | 12.5% | — | 12.5% | 5.0% including failures |
+| mean within 1% | 25.0% | — | 18.8% | 7.5% including failures |
+| pass@5 | n/a | n/a | — | 0% |
+
+The two output-bearing hardened attempts scored 0.5839 and 0.6438. Two other
+attempts reached the 300-iteration ceiling without writing `answers.json`; the
+fifth suffered a Gemini API disconnect, retried once, and still produced no
+answer. Consequently the scorer's headline mean/variance (0.6139/0.000899)
+describe answer quality *conditional on completion*. For end-to-end task
+reliability, failed attempts must count as zero, giving 0.2455/0.09080.
+
+This separates two effects. Conditional answer quality is effectively
+unchanged from the historical result (+0.0135), and the successful attempts
+improved DSCR, free cash flow after debt service, and parts of the enterprise
+value chain. But the hardened retrieval workflow consumed 20-28
+`query_records` interactions/mentions and 178-301 steps per attempt; three
+attempts failed to finish. The environment therefore increases Gemini's
+agentic planning burden much more than its numerical error *after* an answer
+is produced. Full outputs are in `runs/gemini35-mcp2-hinted-0233/`, with the
+raw reliability and per-cell comparison in `comparison.json`.
+
+### Agent execution budget after the Gemini run
+
+The hardened retrieval flow can consume most of a 300-iteration run before
+the workbook calculations are finished. Pipeline-generated task images now
+set `MAX_ITERATIONS=600`, and active MCP v2 evaluation configs use the same
+ceiling. Generated agent timeouts are scaled by exactly 1.5x: for task 0233
+the task-level allowance rises from 3,610 to 5,415 seconds (before any Harbor
+job-level timeout multiplier). The older level-task builder likewise rises
+from 1,800 to 2,700 seconds. Verifier timeouts are unchanged.

@@ -39,6 +39,8 @@ except ImportError:  # pragma: no cover
 
 # agents iterate, so they need far more wall clock than a single chat call;
 # scale with the number of cells the task asks for
+AGENT_MAX_ITERATIONS = 600
+AGENT_TIMEOUT_SCALE = 1.5
 TIMEOUT_BASE_SEC = 2400.0
 TIMEOUT_PER_TARGET_SEC = 2.0
 # deeper workbooks push recon_full past 8k cells; the observed rate on 0248 was
@@ -55,6 +57,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir openpyxl
+
+# OpenHands reads this environment variable when a job config does not supply
+# an agent-specific override. Active evaluation configs use the same ceiling.
+ENV MAX_ITERATIONS=600
 
 WORKDIR /app
 COPY %s /app/%s
@@ -74,8 +80,10 @@ echo 0 > /logs/verifier/reward.txt
 
 
 def agent_timeout(n_answer_cells):
-    return min(TIMEOUT_MAX_SEC,
-               TIMEOUT_BASE_SEC + TIMEOUT_PER_TARGET_SEC * n_answer_cells)
+    return AGENT_TIMEOUT_SCALE * min(
+        TIMEOUT_MAX_SEC,
+        TIMEOUT_BASE_SEC + TIMEOUT_PER_TARGET_SEC * n_answer_cells,
+    )
 
 
 def rewrite_task_toml(text, timeout_sec, memory_mb):

@@ -933,7 +933,9 @@ def emit_bundle(out_dir, task_name, instance, instruction, snapshot,
         "",
         toml_table("metadata.naturalizer", metadata["naturalizer"]),
         "",
-        toml_table("agent", {"timeout_sec": 1800.0}),
+        # 1.5x the original 1,800-second allowance. Agentic spreadsheet
+        # reconstruction now includes paginated MCP research before modelling.
+        toml_table("agent", {"timeout_sec": 2700.0}),
         "",
         toml_table("verifier", {"timeout_sec": 300.0}),
         "",

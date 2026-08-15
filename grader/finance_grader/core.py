@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
@@ -132,6 +133,31 @@ class Grade:
         return {**dict(self.metadata), "score": _clamp01(self.score), "cells": list(self.cells)}
 
 
+def _group_assignments(
+    answer_key: Mapping[str, Any],
+    targets: Mapping[str, Any],
+) -> dict[str, str]:
+    """Map each target ref to the curated output (band) it belongs to.
+
+    A multi-period output band is one piece of logic filled across its row, so
+    it must count once in the headline score no matter how many cells it spans.
+    Target refs absent from ``groups`` fall back to singleton groups, which
+    reproduces the historical uniform per-cell weighting exactly.
+    """
+    groups_raw = answer_key.get("groups")
+    by_norm: dict[str, str] = {}
+    if isinstance(groups_raw, Mapping):
+        for group_key, refs in groups_raw.items():
+            if not isinstance(refs, (list, tuple)):
+                continue
+            for ref in refs:
+                by_norm[_normalise_ref(ref)] = str(group_key)
+    return {
+        str(ref): by_norm.get(_normalise_ref(str(ref)), str(ref))
+        for ref in targets
+    }
+
+
 def _grade(
     answers: Any,
     answer_key: Mapping[str, Any],
@@ -154,6 +180,21 @@ def _grade(
     if len(targets) == 1 and valid_answers and "answer" in answers:
         only_ref = next(iter(targets))
         got_map.setdefault(_normalise_ref(only_ref), answers["answer"])
+
+    # Each curated output gets an equal share of the headline score, split
+    # evenly among the cells of its band. Without a groups table every cell is
+    # its own group and the weights collapse to the historical 1/n_targets.
+    group_of = _group_assignments(answer_key, targets)
+    group_sizes = Counter(group_of.values())
+    n_groups = len(group_sizes)
+    weights = {
+        str(ref): (
+            1.0 / (n_groups * group_sizes[group_of[str(ref)]])
+            if n_groups
+            else 0.0
+        )
+        for ref in targets
+    }
 
     cells: list[dict[str, Any]] = []
     subscores: dict[str, float] = {}
@@ -224,17 +265,18 @@ def _grade(
                 "normalized_error": normalized_error,
                 "continuous_score": continuous,
                 "score": cell_score,
+                "weight": weights.get(ref, 0.0),
+                "group": group_of.get(ref, ref),
                 "reasoning": reasoning,
             }
         )
 
     n_targets = len(targets)
-    weights = {
-        ref: (1.0 / n_targets if n_targets else 0.0) for ref in subscores
-    }
     passed = n_targets > 0 and n_exact == n_targets
     if mode == "continuous":
-        headline = sum(subscores.values()) / n_targets if n_targets else 0.0
+        headline = sum(
+            subscores[ref] * weights.get(ref, 0.0) for ref in subscores
+        )
         scoring_mode: Literal["weighted", "binary"] = "weighted"
     else:
         headline = 1.0 if passed else 0.0
@@ -250,6 +292,10 @@ def _grade(
         ),
         "valid_answers_json": valid_answers,
         "n_targets": n_targets,
+        "n_groups": n_groups,
+        "weighting": (
+            "band_grouped" if n_groups != n_targets else "uniform"
+        ),
         "n_answered": n_answered,
         "n_exact": n_exact,
         "n_close_1pct": n_close,

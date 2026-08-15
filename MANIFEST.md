@@ -27,6 +27,15 @@ run the pipeline against your own source folder.
 | `task_templates.yaml` | Template spec read by `xl_task_build.py`. |
 | `taxonomy_out/workbooks.json` | Workbook-family taxonomy; needed for `--semantic-hints`. |
 
+## Variable-source MCP environments (README section 23)
+
+| File | Role |
+| --- | --- |
+| `xl_variable_mcp.py` | CLI: Markdown table -> draft -> MCP bundle (build/validate) -> smoke test; emits `mask_cells.json` and the `masked_inputs.json` audit map. |
+| `mcp_env/` | Vendored generator: importer, distractor builder, isolation validator, and the FastMCP sidecar server/Dockerfile/compose assets. |
+| `xl_input_mask.py --mask-cells` | Blanks the served variables from the inputs workbook (deny-set hook). |
+| `xl_output_task.py --mcp` | Packages the sidecar into the Harbor bundle: `environment/mcp-server/`, `docker-compose.yaml`, `[[environment.mcp_servers]]`, research instruction section. |
+
 ## Rollout scoring and workflow support
 
 | File | Role |

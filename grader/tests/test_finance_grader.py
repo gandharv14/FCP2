@@ -89,6 +89,84 @@ class ContinuousGradeTests(unittest.TestCase):
         self.assertEqual(set(result.subscores), {"Sheet!A1"})
 
 
+class GroupedWeightingTests(unittest.TestCase):
+    """Each curated output counts once, however many period cells it spans."""
+
+    def grouped_key(self):
+        key = answer_key({
+            "Sheet!C1": 10.0,
+            "Sheet!D1": 20.0,
+            "Sheet!E1": 30.0,
+            "Sheet!C9": 99.0,
+        })
+        key["groups"] = {
+            "Sheet!C1:E1": ["Sheet!C1", "Sheet!D1", "Sheet!E1"],
+            "Sheet!C9": ["Sheet!C9"],
+        }
+        return key
+
+    def test_each_group_gets_an_equal_share(self):
+        key = self.grouped_key()
+
+        series_only = grade_continuous(
+            {"Sheet!C1": 10.0, "Sheet!D1": 20.0, "Sheet!E1": 30.0},
+            key,
+        )
+        scalar_only = grade_continuous({"Sheet!C9": 99.0}, key)
+
+        self.assertAlmostEqual(series_only.score, 0.5)
+        self.assertAlmostEqual(scalar_only.score, 0.5)
+
+    def test_weights_split_within_a_band_and_sum_to_one(self):
+        key = self.grouped_key()
+        result = grade_continuous({}, key)
+
+        self.assertAlmostEqual(result.weights["Sheet!C1"], 1.0 / 6.0)
+        self.assertAlmostEqual(result.weights["Sheet!C9"], 0.5)
+        self.assertAlmostEqual(sum(result.weights.values()), 1.0)
+        self.assertEqual(result.metadata["n_groups"], 2)
+        self.assertEqual(result.metadata["weighting"], "band_grouped")
+
+    def test_partial_series_earns_a_fraction_of_the_band_share(self):
+        key = self.grouped_key()
+        result = grade_continuous({"Sheet!C1": 10.0}, key)
+
+        self.assertAlmostEqual(result.score, 1.0 / 6.0)
+
+    def test_target_missing_from_groups_becomes_its_own_group(self):
+        key = self.grouped_key()
+        key["targets"]["Sheet!Z9"] = 7.0
+
+        result = grade_continuous({"Sheet!Z9": 7.0}, key)
+
+        self.assertEqual(result.metadata["n_groups"], 3)
+        self.assertAlmostEqual(result.score, 1.0 / 3.0)
+
+    def test_without_groups_weighting_is_uniform_per_cell(self):
+        key = answer_key({"Sheet!A1": 1.0, "Sheet!A2": 2.0})
+        result = grade_continuous({"Sheet!A1": 1.0}, key)
+
+        self.assertEqual(result.metadata["weighting"], "uniform")
+        self.assertEqual(result.metadata["n_groups"], 2)
+        self.assertEqual(result.score, 0.5)
+
+    def test_discrete_pass_still_requires_every_cell(self):
+        key = self.grouped_key()
+
+        partial = grade_discrete(
+            {"Sheet!C1": 10.0, "Sheet!D1": 20.0, "Sheet!E1": 30.0},
+            key,
+        )
+        full = grade_discrete(
+            {"Sheet!C1": 10.0, "Sheet!D1": 20.0, "Sheet!E1": 30.0,
+             "Sheet!C9": 99.0},
+            key,
+        )
+
+        self.assertEqual(partial.score, 0.0)
+        self.assertEqual(full.score, 1.0)
+
+
 class DiscreteGradeTests(unittest.TestCase):
     def test_discrete_requires_every_target(self):
         key = answer_key({"Sheet!A1": 10.0, "Sheet!A2": 20.0})

@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover
 from xl_task_build import (Instance, PROD_ENDPOINT, naturalize, read_env_key,
                            toml_table)
 from xl_harbor_prep import DOCKERFILE
+from mcp_env.server_assets import COMPOSE_YAML
 
 PIPELINE_VERSION = "1.0.0"
 TIMEOUT_BASE_SEC = 2400.0
@@ -329,9 +330,21 @@ def collect(workbook, source_dir, seg_root, inputs_root):
     return resolved, targets
 
 
-def scenario_for(workbook, family, outputs):
+def scenario_for(workbook, family, outputs, mcp=False):
     phrase = FAMILY_PHRASE.get(family, "a financial model")
     headline = ", ".join(o["name"] for o in outputs[:3])
+    if mcp:
+        return (
+            "A colleague has sent you %s with every calculated figure stripped "
+            "out, and this time the externally-sourced input assumptions have "
+            "been removed from the sheets as well: market rates, tax rates, "
+            "macro assumptions, contractual terms and opening balances have to "
+            "be researched through the data service described below before "
+            "anything can be computed. Rebuild the calculations from the "
+            "remaining inputs plus your research, and report the %d headline "
+            "figures the model exists to produce, such as %s. The full list of "
+            "figures and the cells they belong in is given below."
+            % (phrase, len(outputs), headline))
     return (
         "A colleague has sent you %s with every input assumption in place and "
         "every calculated figure stripped out. Nothing has been computed yet: "
@@ -357,8 +370,70 @@ def answer_example(targets):
     return "{%s}" % body
 
 
+MCP_URL = "http://mcp-server:8000/mcp"
+
+INPUT_SECTION_PLAIN = """\
+The workbook `%s` is in your working directory. Every input the model needs is
+present - assumptions, drivers, historicals and labels - and every cell the
+model is meant to work out is blank. The artifact has been checked to contain
+no formulas or derived numbers and to preserve the identified input cells.
+You may install Python packages (for example `openpyxl`) to read it.
+"""
+
+INPUT_SECTION_MCP = """\
+The workbook `%s` is in your working directory. Every cell the model is meant
+to work out is blank, and a set of externally-sourced input assumptions has
+additionally been removed from the sheets. Those removed inputs are only
+retrievable through the research data service described in the next section;
+every other input - drivers, historicals and labels - is present. The artifact
+has been checked to contain no formulas or derived numbers. You may install
+Python packages (for example `openpyxl`) to read it.
+"""
+
+RESEARCH_SECTION = """\
+## Research data service
+
+The removed input assumptions (rates, tax and macro assumptions, contractual
+terms, opening balances, dates and similar externally-sourced values) are
+served by a mock research MCP server at `%s` (streamable HTTP transport). It
+exposes five tools:
+
+- `list_sources` - the organizations and data platforms available
+- `list_datasets` - structured datasets and their filter dimensions
+- `search_documents` / `fetch_document` - keyword search over source
+  documents, then fetch one by id
+- `query_records` - filter dataset records by entity, metric, period,
+  scenario, basis, unit and status
+
+Records vary across those dimensions and broad queries return conflicting
+candidate values from adjacent periods, other scenario cases and superseded
+releases. Filter every dimension that matters to your question and rely only
+on records whose status is `final`. Convert each retrieved value into the
+units and scale of the sheet it belongs on (rates are reported in percent
+while sheets may store decimal fractions; monetary amounts state their unit
+on the record).
+
+Any MCP client works, for example from Python:
+
+```
+pip install fastmcp
+```
+
+```python
+import asyncio
+from fastmcp import Client
+
+async def main():
+    async with Client("%s") as client:
+        print(await client.call_tool("list_sources", {}))
+
+asyncio.run(main())
+```
+"""
+
+
 def build_instruction(scenario, artifact, outputs, targets, hints=None,
-                      hint_style=""):
+                      hint_style="", mcp=False):
     n_cells = len(targets)
     hints_text = ""
     if hints:
@@ -383,17 +458,14 @@ dependency routes, intermediate values or answers."""
 
 %s
 """ % (heading, introduction, hint_section(hints))
+    input_section = (INPUT_SECTION_MCP if mcp else INPUT_SECTION_PLAIN) % artifact
+    research = ("\n" + RESEARCH_SECTION % (MCP_URL, MCP_URL)) if mcp else ""
     return """\
 %s
 
 ## Input
 
-The workbook `%s` is in your working directory. Every input the model needs is
-present - assumptions, drivers, historicals and labels - and every cell the
-model is meant to work out is blank. The artifact has been checked to contain
-no formulas or derived numbers and to preserve the identified input cells.
-You may install Python packages (for example `openpyxl`) to read it.
-
+%s%s
 ## What to compute
 
 %s
@@ -412,17 +484,26 @@ the value the model computes for it, keyed exactly as written in the table:
 Report %d values in total, one per cell listed. Give each number exactly as the
 model computes it, in the same units and scale as the sheet it sits on - do not
 round, rescale or convert percentages.
-""" % (scenario.strip(), artifact, target_table(outputs), hints_text,
-       answer_example(targets), n_cells)
+""" % (scenario.strip(), input_section, research, target_table(outputs),
+       hints_text, answer_example(targets), n_cells)
 
 
-def agent_timeout(n_cells):
+TIMEOUT_PER_MCP_VARIABLE_SEC = 15.0
+
+
+def agent_timeout(n_cells, n_mcp_variables=0):
     return min(TIMEOUT_MAX_SEC,
-               TIMEOUT_BASE_SEC + TIMEOUT_PER_TARGET_SEC * n_cells)
+               TIMEOUT_BASE_SEC + TIMEOUT_PER_TARGET_SEC * n_cells
+               + TIMEOUT_PER_MCP_VARIABLE_SEC * n_mcp_variables)
+
+
+def mcp_variable_count(mcp_dir):
+    tasks = (mcp_dir / "eval" / "tasks.jsonl").read_text(encoding="utf-8")
+    return sum(1 for line in tasks.splitlines() if line.strip())
 
 
 def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
-         nat_meta, hints=None, hint_style=""):
+         nat_meta, hints=None, hint_style="", mcp_dir=None):
     if out_dir.exists():
         shutil.rmtree(out_dir)
     (out_dir / "environment").mkdir(parents=True)
@@ -431,6 +512,19 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
     shutil.copy2(artifact, out_dir / "environment" / artifact.name)
     (out_dir / "environment" / "Dockerfile").write_text(
         DOCKERFILE % (artifact.name, artifact.name), encoding="utf-8")
+
+    n_mcp_variables = 0
+    if mcp_dir is not None:
+        # Sidecar image: server + runtime data only. eval/ and the normalized
+        # spec must never enter the task environment.
+        sidecar = out_dir / "environment" / "mcp-server"
+        sidecar.mkdir()
+        shutil.copy2(mcp_dir / "server.py", sidecar / "server.py")
+        shutil.copy2(mcp_dir / "Dockerfile", sidecar / "Dockerfile")
+        shutil.copytree(mcp_dir / "runtime", sidecar / "runtime")
+        (out_dir / "environment" / "docker-compose.yaml").write_text(
+            COMPOSE_YAML, encoding="utf-8")
+        n_mcp_variables = mcp_variable_count(mcp_dir)
 
     # Harbor's loader requires instruction.md
     (out_dir / "instruction.md").write_text(instruction, encoding="utf-8")
@@ -471,6 +565,15 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
         "pipeline_version": PIPELINE_VERSION,
         "created_at": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if mcp_dir is not None:
+        metadata.update({
+            "mcp_environment": str(mcp_dir),
+            "mcp_url": MCP_URL,
+            "n_mcp_variables": n_mcp_variables,
+            "mcp_masked_cells": json.loads(
+                (mcp_dir / "mask_cells.json").read_text(encoding="utf-8")
+            ).__len__(),
+        })
 
     sections = [
         'schema_version = "1.4"',
@@ -498,13 +601,22 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
         "",
         toml_table("metadata.naturalizer", nat_meta),
         "",
-        toml_table("agent", {"timeout_sec": agent_timeout(len(targets))}),
+        toml_table("agent", {"timeout_sec": agent_timeout(len(targets),
+                                                          n_mcp_variables)}),
         "",
         toml_table("verifier", {"timeout_sec": 300.0}),
         "",
         toml_table("environment", {"cpus": 2, "memory_mb": 4096}),
         "",
     ]
+    if mcp_dir is not None:
+        sections += [
+            "[[environment.mcp_servers]]",
+            'name = "research"',
+            'transport = "streamable-http"',
+            'url = "%s"' % MCP_URL,
+            "",
+        ]
     (out_dir / "task.toml").write_text("\n".join(sections), encoding="utf-8")
 
     test_path = out_dir / "tests" / "test.sh"
@@ -518,15 +630,25 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
         out_dir / "tests" / "finance_grader",
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
+    # Group each output's cells under its band so the grader can weight per
+    # curated figure rather than per cell; a 7-period fill row counts once.
+    groups = {o["band"]: o["refs"] for o in outputs}
     with open(out_dir / "tests" / "answer_key.json", "w", encoding="utf-8") as fh:
         json.dump({"kind": "cell_value",
                    "tolerance": {"numeric_abs": 1e-6, "numeric_rel": 1e-6},
-                   "targets": targets}, fh, indent=1)
+                   "targets": targets,
+                   "groups": groups}, fh, indent=1)
     with open(out_dir / "tests" / "outputs.json", "w", encoding="utf-8") as fh:
         json.dump(outputs, fh, indent=1)
     if hints:
         with open(out_dir / "tests" / "hints.json", "w", encoding="utf-8") as fh:
             json.dump(hints, fh, indent=1)
+    if mcp_dir is not None:
+        # Audit map of masked inputs and their MCP evidence. tests/ is mounted
+        # only at verification time, so like answer_key.json it never reaches
+        # the agent.
+        shutil.copy2(mcp_dir / "masked_inputs.json",
+                     out_dir / "tests" / "masked_inputs.json")
 
 
 def main(argv=None):
@@ -549,6 +671,13 @@ def main(argv=None):
         "--semantic-hints", action="store_true",
         help="append finance-domain checks without formulas or routes",
     )
+    parser.add_argument(
+        "--mcp", default="",
+        help="MCP bundle from xl_variable_mcp.py; adds the research sidecar, "
+             "docker-compose.yaml and the task.toml mcp_servers entry. The "
+             "inputs workbook must have been masked with the bundle's "
+             "mask_cells.json.",
+    )
     parser.add_argument("-o", "--out", default="tasks_outputs")
     args = parser.parse_args(argv)
     if args.hints and args.semantic_hints:
@@ -563,6 +692,10 @@ def main(argv=None):
         "model": args.model,
         "project_id": args.project_id,
     }
+
+    mcp_dir = Path(args.mcp) if args.mcp else None
+    if mcp_dir is not None and not (mcp_dir / "runtime").is_dir():
+        parser.error("--mcp %s has no runtime/ directory" % mcp_dir)
 
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -579,7 +712,8 @@ def main(argv=None):
         elif args.semantic_hints:
             hints = semantic_hints(family)
             hint_style = "semantic"
-        scenario = scenario_for(workbook, family, outputs)
+        scenario = scenario_for(workbook, family, outputs,
+                                mcp=mcp_dir is not None)
         instance = Instance(
             template_id="outputs", financebench="metrics-generated",
             slots={}, scenario=scenario, output_format="", answer_key={},
@@ -590,7 +724,7 @@ def main(argv=None):
         artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
         instruction = build_instruction(
             text, artifact.name, outputs, targets, hints=hints,
-            hint_style=hint_style,
+            hint_style=hint_style, mcp=mcp_dir is not None,
         )
         if args.semantic_hints:
             suffix = "outputs_semantic_hints"
@@ -600,10 +734,13 @@ def main(argv=None):
             suffix = "outputs"
         out_dir = out_root / ("%s-%s" % (workbook, suffix))
         emit(out_dir, workbook, family, artifact, instruction, targets,
-             outputs, nat_meta, hints=hints, hint_style=hint_style)
-        print("%s  %-16s %2d outputs, %3d cells, timeout %.0fs -> %s"
+             outputs, nat_meta, hints=hints, hint_style=hint_style,
+             mcp_dir=mcp_dir)
+        n_vars = mcp_variable_count(mcp_dir) if mcp_dir is not None else 0
+        print("%s  %-16s %2d outputs, %3d cells%s, timeout %.0fs -> %s"
               % (workbook, family, len(outputs), len(targets),
-                 agent_timeout(len(targets)), out_dir))
+                 ", %d mcp variables" % n_vars if n_vars else "",
+                 agent_timeout(len(targets), n_vars), out_dir))
     print("\n%d task(s) -> %s" % (len(args.workbooks), out_root.resolve()))
 
 

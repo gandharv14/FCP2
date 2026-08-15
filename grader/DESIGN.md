@@ -31,10 +31,19 @@ grade(answers, answer_key, mode="continuous") -> Grade
     "numeric_rel": 0.000001
   },
   "targets": {
-    "Sheet!A1": 123.45
+    "Sheet!A1": 123.45,
+    "Sheet!C1": 10.0,
+    "Sheet!D1": 20.0
+  },
+  "groups": {
+    "Sheet!A1": ["Sheet!A1"],
+    "Sheet!C1:D1": ["Sheet!C1", "Sheet!D1"]
   }
 }
 ```
+
+`groups` is optional and maps each curated output band to the target refs it
+covers; it drives the band-grouped weighting described below.
 
 The returned `Grade` contains the headline score, per-cell subscores and
 weights, scoring mode, metadata, and detailed cell results. `Grade.to_dict()`
@@ -72,11 +81,20 @@ and large currency values. A 100% or larger normalized error receives zero,
 while progressively closer answers receive progressively more credit. Near-zero
 answers must fall within the absolute tolerance to receive meaningful credit.
 
-All target cells have equal weight:
+Weights are grouped by curated output. The answer key's optional `groups`
+table maps each output band to the cell refs it spans; every group receives an
+equal share of the headline score, split evenly among its cells:
 
 ```text
-continuous_score = sum(cell_score) / number_of_targets
+cell_weight      = 1 / (number_of_groups * cells_in_this_group)
+continuous_score = sum(cell_score * cell_weight)
 ```
+
+A multi-period band — one fill formula copied across seven periods — therefore
+counts once, not seven times, which stops wide series from dominating the
+score. Target refs absent from `groups` (and keys without a `groups` table at
+all) become singleton groups, which reproduces the historical uniform
+`1 / number_of_targets` weighting exactly.
 
 Consequently, coverage is part of the reward: unanswered targets contribute
 zero rather than being removed from the denominator.

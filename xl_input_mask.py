@@ -265,6 +265,27 @@ def pasted_answers(book, formula_coords, frontier, outputs):
     return deny, report
 
 
+def load_mask_cells(path):
+    """``{sheet: {(row, col)}}`` from a JSON list of refs, ranges allowed.
+
+    These are externally-sourced variables served through a mock MCP research
+    service; blanking them is the one sanctioned exception to the golden rule
+    that a typed cell is never removed, because the value stays retrievable --
+    just through the research tools instead of the sheet.
+    """
+    from openpyxl.utils import range_boundaries
+    refs = json.loads(Path(path).read_text(encoding="utf-8"))
+    cells = defaultdict(set)
+    for ref in refs:
+        sheet, _, coords = ref.rpartition("!")
+        sheet = sheet.strip("'")
+        min_col, min_row, max_col, max_row = range_boundaries(coords)
+        for row in range(min_row, max_row + 1):
+            for col in range(min_col, max_col + 1):
+                cells[sheet].add((row, col))
+    return cells
+
+
 def frontier_proof(seg_dir):
     """What stage 9 established for this workbook: PASS, FAIL or SKIPPED."""
     path = Path(seg_dir) / "segments.json"
@@ -584,6 +605,17 @@ def process(wb_id, args):
     outputs = output_values(bands, book)
     deny, denied_report = pasted_answers(book, formula_coords, frontier, outputs)
 
+    # Externally-sourced variables: blank them everywhere. Removing them from
+    # ``keep``/``frontier`` blanks frozen formula hosts too and tells verify()
+    # the blanks are intentional.
+    masked_external = 0
+    if getattr(args, "mask_cells", ""):
+        for sheet, spots in load_mask_cells(args.mask_cells).items():
+            masked_external += len(spots)
+            deny[sheet].update(spots)
+            keep[sheet].difference_update(spots)
+            frontier[sheet].difference_update(spots)
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / ("%s-inputs%s" % (wb_id, source.suffix))
@@ -613,6 +645,9 @@ def process(wb_id, args):
     if denied_report:
         print("       redacted %d typed duplicate(s) of output values: %s"
               % (len(denied_report), ", ".join(denied_report[:6])))
+    if masked_external:
+        print("       masked %d externally-sourced cell(s) listed in %s"
+              % (masked_external, args.mask_cells))
     if assumptions_sheet:
         print("       %d hardcoded formula constants -> sheet %r"
               % (len(assumptions), assumptions_sheet))
@@ -647,6 +682,10 @@ def main(argv=None):
     parser.add_argument("-o", "--out", default="inputs_out")
     parser.add_argument("--keep", choices=KEEP_MODES, default="headers",
                         help="how much non-input content survives")
+    parser.add_argument("--mask-cells", default="",
+                        help="JSON list of Sheet!Cell refs (ranges allowed) to "
+                             "additionally blank; used for variables served "
+                             "through a mock MCP research service")
     args = parser.parse_args(argv)
 
     print("masking to inputs only (--keep %s)" % args.keep)

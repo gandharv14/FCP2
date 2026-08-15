@@ -21,6 +21,7 @@ the run; you will not find those directories in a fresh clone.
 | `xl_level_split.py` | Writes one workbook per dependency level; `xl_input_mask.py` reuses its XML rewriter. |
 | `/create-harbor-task` | Cursor skill: raw workbook → Harbor rebuild task via AST, segment, mask, and `xl_output_task.py` (section 21). |
 | `/custom-formula-gate` | Post-Harbor review skill: classifies golden formulas against a closed finance catalog (section 22). |
+| `xl_variable_mcp.py` + `mcp_env/` | Variable-source MCP environments: externally-sourced inputs masked from the workbook and served through a mock research service (section 23). |
 | `requirements.txt` | One dependency, `openpyxl`. |
 
 ```bash
@@ -75,6 +76,7 @@ the thing that makes the segmentation trustworthy.
 20. [Glossary](#20-glossary)
 21. [`/create-harbor-task`](#21-create-harbor-task)
 22. [`/custom-formula-gate`](#22-custom-formula-gate)
+23. [Variable-source MCP environments](#23-variable-source-mcp-environments)
 
 ---
 
@@ -1859,3 +1861,184 @@ cached values when available, and writes:
 Rollout failure alone is not evidence of custom logic. It only controls when the
 gate may run and what to look at first; the classification comes from golden
 formula versus catalog agreement.
+
+---
+
+## 23. Variable-source MCP environments
+
+A rebuild task normally hands the agent every input. This stage removes the
+*externally-sourced* inputs — market rates, tax rates, macro assumptions,
+contractual terms, opening balances — and serves them through a mock MCP
+research service running as a docker-compose sidecar next to the agent
+container. The agent has to research the missing assumptions with generic
+retrieval tools before it can rebuild the model. Broad queries return
+plausible distractors; only a query that pins down every dimension (entity,
+metric, period, scenario, basis, unit, status) resolves the true value.
+
+The design is adapted from the `build-variable-source-mcp` skill and follows
+the [Harbor MCP server task pattern](https://www.harborframework.com/docs/tutorials/mcp-server-task).
+
+### Pipeline
+
+```bash
+# 0. Audit artifact: a Markdown table mapping workbook variables to true
+#    values and plausible external sources, kept for review
+#    (runs/<wb>-variable-sources/<wb>-inputs-variable-sources.md)
+
+# 1. Preserve every table row as a draft review queue
+python3 xl_variable_mcp.py import \
+    runs/0233-variable-sources/0233-inputs-variable-sources.md \
+    runs/0233-variable-sources/draft.json
+
+# 2. Normalize by hand/agent into atomic variables (one per entity, metric,
+#    period, scenario, basis, unit, status tuple), with workbook cell refs.
+#    For 0233 the authoring script is runs/0233-variable-sources/normalize_0233.py
+#    and exclusions are documented in exclusions.json.
+
+# 3. Build the environment. Every variable's raw cell value is verified
+#    against the golden workbook; any mismatch aborts the build.
+python3 xl_variable_mcp.py build \
+    runs/0233-variable-sources/normalized.json \
+    runs/0233-variable-sources/mcp --workbook 0233 --source "4-10 100"
+
+# 4. Exercise the generated server with a real MCP client
+uv run --python 3.12 --with fastmcp --with openpyxl \
+    python xl_variable_mcp.py smoke runs/0233-variable-sources/mcp
+
+# 5. Mask the served variables out of the inputs workbook
+python3 xl_input_mask.py 0233 --source "4-10 100" -o inputs_out_mcp \
+    --mask-cells runs/0233-variable-sources/mcp/mask_cells.json
+
+# 6. Package the Harbor task with the MCP sidecar
+python3 xl_output_task.py 0233 --source "4-10 100" \
+    --inputs-root inputs_out_mcp --mcp runs/0233-variable-sources/mcp \
+    -o tasks_outputs
+
+# 7. Re-apply formula hints as usual (the clone carries the sidecar through)
+python3 xl_formula_hint_tasks.py --source tasks_outputs -o tasks_outputs_hinted
+```
+
+### What `build` emits
+
+```
+runs/<wb>-variable-sources/mcp/
+  runtime/            served data: sources, documents, datasets, records
+  eval/tasks.jsonl    prompts, typed answers, evidence ids — NEVER shipped
+  server.py           standalone FastMCP server (streamable HTTP :8000/mcp)
+  Dockerfile          sidecar image (python:3.12-slim + fastmcp)
+  mask_cells.json     every cell the masker must additionally blank
+  masked_inputs.json  audit map: variable -> refs, raw value, MCP evidence
+```
+
+Each variable produces one supported record plus ~18 distractors that each
+differ on at least one meaningful dimension (adjacent period, another scenario
+case, another basis or unit, a superseded status). No distractor shares every
+required dimension with *any* supported record, so a fully-disambiguated
+`query_records` call resolves to exactly one row — the generator enforces this
+globally, and `validate` re-proves it per task. Values are exact raw workbook
+values (the grader tolerance is 1e-6, so the service must serve exactly what
+the masked cells held); the golden-value check makes a mismatched spec
+impossible to build.
+
+The server exposes one generic tool surface across all domains —
+`list_sources`, `list_datasets`, `search_documents`, `fetch_document`,
+`query_records` — with no target-named tools, no truth flags, and `mock://`
+document URLs so synthetic documents cannot be mistaken for genuine
+publications. Real source URLs survive only as `origin_url` metadata.
+
+### Masking
+
+`xl_input_mask.py --mask-cells` merges the listed refs into the pasted-answer
+`deny` set (typed cells are blanked) and removes them from the keep/frontier
+sets (frozen formula hosts are blanked, and `verify` accepts the intentional
+blanks). This is the one sanctioned exception to the golden rule that a typed
+cell is never removed: the value stays retrievable, just through the research
+tools instead of the sheet.
+
+Normalization has to hunt down duplicate representations, or the mask is
+theatre. For 0233 that meant: sensitivity-table centres holding the same 9%
+cost of equity (`DDM!BG68` etc.), the active-case debt-term column
+(`Control!F61:F63`), and text renderings like `"20 years"` on the Term
+facilities sheet (masked via `workbook.extra_cells`, which are blanked and
+audited but not value-checked). Variables whose values are exposed on the
+Embedded Assumptions sheet (the 85% availability factor, grid/insurance cost
+literals, the reserves bridge) are *excluded* from masking rather than half
+masked — see `runs/0233-variable-sources/exclusions.json`.
+
+### Harbor integration
+
+With `--mcp`, `xl_output_task.py` adds to the bundle:
+
+- `environment/mcp-server/` — sidecar Dockerfile, `server.py`, and the
+  `runtime/` data. `eval/` never enters the bundle; the audit map goes to
+  `tests/masked_inputs.json`, which like `answer_key.json` is only mounted at
+  verification time.
+- `environment/docker-compose.yaml` — the Harbor compose override: `main`
+  depends on a healthy `mcp-server`, which exposes port 8000 with a TCP
+  healthcheck.
+- `task.toml` — `[[environment.mcp_servers]]` with
+  `url = "http://mcp-server:8000/mcp"` (streamable HTTP). The openhands-sdk
+  agent registers it natively via `MCP_SERVERS_JSON`; the instruction's
+  "Research data service" section also documents the URL and tools so any
+  shell-capable agent can connect with `fastmcp`.
+- agent timeout extended by 15 s per served variable.
+
+The grader is unchanged: the answer key still holds only the curated output
+cells, and retrieval quality is graded implicitly — wrong or unretrieved
+inputs surface as wrong outputs.
+
+### Verification before rollout
+
+`runs/0233-variable-sources/oracle_check.py` runs against the live sidecar
+container exactly as the agent reaches it and asserts: every masked variable
+resolves over streamable HTTP through a fully-disambiguated query; every broad
+metric query returns conflicting candidates; every masked cell is blank in the
+shipped workbook; no surviving cell leaks a masked value (numeric, string, or
+date representation); and neither the golden workbook nor `eval/` is in
+`environment/`. For 0233: 70/70 resolved, 70/70 broad conflicts, 0 leaks
+beyond documented axis-header coincidences and the excluded Group Tax rate
+rows.
+
+### 0233 rerun: opus-5, formula hints, 5 attempts
+
+The 0233 task was rebuilt with 70 atomic variables masked (573 cells) and
+re-evaluated with the same harness as the baseline: `harbor run` (docker),
+openhands-sdk, `anthropic/claude-opus-5`, 5 attempts, formula-hinted bundle,
+scored by `xl_passk_score.py`. One harness change was forced by the docker
+backend: containers on user-defined compose networks could not reach
+`host.docker.internal`, so the Labelbox attribution proxy now runs as a
+per-trial compose sidecar (`runs/llm-proxy-compose.yaml`, layered in through
+the job config's `environment.extra_docker_compose`) and the agent points at
+`http://llm-proxy:8019`.
+
+All five attempts completed without errors, every attempt used the research
+tools (11-19 `query_records` invocations plus document search/fetch per
+attempt, often batch-retrieving variables from scripts), and coverage stayed
+at 100%.
+
+| metric (0233-outputs) | baseline (inputs on sheet) | MCP (70 vars masked) | delta |
+| --- | --- | --- | --- |
+| continuous score mean | 0.8159 | 0.7964 | -0.0196 |
+| pass@5 (all 8 cells exact) | 0% | 0% | = |
+| mean cells exact | 30.0% | 30.0% | = |
+| best attempt exact | 50% | 50% | = |
+| mean within 1% | 45.0% | 45.0% | = |
+| cost | $37.37 | $32.10 | |
+
+Per-cell continuous means (baseline -> MCP): DSCR 2022 `'Term facilities'!E88`
+0.982 -> 0.766 (the largest drop - the debt terms feeding it now have to be
+researched), DCF Implied EV `DCF!H71` 0.789 -> 0.685, DDM Valuation `DDM!H81`
+1.000 -> 0.955 (solved 5/5 -> 4/5), FCF After Debt Service `Model!H185` 0.969
+-> 0.927; DCF Terminal Value `DCF!BB45` improved 0.000 -> 0.200 (one attempt
+now exact), DCF Valuation `DCF!H90` and Implied Equity `DCF!H85` edged up, and
+Dividends `Model!H335` stayed at 1.000 (solved 5/5 in both). Full numbers:
+`runs/opus5-mcp-hinted-0233/percell_comparison.json`, with the scorer outputs
+in `runs/opus5-mcp-hinted-0233/` next to the baseline in
+`runs/opus5-hinted-pass5/`.
+
+The headline: masking 70 externally-sourced assumptions behind a
+distractor-dense research service cost opus-5 only about 2 continuous points
+(0.816 -> 0.796) on this task - the model reliably disambiguated scenario,
+period, basis, unit and status to recover the masked inputs, and the residual
+errors sit in the same deep calculation chains that were already failing with
+the inputs on the sheet.

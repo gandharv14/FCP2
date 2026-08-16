@@ -2,7 +2,8 @@
 # through it as well. Everything else in the pipeline is standard library.
 openpyxl>=3.1.5
 
-# Optional. Only needed for `xl_segment.py --adjudicate`, which asks an LLM to
-# name and rank output candidates. Without it the pipeline falls back to the
-# scoring heuristic and `curation.toml`.
-# (uses urllib against the Anthropic HTTP API directly, so no SDK is required)
+# LLM stages use stdlib urllib against the configured HTTP endpoints, so no SDK
+# is required. `xl_variable_source_audit.py` calls GPT 5.6 Sol through Labelbox
+# LiteLLM; `xl_output_task.py` runs that audit by default before packaging.
+# Public-source profiles are authored by the Cursor skill/subagent, then the
+# MCP builder consumes the reviewed JSON entirely offline.

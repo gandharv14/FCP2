@@ -30,8 +30,21 @@ def _split(cid: str):
 EPOCH = datetime(1899, 12, 30)
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]")
 CRITERIA_RE = re.compile(r"^\s*(>=|<=|<>|>|<|=)?\s*(.*)$")
+A1_RANGE_RE = re.compile(
+    r"(?:(?:'(?P<quoted>(?:[^']|'')+)'|(?P<bare>[A-Za-z0-9_ .&-]+))!)?"
+    r"\$?(?P<col0>[A-Za-z]{1,3})\$?(?P<row0>\d+)"
+    r"\s*:\s*\$?(?P<col1>[A-Za-z]{1,3})\$?(?P<row1>\d+)"
+)
+OFFSET_BASE_RE = re.compile(
+    r"^OFFSET\(\s*(?:(?:'(?P<quoted>(?:[^']|'')+)'|(?P<bare>[A-Za-z0-9_ .&-]+))!)?"
+    r"\$?(?P<col>[A-Za-z]{1,3})\$?(?P<row>\d+)",
+    re.IGNORECASE,
+)
 MAX_ITERATIONS = 5000
 MAX_SWEEPS = 12
+MAX_ACTIVE_PASSES = 12
+EXCEL_DEFAULT_ITERATIONS = 100
+EXCEL_DEFAULT_CHANGE = 0.001
 CONVERGENCE = 1e-12
 
 
@@ -333,8 +346,8 @@ class Evaluator:
         self._arg_cache: dict = {}
 
     # -- AST walking ------------------------------------------------------
-    def _args(self, node):
-        """Positional arguments for an op node.
+    def _arg_specs(self, node):
+        """Cached positional argument specifications for an op node.
 
         Slots are indexed by ``arg_index`` rather than packed, because the parser
         emits no edge for an operand that points at an empty cell. Packing would
@@ -349,21 +362,28 @@ class Evaluator:
             size = max([declared] + [k + 1 for k in grouped]) if (grouped or declared) else 0
             cached = [self._spec(grouped.get(i)) for i in range(size)]
             self._arg_cache[node.id] = cached
-        out = []
-        for kind, payload in cached:
-            if kind == "none":
-                out.append(None)
-            elif kind == "scalar":
-                out.append(self._eval_node(payload))
-            elif kind == "span":
-                values = [self._read(cid) for cid in payload]
-                coordinates = [_split(cid) for cid in payload]
-                rows = len({row for _, row, _ in coordinates})
-                cols = len({col for _, _, col in coordinates})
-                out.append(RangeValues(values, rows, cols))
-            else:
-                out.append([self._eval_node(src) for src in payload])
-        return out
+        return cached
+
+    def _arg_value(self, spec):
+        kind, payload = spec
+        if kind == "none":
+            return None
+        if kind == "scalar":
+            return self._eval_node(payload)
+        if kind == "span":
+            values = [self._read(cid) for cid in payload]
+            coordinates = [_split(cid) for cid in payload]
+            rows = len({row for _, row, _ in coordinates})
+            cols = len({col for _, _, col in coordinates})
+            return RangeValues(values, rows, cols)
+        return [self._eval_node(src) for src in payload]
+
+    def _arg(self, node, index):
+        specs = self._arg_specs(node)
+        return self._arg_value(specs[index]) if index < len(specs) else None
+
+    def _args(self, node):
+        return [self._arg_value(spec) for spec in self._arg_specs(node)]
 
     def _spec(self, group):
         """Decide once how an argument slot should be read.
@@ -400,9 +420,15 @@ class Evaluator:
         if node is None:
             return Unresolved("missing-node")
         if node.kind == "const":
+            if node.op == "text" and node.value == "":
+                return ""
             return literal(node.value if node.value != "" else node.expr)
         if node.kind == "range":
             return self._expand_range(node)
+        if node.kind == "name":
+            return ExcelError("#NAME?")
+        if node.kind == "external":
+            return Unresolved("external-reference")
         if node.is_cell:
             if node_id in self.values:
                 return self.values[node_id]
@@ -414,7 +440,10 @@ class Evaluator:
         members = range_members(node.sheet, node.coordinate or "")
         if not members:
             return Unresolved("opaque-range")
-        return [self._read(cid) for cid in members]
+        coordinates = [_split(cid) for cid in members]
+        rows = len({row for _, row, _ in coordinates})
+        cols = len({col for _, _, col in coordinates})
+        return RangeValues([self._read(cid) for cid in members], rows, cols)
 
     def _apply(self, node):
         op = node.op
@@ -422,32 +451,56 @@ class Evaluator:
             return self._offset(node)
         if op == "CELL":
             return self._cell_info(node)
-        args = self._args(node)
+        if op == "INDIRECT":
+            return self._indirect(node)
+        if op == "ROW":
+            return self._row(node)
+        if op == "COUNTA":
+            return self._counta(node)
         if op == "IFERROR":
-            value = args[0] if args else Unresolved("iferror-arity")
+            if not self._arg_specs(node):
+                return Unresolved("iferror-arity")
+            value = self._arg(node, 0)
             if isinstance(value, ExcelError):
-                return args[1] if len(args) > 1 else 0.0
+                fallback = self._arg(node, 1)
+                return 0.0 if fallback is None else fallback
             return value
         if op == "IF":
-            cond = args[0]
+            cond = self._arg(node, 0)
             if is_bad(cond):
                 return cond
             chosen = 1 if truthy(cond) else 2
-            return args[chosen] if len(args) > chosen else (False if chosen == 2 else True)
+            value = self._arg(node, chosen)
+            return value if value is not None else (False if chosen == 2 else True)
+        if op == "CHOOSE":
+            index = self._arg(node, 0)
+            if index is None:
+                return Unresolved("choose-arity")
+            if is_bad(index):
+                return index
+            selected = int(num(index))
+            if not 1 <= selected < len(self._arg_specs(node)):
+                return ExcelError("#VALUE!")
+            return self._arg(node, selected)
         if op in ("IFS", "_XLFN.IFS"):
-            for index in range(0, len(args) - 1, 2):
-                cond = args[index]
+            specs = self._arg_specs(node)
+            for index in range(0, len(specs) - 1, 2):
+                cond = self._arg(node, index)
                 if is_bad(cond):
                     return cond
                 if truthy(cond):
-                    return args[index + 1]
+                    return self._arg(node, index + 1)
             return ExcelError("#N/A")
+        args = self._args(node)
+        selective = (
+            "VLOOKUP", "HLOOKUP", "XLOOKUP", "_XLFN.XLOOKUP", "MATCH", "INDEX"
+        )
         bad = next((a for a in flatten(args) if isinstance(a, Unresolved)), None)
-        if bad is not None:
+        if bad is not None and op not in selective:
             return bad
         err = next((a for a in flatten(args) if isinstance(a, ExcelError)), None)
         if err is not None and op not in (
-            "COUNTIF", "COUNTIFS", "SUMIF", "SUMIFS", "AVERAGEIFS"
+            "COUNTIF", "COUNTIFS", "SUMIF", "SUMIFS", "AVERAGEIFS", *selective
         ):
             return err
         if node.op_kind in ("infix",) and op in BINARY:
@@ -544,6 +597,23 @@ class Evaluator:
     def _fn_month(self, args):
         return float((EPOCH + timedelta(days=num(args[0]))).month)
 
+    def _fn_day(self, args):
+        return float((EPOCH + timedelta(days=num(args[0]))).day)
+
+    def _fn_date(self, args):
+        year = int(num(args[0]))
+        month = int(num(args[1]))
+        day = int(num(args[2]))
+        if 0 <= year < 1900:
+            year += 1900
+        absolute_month = year * 12 + month - 1
+        normalized_year, month0 = divmod(absolute_month, 12)
+        try:
+            stamp = datetime(normalized_year, month0 + 1, 1) + timedelta(days=day - 1)
+        except (OverflowError, ValueError):
+            return ExcelError("#NUM!")
+        return float((stamp - EPOCH).days)
+
     def _fn_eomonth(self, args):
         return float(_eomonth(args[0], args[1]))
 
@@ -563,9 +633,28 @@ class Evaluator:
         return args[idx] if 1 <= idx < len(args) else ExcelError("#VALUE!")
 
     def _fn_index(self, args):
-        pool = list(flatten([args[0]]))
-        idx = int(num(args[1])) if len(args) > 1 else 1
-        return pool[idx - 1] if 1 <= idx <= len(pool) else ExcelError("#REF!")
+        source = args[0]
+        pool = list(flatten([source]))
+        row = int(num(args[1])) if len(args) > 1 else 1
+        if not isinstance(source, RangeValues):
+            return pool[row - 1] if 1 <= row <= len(pool) else ExcelError("#REF!")
+        col = int(num(args[2])) if len(args) > 2 and args[2] is not None else 1
+        if row == 0 and col == 0:
+            return source
+        if row == 0:
+            if not 1 <= col <= source.cols:
+                return ExcelError("#REF!")
+            values = [pool[index] for index in range(col - 1, len(pool), source.cols)]
+            return RangeValues(values, len(values), 1)
+        if col == 0:
+            if not 1 <= row <= source.rows:
+                return ExcelError("#REF!")
+            start = (row - 1) * source.cols
+            return RangeValues(pool[start:start + source.cols], 1, source.cols)
+        index = (row - 1) * source.cols + col - 1
+        if not (1 <= row <= source.rows and 1 <= col <= source.cols and index < len(pool)):
+            return ExcelError("#REF!")
+        return pool[index]
 
     def _fn_countif(self, args):
         pool = list(flatten([args[0]]))
@@ -762,6 +851,29 @@ class Evaluator:
                 selected = row
         return selected[column - 1] if selected is not None else ExcelError("#N/A")
 
+    def _fn_hlookup(self, args):
+        lookup = args[0]
+        table = args[1] if len(args) > 1 else []
+        values = list(flatten([table]))
+        row = int(num(args[2])) if len(args) > 2 else 1
+        exact = len(args) > 3 and not truthy(args[3])
+        cols = table.cols if isinstance(table, RangeValues) else len(values)
+        rows = table.rows if isinstance(table, RangeValues) else 1
+        if row < 1 or row > rows or cols < 1:
+            return ExcelError("#REF!")
+        header = values[:cols]
+        selected = None
+        for index, value in enumerate(header):
+            if _equal(value, lookup):
+                selected = index
+                break
+            if not exact and isinstance(value, (int, float)) and value <= num(lookup):
+                selected = index
+        if selected is None:
+            return ExcelError("#N/A")
+        index = (row - 1) * cols + selected
+        return values[index] if index < len(values) else ExcelError("#REF!")
+
     def _fn_transpose(self, args):
         source = args[0] if args else []
         values = list(flatten([source]))
@@ -821,33 +933,177 @@ class Evaluator:
                 break
         return f"[{self.graph.wb}.xlsx]{target}"
 
+    def _indirect(self, node):
+        """Return the statically resolved target attached by the AST builder."""
+        args = self._args(node)
+        declared = int(node.arity) if str(node.arity).isdigit() else 1
+        if len(args) > declared:
+            return args[declared]
+        return ExcelError("#REF!")
+
+    def _row(self, node):
+        """Excel ROW, using the referenced range or the formula owner's row."""
+        incoming = sorted(self.graph.in_edges.get(node.id, ()), key=lambda edge: edge.arg_index)
+        if incoming:
+            source = self.graph.nodes.get(incoming[0].source)
+            if source is not None and source.row is not None:
+                return float(source.row)
+        owner = self.graph.nodes.get(node.owner)
+        return float(owner.row) if owner is not None and owner.row is not None else ExcelError("#REF!")
+
+    def _counta(self, node):
+        """Count nonblank values, recovering a range omitted by older AST graphs."""
+        args = self._args(node)
+        values = list(flatten(args))
+        if not values or all(value is None for value in values):
+            match = A1_RANGE_RE.search(node.expr or "")
+            if match:
+                sheet = (match.group("quoted") or match.group("bare") or node.sheet)
+                sheet = sheet.replace("''", "'").strip()
+                span = (
+                    f"{match.group('col0')}{match.group('row0')}:"
+                    f"{match.group('col1')}{match.group('row1')}"
+                )
+                values = [self._read(cid) for cid in range_members(sheet, span)]
+        bad = next((value for value in values if isinstance(value, Unresolved)), None)
+        if bad is not None:
+            return bad
+        return float(sum(value is not None and value != "" for value in values))
+
     def _offset(self, node):
-        """Resolve a dynamic reference against the grid, then read the target."""
+        """Resolve a dynamic reference, including optional range dimensions."""
+        targets = self._offset_targets(node)
+        if is_bad(targets):
+            return targets
+        values = [self._read(target) for target in targets]
+        groups = {
+            edge.arg_index for edge in self.graph.in_edges.get(node.id, ())
+        }
+        height = int(num(self._arg(node, 3), 1.0)) if 3 in groups else 1
+        width = int(num(self._arg(node, 4), 1.0)) if 4 in groups else 1
+        if height == 1 and width == 1:
+            return values[0]
+        return RangeValues(values, height, width)
+
+    def _offset_targets(self, node):
+        """Resolve the cell ids addressed by OFFSET without reading their values."""
         groups: dict = {}
         for edge in self.graph.in_edges.get(node.id, ()):
             groups.setdefault(edge.arg_index, []).append(edge)
-        if 0 not in groups:
-            return Unresolved("offset-no-base")
-        base_id = groups[0][0].source
-        base = self.graph.nodes.get(base_id)
-        if base is None or base.row is None:
-            return Unresolved("offset-base-not-cell")
-        rows = self._eval_node(groups[1][0].source) if 1 in groups else 0
-        cols = self._eval_node(groups[2][0].source) if 2 in groups else 0
+        if 0 in groups:
+            base_id = groups[0][0].source
+            base = self.graph.nodes.get(base_id)
+            if base is None or base.row is None:
+                return Unresolved("offset-base-not-cell")
+            base_sheet, base_row, base_col = base.sheet, base.row, base.col
+        else:
+            # Older ASTs omitted an OFFSET base when that anchor cell was blank.
+            # The coordinate is still a reference origin, not a value dependency.
+            match = OFFSET_BASE_RE.match(node.expr or "")
+            if not match:
+                return Unresolved("offset-no-base")
+            base_sheet = match.group("quoted") or match.group("bare") or node.sheet
+            base_sheet = base_sheet.replace("''", "'").strip()
+            parsed = _split(f"{base_sheet}!{match.group('col')}{match.group('row')}")
+            if parsed is None:
+                return Unresolved("offset-base-not-cell")
+            base_sheet, base_row, base_col = parsed
+        rows = self._arg(node, 1) if 1 in groups else 0
+        cols = self._arg(node, 2) if 2 in groups else 0
         if is_bad(rows) or is_bad(cols):
             return rows if is_bad(rows) else cols
-        target_row = base.row + int(num(rows))
-        target_col = base.col + int(num(cols))
-        target = a1(base.sheet, target_row, target_col)
-        if target in self.values:
-            return self.values[target]
-        if target in self.graph.nodes:
-            return Unresolved("offset-uncomputed")
-        if self.oracle is not None:
-            found = self.oracle(base.sheet, target_row, target_col)
-            if found is not None:
-                return literal(found) if isinstance(found, str) else found
-        return None
+        target_row = base_row + int(num(rows))
+        target_col = base_col + int(num(cols))
+        height = self._arg(node, 3) if 3 in groups else 1
+        width = self._arg(node, 4) if 4 in groups else 1
+        if is_bad(height) or is_bad(width):
+            return height if is_bad(height) else width
+        height, width = int(num(height, 1.0)), int(num(width, 1.0))
+        if height < 1 or width < 1 or target_row < 1 or target_col < 1:
+            return ExcelError("#REF!")
+        return [
+            a1(base_sheet, row, col)
+            for row in range(target_row, target_row + height)
+            for col in range(target_col, target_col + width)
+        ]
+
+    def _active_node_sources(self, node_id, seen=None):
+        """Cell precedents actually evaluated under the current selector values."""
+        seen = set() if seen is None else seen
+        if node_id in seen:
+            return set()
+        seen.add(node_id)
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            return set()
+        if node.is_cell:
+            return {node.id}
+        if node.kind == "range":
+            return set(range_members(node.sheet, node.coordinate or ""))
+        if node.kind != "op":
+            return set()
+
+        specs = self._arg_specs(node)
+        indices = list(range(len(specs)))
+        if node.op == "OFFSET":
+            # The first argument supplies an address origin, not a value. The
+            # resolved target below is the actual value dependency.
+            indices = list(range(1, len(specs)))
+        elif node.op == "IF":
+            cond = self._arg(node, 0)
+            indices = [0] if is_bad(cond) else [0, 1 if truthy(cond) else 2]
+        elif node.op == "CHOOSE":
+            selected = self._arg(node, 0)
+            index = int(num(selected)) if not is_bad(selected) and selected is not None else -1
+            indices = [0] + ([index] if 1 <= index < len(specs) else [])
+        elif node.op in ("IFS", "_XLFN.IFS"):
+            indices = []
+            for index in range(0, len(specs) - 1, 2):
+                indices.append(index)
+                cond = self._arg(node, index)
+                if not is_bad(cond) and truthy(cond):
+                    indices.append(index + 1)
+                    break
+                if is_bad(cond):
+                    break
+        elif node.op == "IFERROR":
+            indices = [0]
+            if isinstance(self._arg(node, 0), ExcelError) and len(specs) > 1:
+                indices.append(1)
+
+        sources = set()
+        for index in indices:
+            if index >= len(specs):
+                continue
+            kind, payload = specs[index]
+            if kind == "span":
+                sources.update(payload)
+            elif kind == "scalar":
+                sources.update(self._active_node_sources(payload, seen))
+            elif kind == "many":
+                for source in payload:
+                    sources.update(self._active_node_sources(source, seen))
+        if node.op == "OFFSET":
+            targets = self._offset_targets(node)
+            if isinstance(targets, list):
+                sources.update(targets)
+        return sources
+
+    def _active_graph(self, cells):
+        """Build source-to-consumer edges after pruning inactive formula branches."""
+        known = set(cells)
+        adj: dict[str, set] = {}
+        radj: dict[str, set] = {}
+        for target in cells:
+            root = self.graph.root_of(target)
+            if root is None:
+                continue
+            for source in self._active_node_sources(root):
+                if source not in known:
+                    continue
+                adj.setdefault(source, set()).add(target)
+                radj.setdefault(target, set()).add(source)
+        return adj, radj
 
     # -- driver -----------------------------------------------------------
     def run(self, inputs: set) -> EvalResult:
@@ -857,78 +1113,282 @@ class Evaluator:
             info = self.cg.info[cid]
             if cid in inputs or info.node.kind in ("input", "label") or info.is_literal:
                 self.values[cid] = literal(info.node.value)
+        seeded = set(self.values)
+        # Excel initializes every iterative formula at zero. Doing this globally
+        # also makes selector evaluation deterministic before the first active
+        # dependency graph is built.
+        for cid in cells:
+            if cid not in seeded:
+                self.values[cid] = 0.0
+        indeterminate: set[str] = set()
 
-        groups = strongly_connected(cells, self.cg.adj)
-        comp_of, members = {}, {}
-        for group in groups:
-            key = group[0]
-            members[key] = group
-            for cell in group:
-                comp_of[cell] = key
-        comp_adj, comp_radj = {}, {}
-        for src, targets in self.cg.adj.items():
-            csrc = comp_of.get(src)
-            for dst in targets:
-                cdst = comp_of.get(dst)
-                if csrc is None or cdst is None or csrc == cdst:
+        iterate = bool(getattr(self.oracle, "iterate", True))
+        iteration_limit = getattr(self.oracle, "iterate_count", None)
+        iteration_limit = iteration_limit or EXCEL_DEFAULT_ITERATIONS
+        iteration_delta = getattr(self.oracle, "iterate_delta", None)
+        iteration_delta = iteration_delta or EXCEL_DEFAULT_CHANGE
+
+        last_signature = None
+        latest_cycles = {}
+        indeterminate_diagnostics = {}
+        graph_passes = 0
+        for graph_pass in range(MAX_ACTIVE_PASSES):
+            graph_passes = graph_pass + 1
+            before_pass = dict(self.values)
+            cycle_candidates = []
+            disabled_cycle_candidates = []
+            current_cycles = dict(indeterminate_diagnostics)
+            active_adj, active_radj = self._active_graph(cells)
+            signature = frozenset(
+                (source, target)
+                for source, targets in active_adj.items()
+                for target in targets
+            )
+            groups = strongly_connected(cells, active_adj)
+            comp_of, members = {}, {}
+            for group in groups:
+                key = group[0]
+                members[key] = group
+                for cell in group:
+                    comp_of[cell] = key
+            comp_adj, comp_radj = {}, {}
+            for source, targets in active_adj.items():
+                csrc = comp_of.get(source)
+                for target in targets:
+                    cdst = comp_of.get(target)
+                    if csrc is None or cdst is None or csrc == cdst:
+                        continue
+                    comp_adj.setdefault(csrc, set()).add(cdst)
+                    comp_radj.setdefault(cdst, set()).add(csrc)
+
+            for comp in topo_order(members, comp_adj, comp_radj):
+                group = members[comp]
+                pending = sorted(
+                    cell for cell in group
+                    if cell not in seeded and cell not in indeterminate
+                )
+                if not pending:
                     continue
-                comp_adj.setdefault(csrc, set()).add(cdst)
-                comp_radj.setdefault(cdst, set()).add(csrc)
+                cyclic = len(group) > 1 or any(
+                    cell in active_adj.get(cell, ()) for cell in group
+                )
+                if not cyclic:
+                    self.values[pending[0]] = self._eval_cell(pending[0])
+                    continue
+                if not iterate:
+                    # A zero-valued selector can temporarily expose an otherwise
+                    # inactive self-reference. Give the active graph a single
+                    # lazy sweep to settle before declaring a real cycle.
+                    diagnostic = self._iterate_group(pending, 1, iteration_delta)
+                    diagnostic.update({
+                        "size": len(group), "seed": comp,
+                        "reason": "iteration-disabled-provisional",
+                        "graph_pass": graph_pass + 1,
+                    })
+                    disabled_cycle_candidates.append(
+                        (tuple(sorted(group)), pending, diagnostic)
+                    )
+                else:
+                    diagnostic = self._iterate_group(
+                        pending, iteration_limit, iteration_delta
+                    )
+                    diagnostic["unique"] = True
+                    diagnostic.update({
+                        "size": len(group), "seed": comp,
+                        "graph_pass": graph_pass + 1,
+                    })
+                    cycle_candidates.append((tuple(sorted(group)), pending, diagnostic))
+                current_cycles[tuple(sorted(group))] = diagnostic
 
-        iterated = []
-        for comp in topo_order(members, comp_adj, comp_radj):
-            group = members[comp]
-            # Sorted so a circular block always relaxes in the same order; set
-            # iteration order otherwise varies per process and the iteration
-            # count stops being reproducible.
-            pending = sorted(c for c in group if c not in self.values)
-            if not pending:
-                continue
-            if len(group) == 1:
-                self.values[group[0]] = self._eval_cell(group[0])
-                continue
-            # Circular block: seed at zero and iterate the way Excel does.
-            for cell in pending:
-                self.values[cell] = 0.0
-            for step in range(MAX_ITERATIONS):
-                delta = 0.0
-                for cell in pending:
-                    before = self.values[cell]
-                    after = self._eval_cell(cell)
-                    self.values[cell] = after
-                    if isinstance(before, float) and isinstance(after, float):
-                        delta = max(delta, abs(after - before) / max(abs(after), 1.0))
-                    else:
-                        delta = max(delta, 1.0)
-                if delta < CONVERGENCE:
-                    break
-            iterated.append({"size": len(group), "seed": comp, "iterations": step + 1,
-                             "converged": delta < CONVERGENCE})
+            max_change = max(
+                (self._value_change(before_pass[cell], self.values[cell]) for cell in cells),
+                default=0.0,
+            )
+            latest_cycles = current_cycles
+            if signature == last_signature and max_change <= iteration_delta:
+                found_indeterminate = False
+                for group_key, pending, diagnostic in disabled_cycle_candidates:
+                    diagnostic.update({
+                        "iterations": 0,
+                        "converged": False,
+                        "max_change": None,
+                        "reason": "iteration-disabled",
+                    })
+                    latest_cycles[group_key] = diagnostic
+                    indeterminate_diagnostics[group_key] = diagnostic
+                    indeterminate.update(pending)
+                    for cell in pending:
+                        self.values[cell] = Unresolved("circular-reference")
+                    found_indeterminate = True
+                for group_key, pending, diagnostic in cycle_candidates:
+                    alternative = self._alternate_fixed_point(
+                        pending, diagnostic, iteration_limit, iteration_delta
+                    )
+                    if alternative is None:
+                        continue
+                    canonical, alternate = alternative
+                    diagnostic.update({
+                        "unique": False,
+                        "reason": "non-unique-fixed-point",
+                        "canonical_fixed_point": canonical,
+                        "alternate_fixed_point": alternate,
+                    })
+                    latest_cycles[group_key] = diagnostic
+                    indeterminate_diagnostics[group_key] = diagnostic
+                    indeterminate.update(pending)
+                    for cell in pending:
+                        self.values[cell] = Unresolved(
+                            "non-unique-circular-reference"
+                        )
+                    found_indeterminate = True
+                if found_indeterminate:
+                    continue
+                break
+            last_signature = signature
 
-        # OFFSET targets and unexpanded ranges are resolved from values, so the
-        # static edge set never ordered them. Sweep until nothing more resolves.
-        order = [c for comp in topo_order(members, comp_adj, comp_radj) for c in members[comp]]
-        for _ in range(MAX_SWEEPS):
-            stuck = [c for c in order if isinstance(self.values.get(c), Unresolved)]
-            if not stuck:
-                break
-            for cell in stuck:
-                self.values[cell] = self._eval_cell(cell)
-            if sum(1 for c in stuck if isinstance(self.values.get(c), Unresolved)) == len(stuck):
-                break
+        cycle_diagnostics = list(latest_cycles.values())
+        iterated = [
+            diagnostic for diagnostic in cycle_diagnostics
+            if diagnostic["size"] > 1
+            or diagnostic["iterations"] > 1
+            or not diagnostic["converged"]
+            or not diagnostic.get("unique", True)
+            or diagnostic.get("errors")
+            or diagnostic.get("unresolved")
+        ]
 
         for cid, value in self.values.items():
             if isinstance(value, Unresolved):
                 self.unresolved[cid] = value.reason
 
         computed = sum(1 for c in cells if not isinstance(self.values.get(c), Unresolved))
+        errors = sum(isinstance(self.values.get(c), ExcelError) for c in cells)
         coverage = {
             "cells": len(cells),
             "computed": computed,
             "unresolved": len(self.unresolved),
+            "errors": errors,
             "unknown_ops": dict(self.unknown_ops),
+            "active_graph_passes": graph_passes,
+            "iteration_enabled": iterate,
+            "iteration_limit": iteration_limit,
+            "iteration_delta": iteration_delta,
+            "active_cycles": len(cycle_diagnostics),
+            "stable_self_cycles": sum(
+                diagnostic["size"] == 1 and diagnostic["converged"]
+                and diagnostic.get("unique", True)
+                for diagnostic in cycle_diagnostics
+            ),
         }
         return EvalResult(self.values, self.unresolved, iterated, coverage)
+
+    @staticmethod
+    def _value_change(before, after):
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            if math.isfinite(float(before)) and math.isfinite(float(after)):
+                return abs(float(after) - float(before))
+        return 0.0 if type(before) is type(after) and repr(before) == repr(after) else math.inf
+
+    def _iterate_group(self, pending, iteration_limit, iteration_delta):
+        max_change = math.inf
+        for step in range(iteration_limit):
+            max_change = 0.0
+            for cell in pending:
+                before = self.values[cell]
+                after = self._eval_cell(cell)
+                self.values[cell] = after
+                max_change = max(max_change, self._value_change(before, after))
+            if max_change <= iteration_delta:
+                break
+        return {
+            "iterations": step + 1,
+            "converged": max_change <= iteration_delta,
+            "max_change": None if math.isinf(max_change) else max_change,
+            "errors": sum(isinstance(self.values[cell], ExcelError) for cell in pending),
+            "unresolved": sum(isinstance(self.values[cell], Unresolved) for cell in pending),
+        }
+
+    def _alternate_fixed_point(
+        self, pending, canonical_diagnostic, iteration_limit, iteration_delta
+    ):
+        """Prove non-uniqueness when a second numeric fixed point is reachable.
+
+        A zero-seeded circular calculation can appear to converge even when the
+        recurrence merely preserves its initial state (for example ``x = x``).
+        Re-run the same active SCC from a unit seed. If both runs converge and
+        produce distinct numeric solutions, frontier inputs do not determine the
+        workbook's persisted value, so strict verification must remain unresolved.
+        """
+        if (
+            not canonical_diagnostic["converged"]
+            or canonical_diagnostic["errors"]
+            or canonical_diagnostic["unresolved"]
+        ):
+            return None
+        canonical = {cell: self.values[cell] for cell in pending}
+        if not all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            for value in canonical.values()
+        ):
+            return None
+
+        seed = 1.0
+        if all(abs(float(value) - seed) <= iteration_delta for value in canonical.values()):
+            seed = -1.0
+        for cell in pending:
+            self.values[cell] = seed
+        alternate_diagnostic = self._iterate_group(
+            pending, iteration_limit, iteration_delta
+        )
+        alternate = {cell: self.values[cell] for cell in pending}
+        self.values.update(canonical)
+
+        if (
+            not alternate_diagnostic["converged"]
+            or alternate_diagnostic["errors"]
+            or alternate_diagnostic["unresolved"]
+            or not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in alternate.values()
+            )
+        ):
+            return None
+        distinct = any(
+            self._value_change(canonical[cell], alternate[cell]) > iteration_delta
+            for cell in pending
+        )
+        if not distinct:
+            return None
+        return (
+            {cell: canonical[cell] for cell in pending[:20]},
+            {cell: alternate[cell] for cell in pending[:20]},
+        )
+
+    def _stabilize(self, order, seeded):
+        """Bounded fixed-point sweeps for dependencies hidden by dynamic references."""
+        for _ in range(MAX_SWEEPS):
+            changed = 0
+            # The static order is optimal for known edges. The reverse pass
+            # quickly carries values across dynamic edges whose direction was
+            # unavailable to the graph builder.
+            for sweep in (order, reversed(order)):
+                for cell in sweep:
+                    if cell in seeded:
+                        continue
+                    before = self.values.get(cell)
+                    after = self._eval_cell(cell)
+                    self.values[cell] = after
+                    if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+                        scale = max(abs(float(before)), abs(float(after)), 1.0)
+                        changed += abs(float(after) - float(before)) > CONVERGENCE * scale
+                    else:
+                        changed += type(before) is not type(after) or repr(before) != repr(after)
+            if not changed:
+                break
 
     def _eval_cell(self, cid: str):
         info = self.cg.info[cid]
@@ -973,6 +1433,10 @@ def workbook_oracle(path):
             return (value - EPOCH).days
         return value
 
+    calculation = getattr(book, "calculation", None)
+    lookup.iterate = bool(getattr(calculation, "iterate", False))
+    lookup.iterate_count = getattr(calculation, "iterateCount", None)
+    lookup.iterate_delta = getattr(calculation, "iterateDelta", None)
     return lookup
 
 

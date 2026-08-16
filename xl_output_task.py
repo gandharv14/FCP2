@@ -11,6 +11,8 @@ sufficient to recompute them, so the ask is answerable from the artifact alone.
 
 The framing paragraph goes through the same naturalizer as the level-split
 tasks; the target list is appended verbatim so the deliverable stays exact.
+Before packaging, a separate GPT 5.6 Sol stage writes a variable/source audit
+and deterministic inventory under ``runs/<id>-variable-sources/``.
 """
 
 from __future__ import annotations
@@ -33,12 +35,12 @@ except ImportError:  # pragma: no cover
 
 from xl_task_build import (Instance, PROD_ENDPOINT, naturalize, read_env_key,
                            toml_table)
-from xl_harbor_prep import (
-    AGENT_MAX_ITERATIONS,
-    AGENT_TIMEOUT_SCALE,
-    DOCKERFILE,
-)
+from xl_harbor_prep import DOCKERFILE
 from mcp_env.server_assets import COMPOSE_YAML
+from xl_variable_source_audit import (
+    DEFAULT_MODEL as DEFAULT_AUDIT_MODEL,
+    generate_audit,
+)
 
 PIPELINE_VERSION = "1.0.0"
 TIMEOUT_BASE_SEC = 2400.0
@@ -500,11 +502,9 @@ TIMEOUT_PER_MCP_VARIABLE_SEC = 15.0
 
 
 def agent_timeout(n_cells, n_mcp_variables=0):
-    return AGENT_TIMEOUT_SCALE * min(
-        TIMEOUT_MAX_SEC,
-        TIMEOUT_BASE_SEC + TIMEOUT_PER_TARGET_SEC * n_cells
-        + TIMEOUT_PER_MCP_VARIABLE_SEC * n_mcp_variables,
-    )
+    return min(TIMEOUT_MAX_SEC,
+               TIMEOUT_BASE_SEC + TIMEOUT_PER_TARGET_SEC * n_cells
+               + TIMEOUT_PER_MCP_VARIABLE_SEC * n_mcp_variables)
 
 
 def mcp_variable_count(mcp_dir):
@@ -513,7 +513,7 @@ def mcp_variable_count(mcp_dir):
 
 
 def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
-         nat_meta, hints=None, hint_style="", mcp_dir=None):
+         nat_meta, hints=None, hint_style="", mcp_dir=None, audit_meta=None):
     if out_dir.exists():
         shutil.rmtree(out_dir)
     (out_dir / "environment").mkdir(parents=True)
@@ -573,10 +573,16 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
             if hinted else ""
         ),
         "pipeline_version": PIPELINE_VERSION,
-        "agent_max_iterations": AGENT_MAX_ITERATIONS,
-        "agent_timeout_scale": AGENT_TIMEOUT_SCALE,
         "created_at": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if audit_meta is not None:
+        metadata.update({
+            "variable_source_audit": audit_meta["markdown"],
+            "variable_source_audit_model": audit_meta["model"],
+            "variable_source_audit_inventory_sha256":
+                audit_meta["inventory_sha256"],
+            "variable_source_audit_rows": audit_meta["inventory_rows"],
+        })
     if mcp_dir is not None:
         metadata.update({
             "mcp_environment": str(mcp_dir),
@@ -676,6 +682,26 @@ def main(argv=None):
     parser.add_argument("--model", default="openai/gpt-5.6-luna")
     parser.add_argument("--no-naturalize", action="store_true")
     parser.add_argument(
+        "--variable-source-audit-root", default="runs",
+        help="root for <workbook>-variable-sources audit artifacts",
+    )
+    parser.add_argument(
+        "--variable-source-audit-inputs-root", default="inputs_out",
+        help="unredacted inputs-only workbooks audited before optional MCP masking",
+    )
+    parser.add_argument(
+        "--variable-source-audit-model", default=DEFAULT_AUDIT_MODEL,
+        help="LiteLLM model used only for variable/source Markdown",
+    )
+    parser.add_argument(
+        "--no-variable-source-audit", action="store_true",
+        help="skip the GPT-generated variable/source audit stage",
+    )
+    parser.add_argument(
+        "--refresh-variable-source-audit", action="store_true",
+        help="regenerate audit Markdown even when its inventory hash matches",
+    )
+    parser.add_argument(
         "--hints", action="store_true",
         help="append answer-free routes derived from lineage.json",
     )
@@ -715,6 +741,26 @@ def main(argv=None):
         family = families.get(workbook, "")
         outputs, targets = collect(workbook, args.source, args.seg_root,
                                    args.inputs_root)
+        artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
+        audit_meta = None
+        if not args.no_variable_source_audit:
+            audit_artifact = (
+                Path(args.variable_source_audit_inputs_root)
+                / ("%s-inputs.xlsx" % workbook)
+            )
+            audit_meta = generate_audit(
+                workbook,
+                audit_artifact,
+                Path(args.seg_root) / workbook,
+                Path(args.variable_source_audit_root)
+                / ("%s-variable-sources" % workbook),
+                config["api_key"],
+                model=args.variable_source_audit_model,
+                endpoint=PROD_ENDPOINT,
+                project_id=args.project_id,
+                refresh=args.refresh_variable_source_audit,
+                log=lambda message: print("   ", message),
+            )
         hints = None
         hint_style = ""
         if args.hints:
@@ -733,7 +779,6 @@ def main(argv=None):
             forbidden=[repr(v) for v in targets.values()])
         text, nat_meta = naturalize(instance, config,
                                     lambda m: print("   ", m))
-        artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
         instruction = build_instruction(
             text, artifact.name, outputs, targets, hints=hints,
             hint_style=hint_style, mcp=mcp_dir is not None,
@@ -747,7 +792,7 @@ def main(argv=None):
         out_dir = out_root / ("%s-%s" % (workbook, suffix))
         emit(out_dir, workbook, family, artifact, instruction, targets,
              outputs, nat_meta, hints=hints, hint_style=hint_style,
-             mcp_dir=mcp_dir)
+             mcp_dir=mcp_dir, audit_meta=audit_meta)
         n_vars = mcp_variable_count(mcp_dir) if mcp_dir is not None else 0
         print("%s  %-16s %2d outputs, %3d cells%s, timeout %.0fs -> %s"
               % (workbook, family, len(outputs), len(targets),

@@ -50,7 +50,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mcp_env.build import build, load, validate_spec, write_json
+from mcp_env.build import (
+    access_status,
+    build,
+    load,
+    profile_catalog,
+    validate_spec,
+    write_json,
+)
 from mcp_env.import_table import import_table
 from mcp_env.server_assets import SERVER_PY, SIDECAR_DOCKERFILE
 from mcp_env.validate import validate
@@ -144,6 +151,24 @@ def cmd_import(args):
     output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n",
                       encoding="utf-8")
     print(json.dumps({"rows": result["row_count"], "output": str(output)}, indent=2))
+    return 0
+
+
+def cmd_validate_spec(args):
+    """Validate normalized variables and reviewed profiles without building."""
+    spec = load(Path(args.spec))
+    validate_spec(spec)
+    profiles = profile_catalog(spec)
+    public = sum(access_status(profile) == "public"
+                 for profile in profiles.values())
+    skipped = len(profiles) - public
+    print(json.dumps({
+        "valid": True,
+        "variables": len(spec["variables"]),
+        "source_profiles": len(profiles),
+        "approved_public_profiles": public,
+        "skipped_profiles": skipped,
+    }, indent=2))
     return 0
 
 
@@ -300,6 +325,12 @@ def main(argv=None):
     p_build.add_argument("--source", default="4-10 100",
                          help="folder holding the golden <wb>.xlsx")
     p_build.set_defaults(func=cmd_build)
+
+    p_validate = sub.add_parser(
+        "validate-spec",
+        help="validate normalized variables and reviewed source profiles")
+    p_validate.add_argument("spec")
+    p_validate.set_defaults(func=cmd_validate_spec)
 
     p_smoke = sub.add_parser("smoke", help="exercise the server with an MCP client")
     p_smoke.add_argument("bundle")

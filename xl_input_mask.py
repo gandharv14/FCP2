@@ -334,7 +334,9 @@ def _xml_escape(text):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def _assumptions_sheet_xml(rows):
+def _assumptions_sheet_xml(rows, deny=None):
+    deny = deny or set()
+
     def cell(ref, value):
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return '<c r="%s"><v>%.17g</v></c>' % (ref, value)
@@ -345,16 +347,20 @@ def _assumptions_sheet_xml(rows):
     for entry in rows:
         host = entry.get("host", "")
         coords = host.split("!", 1)[1] if "!" in host else host
+        formula = entry.get("formula", "")
+        if str(formula).startswith("="):
+            formula = "'" + str(formula)
         table.append([
             entry.get("sheet", ""), coords, entry.get("label", ""),
-            entry.get("value", ""), entry.get("formula", ""),
+            entry.get("value", ""), formula,
         ])
 
     body = []
     for r, values in enumerate(table, start=1):
         cells = "".join(
             cell("%s%d" % (get_column_letter(c), r), v)
-            for c, v in enumerate(values, start=1) if v != ""
+            for c, v in enumerate(values, start=1)
+            if v != "" and (r, c) not in deny
         )
         body.append('<row r="%d">%s</row>' % (r, cells))
     xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -364,11 +370,12 @@ def _assumptions_sheet_xml(rows):
     return xml.encode("utf-8")
 
 
-def inject_assumptions(out_path, rows, existing_sheets):
+def inject_assumptions(out_path, rows, existing_sheets, deny=None):
     """Append an assumptions sheet at the XML level, sparing charts and styles."""
     name = ASSUMPTIONS_SHEET
     while name in existing_sheets:
         name += " (pipeline)"
+    denied = (deny or {}).get(name, set())
 
     with zipfile.ZipFile(out_path) as src:
         items = [(item, src.read(item.filename)) for item in src.infolist()]
@@ -412,7 +419,7 @@ def inject_assumptions(out_path, rows, existing_sheets):
             info.compress_type = item.compress_type
             info.external_attr = item.external_attr
             out.writestr(info, parts[item.filename])
-        out.writestr(ASSUMPTIONS_PART, _assumptions_sheet_xml(rows))
+        out.writestr(ASSUMPTIONS_PART, _assumptions_sheet_xml(rows, denied))
     os.replace(tmp, out_path)
     return name
 
@@ -515,8 +522,6 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
     faults = {"formula": [], "leaked": [], "lost": [], "changed": []}
 
     for ws in masked.worksheets:
-        if assumptions_sheet is not None and ws.title == assumptions_sheet:
-            continue  # the sheet this run added; its numbers are the assumptions
         allowed = keep.get(ws.title, set())
         derived = formula_coords.get(ws.title, set())
         denied = deny.get(ws.title, set())
@@ -628,7 +633,9 @@ def process(wb_id, args):
     if assumptions:
         with zipfile.ZipFile(source) as zf:
             existing = {name for name, _ in sheet_parts(zf)}
-        assumptions_sheet = inject_assumptions(out_path, assumptions, existing)
+        assumptions_sheet = inject_assumptions(
+            out_path, assumptions, existing, deny
+        )
 
     faults = verify(out_path, source, keep, frontier, formula_coords, deny,
                     assumptions_sheet)

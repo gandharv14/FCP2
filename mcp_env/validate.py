@@ -47,6 +47,27 @@ def keys(value: Any) -> set[str]:
     return result
 
 
+def strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from strings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from strings(child)
+
+
+def unique_ids(rows: list[dict[str, Any]], label: str) -> set[str]:
+    ids = [str(row.get("id") or "") for row in rows]
+    if any(not value for value in ids):
+        raise ValueError("%s contains a row without an id" % label)
+    duplicates = sorted({value for value in ids if ids.count(value) > 1})
+    if duplicates:
+        raise ValueError("%s contains duplicate ids: %s" % (label, duplicates))
+    return set(ids)
+
+
 def validate(root: Path) -> dict[str, Any]:
     required = [
         root / "runtime/server.json",
@@ -62,9 +83,10 @@ def validate(root: Path) -> dict[str, Any]:
     if missing:
         raise ValueError("Missing required files: %s" % missing)
 
-    runtime_objects = [load(root / "runtime/server.json"),
-                       load(root / "runtime/sources.json"),
-                       load(root / "runtime/datasets.json")]
+    server = load(root / "runtime/server.json")
+    sources = load(root / "runtime/sources.json")
+    datasets = load(root / "runtime/datasets.json")
+    runtime_objects = [server, sources, datasets]
     documents = read_jsonl(root / "runtime/documents.jsonl")
     records = read_jsonl(root / "runtime/records.jsonl")
     tasks = read_jsonl(root / "eval/tasks.jsonl")
@@ -74,14 +96,65 @@ def validate(root: Path) -> dict[str, Any]:
     if leaked:
         raise ValueError("Evaluation keys leaked into runtime: %s" % sorted(leaked))
 
-    document_ids = {row["id"] for row in documents}
-    record_ids = {row["id"] for row in records}
+    source_ids = unique_ids(sources, "sources")
+    dataset_ids = unique_ids(datasets, "datasets")
+    document_ids = unique_ids(documents, "documents")
+    record_ids = unique_ids(records, "records")
+    datasets_by_id = {row["id"]: row for row in datasets}
+    documents_by_id = {row["id"]: row for row in documents}
+    for source in sources:
+        origin = str(source.get("origin_url") or "")
+        if not re.match(r"^(?:https?|internal)://", origin):
+            raise ValueError("Source %s has an invalid origin_url" % source["id"])
+        source_metadata = {
+            key: value for key, value in source.items() if key != "origin_url"
+        }
+        if any(re.search(r"https?://", value, re.IGNORECASE)
+               for value in strings(source_metadata)):
+            raise ValueError(
+                "Source %s exposes a real URL outside origin_url" % source["id"])
+    non_source_runtime = [server, datasets, documents, records]
+    if any(re.search(r"https?://", value, re.IGNORECASE)
+           for value in strings(non_source_runtime)):
+        raise ValueError("Runtime exposes a real URL outside source origin_url")
+    for dataset in datasets:
+        if dataset.get("source_id") not in source_ids:
+            raise ValueError("Dataset %s references an unknown source" % dataset["id"])
+        if bool(dataset.get("profile_id")) != bool(dataset.get("dataset_key")):
+            raise ValueError(
+                "Profiled dataset %s needs profile_id and dataset_key" % dataset["id"])
+        if dataset.get("profile_id"):
+            labels = dataset.get("field_labels")
+            if not isinstance(labels, dict):
+                raise ValueError("Profiled dataset %s has invalid field labels"
+                                 % dataset["id"])
+    for document in documents:
+        if document.get("source_id") not in source_ids:
+            raise ValueError("Document %s references an unknown source" % document["id"])
+        if document.get("related_dataset_id") not in dataset_ids:
+            raise ValueError("Document %s references an unknown dataset"
+                             % document["id"])
+        expected_prefix = "mock://%s/documents/" % document["source_id"]
+        if not str(document.get("url") or "").startswith(expected_prefix):
+            raise ValueError("Document %s must use its mock:// source URL"
+                             % document["id"])
+    for record in records:
+        if record.get("source_id") not in source_ids or \
+                record.get("dataset_id") not in dataset_ids or \
+                record.get("document_id") not in document_ids:
+            raise ValueError("Record %s has a broken runtime reference" % record["id"])
+        document = documents_by_id[record["document_id"]]
+        if document["related_dataset_id"] != record["dataset_id"]:
+            raise ValueError("Record %s document points to another dataset"
+                             % record["id"])
     ambiguous_broad = 0
     chained = 0
     for task in tasks:
         evidence = task["evidence"]
         if evidence["document_id"] not in document_ids or \
-                evidence["record_id"] not in record_ids:
+                evidence["record_id"] not in record_ids or \
+                evidence["dataset_id"] not in dataset_ids or \
+                evidence["source_id"] not in source_ids:
             raise ValueError("Missing evidence for task %s" % task["task_id"])
         wanted = task["required_dimensions"]
         # Filter with the live server's token-containment semantics, so an
@@ -120,6 +193,21 @@ def validate(root: Path) -> dict[str, Any]:
                 raise ValueError(
                     "Task %s: chain from %s does not end at the evidence row"
                     % (task["task_id"], row["release"]))
+        published = [row["published_at"] for row in exact]
+        if len(set(published)) != len(published):
+            raise ValueError(
+                "Task %s has duplicate provenance publication dates"
+                % task["task_id"])
+        if datasets_by_id[evidence["dataset_id"]].get("profile_id"):
+            if any(not row.get("release_label") for row in exact):
+                raise ValueError(
+                    "Task %s profiled releases are missing labels"
+                    % task["task_id"])
+            ordered = sorted(exact, key=lambda row: row["published_at"])
+            if ordered[-1]["id"] != evidence["record_id"]:
+                raise ValueError(
+                    "Task %s profiled release cadence does not end at evidence"
+                    % task["task_id"])
         if len(exact) > 1:
             chained += 1
         # A stale release must not silently agree with the current value.

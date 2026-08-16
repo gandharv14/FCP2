@@ -19,9 +19,12 @@ the run; you will not find those directories in a fresh clone.
 | `xl_segment.py` | The CLI that runs the stages and verifies the result. |
 | `xl_input_mask.py` | Turns the segmentation into an inputs-only workbook (section 17). |
 | `xl_level_split.py` | Writes one workbook per dependency level; `xl_input_mask.py` reuses its XML rewriter. |
-| `/create-harbor-task` | Cursor skill: raw workbook → Harbor rebuild task via AST, segment, mask, and `xl_output_task.py` (section 21). |
+| `/create-harbor-task` | Fail-closed Cursor skill: raw workbook → verified, source-profiled MCP Harbor task (section 21). |
+| `/profile-mcp-sources` | GPT 5.6 Sol subagent skill: bounded public-source reads → reviewed terminology, dataset, cadence, and excerpt profiles; auth/blocked pages are skipped. |
 | `/custom-formula-gate` | Post-Harbor review skill: classifies golden formulas against a closed finance catalog (section 22). |
+| `xl_variable_source_audit.py` | GPT 5.6 Sol audit stage: inputs workbook → variable/source Markdown, deterministic inventory, and generation metadata. |
 | `xl_variable_mcp.py` + `mcp_env/` | Variable-source MCP environments: externally-sourced inputs masked from the workbook and served through a mock research service (section 23). |
+| `xl_mcp_oracle.py` | Generic live-sidecar oracle: exact retrieval, provenance, conflicts, masking, leak isolation, and profile-attribution checks. |
 | `requirements.txt` | One dependency, `openpyxl`. |
 
 ```bash
@@ -38,12 +41,16 @@ python3 xl_input_mask.py 0248 0262 0449 0450 -o inputs_out
 
 # Optional: mask externally-sourced inputs and serve them through a mock MCP
 # research sidecar instead (full walkthrough in section 23)
+python3 xl_variable_mcp.py validate-spec \
+    runs/0233-variable-sources/normalized.json
 python3 xl_variable_mcp.py build runs/0233-variable-sources/normalized.json \
     runs/0233-variable-sources/mcp --workbook 0233 --source "4-10 100"
 python3 xl_input_mask.py 0233 --source "4-10 100" -o inputs_out_mcp \
     --mask-cells runs/0233-variable-sources/mcp/mask_cells.json
+# Package in staging; the audit always reads the unredacted inputs_out copy.
 python3 xl_output_task.py 0233 --source "4-10 100" --inputs-root inputs_out_mcp \
-    --mcp runs/0233-variable-sources/mcp -o tasks_outputs
+    --variable-source-audit-inputs-root inputs_out \
+    --mcp runs/0233-variable-sources/mcp -o tasks_outputs_mcp
 ```
 
 `xl_segment.py` takes workbook ids rather than paths: it reads the graph from
@@ -1786,35 +1793,43 @@ in the graph to begin with (section 3.10).
 
 ## 21. `/create-harbor-task`
 
-Package a raw golden workbook into a Harbor rebuild-the-model task. The Cursor
-skill at `.cursor/skills/create-harbor-task/` runs the pipeline end to end and
-keeps the golden `.xlsx` out of the task environment — agents only see the
-masked inputs workbook.
+Package a raw golden workbook into a verified MCP-backed Harbor task. The
+Cursor skill at `.cursor/skills/create-harbor-task/` is fail-closed: no plain
+task fallback, no skipped segmentation proof, and no promotion before the live
+sidecar oracle and grader pass. The golden `.xlsx` stays outside the task
+environment.
 
 Accepts a path like `4-10 100/0256.xlsx`, a file under the default source
 folder, or a workbook id such as `0256`.
 
 ### Pipeline
 
-1. **AST** — `python3 xl_ast_graph.py "$SOURCE/$WB.xlsx" -o ast_out`
-2. **Segment** — `python3 xl_segment.py "$WB" --source "$SOURCE" -o seg_out`
-   (optional `--llm` to adjudicate the output shortlist)
-3. **Curate** — review `seg_out/$WB/curation.toml`; confirm or edit `include` /
-   `name` before packaging
-4. **Re-segment** if curation changed
-5. **Mask** — `python3 xl_input_mask.py "$WB" --source "$SOURCE" -o inputs_out`
-6. **Package** — `python3 xl_output_task.py "$WB" --source "$SOURCE" -o tasks_outputs`
-7. **Smoke-check** the bundle layout and that `environment/` holds the masked
-   inputs, not the golden workbook
+1. **AST and segment**; preserve curation and require `verification.passed`.
+2. **Baseline mask** to `inputs_out/`; this unredacted-input copy drives the
+   source audit and is never replaced by the MCP-masked copy.
+3. **Audit** with GPT 5.6 Sol through Labelbox LiteLLM.
+4. **Import and normalize** every audit row into an atomic variable or an
+   explicit exclusion; discover duplicate representations and `extra_cells`.
+5. **Profile public sources** with `/profile-mcp-sources`. GPT 5.6 Sol reads at
+   most three public pages per canonical URL and retains only reviewed source
+   vocabulary, dataset names, field conventions, cadence, and short attributed
+   excerpts. Login, SSO, 401/403, paywall, bot-challenge, unreachable, and
+   unsupported pages are skipped and keep the generic source renderer.
+6. **Validate and build** the network-free, seed-deterministic MCP environment;
+   golden-value mismatch aborts.
+7. **Smoke-test** the generated FastMCP server.
+8. **MCP mask** to a separate `inputs_out_mcp/` workbook.
+9. **Package one workbook** with `--mcp` under `tasks_outputs_mcp/`.
+10. **Live oracle** the shipped Docker sidecar with `xl_mcp_oracle.py`.
+11. **Grade an exact submission** and structurally inspect the bundle.
+12. **Promote** into `tasks_outputs/` only after every requested workbook passes.
 
-Default output is `tasks_outputs/<WB>-outputs/`. Optional variants when asked:
-`--mcp <bundle>` → mask externally-sourced inputs behind the research sidecar
-(section 23); `--hints` → `tasks_outputs_hinted/`; `--semantic-hints` → needs a `primary`
-family in `taxonomy_out/workbooks.json`.
-
-Naturalized instructions need LiteLLM credentials in `.env`. Use
-`--no-naturalize` on `xl_output_task.py` to skip that step. Do not invent a
-taxonomy entry if the workbook is missing from `workbooks.json`.
+Naturalized instructions and variable/source audits need `lbx_api_key` in
+`.env`. The audit is pinned by default to `openai/gpt-5.6-sol`; public-source
+profiling delegates only a redacted URL/name/kind worklist to
+`gpt-5.6-sol-high`. `/create-harbor-task` never uses
+`--no-variable-source-audit`. Do not invent a taxonomy entry when a workbook is
+missing from `workbooks.json`.
 
 In Cursor, invoke `/create-harbor-task` with the workbook path or id.
 
@@ -1890,12 +1905,29 @@ chain of otherwise identical records, five paginated rows at a time.
 The design is adapted from the `build-variable-source-mcp` skill and follows
 the [Harbor MCP server task pattern](https://www.harborframework.com/docs/tutorials/mcp-server-task).
 
+The Markdown is a model-generated audit candidate, not evidence that a named
+source supplied an exact workbook value. Its warning, deterministic inventory,
+inventory SHA-256, model id, endpoint, prompt version, timestamp, API-call
+count, and finish reasons are retained so a reviewer can reproduce and audit
+the generation. `xl_output_task.py` runs or cache-reuses this stage by default;
+pass `--refresh-variable-source-audit` to force a new GPT response. Before a
+response is accepted, the generator mechanically rejects qualified cell
+references or workbook-value numbers that do not occur in that inventory
+batch; one corrective retry is allowed.
+
 ### Pipeline
 
 ```bash
-# 0. Audit artifact: a Markdown table mapping workbook variables to true
-#    values and plausible external sources, kept for review
-#    (runs/<wb>-variable-sources/<wb>-inputs-variable-sources.md)
+# 0. Generate the review artifacts from the inputs-only workbook.
+#    The deterministic inventory is sent to GPT 5.6 Sol through Labelbox's
+#    LiteLLM proxy; lbx_api_key is read from .env and never written to disk.
+python3 xl_variable_source_audit.py 0233 \
+    --inputs-root inputs_out --seg-root seg_out --audit-root runs
+#
+#    Emits:
+#    runs/<wb>-variable-sources/<wb>-inputs-variable-sources.md
+#    runs/<wb>-variable-sources/<wb>-inputs-variable-sources.inventory.json
+#    runs/<wb>-variable-sources/<wb>-inputs-variable-sources.metadata.json
 
 # 1. Preserve every table row as a draft review queue
 python3 xl_variable_mcp.py import \
@@ -1907,34 +1939,42 @@ python3 xl_variable_mcp.py import \
 #    For 0233 the authoring script is runs/0233-variable-sources/normalize_0233.py
 #    and exclusions are documented in exclusions.json.
 
-# 3. Build the environment. Every variable's raw cell value is verified
-#    against the golden workbook; any mismatch aborts the build.
+# 3. Profile deduplicated public source URLs with /profile-mcp-sources.
+#    GPT 5.6 Sol receives only a redacted URL/name/kind worklist. Each source
+#    is capped at three public reads. Authenticated, paywalled, challenged,
+#    unreachable, and unsupported pages are skipped and retain generic source
+#    rendering. The normalization script embeds only reviewed profiles.
+
+# 4. Validate the atomic spec and reviewed source-profile references.
+python3 xl_variable_mcp.py validate-spec \
+    runs/0233-variable-sources/normalized.json
+
+# 5. Build offline and deterministically. Every variable's raw cell value is
+#    verified against the golden workbook; any mismatch aborts.
 python3 xl_variable_mcp.py build \
     runs/0233-variable-sources/normalized.json \
     runs/0233-variable-sources/mcp --workbook 0233 --source "4-10 100"
 
-# 4. Exercise the generated server with a real MCP client
+# 6. Exercise the generated server with a real MCP client.
 uv run --python 3.12 --with fastmcp --with openpyxl \
     python xl_variable_mcp.py smoke runs/0233-variable-sources/mcp
 
-# 5. Mask the served variables out of the inputs workbook
+# 7. Mask served variables into a separate inputs workbook.
 python3 xl_input_mask.py 0233 --source "4-10 100" -o inputs_out_mcp \
     --mask-cells runs/0233-variable-sources/mcp/mask_cells.json
 
-# 6. Package the Harbor task with the MCP sidecar
+# 8. Package into staging; audit the unredacted baseline inputs.
 python3 xl_output_task.py 0233 --source "4-10 100" \
     --inputs-root inputs_out_mcp --mcp runs/0233-variable-sources/mcp \
-    -o tasks_outputs
+    --variable-source-audit-inputs-root inputs_out \
+    -o tasks_outputs_mcp
 
-# 7. Re-apply formula hints as usual (the clone carries the sidecar through)
-python3 xl_formula_hint_tasks.py --source tasks_outputs -o tasks_outputs_hinted
-
-# 8. Oracle-check the shipped bundle against the live sidecar container
-docker build -t mcp-0233-oracle tasks_outputs_hinted/0233-outputs/environment/mcp-server
+# 9. Oracle-check the shipped bundle against the live sidecar container.
+docker build -t mcp-0233-oracle tasks_outputs_mcp/0233-outputs/environment/mcp-server
 docker run -d --name mcp-0233-oracle-run -p 18233:8000 mcp-0233-oracle
 uv run --python 3.12 --with fastmcp --with openpyxl \
-    python runs/0233-variable-sources/oracle_check.py \
-    --bundle tasks_outputs_hinted/0233-outputs \
+    python xl_mcp_oracle.py \
+    --bundle tasks_outputs_mcp/0233-outputs \
     --mcp runs/0233-variable-sources/mcp --url http://127.0.0.1:18233/mcp
 ```
 
@@ -1949,6 +1989,25 @@ runs/<wb>-variable-sources/mcp/
   mask_cells.json     every cell the masker must additionally blank
   masked_inputs.json  audit map: variable -> refs, raw value, MCP evidence
 ```
+
+Authoring artifacts next to `mcp/` include `draft.json`, `normalized.json`,
+`exclusions.json`, `source_profiles.json`, and bounded profile captures. They
+never enter `environment/`.
+
+### Public-source realism without live-value substitution
+
+Accepted profiles shape source descriptions, dataset names and aliases, field
+labels, document kinds, release cadence/labels, and at most two short
+attributed excerpts. They cannot alter record dimensions, workbook values,
+distractor logic, or the generic MCP tools. The builder makes no network calls;
+identical normalized specs and seeds produce byte-identical runtime artifacts.
+Real URLs remain `origin_url`, while served documents use `mock://`.
+
+Only `status: profiled` plus `review.status: accepted` affects rendering.
+Skipped, pending, rejected, internal, and unprofiled sources use the prior
+generic treatment. Validation rejects broken references, unsafe URLs,
+authentication-derived content, source-ID collisions, unattributed or overlong
+excerpts, and workbook-value leakage.
 
 Each variable produces one supported record plus two layers of noise, both
 seed-controlled:
@@ -2027,17 +2086,45 @@ inputs surface as wrong outputs.
 
 ### Verification before rollout
 
-`runs/0233-variable-sources/oracle_check.py` runs against the live sidecar
-container exactly as the agent reaches it — paginating through `next_cursor`
-and applying the supersession rule — and asserts: every masked variable
-resolves over streamable HTTP to its evidence record; every variable's
-provenance chain is visible; every broad metric query returns conflicting
-candidates; every masked cell is blank in the shipped workbook; no surviving
-cell leaks a masked value (numeric, string, or date representation); and
-neither the golden workbook nor `eval/` is in `environment/`. For 0233:
+`xl_mcp_oracle.py` runs against any live sidecar exactly as the agent reaches
+it — paginating through `next_cursor` and applying the supersession rule — and
+asserts: every masked variable resolves to its evidence record; every
+provenance chain is visible; every broad metric query conflicts; every masked
+cell is blank; no unapproved numeric, string, date, or formatted duplicate
+survives; profile excerpts are attributed and value-safe; and neither the
+golden workbook, `eval/`, normalized specs, nor profile captures are in
+`environment/`. Legitimate duplicate representations require an explicit
+cell/variable/reason allowlist; unknown or unused allowlist rows fail. The
+historical 0233 oracle reported:
 70/70 resolved, 70/70 chains seen, 70/70 broad conflicts, 0 leaks beyond
 documented axis-header coincidences and the excluded Group Tax rate rows
 (reports in `runs/0233-variable-sources/oracle_report*.json`).
+
+### Source-profiled rebuild results
+
+The strict staged rebuild promoted three MCP tasks after deterministic
+double-builds, in-memory smoke tests, live-container oracles, and exact-answer
+grader checks:
+
+| workbook | MCP variables | masked cells | runtime records | accepted / skipped public profiles | result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 0248 | 48 | 184 | 1,008 | 1 / 3 | promoted; 48/48 exact resolutions, chains, and broad conflicts |
+| 0251 | 1 | 108 | 21 | 0 / 0 | promoted; 1/1 exact resolution, chain, and broad conflict |
+| 0255 | 15 | 35 | 315 | 0 / 0 | promoted; 15/15 exact resolutions, chains, and broad conflicts |
+
+All three segmentation proofs pass with no cells seeded inside an output cone;
+all strict oracles report zero masked cells left populated, zero unapproved
+value leaks, and no allowlist. Workbook 0248 also validates the Damodaran
+source-shaped terminology and short attributed excerpts in the shipped
+runtime. Reports are under `runs/<wb>-variable-sources/oracle-report.json`.
+
+Workbook 0233 was not promoted. General lazy-branch, dynamic-reference, and
+iterative-cycle fixes recompute seven of its eight curated outputs, but
+`Term facilities!E88` evaluates `IF(F4=B80,E17,E88)` with `2 != 3`, selecting
+the recurrence `E88 = E88`. Every value is a fixed point; the saved
+`2.156135461674124` is persisted workbook state rather than a result determined
+by frontier inputs. Recovering it would require the cached formula seeding that
+the strict pipeline forbids, so the existing 0233 task remains unchanged.
 
 ### Difficulty hardening (v2): pagination caps and provenance chains
 
@@ -2137,52 +2224,3 @@ debt service, enterprise value bridge), not retrieval. One residual softness
 to tighten next: `search_documents` snippets can expose a document's reported
 value without its supersession notice; no agent exploited it, but trimming
 the snippet before the value line would close it.
-
-### 0233 rerun: Gemini 3.5 Flash, formula hints, 5 attempts
-
-Gemini 3.5 Flash was evaluated on the same hardened MCP v2 task with
-openhands-sdk, 300 maximum iterations, and five concurrent attempts. The only
-official historical 0233 Gemini result is one successful baseline attempt
-(`runs/gemini35-hinted-pass1/`): score 0.6004, 1/8 exact, 2/8 within 1%, 197
-steps, $10.67. Its reported variance is zero only because `n=1`; it is not an
-estimate of model stability. Before that selected result, two historical
-replacement attempts produced no answer, so the raw baseline retry sequence
-was `[0, 0, 0.6004]`.
-
-The hardened run produced answers in two of five attempts:
-
-| metric | historical selected (`n=1`) | historical raw retries (`n=3`) | hardened, completed outputs (`n=2`) | hardened, all attempts (`n=5`) |
-| --- | ---: | ---: | ---: | ---: |
-| continuous mean | 0.6004 | 0.2001 | 0.6139 | 0.2455 |
-| population variance | n/a (`0` at `n=1`) | 0.08010 | 0.000899 | 0.09080 |
-| output completion rate | 100% (selected result) | 33% | 100% (conditional) | 40% |
-| mean exact cells | 12.5% | — | 12.5% | 5.0% including failures |
-| mean within 1% | 25.0% | — | 18.8% | 7.5% including failures |
-| pass@5 | n/a | n/a | — | 0% |
-
-The two output-bearing hardened attempts scored 0.5839 and 0.6438. Two other
-attempts reached the 300-iteration ceiling without writing `answers.json`; the
-fifth suffered a Gemini API disconnect, retried once, and still produced no
-answer. Consequently the scorer's headline mean/variance (0.6139/0.000899)
-describe answer quality *conditional on completion*. For end-to-end task
-reliability, failed attempts must count as zero, giving 0.2455/0.09080.
-
-This separates two effects. Conditional answer quality is effectively
-unchanged from the historical result (+0.0135), and the successful attempts
-improved DSCR, free cash flow after debt service, and parts of the enterprise
-value chain. But the hardened retrieval workflow consumed 20-28
-`query_records` interactions/mentions and 178-301 steps per attempt; three
-attempts failed to finish. The environment therefore increases Gemini's
-agentic planning burden much more than its numerical error *after* an answer
-is produced. Full outputs are in `runs/gemini35-mcp2-hinted-0233/`, with the
-raw reliability and per-cell comparison in `comparison.json`.
-
-### Agent execution budget after the Gemini run
-
-The hardened retrieval flow can consume most of a 300-iteration run before
-the workbook calculations are finished. Pipeline-generated task images now
-set `MAX_ITERATIONS=600`, and active MCP v2 evaluation configs use the same
-ceiling. Generated agent timeouts are scaled by exactly 1.5x: for task 0233
-the task-level allowance rises from 3,610 to 5,415 seconds (before any Harbor
-job-level timeout multiplier). The older level-task builder likewise rises
-from 1,800 to 2,700 seconds. Verifier timeouts are unchanged.

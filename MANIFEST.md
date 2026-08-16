@@ -31,8 +31,10 @@ run the pipeline against your own source folder.
 
 | File | Role |
 | --- | --- |
-| `xl_variable_mcp.py` | CLI: Markdown table -> draft -> MCP bundle (build/validate) -> smoke test; emits `mask_cells.json` and the `masked_inputs.json` audit map. |
-| `mcp_env/` | Vendored generator: importer, distractor builder (dimension distractors + provenance release chains), isolation validator, and the FastMCP sidecar server (paginated, filter-gated `query_records`) with Dockerfile/compose assets. |
+| `xl_variable_source_audit.py` | Default pre-packaging audit stage: deterministic inputs inventory → GPT 5.6 Sol variable/source Markdown through Labelbox LiteLLM, with hash and generation metadata. |
+| `xl_variable_mcp.py` | CLI: Markdown table → draft; normalized/profiled spec validation; deterministic MCP build/validation; smoke test; emits `mask_cells.json` and `masked_inputs.json`. |
+| `mcp_env/` | Offline generator: reviewed source-profile rendering, dimension distractors, provenance release chains, isolation validator, and the paginated/filter-gated FastMCP sidecar with Dockerfile/compose assets. |
+| `xl_mcp_oracle.py` | Reusable live-sidecar oracle for pagination, exact evidence, provenance, broad conflicts, masking, duplicate-value leaks, environment isolation, and attributed profile excerpts. |
 | `xl_input_mask.py --mask-cells` | Blanks the served variables from the inputs workbook (deny-set hook). |
 | `xl_output_task.py --mcp` | Packages the sidecar into the Harbor bundle: `environment/mcp-server/`, `docker-compose.yaml`, `[[environment.mcp_servers]]`, research instruction section. |
 
@@ -52,7 +54,8 @@ run the pipeline against your own source folder.
 
 | Path | Role |
 | --- | --- |
-| `.cursor/skills/create-harbor-task/` | `/create-harbor-task`: raw workbook → Harbor rebuild task, end to end. |
+| `.cursor/skills/create-harbor-task/` | `/create-harbor-task`: fail-closed raw workbook → segmented, normalized, source-profiled, MCP-backed, oracle-validated Harbor task. |
+| `.cursor/skills/profile-mcp-sources/` | `/profile-mcp-sources`: bounded GPT 5.6 Sol public reads → reviewed source terminology/structure profiles; auth and blocked pages are skipped. |
 | `.cursor/skills/custom-formula-gate/` | `/custom-formula-gate`: post-rollout classification of golden formulas against the closed catalog (`SKILL.md`, `CATALOG.md`, `scripts/extract_gate_context.py`). |
 
 ## Dependencies
@@ -62,5 +65,11 @@ run the pipeline against your own source folder.
   `xl_output_task.py` / the `/create-harbor-task` skill.
 - Python 3.11+ (`xl_output_task.py` falls back to stdlib `tomllib` when `tomli`
   is absent).
-- Naturalized task instructions need LiteLLM credentials in a `.env` at the
-  repo root (not included here); pass `--no-naturalize` to skip.
+- Naturalized task instructions and variable/source audits need
+  `lbx_api_key` in a `.env` at the repo root (not included here).
+  `--no-naturalize` skips instruction rewriting only; the audit has a separate
+  explicit `--no-variable-source-audit` opt-out.
+- Public-source profiling uses Cursor's `gpt-5.6-sol-high` subagent and public
+  read tools at authoring time. MCP builds and runtime episodes remain offline.
+- `fastmcp` is optional for generated-server smoke/oracle checks and is normally
+  supplied ephemerally with `uv run --with fastmcp`.

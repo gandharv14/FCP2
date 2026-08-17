@@ -134,8 +134,21 @@ Because a workbook has several sheets (tabs), we write the full name as
 
 ## 2. The big picture
 
-There are two programs. The first one already existed; the second one is the
-subject of this report.
+The core pipeline uses two programs. The first reads Excel. The second decides
+what each part of the workbook does.
+
+The main idea is simple:
+
+1. Turn the workbook into a map of cells and formulas.
+2. Follow that map to separate supplied inputs from calculated values.
+3. Choose the headline outputs the model is trying to produce.
+4. Prove that those outputs can be rebuilt from the selected inputs.
+5. Save both a human-readable explanation and machine-readable files.
+
+The pipeline does not decide that a cell is an input just because it is blue,
+unlocked, or on a sheet called "Assumptions." Formatting and sheet names are
+often inconsistent. Instead, it uses the formulas themselves. If one cell is
+used to calculate another, the graph records an arrow between them.
 
 ```
         4-10 100/0248.xlsx                      the raw Excel file
@@ -144,22 +157,22 @@ subject of this report.
                 │   "read the file and turn every
                 │    formula into a wiring diagram"
                 ▼
-        ast_out/0248/                           8,783 nodes
+        ast_out/0248/                           9,179 nodes
           nodes.csv                             9,895 edges
           edges.csv
                 │
                 │   xl_segment.py               STAGES 1-11  (new)
                 ▼
     ┌───────────────────────────────────────────────────────────┐
-    │  1  collapse the AST         8,783 nodes → 5,448 cells    │
+    │  1  collapse the AST         9,179 nodes → 5,844 cells    │
     │  2  type every cell          number? text? date? unit?    │
-    │  3  group cells into bands   5,448 cells → 1,739 bands    │
-    │  3½ promote formula literals 1,739 → 1,747 bands          │
-    │  4  bypass the mirrors       1,747 bands →   756 real     │
-    │  5  contract the loops       756 → 756 components         │
-    │  6  find the islands         145 islands, 1 big one       │
-    │  7  score the outputs        528 candidates, 15 chosen    │
-    │  8  cut the four buckets     input/middle/output/scaffold │
+    │  3  group cells into bands   5,844 cells → 2,112 bands    │
+    │  3½ promote formula literals 2,112 → 2,120 bands          │
+    │  4  bypass the mirrors       991 display bands removed    │
+    │  5  contract the loops       circular blocks become one   │
+    │  6  find the islands         separate connected groups    │
+    │  7  score the outputs        15 headline outputs chosen   │
+    │  8  cut the four buckets     266 / 184 / 15 / 664 bands   │
     │  9  rebuild and check        20 of 20 outputs correct     │
     │ 10  trace the lineage        454-step derivation          │
     │ 11  write the files                                       │
@@ -175,8 +188,67 @@ subject of this report.
           lineage.json           the same, machine-readable
 ```
 
-The numbers above are real, from workbook `0248`. The whole thing runs in about
-five seconds for all four workbooks.
+Here is what those steps mean in plain language:
+
+- **Collapse the AST.** Stage 0 records operators such as `+`, `SUM`, and `IF`
+  as separate graph nodes. Stage 1 folds those details back into the Excel cell
+  that owns the formula. The graph becomes a cell-to-cell map.
+- **Type the cells.** The pipeline records whether a cell holds text, a number,
+  a date, a percentage, a formula, or another kind of value. This helps it avoid
+  treating a heading or year label as a financial result.
+- **Build bands.** A financial model usually repeats one line item across
+  several months or years. Cells with the same repeated formula pattern are
+  grouped into one band, such as a six-year revenue forecast.
+- **Expose hidden assumptions.** A number typed directly inside a formula can
+  act like an input even though it has no separate cell. Stage 3½ gives each
+  important hardcoded number its own source band.
+- **Remove display-only copies.** Summary sheets often contain formulas that
+  simply point to a result calculated somewhere else. The pipeline follows the
+  pointer back to the real calculation instead of counting both as separate
+  results.
+- **Handle circular calculations.** Interest, debt, and cash schedules can
+  refer back to themselves. A whole circular block is treated as one component
+  so the rest of the dependency map remains usable.
+- **Separate islands.** Not every sheet is connected to the main model. Notes,
+  scratch work, and abandoned calculations often form small disconnected
+  groups. Keeping them separate prevents them from distorting output selection.
+- **Choose outputs.** Candidate results are scored using signals such as labels,
+  position, downstream use, and whether they look like final valuation or return
+  measures. A human can review the shortlist in `curation.toml`.
+- **Create four buckets.** `input` means supplied information; `middle` means an
+  intermediate calculation; `output` means a requested result; `scaffolding`
+  means content outside the selected calculation path.
+- **Rebuild the model.** The evaluator starts with only the selected inputs,
+  recalculates the formulas in dependency order, and compares its answers with
+  Excel's saved values. A task cannot pass if an output must be copied from the
+  original workbook instead of calculated.
+- **Write lineage.** For each output, the pipeline records every input and
+  intermediate step that leads to it. This is the calculation's audit trail.
+
+The numbers in the diagram come from the current run of workbook `0248`. It
+takes only a few seconds. Much larger workbooks, especially those with tens of
+thousands of formulas, take longer.
+
+### What happens after segmentation
+
+Segmentation proves that the workbook can be rebuilt, but it is not yet a
+finished task. The packaging workflow then:
+
+1. Writes an inputs-only workbook with calculated cells removed.
+2. Checks whether important formulas use standard finance methods or
+   workbook-specific logic. Safe method guidance is added when needed.
+3. Identifies externally sourced assumptions and moves selected values into a
+   mock research service, while keeping the task fully reproducible offline.
+4. Packages the workbook, research server, instructions, and grader in a staged
+   Harbor task.
+5. Rewrites only the opening and input prose in a more natural finance style.
+   Tables, cell references, rules, hints, and output requirements stay exactly
+   the same.
+6. Runs the live research-service oracle and an exact-answer grader.
+7. Promotes the staged task only if every check passes.
+
+The original workbook is used as a build-time answer key, but it is never placed
+inside the task environment.
 
 ---
 

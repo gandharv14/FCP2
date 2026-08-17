@@ -79,83 +79,52 @@ def json_value(value):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Extract golden formula context after matching Harbor rollouts"
+        description="Extract pre-package golden formula context from verified segmentation"
     )
-    parser.add_argument("task_bundle", type=Path)
     parser.add_argument(
-        "--job-dir",
+        "workbook",
+        help="Workbook id or path to the golden .xlsx workbook",
+    )
+    parser.add_argument(
+        "--source",
         type=Path,
-        default=None,
-        help="Harbor job root; defaults to <repo>/jobs",
+        default=Path("4-10 100"),
+        help="Source workbook directory when workbook is an id",
     )
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
-    parser.add_argument("--workbook", type=Path, default=None)
     parser.add_argument("--seg-dir", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--neighbor-radius", type=int, default=2)
     return parser.parse_args()
 
 
-def load_task(bundle: Path):
-    task_file = bundle / "task.toml"
-    if not task_file.exists():
-        raise FileNotFoundError(f"missing task metadata: {task_file}")
-    with task_file.open("rb") as handle:
+def resolve_workbook(repo_root: Path, source: Path, value: str):
+    candidate = Path(value)
+    explicit = candidate if candidate.is_absolute() else repo_root / candidate
+    if explicit.is_file():
+        workbook = explicit.resolve()
+        workbook_id = workbook.stem
+    else:
+        workbook_id = candidate.stem
+        source_dir = source if source.is_absolute() else repo_root / source
+        workbook = (source_dir / f"{workbook_id}.xlsx").resolve()
+    if not workbook.exists():
+        raise FileNotFoundError(f"missing raw workbook: {workbook}")
+    return workbook_id, workbook
+
+
+def load_curation(seg_dir: Path):
+    curation_file = seg_dir / "curation.toml"
+    if not curation_file.exists():
+        raise FileNotFoundError(f"missing curation: {curation_file}")
+    with curation_file.open("rb") as handle:
         data = tomllib.load(handle)
-    metadata = data.get("metadata") or {}
-    workbook_id = str(metadata.get("workbook") or "").strip()
-    if not workbook_id:
-        raise ValueError(f"{task_file} has no metadata.workbook")
-    return data, metadata, workbook_id
-
-
-def rollout_matches(result: dict, bundle: Path) -> bool:
-    bundle_name = bundle.name
-    task_name = str(result.get("task_name") or "")
-    if task_name == bundle_name or task_name.endswith("/" + bundle_name):
-        return True
-    task_id = result.get("task_id")
-    if isinstance(task_id, dict):
-        task_path = str(task_id.get("path") or "")
-        if task_path and Path(task_path).name == bundle_name:
-            return True
-    config_path = (
-        ((result.get("config") or {}).get("task") or {}).get("path")
-        if isinstance(result.get("config"), dict)
-        else None
-    )
-    return bool(config_path and Path(str(config_path)).name == bundle_name)
-
-
-def find_rollouts(job_dir: Path, bundle: Path):
-    if not job_dir.exists():
-        raise FileNotFoundError(f"job directory does not exist: {job_dir}")
-    matches = []
-    for result_file in sorted(job_dir.rglob("result.json")):
-        try:
-            result = json.loads(result_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(result, dict) or not rollout_matches(result, bundle):
-            continue
-        verifier = result.get("verifier_result")
-        if not isinstance(verifier, dict):
-            continue
-        rewards = verifier.get("rewards") or {}
-        score = rewards.get("score") if isinstance(rewards, dict) else None
-        matches.append(
-            {
-                "trial": result.get("trial_name") or result_file.parent.name,
-                "result_file": str(result_file),
-                "score": json_value(score),
-            }
-        )
-    if not matches:
-        raise RuntimeError(
-            f"no completed rollout for {bundle.name} under {job_dir}; "
-            "the custom-formula gate is post-rollout only"
-        )
-    return matches
+    outputs = [
+        output for output in data.get("output") or [] if output.get("include")
+    ]
+    if not outputs:
+        raise RuntimeError(f"{curation_file} contains no included outputs")
+    return outputs
 
 
 def load_lineage(seg_dir: Path):
@@ -164,13 +133,48 @@ def load_lineage(seg_dir: Path):
         raise FileNotFoundError(f"missing lineage: {lineage_file}")
     data = json.loads(lineage_file.read_text(encoding="utf-8"))
     outputs_by_band = defaultdict(set)
+    step_metadata = {}
+    consumers = defaultdict(set)
+    drivers_by_band = defaultdict(dict)
     for trace in data.get("traces") or []:
         output = str(trace.get("output") or "")
-        for step in trace.get("band_steps") or []:
+        steps = trace.get("band_steps") or []
+        by_node = {
+            str(step.get("node") or ""): step
+            for step in steps
+            if step.get("node")
+        }
+        for step in steps:
             node = str(step.get("node") or "")
             if node:
                 outputs_by_band[node].add(output)
-    return data, outputs_by_band
+                current = step_metadata.setdefault(
+                    node,
+                    {
+                        "node": node,
+                        "bucket": step.get("bucket") or "",
+                        "label": step.get("label") or "",
+                        "formula": step.get("formula") or "",
+                        "depth": int(step.get("depth") or 0),
+                        "values": step.get("values") or [],
+                    },
+                )
+                current["depth"] = max(
+                    int(current.get("depth") or 0), int(step.get("depth") or 0)
+                )
+                for driver_node in step.get("inputs") or []:
+                    driver_node = str(driver_node)
+                    consumers[driver_node].add(node)
+                    driver = by_node.get(driver_node) or {}
+                    drivers_by_band[node][driver_node] = {
+                        "node": driver_node,
+                        "bucket": driver.get("bucket") or "",
+                        "label": driver.get("label") or "",
+                        "formula": driver.get("formula") or "",
+                        "depth": int(driver.get("depth") or 0),
+                        "values": driver.get("values") or [],
+                    }
+    return data, outputs_by_band, step_metadata, consumers, drivers_by_band
 
 
 def load_bands(seg_dir: Path):
@@ -271,7 +275,16 @@ def cell_payload(ws_formula, ws_values, coordinate: str):
     }
 
 
-def extract_series(row, wb_formula, wb_values, outputs, radius: int):
+def extract_series(
+    row,
+    wb_formula,
+    wb_values,
+    outputs,
+    radius: int,
+    depth: int,
+    fanout: int,
+    drivers,
+):
     band = row["band"]
     sheet, min_row, min_col, max_row, max_col = split_band(band)
     if min_row != max_row:
@@ -339,49 +352,55 @@ def extract_series(row, wb_formula, wb_values, outputs, radius: int):
         "signals": list(dict.fromkeys(signals)),
         "neighbors": neighbors,
         "downstream_outputs": sorted(outputs),
+        "importance": {
+            "output_coverage": len(outputs),
+            "max_depth": depth,
+            "downstream_fanout": fanout,
+        },
+        "direct_drivers": sorted(
+            drivers,
+            key=lambda driver: (
+                int(driver.get("depth") or 0),
+                str(driver.get("node") or ""),
+            ),
+        ),
     }
 
 
 def main():
     args = parse_args()
     repo_root = args.repo_root.resolve()
-    bundle = args.task_bundle
-    if not bundle.is_absolute():
-        bundle = repo_root / bundle
-    bundle = bundle.resolve()
-
-    task_data, metadata, workbook_id = load_task(bundle)
-    job_dir = args.job_dir or (repo_root / "jobs")
-    if not job_dir.is_absolute():
-        job_dir = repo_root / job_dir
-    rollouts = find_rollouts(job_dir.resolve(), bundle)
-
-    workbook = args.workbook or (repo_root / "4-10 100" / f"{workbook_id}.xlsx")
-    if not workbook.is_absolute():
-        workbook = repo_root / workbook
-    workbook = workbook.resolve()
-    if not workbook.exists():
-        raise FileNotFoundError(f"missing raw workbook: {workbook}")
+    workbook_id, workbook = resolve_workbook(
+        repo_root, args.source, args.workbook
+    )
 
     seg_dir = args.seg_dir or (repo_root / "seg_out" / workbook_id)
     if not seg_dir.is_absolute():
         seg_dir = repo_root / seg_dir
     seg_dir = seg_dir.resolve()
 
-    lineage, outputs_by_band = load_lineage(seg_dir)
+    curated_outputs = load_curation(seg_dir)
+    lineage, outputs_by_band, step_metadata, consumers, drivers_by_band = (
+        load_lineage(seg_dir)
+    )
     bands = load_bands(seg_dir)
     relevant_rows = []
     relevant_outputs = {}
+    relevant_nodes = {}
     for row in bands:
         if row.get("kind") != "formula":
             continue
-        outputs = set(outputs_by_band.get(row.get("band") or "", ()))
+        band = row.get("band") or ""
+        outputs = set(outputs_by_band.get(band, ()))
         component = row.get("component") or ""
         if component:
             outputs.update(outputs_by_band.get(component, ()))
         if outputs:
             relevant_rows.append(row)
-            relevant_outputs[row["band"]] = outputs
+            relevant_outputs[band] = outputs
+            relevant_nodes[band] = (
+                band if band in step_metadata else component
+            )
     if not relevant_rows:
         raise RuntimeError("lineage contains no formula bands found in bands.csv")
 
@@ -395,6 +414,15 @@ def main():
                 wb_values,
                 relevant_outputs[row["band"]],
                 max(0, args.neighbor_radius),
+                int(
+                    (step_metadata.get(relevant_nodes[row["band"]]) or {}).get(
+                        "depth", 0
+                    )
+                ),
+                len(consumers.get(relevant_nodes[row["band"]], ())),
+                list(
+                    drivers_by_band.get(relevant_nodes[row["band"]], {}).values()
+                ),
             )
             for row in relevant_rows
         ]
@@ -402,20 +430,38 @@ def main():
         wb_formula.close()
         wb_values.close()
 
-    series.sort(key=lambda item: (item["sheet"], item["row"], item["columns"][0]))
+    series.sort(
+        key=lambda item: (
+            -item["importance"]["output_coverage"],
+            -item["importance"]["max_depth"],
+            -item["importance"]["downstream_fanout"],
+            item["sheet"],
+            item["row"],
+            item["columns"][0],
+        )
+    )
+    for rank, item in enumerate(series, 1):
+        item["key_rank"] = rank
+
+    output_names = [
+        output.get("name") or output.get("label") or output.get("band")
+        for output in curated_outputs
+    ]
+    answer_cells = []
+    for output in curated_outputs:
+        sheet, min_row, min_col, max_row, max_col = split_band(output["band"])
+        answer_cells.extend(
+            f"{sheet}!{get_column_letter(col)}{row}"
+            for row in range(min_row, max_row + 1)
+            for col in range(min_col, max_col + 1)
+        )
     output = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "task": {
-            "bundle": str(bundle),
-            "name": bundle.name,
+            "name": f"{workbook_id}-outputs",
             "workbook": workbook_id,
-            "output_names": metadata.get("output_names") or [],
-            "answer_cells": metadata.get("answer_cells") or [],
-        },
-        "post_rollout_check": {
-            "job_dir": str(job_dir.resolve()),
-            "completed_matching_rollouts": len(rollouts),
-            "rollouts": rollouts,
+            "output_names": output_names,
+            "answer_cells": answer_cells,
         },
         "sources": {
             "raw_workbook": str(workbook),
@@ -425,14 +471,22 @@ def main():
             ],
         },
         "extraction": {
-            "formula_series": len(series),
+            "key_variables": len(series),
             "neighbor_radius": max(0, args.neighbor_radius),
+            "ranking": [
+                "output_coverage_desc",
+                "max_depth_desc",
+                "downstream_fanout_desc",
+                "stable_band_order",
+            ],
             "note": (
-                "role_hints and signals are candidate evidence only; final classes "
-                "require closed-catalog agreement and assumption recoverability"
+                "Every formula series in curated-output reverse closure is retained. "
+                "Ranking prioritizes analysis but does not filter variables. Role "
+                "hints and signals are candidate evidence only; final classes require "
+                "closed-catalog agreement and assumption recoverability."
             ),
         },
-        "series": series,
+        "key_variables": series,
     }
 
     output_path = args.output
@@ -441,8 +495,7 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
     print(
-        f"{bundle.name}: {len(rollouts)} completed rollouts; "
-        f"{len(series)} golden formula series -> {output_path}"
+        f"{workbook_id}: {len(series)} key golden formula series -> {output_path}"
     )
 
 

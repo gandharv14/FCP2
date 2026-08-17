@@ -1,9 +1,24 @@
 # Closed Finance Formula Catalog
 
-This catalog is deliberately small. Match economic meaning, not exact Excel syntax.
-Equivalent sign conventions and sheet references are structural wrappers. Parameters
-such as `rate`, `life`, `days`, and timing conventions must come from labeled
+Catalog version: `textbook-finance-v1`.
+
+This catalog is deliberately small. Its variants are standard identities and
+schedule methods found in corporate-finance, valuation, and financial-modeling
+texts: present value, NPV and IRR; perpetuity-growth and exit-multiple valuation;
+price-volume, margin and growth schedules; working-capital days; depreciation,
+debt and interest roll-forwards; and returns on invested equity. This is a
+method catalog, not evidence that any workbook followed a particular publication.
+
+Match economic meaning and all-period values, not exact Excel syntax. Equivalent
+sign conventions and sheet references are structural wrappers. Parameters such
+as `rate`, `life`, `days`, and timing conventions must come from labeled
 assumptions.
+
+For every match, map each named variable slot in the selected variant to a
+labeled workbook row or assumption. A variant is recoverable only when all
+required slots are mapped and it agrees with every usable cached period under
+the gate tolerance. The catalog is closed during a run; workbook-specific logic
+must not be promoted into it.
 
 Notation:
 

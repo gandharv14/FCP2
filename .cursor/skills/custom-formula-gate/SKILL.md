@@ -1,173 +1,175 @@
 ---
 name: custom-formula-gate
-description: Classifies golden workbook formula series against a closed finance-method catalog after Harbor model rollouts, and flags custom logic, embedded literals, definitional choices, and structural plumbing. Use when reviewing spreadsheet reconstruction tasks after rollouts or when asked to identify non-standard formulas in raw financial workbooks.
+description: Identifies key formula variables in curated-output lineage before packaging, compares them with a closed textbook finance catalog, and emits audited method-only hints for custom logic. Use during Harbor task creation after verified segmentation and before packaging.
 ---
 
-# Custom Formula Gate
+# Pre-package Custom Formula Gate
 
-Run this gate only after at least one Harbor rollout has completed for the task. The
-raw workbook is a post-rollout answer key; never expose it to the model that performs
-the task.
+This is a build-time gate. It does not require or inspect Harbor rollouts.
 
-## Inputs
+The analysis model is pinned: exactly one `generalPurpose` subagent using
+`gpt-5.6-terra-high` must perform the semantic mapping and classification. If
+this skill is loaded by another model, delegate the work once to that pinned
+subagent and do not duplicate the classification in the parent.
 
-- Harbor task bundle, for example `tasks_outputs/0256-outputs`
-- Harbor job directory containing completed attempts, for example
-  `jobs/new10-pass5`
-- Raw workbook, normally `4-10 100/<workbook>.xlsx`
-- Segmentation artifacts, normally `seg_out/<workbook>/`
+The raw workbook is a build-time answer key. It may be read only by the gate and
+must never enter the packaged task environment. Only validated method guidance
+from the hints artifact may be shown to the task-solving agent.
 
-## Prepare the evidence
+## Inputs and artifacts
 
-From the repository root:
+For workbook `$WB`, use:
 
 ```bash
+FORMULA_RUN="runs/$WB-custom-formula-gate"
+CONTEXT="$FORMULA_RUN/context.json"
+REPORT="$FORMULA_RUN/report.json"
+HINTS="$FORMULA_RUN/hints.json"
+
 python3 .cursor/skills/custom-formula-gate/scripts/extract_gate_context.py \
-  tasks_outputs/0256-outputs \
-  --job-dir jobs/new10-pass5 \
-  --output runs/custom-formula-gate/0256-outputs-context.json
+  "$WB" --source "4-10 100" --seg-dir "seg_out/$WB" --output "$CONTEXT"
 ```
 
-The extractor fails closed if it cannot find a completed matching rollout. It takes
-the union of formula bands in the curated outputs' lineage, then records the golden
-formula, normalized series pattern, cached values, labels, neighboring rows, direct
-references, downstream outputs, and custom-logic signals.
+The extractor starts from every curated output and retains the complete reverse
+closure of formula series as `key_variables`. It ranks them by output coverage,
+dependency depth, and downstream fan-out, but ranking never filters a variable.
+Each row includes formulas, cached period values, labels, neighboring rows,
+direct formula references, and labeled direct lineage drivers.
 
-Read [CATALOG.md](CATALOG.md) before classifying. Treat it as closed for the current
-review. Do not add a new variant merely because the golden workbook uses it.
+Read `CATALOG.md` before classifying and treat it as closed for this run. Do not
+add a variant merely because the golden workbook uses it.
 
-## Classification workflow
+## Required order of analysis
 
-### 1. Assign the finance role
+### 1. Identify the key variable and its drivers
 
-Assign a role from the row label and neighboring rows first. Use roll-forward
-neighbors such as BOP/EOP, CAPEX, debt draw, repayment, EBT, and tax rate. Formula
-shape and sheet name may break ties but must not override clear labels.
+Process `key_variables` in `key_rank` order. For each one:
 
-Record `unclassified` when the role is not confident. Do not infer a role solely
-because a formula happens to multiply by a percentage.
+1. Name the financial variable represented by the row.
+2. Assign a finance role from the row label, neighboring labels, and direct
+   drivers before considering formula shape.
+3. Map labeled workbook drivers to textbook variable slots such as `revenue`,
+   `rate`, `bop_balance`, `draw`, `life`, or `period`.
+4. Use `unclassified` when the role or mapping is not supportable from supplied
+   evidence. Do not infer a role merely because a formula multiplies a percent.
 
-### 2. Select only catalog variants for that role
+### 2. Match values against textbook formulas
 
-Compare the series with the variants in `CATALOG.md`. A formula is not standard
-because it looks financially plausible. It must match an enumerated variant.
+Consider only catalog variants for the assigned role. For each plausible
+variant:
 
-Separate method from presentation:
+1. Express its named slots using referenced rows or labeled assumptions.
+2. Compute the variant over every period having usable golden cached values.
+3. Compare computed `a` with expected `e` using
+   `abs(a - e) <= max(1e-6, 1e-6 * abs(e))`.
+4. Record periods tested/matched and maximum absolute/relative error.
+5. Require every rate, life, timing convention, and threshold to be recoverable
+   from a labeled assumption.
 
-- sign flips, lags, annualization, zero clamps, and aggregation are structural;
-- metric composition such as what Net Profit or FCF includes is definitional;
-- sheet-to-sheet references and copied subtotals are plumbing, not methods.
+A one-period match is insufficient. Zero balances and inactive years often make
+different methods coincide. If cached values are unavailable, accept only an
+exact symbolic catalog match and record `exact_symbolic_match: true`; otherwise
+use `unclassified`.
 
-### 3. Test agreement and recoverability
-
-For every plausible catalog variant:
-
-1. Express the variant using referenced rows and labeled assumptions only.
-2. Compute it over every period with usable golden cached values.
-3. Compare each computed value `a` with golden value `e` using:
-
-   `abs(a - e) <= max(1e-6, 1e-6 * abs(e))`
-
-4. Record matched periods, mismatches, and maximum absolute and relative error.
-5. List every parameter and the labeled assumption that supplies it.
-
-Agreement in one period is insufficient. Zero balances and no-draw years often make
-different methods coincide. A match is recoverable only when all rates, useful
-lives, timing conventions, and thresholds come from labeled assumptions.
-
-If cached values are unavailable, accept an exact symbolic catalog match. Otherwise
-return `unclassified`; do not claim numeric agreement that was not tested.
-
-### 4. Assign exactly one primary class
-
-Use these classes:
+### 3. Assign one primary class
 
 | Class | Rule |
 | --- | --- |
-| `standard` | Matches a catalog variant marked standard using only labeled assumptions. |
-| `standard_variant` | Matches a catalog variant marked variant using only labeled assumptions. |
-| `custom_logic` | Role is confident, but no catalog variant matches, or a match requires an extra predicate/branch not represented by an assumption. |
-| `definitional` | The choice is what a metric includes rather than how a finance method is calculated. |
-| `structural` | The difference is timing, sign, aggregation, lag, annualization, clamp, or sheet plumbing rather than a domain method. |
-| `literal_embedded` | An otherwise recognizable method embeds a rate, life, amount, or threshold in the formula instead of a labeled assumption. |
-| `unclassified` | No confident role, no applicable catalog, or insufficient evidence. |
+| `standard` | Matches a catalog variant marked standard using labeled assumptions. |
+| `standard_variant` | Matches a catalog variant marked variant using labeled assumptions. |
+| `custom_logic` | Role is known, but no catalog variant matches, or an unlabeled predicate/branch changes the method. |
+| `definitional` | The choice determines what a metric includes rather than how a finance method is calculated. |
+| `structural` | Timing, sign, aggregation, lag, annualization, clamp, or sheet plumbing only. |
+| `literal_embedded` | A recognizable method embeds a required rate, life, amount, or threshold instead of using a labeled assumption. |
+| `unclassified` | Role, mapping, catalog applicability, or evidence is insufficient. |
 
-Use this precedence when more than one description applies:
+Precedence is: insufficient evidence → definitional/structural → custom branch →
+embedded literal → standard variant → standard. Keep secondary observations in
+`signals`.
 
-1. `unclassified` if the role or evidence is insufficient
-2. `definitional` or `structural` when there is no distinct domain method to judge
-3. `custom_logic` when out-of-catalog predicates or branches alter the method
-4. `literal_embedded` when the embedded value is the only reason it is not recoverable
-5. `standard_variant`
-6. `standard`
+The verdict is:
 
-Keep secondary evidence in `signals`; do not turn every signal into another class.
-For example, a custom `IF` containing `0.5` is `custom_logic` with a
-`literal_embedded` signal, not two primary classes.
+- `REVIEW` when any key variable is `unclassified`; packaging must stop.
+- `FLAG` when there is no review row and at least one `custom_logic` or
+  `literal_embedded` row; validated hints are added and packaging continues.
+- `PASS` otherwise; packaging continues without custom hints.
 
-### 5. Apply the gate
+## Required Terra outputs
 
-- `FLAG`: at least one `custom_logic` or `literal_embedded` series is in a curated
-  output's lineage.
-- `REVIEW`: no flagged series, but at least one relevant series is `unclassified`.
-- `PASS`: all relevant domain-method series are `standard` or `standard_variant`;
-  `definitional` and `structural` rows are documented but do not fail the gate.
-
-Never use rollout failure by itself as evidence of custom logic. Rollout results
-control when the post-hoc gate may run and can prioritize investigation, but the
-classification must come from golden formula/catalog agreement.
-
-## Required report
-
-Write both:
-
-- `runs/custom-formula-gate/<task>-report.json`
-- `runs/custom-formula-gate/<task>-report.md`
-
-The JSON must contain:
+Write `report.json`:
 
 ```json
 {
+  "schema_version": "2.0",
   "task": "0256-outputs",
-  "rollouts_observed": 5,
+  "generator": {
+    "model": "gpt-5.6-terra-high",
+    "prompt_version": "custom-formula-gate-v2",
+    "context_sha256": "<sha256 of context.json bytes>",
+    "catalog_sha256": "<sha256 of CATALOG.md bytes>"
+  },
   "verdict": "FLAG",
-  "counts": {"custom_logic": 1},
+  "counts": {"custom_logic": 1, "structural": 4},
   "series": [
     {
+      "key_rank": 1,
       "band": "CalcA!H26:Q26",
       "label": "Interests",
       "role": "interest_expense_income",
       "class": "custom_logic",
       "catalog_variant": null,
-      "golden_formula": "=IF(...)",
-      "assumptions": [],
-      "agreement": {"periods_tested": 10, "periods_matched": 0},
-      "signals": ["boolean_gate", "asymmetric_if", "literal_embedded:0.5"],
-      "downstream_outputs": ["CalcA!C62", "CalcA!C64"],
-      "reason": "The draw-year predicate changes full-year versus half-year interest without a labeled convention."
+      "variable_mapping": {
+        "bop_balance": "CalcA!H24:Q24",
+        "draw": "CalcA!H25:Q25",
+        "rate": "Assumptions!H8:Q8"
+      },
+      "agreement": {
+        "periods_tested": 10,
+        "periods_matched": 0,
+        "exact_symbolic_match": false,
+        "max_absolute_error": 12.3,
+        "max_relative_error": 0.5
+      },
+      "signals": ["boolean_gate", "literal_embedded:0.5"],
+      "reason": "An unlabeled predicate switches full-year and half-year interest."
     }
   ]
 }
 ```
 
-The Markdown report should lead with the verdict, then list flagged and review rows,
-catalog matches, and rollout evidence. Include formulas and cell references so every
-decision is auditable.
+Include exactly one `series` row for every context `key_variables` row, preserving
+`band` and `key_rank`. A standard match must name a catalog variant and provide
+a non-empty `variable_mapping`.
 
-## Calibration example
+Write `hints.json`:
 
-`CalcA!H26:Q26` in workbook `0256` is labeled `Interests`; its neighbors are
-`Debt - bop`, `Debt - drawdown`, and an interest-rate row. Its role is therefore
-`interest_expense_income`, not depreciation.
-
-The formula applies full-year interest when opening debt is zero and drawdown is
-positive, but half-year interest otherwise:
-
-```text
-=IF(AND(H24=0,H25>0),(H24+H25)*rate,(H24+H25)*0.5*rate)
+```json
+{
+  "schema_version": "1.0",
+  "task": "0256-outputs",
+  "hints": [
+    {
+      "title": "Draw-year interest timing",
+      "guidance": "Use full-year interest in an initial draw year and half-year treatment otherwise.",
+      "bands": ["CalcA!H26:Q26"],
+      "classes": ["custom_logic"]
+    }
+  ]
+}
 ```
 
-That is `custom_logic`: the asymmetric predicate is not a catalog assumption.
-`0.5` is also a supporting `literal_embedded` signal unless a labeled half-year
-convention exists. The actual depreciation series nearby is `CalcA!H40:Q40`, labeled
-`Depreciation` between Asset BOP, CAPEX, and Asset EOP.
+Hints cover every and only `custom_logic`/`literal_embedded` band exactly once.
+They describe the method in words. They must not contain Excel formulas,
+requested answer values, or copied golden expressions.
+
+## Validate before packaging
+
+```bash
+python3 .cursor/skills/custom-formula-gate/scripts/validate_gate_outputs.py \
+  "$CONTEXT" "$REPORT" "$HINTS"
+```
+
+The validator checks the Terra model pin, prompt/context/catalog hashes, complete
+key-variable coverage, closed classes and catalog IDs, all-period agreement,
+verdict/count consistency, hint coverage, and answer/formula leakage. Any
+validation error or `REVIEW` verdict is a blocker.

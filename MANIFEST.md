@@ -2,7 +2,7 @@
 
 Everything needed to run the synthetic data generation pipeline described in
 `README.md`, from a raw `.xlsx` workbook to a packaged Harbor task bundle and
-the post-rollout review gate. Workbooks and derived artifacts (`ast_out/`,
+the pre-package Terra formula gate. Workbooks and derived artifacts (`ast_out/`,
 `seg_out/`, `inputs_out/`, `tasks_outputs/`, `jobs/`, `runs/`) are not included;
 run the pipeline against your own source folder.
 
@@ -46,7 +46,7 @@ run the pipeline against your own source folder.
 | `xl_passk_score.py` | pass@k summary over scored attempts; exercised by `grader/tests/test_passk_score.py`. |
 | `xl_pass1_score.py` | Continuous and pass@1 metrics for one final attempt per task. |
 | `xl_eval_run.py` | Chat-level stand-in for `harbor run` through the LiteLLM proxy. |
-| `xl_formula_hint_tasks.py` | Clones task bundles and appends audited custom-formula hints (pairs with `/custom-formula-gate`). |
+| `xl_formula_hint_tasks.py` | Validates and renders audited custom-formula hints for packaging; also supports legacy bundle cloning. |
 | `xl_wb_classify.py` | Generates `taxonomy_out/workbooks.json`, the family taxonomy used for `--semantic-hints`. |
 | `labelbox_llm_proxy.py` | Local proxy adding the `x-labelbox-context` header Harbor's adapter cannot set. |
 
@@ -56,7 +56,8 @@ run the pipeline against your own source folder.
 | --- | --- |
 | `.cursor/skills/create-harbor-task/` | `/create-harbor-task`: fail-closed raw workbook → segmented, normalized, source-profiled, MCP-backed, oracle-validated Harbor task. |
 | `.cursor/skills/profile-mcp-sources/` | `/profile-mcp-sources`: bounded GPT 5.6 Sol public reads → reviewed source terminology/structure profiles; auth and blocked pages are skipped. |
-| `.cursor/skills/custom-formula-gate/` | `/custom-formula-gate`: post-rollout classification of golden formulas against the closed catalog (`SKILL.md`, `CATALOG.md`, `scripts/extract_gate_context.py`). |
+| `.cursor/skills/custom-formula-gate/` | `/custom-formula-gate`: pinned GPT-5.6 Terra pre-package classification of key golden variables against the closed textbook catalog, with deterministic extraction and output validation. |
+| `.cursor/skills/naturalize-finance-task-instruction/` | `/naturalize-finance-task-instruction`: pinned GPT-5.6 Sol final-instruction rewrite with protected sections, deterministic validation, semantic review, and atomic application. |
 
 ## Dependencies
 
@@ -65,11 +66,13 @@ run the pipeline against your own source folder.
   `xl_output_task.py` / the `/create-harbor-task` skill.
 - Python 3.11+ (`xl_output_task.py` falls back to stdlib `tomllib` when `tomli`
   is absent).
-- Naturalized task instructions and variable/source audits need
+- Variable/source audits and the standalone early naturalizer need
   `lbx_api_key` in a `.env` at the repo root (not included here).
-  `--no-naturalize` skips instruction rewriting only; the audit has a separate
-  explicit `--no-variable-source-audit` opt-out.
-- Public-source profiling uses Cursor's `gpt-5.6-sol-high` subagent and public
-  read tools at authoring time. MCP builds and runtime episodes remain offline.
+  `/create-harbor-task` disables that early rewrite and uses the final Cursor
+  instruction skill instead; the audit has a separate explicit
+  `--no-variable-source-audit` opt-out.
+- Public-source profiling and final instruction naturalization use Cursor's
+  `gpt-5.6-sol-high` subagent at authoring time. MCP builds and runtime episodes
+  remain offline.
 - `fastmcp` is optional for generated-server smoke/oracle checks and is normally
   supplied ephemerally with `uv run --with fastmcp`.

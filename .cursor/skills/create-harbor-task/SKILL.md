@@ -31,6 +31,11 @@ EXCLUSIONS="$RUN/exclusions.json"
 DISPOSITIONS="$RUN/normalization_report.json"
 PROFILES="$RUN/source_profiles.json"
 MCP="$RUN/mcp"
+FORMULA_RUN="runs/$WB-custom-formula-gate"
+FORMULA_CONTEXT="$FORMULA_RUN/context.json"
+FORMULA_REPORT="$FORMULA_RUN/report.json"
+FORMULA_HINTS="$FORMULA_RUN/hints.json"
+NAT_RUN="runs/$WB-instruction-naturalization"
 STAGE_ROOT=tasks_outputs_mcp
 STAGED="$STAGE_ROOT/$WB-outputs"
 TASK="tasks_outputs/$WB-outputs"
@@ -41,6 +46,8 @@ Expected artifacts:
 - `ast_out/$WB/{nodes.csv,edges.csv}`
 - `seg_out/$WB/{segments.json,curation.toml,lineage.json}`
 - `inputs_out/$WB-inputs.xlsx`: unredacted baseline inputs
+- `runs/$WB-custom-formula-gate/{context,report,hints}.json`
+- `runs/$WB-instruction-naturalization/{source.md,candidate.md,validation.json}`
 - `runs/$WB-variable-sources/$WB-inputs-variable-sources.{md,inventory.json,metadata.json}`
 - `draft.json`, `normalize_$WB.py`, `normalized.json`, `exclusions.json`,
   `normalization_report.json`, `source_profiles.json`, and profile captures
@@ -63,6 +70,11 @@ Stage all requested workbooks before promoting any of them.
   masking, packaging, or rollout is difficult.
 - Generate and package the GPT 5.6 Sol variable/source audit. Never pass
   `--no-variable-source-audit`.
+- Run `/custom-formula-gate` before packaging with exactly one
+  `gpt-5.6-terra-high` subagent. A missing, stale, differently modeled, invalid,
+  or `REVIEW` report is a blocker.
+- Run `/naturalize-finance-task-instruction` after the complete instruction is
+  packaged. Any generation, validation, or semantic-review failure is a blocker.
 - Missing audit credentials or audit failure is a blocker, not permission to
   produce a plain task.
 - Missing profile skill, unresolved draft rows, partial masking, source-profile
@@ -122,7 +134,38 @@ PY
 
 Do not weaken the verifier, use `--no-verify`, or special-case the workbook.
 
-### 3. Build baseline inputs
+### 3. Run the pre-package GPT 5.6 Terra formula gate
+
+First load and follow `.cursor/skills/custom-formula-gate/SKILL.md`. Extract the
+complete curated-output reverse closure:
+
+```bash
+python3 .cursor/skills/custom-formula-gate/scripts/extract_gate_context.py \
+  "$WB" --source "$SOURCE" --seg-dir "$SEG_ROOT/$WB" \
+  --output "$FORMULA_CONTEXT"
+```
+
+Launch exactly one `generalPurpose` subagent with model
+`gpt-5.6-terra-high`. Give it the context and catalog paths, require the
+key-variable-first and all-period textbook matching workflow from the skill,
+and require it to write `"$FORMULA_REPORT"` and `"$FORMULA_HINTS"`. Do not let
+the parent or another model replace, supplement, or silently repair Terra's
+classification.
+
+Validate the artifacts:
+
+```bash
+python3 .cursor/skills/custom-formula-gate/scripts/validate_gate_outputs.py \
+  "$FORMULA_CONTEXT" "$FORMULA_REPORT" "$FORMULA_HINTS"
+```
+
+`PASS` continues without custom hints. `FLAG` continues with every flagged
+series represented exactly once by an audited method-only hint. `REVIEW`,
+missing coverage, stale hashes, another model, formula/answer leakage, or any
+validator failure stops the workflow. Keep context and report under `runs/`;
+they contain golden evidence and must never be copied into the task.
+
+### 4. Build baseline inputs
 
 ```bash
 python3 xl_input_mask.py "$WB" --source "$SOURCE" \
@@ -135,7 +178,7 @@ The command must report verification `PASS`, zero surviving formulas, and all
 typed cells intact except its documented pasted-answer policy. Keep this file
 unchanged: it is the input to the audit even after MCP masking exists.
 
-### 4. Run the GPT 5.6 Sol audit
+### 5. Run the GPT 5.6 Sol audit
 
 ```bash
 python3 xl_variable_source_audit.py "$WB" \
@@ -150,7 +193,7 @@ Require complete metadata, matching inventory SHA-256, model
 invented references or values. Cache reuse is allowed only when the baseline
 inventory hash, model, and prompt version match.
 
-### 5. Import every Markdown row
+### 6. Import every Markdown row
 
 ```bash
 python3 xl_variable_mcp.py import "$AUDIT" "$DRAFT"
@@ -159,7 +202,7 @@ python3 xl_variable_mcp.py import "$AUDIT" "$DRAFT"
 Confirm `draft.json.row_count` equals the number of imported data rows and every
 row begins as `needs_review`. Import is preservation, not normalization.
 
-### 6. Normalize atomically and account for every row
+### 7. Normalize atomically and account for every row
 
 Create `"$RUN/normalize_$WB.py"` and execute it to write:
 
@@ -203,7 +246,7 @@ print("all %d draft rows resolved" % len(draft_ids))
 PY
 ```
 
-### 7. Profile public sources with GPT 5.6 Sol
+### 8. Profile public sources with GPT 5.6 Sol
 
 First load and follow `.cursor/skills/profile-mcp-sources/SKILL.md`. Launch one
 or more `generalPurpose` subagents with model `gpt-5.6-sol-high`, batching no
@@ -239,7 +282,7 @@ unmatched sources retain generic rendering. Then run:
 python3 xl_variable_mcp.py validate-spec "$NORMALIZED"
 ```
 
-### 8. Review maskability, duplicates, and extra cells
+### 9. Review maskability, duplicates, and extra cells
 
 Before build, inspect every included variable against the golden and baseline
 workbooks. Write `"$RUN/maskability_report.json"` and fail unless:
@@ -258,7 +301,7 @@ workbooks. Write `"$RUN/maskability_report.json"` and fail unless:
 Re-run the atomic normalizer and profile validator after any change. Do not use
 an allowlist to hide an unknown leak.
 
-### 9. Build, validate, and smoke deterministic MCP output
+### 10. Build, validate, and smoke deterministic MCP output
 
 Build twice in fresh sibling directories using the same normalized spec,
 profiles, seed, and golden workbook. The build is network-free.
@@ -292,7 +335,7 @@ acyclic provenance chains, conflicting broad queries, no runtime evaluation
 keys, valid reviewed profile references, and byte-identical builds. Keep `B`
 and all failed build directories as diagnostics until completion.
 
-### 10. Mask MCP inputs separately
+### 11. Mask MCP inputs separately
 
 ```bash
 BASE_SHA=$(shasum -a 256 "$BASE_INPUT_ROOT/$WB-inputs.xlsx" | awk '{print $1}')
@@ -307,7 +350,7 @@ test -f "$MCP_INPUT_ROOT/$WB-inputs.xlsx"
 Require all intended MCP cells blank, no formulas, no unintended typed-cell
 loss, and a non-empty mask. Never overwrite the baseline inputs workbook.
 
-### 11. Package to staging with MCP and baseline audit
+### 12. Package to staging with MCP and baseline audit
 
 ```bash
 test ! -e "$STAGED"
@@ -318,17 +361,36 @@ python3 xl_output_task.py "$WB" \
   --variable-source-audit-inputs-root "$BASE_INPUT_ROOT" \
   --variable-source-audit-root runs \
   --variable-source-audit-model openai/gpt-5.6-sol \
+  --custom-formula-context "$FORMULA_CONTEXT" \
+  --custom-formula-report "$FORMULA_REPORT" \
+  --custom-formula-hints "$FORMULA_HINTS" \
   --mcp "$MCP" \
+  --no-naturalize \
   -o "$STAGE_ROOT"
 ```
 
 The audit must run or validly cache-reuse against baseline inputs, while the
 packaged artifact must come from MCP inputs. Require the MCP server declaration,
 compose sidecar, extended timeout, research instructions, audit metadata, and
-`tests/masked_inputs.json`. Absence of any MCP artifact is failure; never rerun
-without `--mcp`.
+`tests/masked_inputs.json`. Also require custom-formula model/verdict metadata,
+the exact validated method-hint section when verdict is `FLAG`, and
+`tests/formula_hints.json`. Absence of any required artifact is failure; never
+rerun without `--mcp` or without the formula artifacts.
 
-### 12. Run generalized HTTP oracle
+### 13. Naturalize the complete staged instruction
+
+Load and follow
+`.cursor/skills/naturalize-finance-task-instruction/SKILL.md`. Launch exactly
+one `generalPurpose` subagent with model `gpt-5.6-sol-high`, preserve every
+protected section byte-for-byte, and require deterministic plus clause-by-clause
+semantic validation before atomically replacing `"$STAGED/instruction.md"`.
+
+Require `"$NAT_RUN/validation.json"` to report `valid: true` and `applied: true`,
+and require `task.toml` to record model `gpt-5.6-sol-high`, endpoint
+`cursor-subagent`, the prompt version, and matching source/instruction hashes.
+This is the final content mutation; do not continue on fallback or uncertainty.
+
+### 14. Run generalized HTTP oracle
 
 Use the reusable oracle, not a workbook-specific script:
 
@@ -370,7 +432,7 @@ ship. Use an explicit reviewed allowlist only for legitimate unavoidable
 duplicates; unknown, duplicate, and unused entries fail rather than becoming
 report-only warnings.
 
-### 13. Smoke the exact-answer grader
+### 15. Smoke the exact-answer grader
 
 Use the staged answer key only in a verifier workspace and require discrete
 (exact-within-tolerance) score `1.0`:
@@ -399,7 +461,7 @@ print("exact-answer grader score: 1.0")
 PY
 ```
 
-### 14. Promote only after every gate passes
+### 16. Promote only after every gate passes
 
 If a requested set contains multiple workbooks, wait until every staged bundle
 passes before promoting the set. Promotion uses same-filesystem renames and
@@ -435,6 +497,10 @@ Report, per workbook:
 
 - workbook id, golden path, AST path, segmentation `PASS`, and curation hash
 - curated output names/bands and confirmation that curation was preserved
+- formula context/report/hints paths, pinned Terra model, key-variable count,
+  verdict, class counts, and packaged custom-hint count
+- instruction naturalization source/candidate/report paths, pinned Sol model,
+  prompt version, source/instruction hashes, and semantic-review result
 - baseline input path/hash and separate MCP input path/hash
 - audit Markdown/inventory/metadata paths, model, inventory hash, and cache use
 - draft row count; included/excluded disposition counts; atomic variable count

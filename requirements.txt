@@ -5,5 +5,6 @@ openpyxl>=3.1.5
 # LLM stages use stdlib urllib against the configured HTTP endpoints, so no SDK
 # is required. `xl_variable_source_audit.py` calls GPT 5.6 Sol through Labelbox
 # LiteLLM; `xl_output_task.py` runs that audit by default before packaging.
-# Public-source profiles are authored by the Cursor skill/subagent, then the
-# MCP builder consumes the reviewed JSON entirely offline.
+# Public-source profiles and the pre-package custom-formula report are authored
+# by pinned Cursor subagents (Sol and Terra respectively); deterministic
+# validators consume the reviewed artifacts before the MCP builder packages.

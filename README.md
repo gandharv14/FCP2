@@ -21,7 +21,8 @@ the run; you will not find those directories in a fresh clone.
 | `xl_level_split.py` | Writes one workbook per dependency level; `xl_input_mask.py` reuses its XML rewriter. |
 | `/create-harbor-task` | Fail-closed Cursor skill: raw workbook → verified, source-profiled MCP Harbor task (section 21). |
 | `/profile-mcp-sources` | GPT 5.6 Sol subagent skill: bounded public-source reads → reviewed terminology, dataset, cadence, and excerpt profiles; auth/blocked pages are skipped. |
-| `/custom-formula-gate` | Post-Harbor review skill: classifies golden formulas against a closed finance catalog (section 22). |
+| `/custom-formula-gate` | Pre-package GPT 5.6 Terra skill: identifies key formula variables, matches them against a closed textbook catalog, and emits audited custom-method hints (section 22). |
+| `/naturalize-finance-task-instruction` | Final GPT 5.6 Sol skill: losslessly rewrites only the opening and input prose, then fail-closed validates and atomically applies the complete instruction. |
 | `xl_variable_source_audit.py` | GPT 5.6 Sol audit stage: inputs workbook → variable/source Markdown, deterministic inventory, and generation metadata. |
 | `xl_variable_mcp.py` + `mcp_env/` | Variable-source MCP environments: externally-sourced inputs masked from the workbook and served through a mock research service (section 23). |
 | `xl_mcp_oracle.py` | Generic live-sidecar oracle: exact retrieval, provenance, conflicts, masking, leak isolation, and profile-attribution checks. |
@@ -1805,87 +1806,126 @@ folder, or a workbook id such as `0256`.
 ### Pipeline
 
 1. **AST and segment**; preserve curation and require `verification.passed`.
-2. **Baseline mask** to `inputs_out/`; this unredacted-input copy drives the
+2. **Custom-formula gate** with pinned `gpt-5.6-terra-high`; identify every
+   key calculation variable in curated-output lineage, compare all usable
+   periods with the closed textbook catalog, and produce audited method hints.
+3. **Baseline mask** to `inputs_out/`; this unredacted-input copy drives the
    source audit and is never replaced by the MCP-masked copy.
-3. **Audit** with GPT 5.6 Sol through Labelbox LiteLLM.
-4. **Import and normalize** every audit row into an atomic variable or an
+4. **Audit** with GPT 5.6 Sol through Labelbox LiteLLM.
+5. **Import and normalize** every audit row into an atomic variable or an
    explicit exclusion; discover duplicate representations and `extra_cells`.
-5. **Profile public sources** with `/profile-mcp-sources`. GPT 5.6 Sol reads at
+6. **Profile public sources** with `/profile-mcp-sources`. GPT 5.6 Sol reads at
    most three public pages per canonical URL and retains only reviewed source
    vocabulary, dataset names, field conventions, cadence, and short attributed
    excerpts. Login, SSO, 401/403, paywall, bot-challenge, unreachable, and
    unsupported pages are skipped and keep the generic source renderer.
-6. **Validate and build** the network-free, seed-deterministic MCP environment;
+7. **Validate and build** the network-free, seed-deterministic MCP environment;
    golden-value mismatch aborts.
-7. **Smoke-test** the generated FastMCP server.
-8. **MCP mask** to a separate `inputs_out_mcp/` workbook.
-9. **Package one workbook** with `--mcp` under `tasks_outputs_mcp/`.
-10. **Live oracle** the shipped Docker sidecar with `xl_mcp_oracle.py`.
-11. **Grade an exact submission** and structurally inspect the bundle.
-12. **Promote** into `tasks_outputs/` only after every requested workbook passes.
+8. **Smoke-test** the generated FastMCP server.
+9. **MCP mask** to a separate `inputs_out_mcp/` workbook.
+10. **Package one workbook** with `--mcp` and the validated formula artifacts
+    under `tasks_outputs_mcp/`; custom method hints enter `instruction.md`.
+11. **Naturalize the complete instruction** with pinned `gpt-5.6-sol-high`.
+    Only the opening and `Input` prose may change; every other section remains
+    byte-identical. Deterministic invariants and a clause-level semantic review
+    must pass before the candidate is atomically applied.
+12. **Live oracle** the shipped Docker sidecar with `xl_mcp_oracle.py`.
+13. **Grade an exact submission** and structurally inspect the bundle.
+14. **Promote** into `tasks_outputs/` only after every requested workbook passes.
 
-Naturalized instructions and variable/source audits need `lbx_api_key` in
-`.env`. The audit is pinned by default to `openai/gpt-5.6-sol`; public-source
-profiling delegates only a redacted URL/name/kind worklist to
-`gpt-5.6-sol-high`. `/create-harbor-task` never uses
+Variable/source audits need `lbx_api_key` in `.env`. The audit is pinned by
+default to `openai/gpt-5.6-sol`; public-source profiling and final instruction
+naturalization use pinned `gpt-5.6-sol-high` Cursor subagents.
+`/create-harbor-task` packages with `--no-naturalize` so the earlier
+scenario-only Luna rewrite cannot run before all instruction sections exist,
+then invokes the final fail-closed skill. It never uses
 `--no-variable-source-audit`. Do not invent a taxonomy entry when a workbook is
 missing from `workbooks.json`.
 
 In Cursor, invoke `/create-harbor-task` with the workbook path or id.
 
+**Automatic invocation boundary.** When the workflow is started through
+`/create-harbor-task`, it automatically loads `/custom-formula-gate`, launches
+the pinned `gpt-5.6-terra-high` subagent, validates its artifacts, and passes
+them into packaging. After packaging it loads
+`/naturalize-finance-task-instruction`, launches the pinned
+`gpt-5.6-sol-high` subagent, validates the complete rewrite, and applies it
+before the oracle and grader. Running `xl_output_task.py` or the individual
+Python stages directly does not launch a Cursor skill or model. Direct callers
+must generate and validate the formula context/report/hints separately and
+supply all three `--custom-formula-*` arguments; they must also invoke the
+instruction skill after packaging or that standalone path bypasses these gates.
+
 ---
 
 ## 22. `/custom-formula-gate`
 
-After Harbor rollouts for a reconstruction task, some golden formulas are
-standard finance methods and others are custom logic a model is unlikely to
-invent. `/custom-formula-gate` is the Cursor skill that classifies those series
-against a closed catalog and decides whether the task should stay flagged.
+Some golden formulas are standard textbook finance methods and others contain
+workbook-specific logic a task-solving model is unlikely to reconstruct.
+`/custom-formula-gate` now runs during task creation, after segmentation has
+passed and before masking or packaging. It has no Harbor rollout dependency.
 
-Run it only after at least one matching Harbor job has completed. The raw
-workbook is the answer key for this review; it must not be shown to the model
-that performs the task.
+The semantic analysis is pinned to one `generalPurpose` subagent using
+`gpt-5.6-terra-high`. The raw workbook remains a build-time answer key: Terra
+may inspect it through the extracted context, but neither the workbook, context,
+nor full report enters the task environment. Only validated method guidance may
+be included in the task instruction.
 
 ### Inputs
 
-- Harbor task bundle, e.g. `tasks_outputs/0256-outputs`
-- Harbor job directory with completed attempts, e.g. `jobs/new10-pass5`
-- Raw workbook, normally `4-10 100/<workbook>.xlsx`
-- Segmentation artifacts, normally `seg_out/<workbook>/`
+- raw workbook, normally `4-10 100/<workbook>.xlsx`
+- verified segmentation and curation under `seg_out/<workbook>/`
+- closed textbook catalog at
+  `.cursor/skills/custom-formula-gate/CATALOG.md`
 
-### Extract context, then classify
+### Identify key variables, then match textbook values
 
 ```bash
 python3 .cursor/skills/custom-formula-gate/scripts/extract_gate_context.py \
-  tasks_outputs/0256-outputs \
-  --job-dir jobs/new10-pass5 \
-  --output runs/custom-formula-gate/0256-outputs-context.json
+  0256 --source "4-10 100" --seg-dir seg_out/0256 \
+  --output runs/0256-custom-formula-gate/context.json
 ```
 
-The extractor fails closed if it cannot find a completed matching rollout. It
-takes the union of formula bands in the curated outputs' lineage and records
-golden formulas, normalized patterns, cached values, labels, neighbors,
-references, downstream outputs, and custom-logic signals.
+The deterministic extractor starts from every curated output and retains the
+complete reverse closure of load-bearing formula series. It ranks those
+`key_variables` by output coverage, dependency depth, and downstream fan-out,
+then records their labels, direct drivers and assumptions, golden formulas,
+normalized patterns, cached period values, neighbors, references, and
+custom-logic signals. Ranking changes review order only; no output-dependent
+formula is discarded.
 
-In Cursor, invoke `/custom-formula-gate` on that task. The skill reads
-`.cursor/skills/custom-formula-gate/CATALOG.md` as a closed set for the review,
-assigns a finance role from labels and neighbors, tests catalog variants against
-cached values when available, and writes:
+Terra first names each key variable and maps its labeled drivers to textbook
+slots such as revenue, rate, beginning balance, draw, life, or period. It then
+tests only catalog variants for that role against every usable cached period at
+`max(1e-6, 1e-6 * abs(expected))` tolerance. A match is standard only when all
+required parameters come from labeled assumptions. Missing cached values require
+an exact symbolic match; otherwise the row is `unclassified`.
 
-- `runs/custom-formula-gate/<task>-report.json`
-- `runs/custom-formula-gate/<task>-report.md`
+The stage writes:
 
-### Verdicts
+- `runs/<workbook>-custom-formula-gate/context.json`
+- `runs/<workbook>-custom-formula-gate/report.json`
+- `runs/<workbook>-custom-formula-gate/hints.json`
+
+```bash
+python3 .cursor/skills/custom-formula-gate/scripts/validate_gate_outputs.py \
+  runs/0256-custom-formula-gate/context.json \
+  runs/0256-custom-formula-gate/report.json \
+  runs/0256-custom-formula-gate/hints.json
+```
 
 | Verdict | Meaning |
 | --- | --- |
-| `FLAG` | At least one `custom_logic` or `literal_embedded` series sits in a curated output's lineage. |
-| `REVIEW` | Nothing flagged, but at least one relevant series is `unclassified`. |
-| `PASS` | Relevant domain-method series are `standard` or `standard_variant`. `definitional` and `structural` rows are documented and do not fail the gate. |
+| `FLAG` | At least one `custom_logic` or `literal_embedded` key variable exists. Validated method-only hints are packaged and the build continues. |
+| `REVIEW` | At least one key variable is `unclassified`; packaging stops for manual review. |
+| `PASS` | Every domain method is `standard` or `standard_variant`; documented `definitional` and `structural` rows do not fail the gate. |
 
-Rollout failure alone is not evidence of custom logic. It only controls when the
-gate may run and what to look at first; the classification comes from golden
-formula versus catalog agreement.
+Before packaging,
+`scripts/validate_gate_outputs.py` rechecks the exact Terra model, prompt/context/
+catalog hashes, complete key-variable coverage, closed classes and catalog IDs,
+all-period agreement evidence, verdict/count consistency, hint coverage, and
+formula/answer leakage. The package receives only `hints.json` and its prose;
+golden formulas and cached values stay under `runs/`.
 
 ---
 
@@ -2224,3 +2264,47 @@ debt service, enterprise value bridge), not retrieval. One residual softness
 to tighten next: `search_documents` snippets can expose a document's reported
 value without its supersession notice; no agent exploited it, but trimming
 the snippet before the value line would close it.
+
+### Final-instruction naturalization A/B rebuild
+
+The fail-closed task workflow was rerun for `0248`, `0251`, and `0255` after
+adding the pre-package formula gate and final instruction naturalizer. Workbook
+`0233` was not regenerated: strict verification still rebuilds seven of eight
+outputs, while `Term facilities!E88` evaluates to the active recurrence
+`E88 = E88`. Its saved value is persisted Excel state rather than a result
+determined by frontier inputs, so seeding it would violate the no-answer-seeding
+gate.
+
+All three accepted workbooks passed segmentation, deterministic double MCP
+builds, live HTTP oracles, and exact-answer grader smokes for both instruction
+variants. The formula gate classified every key series and packaged only
+validated method guidance:
+
+| workbook | key formula series | packaged method hints | MCP variables | oracle |
+| --- | ---: | ---: | ---: | --- |
+| 0248 | 199 | 9 | 48 | 48/48 exact resolutions, chains, and broad conflicts |
+| 0251 | 5,192 | 83 | 1 | 1/1 exact resolution, chain, and broad conflict |
+| 0255 | 82 | 28 | 15 | 15/15 exact resolutions, chains, and broad conflicts |
+
+For the A/B test, both variants contained the same workbook, MCP environment,
+target table, research instructions, formula hints, conventions, and output
+contract. The naturalized variant changed only the opening and `Input` prose;
+the deterministic validator required every other section to remain
+byte-identical. Each result below is the mean continuous score from five valid
+attempts. Agent-exit failures were excluded and replaced one-for-one before
+comparison.
+
+| model | workbook | original instruction | naturalized instruction | delta |
+| --- | --- | ---: | ---: | ---: |
+| Claude Opus 5 | 0248 | 0.906 | 0.848 | -0.058 |
+| Claude Opus 5 | 0251 | 0.719 | 0.664 | -0.055 |
+| Claude Opus 5 | 0255 | 0.700 | 0.764 | +0.064 |
+| Gemini 3.5 Flash | 0248 | 0.681 | 0.653 | -0.028 |
+| Gemini 3.5 Flash | 0251 | 0.401 | 0.292 | -0.109 |
+| Gemini 3.5 Flash | 0255 | 0.679 | 0.653 | -0.026 |
+| **Claude Opus 5, all 15 attempts** | **all** | **0.775** | **0.759** | **-0.016** |
+| **Gemini 3.5 Flash, all 15 attempts** | **all** | **0.587** | **0.533** | **-0.054** |
+
+No task/model/variant produced an exact `1.0` solve in its five valid attempts,
+so exact pass@5 was zero throughout. The narrow rewrite therefore showed no
+aggregate performance gain in this sample; only Opus on `0255` improved.

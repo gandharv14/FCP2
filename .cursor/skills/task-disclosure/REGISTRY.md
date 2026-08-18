@@ -255,30 +255,35 @@ Records from this section ship a value. Their record metadata is `convention`.
 
 # Section 2: Finance methods
 
-**No detector emits these yet.** They are written down so the vocabulary is fixed before the
-model pass that will propose them, and so the divergence test has variants to swap in. Until a
-detector cites them, no record in this section can ship. The drift check walks detector to
-registry, not the reverse, so it will not flag them as dead.
+The deterministic custom-method detector runs before convention detection. It assigns one role
+from the row label, matches the formula against this section's catalogued variants, and claims
+the band only on a confident no-match. Standard, structural, ambiguous, and unsupported cases
+stay reviewer-visible but produce no custom hint. The reverse drift check requires every entry
+in this section to have a role mapping, signature path, shared `Ship when`, and
+`out_of_catalogue` sentence.
 
 Records from this section ship a rule sentence. Their record metadata is `method`. The
-alternatives are the catalogued variants for the role, and the value is the variant the golden
-used.
+alternatives are the catalogued variants for the role; only `out_of_catalogue` reaches the
+writer.
 
-Match economic meaning, not exact Excel syntax. Parameters such as rate, life, days, and timing
-conventions must come from labelled assumptions; where they do not, the entry declines.
+Match economic meaning, not exact Excel syntax. The same parsed formula profile supplies both
+signature matching and sentence wording; no model or separate paraphraser is involved.
 
-Shared `Ship when` for this section: the variant is not determinable from the labelled inputs
-the agent can see. If the workbook's own labels name the method - a row labelled "Depreciation
-(mid-year convention)" - the entry declines, because the agent can read it.
+Shared `Ship when` for this section: neither the band nor any referenced ingredient is graded,
+and the deterministic sentence covers every parsed reference and literal. Numeric thresholds,
+long ingredient lists, mixed formula shapes, constants, and complete operator sequences are
+rendered and audited rather than declined.
 
 ## `method_depreciation`
 
 - **Id.** `method_depreciation`
 - **Question.** How is depreciation or amortisation calculated?
 - **Alternatives.** `bop_over_life` | `bop_plus_capex_over_life` | `midyear_capex` |
-  `average_balance`
-- **Ship when.** Section default. Declines when a labelled assumption already names the basis.
+  `average_balance` | `out_of_catalogue`
+- **Ship when.** Section default.
 - **Sentence.**
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
+    calculation, shown for {representative}: {steps}."
   - `bop_over_life` - "Depreciation on the row labelled {label} is the opening depreciable
     balance spread over the labelled useful life."
   - `bop_plus_capex_over_life` - "Depreciation on the row labelled {label} is the opening
@@ -296,9 +301,12 @@ the agent can see. If the workbook's own labels name the method - a row labelled
 
 - **Id.** `method_interest`
 - **Question.** What balance is interest struck on?
-- **Alternatives.** `opening_balance` | `average_balance` | `full_draw` | `midyear_flow`
+- **Alternatives.** `opening_balance` | `average_balance` | `full_draw` | `midyear_flow` |
+  `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
+    calculation, shown for {representative}: {steps}."
   - `opening_balance` - "Interest on the row labelled {label} is charged on the opening
     balance."
   - `average_balance` - "Interest on the row labelled {label} is charged on the average of the
@@ -316,9 +324,12 @@ the agent can see. If the workbook's own labels name the method - a row labelled
 
 - **Id.** `method_tax`
 - **Question.** What base is tax struck on?
-- **Alternatives.** `pretax_profit` | `taxable_income` | `taxable_income_after_losses`
+- **Alternatives.** `pretax_profit` | `taxable_income` | `taxable_income_after_losses` |
+  `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
+    calculation, shown for {representative}: {steps}."
   - `pretax_profit` - "Tax on the row labelled {label} is charged on pre-tax profit at the
     labelled rate."
   - `taxable_income` - "Tax on the row labelled {label} is charged on taxable income at the
@@ -334,9 +345,11 @@ the agent can see. If the workbook's own labels name the method - a row labelled
 - **Id.** `method_revenue`
 - **Question.** How is revenue built?
 - **Alternatives.** `prior_period_growth` | `price_times_volume` | `segment_sum` |
-  `capacity_utilisation`
+  `capacity_utilisation` | `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
+    calculation, shown for {representative}: {steps}."
   - `prior_period_growth` - "Revenue on the row labelled {label} grows off the prior period at
     the labelled growth rate."
   - `price_times_volume` - "Revenue on the row labelled {label} is price multiplied by volume."
@@ -352,9 +365,11 @@ the agent can see. If the workbook's own labels name the method - a row labelled
 - **Id.** `method_operating_expense`
 - **Question.** How is an operating cost line built?
 - **Alternatives.** `prior_period_growth` | `percent_of_revenue` | `fixed_plus_variable` |
-  `component_sum`
+  `component_sum` | `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
+    calculation, shown for {representative}: {steps}."
   - `prior_period_growth` - "The cost on the row labelled {label} grows off the prior period at
     the labelled growth rate."
   - `percent_of_revenue` - "The cost on the row labelled {label} is a labelled percentage of
@@ -372,11 +387,12 @@ the agent can see. If the workbook's own labels name the method - a row labelled
 - **Id.** `method_working_capital`
 - **Question.** How is a working-capital balance struck?
 - **Alternatives.** `percent_of_driver` | `days_of_driver` | `balance_delta` |
-  `average_driver_days`
-- **Ship when.** Section default, and additionally declines when the day-count basis is one of
-  the ordinary ones. A hardcoded 365 or 360 is arithmetic plumbing, not a method choice, and
-  the segmentation stage does not treat it as an input worth supplying.
+  `average_driver_days` | `out_of_catalogue`
+- **Ship when.** Section default. A hardcoded 365 or 360 is ordinary arithmetic plumbing and
+  is classified before the gate rather than treated as a custom method.
 - **Sentence.**
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
+    calculation, shown for {representative}: {steps}."
   - `percent_of_driver` - "The balance on the row labelled {label} is a labelled percentage of
     its driver."
   - `days_of_driver` - "The balance on the row labelled {label} is stated as a labelled number
@@ -392,9 +408,12 @@ the agent can see. If the workbook's own labels name the method - a row labelled
 
 - **Id.** `method_capex`
 - **Question.** How is capital expenditure set?
-- **Alternatives.** `percent_of_revenue` | `prior_period_growth` | `maintenance_plus_growth`
+- **Alternatives.** `percent_of_revenue` | `prior_period_growth` | `maintenance_plus_growth` |
+  `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
+    calculation, shown for {representative}: {steps}."
   - `percent_of_revenue` - "Capital spend on the row labelled {label} is a labelled percentage
     of revenue."
   - `prior_period_growth` - "Capital spend on the row labelled {label} grows off the prior
@@ -410,9 +429,11 @@ the agent can see. If the workbook's own labels name the method - a row labelled
 - **Id.** `method_debt_movement`
 - **Question.** How are debt draws and repayments sized?
 - **Alternatives.** `required_funding` | `fixed_amortisation` | `maturity_repayment` |
-  `cash_sweep`
+  `cash_sweep` | `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
+    calculation, shown for {representative}: {steps}."
   - `required_funding` - "The draw on the row labelled {label} is whatever funding the period
     requires, floored at zero."
   - `fixed_amortisation` - "The repayment on the row labelled {label} is the opening principal
@@ -430,9 +451,11 @@ the agent can see. If the workbook's own labels name the method - a row labelled
 - **Id.** `method_discounting`
 - **Question.** How is a present or terminal value calculated?
 - **Alternatives.** `periodic_discount` | `npv_plus_t0` | `perpetuity_growth` |
-  `exit_multiple` | `midyear_discount`
+  `exit_multiple` | `midyear_discount` | `out_of_catalogue`
 - **Ship when.** Section default, and declines when the band is itself a graded cell.
 - **Sentence.**
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
+    calculation, shown for {representative}: {steps}."
   - `periodic_discount` - "The row labelled {label} discounts each period's cash flow at the
     labelled discount rate over that period's count."
   - `npv_plus_t0` - "The row labelled {label} discounts the future cash flows and adds the
@@ -451,10 +474,13 @@ the agent can see. If the workbook's own labels name the method - a row labelled
 
 - **Id.** `method_returns`
 - **Question.** How is a return measure calculated?
-- **Alternatives.** `irr_on_series` | `xirr_on_dated_series` | `multiple_of_money`
+- **Alternatives.** `irr_on_series` | `xirr_on_dated_series` | `multiple_of_money` |
+  `out_of_catalogue`
 - **Ship when.** Section default, and declines when the band is itself a graded cell, which is
   the common case for a returns row.
 - **Sentence.**
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
+    calculation, shown for {representative}: {steps}."
   - `irr_on_series` - "The row labelled {label} takes the internal rate of return of the
     labelled investor cash-flow series."
   - `xirr_on_dated_series` - "The row labelled {label} takes the internal rate of return of the

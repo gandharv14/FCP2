@@ -226,18 +226,11 @@ class Book:
         assumption block, in the same column that legitimately labels those
         blocks. Naming a row "Base" identifies nothing.
         """
-        cache = self._marker_cache.setdefault(sheet, {})
-        if col not in cache:
-            counts = Counter()
-            for k, v in self.value.items():
-                s, coord = k.split("!", 1)
-                if s != sheet or not isinstance(v, str):
-                    continue
-                p = split_coord(coord)
-                if p and col_to_num(p[0]) == col:
-                    counts[v.strip()] += 1
-            cache[col] = counts
-        return cache[col].get(text, 0) <= 3
+        return not bool(re.fullmatch(
+            r"(?:base(?: case| plus)?|downside|lender|pancake|optimistic|pessimistic)",
+            text.strip(),
+            re.I,
+        ))
 
     def has(self, k: str) -> bool:
         return k in self.value or k in self.formula
@@ -259,18 +252,34 @@ class Book:
         p = split_coord(coord)
         label = ""
         if p:
-            label_cols = self.label_columns(sheet)
-            for c in range(col_to_num(p[0]) - 1, 0, -1):
-                if c not in label_cols:
-                    continue
+            candidates = sorted(
+                (c for c in self.label_columns(sheet) if c < col_to_num(p[0])),
+                reverse=True,
+            )
+            if candidates:
+                # The nearest label column defines the local block boundary. If
+                # its cell is blank, a formula, or a repeated scenario marker,
+                # stop. Continuing left would borrow a name from an unrelated
+                # side-by-side table.
+                c = candidates[0]
                 v = self.value.get(key(sheet, "%s%d" % (num_to_col(c), p[1])))
-                if not (isinstance(v, str) and v.strip() and not v.startswith("=")):
-                    continue
-                text = v.strip()
-                if is_unit_stamp(text) or not self.is_row_name(sheet, c, text):
-                    continue
-                label = text
-                break
+                if isinstance(v, str) and v.strip() and not v.startswith("="):
+                    text = v.strip()
+                    if re.fullmatch(r"scenario\s+\d+", text, re.I):
+                        # Some sheets put the selected scenario value immediately
+                        # beside a real "Scenario" label. Use the label, not the
+                        # selected value.
+                        for previous in candidates[1:]:
+                            pv = self.value.get(
+                                key(sheet, "%s%d" % (num_to_col(previous), p[1]))
+                            )
+                            if isinstance(pv, str) and re.fullmatch(
+                                r"scenario", pv.strip(), re.I
+                            ):
+                                label = pv.strip()
+                                break
+                    elif not is_unit_stamp(text) and self.is_row_name(sheet, c, text):
+                        label = text
         self._labels[k] = label
         return label
 
@@ -398,13 +407,20 @@ def blanked_formula_cells(gold: Book, delivered: Book, cells: list[str]) -> list
 def r1c1ish(formula: str, row: int, col: int) -> str:
     """Small local normalizer used only for grouping dragged formulas."""
     def repl(m):
-        coord = m.group(0).replace("$", "")
-        if "!" in coord:
-            return "REF"
-        p = split_coord(coord)
-        if not p:
-            return "REF"
-        return f"R[{p[1] - row}]C[{col_to_num(p[0]) - col}]"
+        def one(raw: str) -> str:
+            parsed = re.match(r"(\$?)([A-Z]{1,3})(\$?)(\d+)", raw)
+            if not parsed:
+                return "REF"
+            abs_col, letters, abs_row, row_text = parsed.groups()
+            ref_col, ref_row = col_to_num(letters), int(row_text)
+            rpart = f"R{ref_row}" if abs_row else f"R[{ref_row - row}]"
+            cpart = f"C{ref_col}" if abs_col else f"C[{ref_col - col}]"
+            return rpart + cpart
+
+        sheet = "S!" if m.group("sheet") else ""
+        start = one(m.group("a"))
+        end = one(m.group("b")) if m.group("b") else ""
+        return sheet + start + (":" + end if end else "")
     return REF_RE.sub(repl, formula or "")
 
 
@@ -503,6 +519,865 @@ def cmd_select(args):
         f"{payload['task']}: {payload['selection']['selected_cells']} selected cells, "
         f"{payload['selection']['bands']} bands ({payload['selection']['closure_source']} closure)"
     )
+
+
+# --------------------------------------------------------------------------- custom methods
+
+# Restored from the old custom-formula extractor, but used deterministically:
+# the row label selects one method entry, then formula signatures decide whether
+# the construction is a catalogued standard or genuinely out of catalogue.
+METHOD_ROLE_PATTERNS = {
+    "method_depreciation": (
+        r"\bdepreciat", r"\bamorti[sz]", r"\bd&a\b", r"\basset depreciation\b",
+    ),
+    "method_interest": (
+        r"\binterest", r"\bfinance cost", r"\bfinancing cost",
+    ),
+    "method_tax": (r"\btax(?:es|ation)?\b", r"\bcurrent tax\b", r"\bcash tax\b"),
+    "method_revenue": (r"\brevenue", r"\bsales\b", r"\bturnover\b"),
+    "method_operating_expense": (
+        r"\bopex\b", r"\boperating expense", r"\bsg&a\b", r"\bsalar",
+        r"\brent\b", r"\bcost of sales\b", r"\bmarketing\b", r"\bcrm\b",
+        r"\bwebsite\b", r"\boffice\b", r"\bmaintenance\b", r"\bmonitoring fee\b",
+        r"\bmanagement fee\b",
+    ),
+    "method_working_capital": (
+        r"\bworking capital\b", r"\breceivable", r"\binventor",
+        r"\bpayable", r"\bdso\b", r"\bdio\b", r"\bdpo\b",
+    ),
+    "method_capex": (
+        r"\bcapex\b", r"\bcapital expenditure", r"\bfixed.asset addition",
+    ),
+    "method_debt_movement": (
+        r"\bdebt\b", r"\bloan\b", r"\bdrawdown\b", r"\brepayment\b",
+        r"\breimbursement\b", r"\bcash sweep\b",
+    ),
+    "method_discounting": (
+        r"\bdiscount", r"\bpresent value\b", r"\bterminal value\b", r"\bnpv\b",
+        r"\bvaluation\b", r"\benterprise value\b", r"\bequity value\b",
+        r"\bmultiple\b",
+    ),
+    "method_returns": (
+        r"\birr\b", r"\bxirr\b", r"\bmoic\b", r"\bmultiple of money\b",
+    ),
+}
+
+# A role describes a calculated metric, not its assumption row. Without these
+# exclusions "Interest Rate" becomes an interest calculation and "Tax Rate"
+# becomes a tax calculation, flooding the custom path with assumptions.
+METHOD_ROLE_EXCLUDES = {
+    "method_interest": (r"\binterest rate\b", r"\brate\s*$"),
+    "method_tax": (r"\btax rate\b",),
+    "method_revenue": (r"\bgrowth", r"\bmargin", r"%"),
+    "method_operating_expense": (r"\bgrowth", r"\bmargin", r"%"),
+    "method_working_capital": (r"^\s*(dso|dio|dpo)\s*$", r"\bdays?\s*$"),
+    "method_capex": (r"\bgrowth", r"\bmargin", r"%"),
+    "method_discounting": (r"\bdiscount rate\b", r"\bdiscount period\b"),
+}
+
+METHOD_ENTRY_IDS = set(METHOD_ROLE_PATTERNS)
+CONVENTION_ENTRY_IDS = {
+    "discount_period", "inert_line", "terminal_value", "row_populated",
+    "npv_timing", "aggregate_scope", "projection_rule", "stake_scaling",
+    "source_selection",
+}
+BORING_METHOD_LITERALS = {
+    0.0, 1.0, -1.0, 2.0, 3.0, 4.0, 12.0, 100.0, 360.0, 365.0,
+    1000.0, 10000.0, 1000000.0,
+}
+
+
+def method_roles(label: str) -> list[str]:
+    """Registry method entries whose aliases match this visible row label."""
+    lowered = (label or "").lower()
+    if not lowered:
+        return []
+    hits = []
+    for entry_id, patterns in METHOD_ROLE_PATTERNS.items():
+        if not any(re.search(pattern, lowered) for pattern in patterns):
+            continue
+        if any(re.search(pattern, lowered) for pattern in METHOD_ROLE_EXCLUDES.get(entry_id, ())):
+            continue
+        hits.append(entry_id)
+    return hits
+
+
+def method_roles_for_band(gold: Book, band: dict) -> tuple[list[str], list[str]]:
+    """Role from the row itself, falling back to two neighboring rows.
+
+    Rows such as "Acq. 1" carry no finance word, while the section immediately
+    above says Revenue. Neighborhood context is used only when the row itself
+    gives no role, so it cannot override a clear label.
+    """
+    own = band.get("label") or ""
+    direct = method_roles(own)
+    if direct:
+        return direct, [own]
+    sheet, row = band.get("sheet"), band.get("row")
+    col = band.get("col_lo", 1)
+    context = []
+    for nearby in range(max(1, int(row or 1) - 2), int(row or 1) + 3):
+        cell = key(sheet, "%s%d" % (num_to_col(int(col)), nearby))
+        label = gold.row_label(cell)
+        if label and label not in context:
+            context.append(label)
+    context_text = " / ".join(context)
+    if re.search(r"revenue.*ebitda.*margin", context_text, re.I):
+        return ["method_revenue"], context
+    hits = sorted({
+        hit for context_label in context for hit in method_roles(context_label)
+    })
+    return hits, context
+
+
+def walk_ast(node):
+    if node is None:
+        return
+    yield node
+    for arg in getattr(node, "args", ()):
+        yield from walk_ast(arg)
+
+
+def method_subbands(gold: Book, band: dict) -> list[dict]:
+    """Selection already split mixed shapes by normalized formula pattern."""
+    return [band]
+
+
+def formula_profile(gold: Book, band: dict) -> dict:
+    """One parsed representation shared by signature matching and prose.
+
+    Parsing failure is reviewer-visible uncertainty. It never falls through to a
+    guessed custom sentence.
+    """
+    cells = band.get("cell_keys", [])
+    formulas = [gold.formula.get(c, "") for c in cells if gold.formula.get(c)]
+    profile = {
+        "complete": False,
+        "band": band.get("band"),
+        "cells": cells,
+        "label": band.get("label") or (gold.row_label(cells[0]) if cells else ""),
+        "formula": formulas[0] if formulas else "",
+        "representative_cell": cells[0] if cells else "",
+        "references": [],
+        "reference_labels": [],
+        "functions": [],
+        "operators": [],
+        "numbers": [],
+        "pattern": band.get("pattern", ""),
+        "error": None,
+    }
+    formula = profile["formula"]
+    if not formula or not cells:
+        profile["error"] = "missing_formula"
+        return profile
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from xl_ast_graph import FormulaError, parse_formula  # type: ignore
+
+        ast = parse_formula(formula)
+    except Exception as exc:
+        profile["error"] = f"parse_error:{exc}"
+        return profile
+
+    sheet = cells[0].split("!", 1)[0]
+    references = refs_in(formula, sheet)
+    labels = []
+    for ref in references:
+        label = gold.row_label(ref)
+        if label and label not in labels:
+            labels.append(label)
+    functions, operators, numbers, raw_references, literal_renderings = [], [], [], [], []
+    for node in walk_ast(ast):
+        if node.kind == "ref" and node.name not in raw_references:
+            raw_references.append(node.name)
+        if node.kind == "func" and node.name not in functions:
+            functions.append(node.name)
+        if node.kind in ("infix", "prefix", "postfix") and node.name not in operators:
+            operators.append(node.name)
+        if node.kind == "const" and node.name == "number":
+            try:
+                numbers.append(float(node.shape))
+            except (TypeError, ValueError):
+                pass
+        if node.kind == "const":
+            rendered = describe_ast(node, gold, sheet, profile["label"])
+            if rendered not in literal_renderings:
+                literal_renderings.append(rendered)
+    profile.update({
+        "complete": True,
+        "ast": ast,
+        "references": references,
+        "reference_labels": labels,
+        "functions": functions,
+        "operators": operators,
+        "numbers": numbers,
+        "raw_references": raw_references,
+        "literal_renderings": literal_renderings,
+        "ast_nodes": sum(1 for _ in walk_ast(ast)),
+    })
+    return profile
+
+
+def profile_has_label(profile: dict, *patterns: str) -> bool:
+    text = " / ".join(profile.get("reference_labels", [])).lower()
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def profile_has_all(profile: dict, *groups: tuple[str, ...]) -> bool:
+    return all(profile_has_label(profile, *group) for group in groups)
+
+
+def references_same_row(profile: dict) -> bool:
+    cells = profile.get("cells") or []
+    if not cells:
+        return False
+    sheet, coord = cells[0].split("!", 1)
+    p = split_coord(coord)
+    if not p:
+        return False
+    row = p[1]
+    for ref in profile.get("references", []):
+        rsheet, rcoord = ref.split("!", 1)
+        rp = split_coord(rcoord)
+        if rsheet == sheet and rp and rp[1] == row:
+            return True
+    return False
+
+
+def ast_ref_cell(node, profile: dict) -> str | None:
+    if node.kind != "ref":
+        return None
+    cells = profile.get("cells") or []
+    sheet = cells[0].split("!", 1)[0] if cells else ""
+    refs = refs_in("=" + node.name, sheet)
+    return refs[0] if len(refs) == 1 else None
+
+
+def exact_prior_period_growth(profile: dict) -> bool:
+    """Exactly previous cell × (1 + one other reference), in either order."""
+    ast = profile.get("ast")
+    cells = profile.get("cells") or []
+    if ast is None or not cells or ast.kind != "infix" or ast.name != "*" or len(ast.args) != 2:
+        return False
+    sheet, coord = cells[0].split("!", 1)
+    p = split_coord(coord)
+    if not p:
+        return False
+    current_col, current_row = col_to_num(p[0]), p[1]
+
+    def is_previous(node) -> bool:
+        ref = ast_ref_cell(node, profile)
+        if not ref:
+            return False
+        rsheet, rcoord = ref.split("!", 1)
+        rp = split_coord(rcoord)
+        return bool(
+            rsheet == sheet and rp
+            and rp[1] == current_row
+            and col_to_num(rp[0]) == current_col - 1
+        )
+
+    def is_one_plus_rate(node) -> bool:
+        if node.kind != "infix" or node.name not in ("+", "-") or len(node.args) != 2:
+            return False
+        left, right = node.args
+        const = left if left.kind == "const" else right if right.kind == "const" else None
+        other = right if const is left else left
+        try:
+            one = const is not None and abs(float(const.shape) - 1.0) < 1e-12
+        except (TypeError, ValueError):
+            one = False
+        return one and other.kind == "ref"
+
+    left, right = ast.args
+    return (is_previous(left) and is_one_plus_rate(right)) or (
+        is_previous(right) and is_one_plus_rate(left)
+    )
+
+
+def root_is_function(profile: dict, name: str) -> bool:
+    ast = profile.get("ast")
+    return bool(ast is not None and ast.kind == "func" and ast.name.upper() == name.upper())
+
+
+def catalog_signature(entry_id: str, profile: dict) -> str | None:
+    """The catalogued variant matched by a complete profile, else None.
+
+    These signatures are deliberately conservative. A positive match suppresses
+    a custom hint, so each one requires both the formula shape and semantically
+    appropriate labelled ingredients.
+    """
+    funcs = set(profile.get("functions", []))
+    ops = set(profile.get("operators", []))
+    formula = profile.get("formula", "").upper()
+
+    if entry_id == "method_depreciation":
+        if not profile_has_label(profile, r"\blife\b", r"useful"):
+            return None
+        if "AVERAGE" in funcs and profile_has_label(profile, r"opening", r"bop") and profile_has_label(profile, r"closing", r"eop"):
+            return "average_balance"
+        if any(abs(n - 0.5) < 1e-12 for n in profile.get("numbers", [])) and profile_has_label(profile, r"capex", r"capital"):
+            return "midyear_capex"
+        if profile_has_label(profile, r"capex", r"capital") and "/" in ops:
+            return "bop_plus_capex_over_life"
+        if profile_has_label(profile, r"asset", r"balance", r"basis") and "/" in ops:
+            return "bop_over_life"
+        return None
+
+    if entry_id == "method_interest":
+        if "IF" in funcs or "IFS" in funcs:
+            return None
+        if not profile_has_all(
+            profile,
+            (r"\brate\b", r"sofr", r"euribor", r"libor"),
+            (r"balance", r"debt", r"cash", r"loan", r"principal", r"draw"),
+        ):
+            return None
+        if "AVERAGE" in funcs:
+            return "average_balance"
+        if any(abs(n - 0.5) < 1e-12 for n in profile.get("numbers", [])):
+            return "midyear_flow"
+        if profile_has_label(profile, r"draw", r"repay") and ("+" in ops or "-" in ops):
+            return "full_draw"
+        if "*" in ops:
+            return "opening_balance"
+        return None
+
+    if entry_id == "method_tax":
+        if "IF" in funcs or "IFS" in funcs:
+            return None
+        if not profile_has_label(profile, r"\brate\b", r"tax %"):
+            return None
+        if profile_has_label(profile, r"\bnol\b", r"loss") and "MAX" in funcs:
+            return "taxable_income_after_losses"
+        if profile_has_label(profile, r"taxable income"):
+            return "taxable_income"
+        if profile_has_label(profile, r"\bebt\b", r"pre.?tax", r"profit before tax"):
+            return "pretax_profit"
+        return None
+
+    if entry_id == "method_revenue":
+        if "IF" in funcs or "IFS" in funcs:
+            return None
+        if exact_prior_period_growth(profile) and profile_has_label(profile, r"growth"):
+            return "prior_period_growth"
+        if profile_has_all(profile, (r"price", r"value"), (r"volume", r"units?")) and "*" in ops:
+            return "price_times_volume"
+        if root_is_function(profile, "SUM") and profile_has_label(profile, r"revenue", r"sales", r"turnover"):
+            return "segment_sum"
+        if profile_has_all(profile, (r"capacity",), (r"utili[sz]ation",), (r"price",)) and "*" in ops:
+            return "capacity_utilisation"
+        return None
+
+    if entry_id == "method_operating_expense":
+        if "IF" in funcs or "IFS" in funcs:
+            return None
+        if exact_prior_period_growth(profile) and profile_has_label(profile, r"growth", r"inflation"):
+            return "prior_period_growth"
+        if profile_has_all(profile, (r"revenue", r"sales"), (r"%", r"margin", r"rate")) and "*" in ops:
+            return "percent_of_revenue"
+        if profile_has_all(profile, (r"fixed",), (r"variable",)) and "+" in ops:
+            return "fixed_plus_variable"
+        if root_is_function(profile, "SUM"):
+            return "component_sum"
+        return None
+
+    if entry_id == "method_working_capital":
+        if "AVERAGE" in funcs and profile_has_label(profile, r"days?", r"dso", r"dio", r"dpo"):
+            return "average_driver_days"
+        if profile_has_label(profile, r"days?", r"dso", r"dio", r"dpo") and "/" in ops:
+            return "days_of_driver"
+        if profile_has_label(profile, r"%", r"rate") and "*" in ops:
+            return "percent_of_driver"
+        if profile_has_all(profile, (r"opening", r"bop"), (r"closing", r"eop")) and "-" in ops:
+            return "balance_delta"
+        return None
+
+    if entry_id == "method_capex":
+        if exact_prior_period_growth(profile) and profile_has_label(profile, r"growth"):
+            return "prior_period_growth"
+        if profile_has_all(profile, (r"revenue", r"sales"), (r"%", r"rate")) and "*" in ops:
+            return "percent_of_revenue"
+        if profile_has_all(profile, (r"maintenance",), (r"growth",)) and "+" in ops:
+            return "maintenance_plus_growth"
+        return None
+
+    if entry_id == "method_debt_movement":
+        if "MAX" in funcs and profile_has_label(profile, r"funding", r"shortfall"):
+            return "required_funding"
+        if profile_has_all(profile, (r"opening", r"bop", r"principal"), (r"amorti[sz]ation rate",)) and "*" in ops:
+            return "fixed_amortisation"
+        if profile_has_label(profile, r"maturity") and profile_has_label(profile, r"opening", r"principal"):
+            return "maturity_repayment"
+        if "MIN" in funcs and profile_has_all(profile, (r"cash",), (r"sweep",)):
+            return "cash_sweep"
+        return None
+
+    if entry_id == "method_discounting":
+        if "NPV" in funcs or "XNPV" in funcs:
+            return "npv_plus_t0" if re.search(r"\)\s*[+\-]", formula) else "periodic_discount"
+        if profile_has_all(profile, (r"growth",), (r"discount", r"wacc")) and "/" in ops:
+            return "perpetuity_growth"
+        if profile_has_label(profile, r"multiple") and "*" in ops:
+            return "exit_multiple"
+        if "^" in ops and profile_has_label(profile, r"discount", r"wacc"):
+            return "midyear_discount" if any(abs(n - 0.5) < 1e-12 for n in profile.get("numbers", [])) else "periodic_discount"
+        return None
+
+    if entry_id == "method_returns":
+        if "XIRR" in funcs:
+            return "xirr_on_dated_series"
+        if "IRR" in funcs:
+            return "irr_on_series"
+        if "/" in ops and profile_has_all(profile, (r"proceeds", r"return"), (r"invest", r"equity")):
+            return "multiple_of_money"
+        return None
+
+    return None
+
+
+def ast_is_ref_like(node) -> bool:
+    if node.kind == "ref":
+        return True
+    if node.kind == "prefix" and node.name in ("+", "-") and len(node.args) == 1:
+        return ast_is_ref_like(node.args[0])
+    if node.kind == "infix" and node.name in ("*", "/") and len(node.args) == 2:
+        left, right = node.args
+        pairs = [(left, right)]
+        if node.name == "*":
+            pairs.append((right, left))
+        for ref_node, const_node in pairs:
+            if not (
+                ast_is_ref_like(ref_node)
+                and const_node.kind == "const"
+                and const_node.name == "number"
+            ):
+                continue
+            try:
+                if abs(float(const_node.shape)) in BORING_METHOD_LITERALS:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def structural_reason(profile: dict) -> str | None:
+    """Structural/definitional plumbing is not custom finance logic."""
+    ast = profile.get("ast")
+    if ast is None:
+        return None
+    if ast_is_ref_like(ast):
+        return "link_sign_or_unit_scale"
+    funcs = set(profile.get("functions", []))
+    ops = set(profile.get("operators", []))
+    if funcs <= {"SUM"} and ops <= {"+", "-"}:
+        return "component_aggregation"
+    if not funcs and ops and ops <= {"+", "-"}:
+        return "composition_or_rollforward"
+    label = (profile.get("label") or "").lower()
+    if not (funcs & {"IF", "IFS", "IFERROR", "CHOOSE", "SWITCH", "LOOKUP", "XLOOKUP"}) and any(
+        token in label for token in ("/revenue", "% of ", " margin", " ratio")
+    ):
+        return "ratio_or_assumption_row"
+    return None
+
+
+def nonboring_numbers(profile: dict) -> list[float]:
+    return [
+        number for number in profile.get("numbers", [])
+        if number not in BORING_METHOD_LITERALS
+        and -number not in BORING_METHOD_LITERALS
+    ]
+
+
+def confident_custom_reason(entry_id: str, profile: dict) -> str | None:
+    """Positive evidence that a no-match is genuinely out of catalogue.
+
+    Merely failing a signature is uncertainty, not custom logic. Claiming the
+    band requires a branch, a load-bearing literal, or a role-specific alternate
+    driver/predicate that the catalogue explicitly excludes.
+    """
+    funcs = set(profile.get("functions", []))
+    numbers = nonboring_numbers(profile)
+    if funcs & {"IF", "IFS", "IFERROR", "CHOOSE", "SWITCH", "LOOKUP", "XLOOKUP"}:
+        return "out_of_catalogue_branch"
+    if numbers:
+        return "embedded_threshold_or_parameter"
+
+    if entry_id == "method_depreciation":
+        if profile_has_all(
+            profile,
+            (r"revenue", r"sales"),
+            (r"depreciat", r"capex", r"amorti[sz]"),
+        ) and not profile_has_label(profile, r"\blife\b", r"useful"):
+            return "alternate_revenue_driver"
+
+    if entry_id == "method_interest":
+        if profile_has_label(profile, r"revenue", r"sales") and not profile_has_label(
+            profile, r"balance", r"debt", r"cash", r"loan", r"principal"
+        ):
+            return "alternate_revenue_driver"
+
+    if entry_id == "method_tax":
+        if "MAX" in funcs or "MIN" in funcs:
+            return "uncatalogued_tax_clamp"
+
+    if entry_id == "method_revenue":
+        growth_rows = [
+            label for label in profile.get("reference_labels", [])
+            if re.search(r"growth|inflation|uplift", label, re.I)
+        ]
+        if len(growth_rows) > 1:
+            return "multiple_growth_drivers"
+
+    if entry_id == "method_operating_expense":
+        if "SUM" in funcs and ("*" in set(profile.get("operators", [])) or "/" in set(profile.get("operators", []))):
+            return "cumulative_base_escalation"
+        if funcs & {"MAX", "MIN"}:
+            return "uncatalogued_floor_or_cap"
+        growth_rows = [
+            label for label in profile.get("reference_labels", [])
+            if re.search(r"growth|inflation|uplift|escalat", label, re.I)
+        ]
+        if len(growth_rows) > 1:
+            return "multiple_growth_drivers"
+
+    if entry_id == "method_working_capital":
+        own = (profile.get("label") or "").lower()
+        refs = " / ".join(profile.get("reference_labels", [])).lower()
+        if "payable" in own and "revenue" in refs:
+            return "nonstandard_payables_driver"
+        if references_same_row(profile):
+            return "recursive_working_capital_rule"
+
+    if entry_id == "method_capex":
+        if len(profile.get("reference_labels", [])) > 2:
+            return "item_driver_build"
+
+    if entry_id == "method_debt_movement":
+        if profile.get("operators") and len(profile.get("references", [])) > 2:
+            return "uncatalogued_debt_waterfall"
+
+    if entry_id == "method_discounting":
+        if "AVERAGE" in funcs or profile_has_label(profile, r"ebitda", r"multiple"):
+            return "uncatalogued_valuation_basis"
+
+    if entry_id == "method_returns":
+        if "^" in set(profile.get("operators", [])):
+            return "uncatalogued_annualisation"
+
+    return None
+
+
+def describe_ref(gold: Book, raw: str, sheet: str, own_label: str) -> str:
+    refs = refs_in("=" + raw, sheet)
+    if len(refs) == 1:
+        value = gold.value.get(refs[0])
+        if (
+            refs[0] not in gold.formula
+            and isinstance(value, str)
+            and value.strip()
+        ):
+            return f"cell {pretty(refs[0])} containing {q(value.strip())}"
+    labels = []
+    for ref in refs:
+        label = gold.row_label(ref)
+        if label and label not in labels:
+            labels.append(label)
+    if refs:
+        if len(refs) == 1 and ":" not in raw:
+            location = "cell " + pretty(refs[0])
+        else:
+            first_sheet, first_coord = pretty(refs[0]).rsplit("!", 1)
+            _, last_coord = pretty(refs[-1]).rsplit("!", 1)
+            location = f"range {first_sheet}!{first_coord}:{last_coord}"
+        if labels:
+            named = [q(label) for label in labels]
+            label_text = named[0] if len(named) == 1 else ", ".join(named[:-1]) + " and " + named[-1]
+            noun = "row" if len(named) == 1 else "rows"
+            return f"{location} on the {noun} labelled {label_text}"
+        return location
+    return f'the named range {q(raw)}'
+
+
+def describe_ast(node, gold: Book, sheet: str, own_label: str) -> str:
+    """Render a parsed Excel AST as deterministic English, never formula text."""
+    kind = node.kind
+    if kind == "ref":
+        return describe_ref(gold, node.name, sheet, own_label)
+    if kind == "const":
+        if node.name == "text":
+            if node.shape == "":
+                return "leave the cell blank"
+            return q(str(node.shape))
+        if node.name == "logical":
+            return "true" if node.shape else "false"
+        return str(node.value)
+    if kind == "missing":
+        return "a blank value"
+    args = [describe_ast(arg, gold, sheet, own_label) for arg in node.args]
+    if kind == "prefix":
+        return f"take the negative of ({args[0]})" if node.name == "-" else args[0]
+    if kind == "postfix":
+        return f"{args[0]} percent" if node.name == "%" else args[0]
+    if kind == "infix" and len(args) == 2:
+        words = {
+            "+": "add ({a}) and ({b})",
+            "-": "subtract ({b}) from ({a})",
+            "*": "multiply ({a}) by ({b})",
+            "/": "divide ({a}) by ({b})",
+            "^": "raise ({a}) to the power ({b})",
+            "=": "({a}) equals ({b})",
+            "<>": "({a}) does not equal ({b})",
+            ">": "({a}) is greater than ({b})",
+            "<": "({a}) is less than ({b})",
+            ">=": "({a}) is at least ({b})",
+            "<=": "({a}) is at most ({b})",
+            "&": "join ({a}) with ({b})",
+        }
+        return words.get(node.name, "combine ({a}) with ({b})").format(a=args[0], b=args[1])
+    if kind == "func":
+        name = node.name.upper()
+        if name == "IF" and len(args) >= 3:
+            return f"when ({args[0]}) is true, use ({args[1]}); otherwise use ({args[2]})"
+        if name == "IF" and len(args) == 2:
+            return f"when ({args[0]}) is true, use ({args[1]}); otherwise use FALSE"
+        if name == "IFERROR" and len(args) >= 2:
+            return f"use ({args[0]}), or use ({args[1]}) if that calculation errors"
+        if name == "MAX":
+            return "take the greater of " + " and ".join(f"({arg})" for arg in args)
+        if name == "MIN":
+            return "take the lesser of " + " and ".join(f"({arg})" for arg in args)
+        if name == "AVERAGE":
+            return "take the mean of " + " and ".join(f"({arg})" for arg in args)
+        if name == "SUM":
+            return "add " + " and ".join(f"({arg})" for arg in args)
+        if name == "CHOOSE" and len(args) >= 2:
+            options = "; ".join(
+                f"option {index}: ({value})" for index, value in enumerate(args[1:], 1)
+            )
+            return f"use ({args[0]}) as the option number, then choose {options}"
+        if name == "MROUND" and len(args) >= 2:
+            return f"round ({args[0]}) to the nearest multiple of ({args[1]})"
+        if name == "SUMPRODUCT":
+            return "sum the products of corresponding values in " + " and ".join(
+                f"({arg})" for arg in args
+            )
+        if name == "SUMIFS" and len(args) >= 3:
+            pairs = [
+                f"({args[index]}) matches ({args[index + 1]})"
+                for index in range(1, len(args) - 1, 2)
+            ]
+            return f"total the values in ({args[0]}) where " + " and ".join(pairs)
+        if name == "SUMIF" and len(args) >= 2:
+            summed = args[2] if len(args) >= 3 else args[0]
+            return f"total the values in ({summed}) where ({args[0]}) matches ({args[1]})"
+        if name == "AND":
+            return " and ".join(args)
+        if name == "OR":
+            return " or ".join(args)
+        if name in ("NPV", "XNPV", "IRR", "XIRR"):
+            return f"the {name.lower()} of " + ", ".join(args)
+        return f"{name.lower()} applied to " + ", ".join(args)
+    if kind in ("union", "array"):
+        return ", ".join(args)
+    return " then ".join(args)
+
+
+def custom_sentence_fields(profile: dict, gold: Book) -> dict:
+    cells = profile.get("cells") or []
+    sheet = cells[0].split("!", 1)[0] if cells else ""
+    ast = profile.get("ast")
+    steps = describe_ast(ast, gold, sheet, profile.get("label", "")) if ast is not None else ""
+    reference_renderings = [
+        describe_ref(gold, raw, sheet, profile.get("label", ""))
+        for raw in profile.get("raw_references", [])
+    ]
+    coverage_complete = all(rendered in steps for rendered in reference_renderings)
+    coverage_complete = coverage_complete and all(
+        rendered in steps for rendered in profile.get("literal_renderings", [])
+    )
+    band = profile.get("band") or compact_cells([pretty(c) for c in cells])
+    representative = pretty(profile.get("representative_cell")) if profile.get("representative_cell") else band
+    return {
+        "label": q(profile.get("label", "")),
+        "band": band,
+        "representative": representative,
+        "steps": steps,
+        "_coverage_complete": coverage_complete,
+    }
+
+
+def detect_custom_methods(gold: Book, delivered: Book, bands: list[dict], targets: set[str]):
+    """Run before convention detectors; only confident no-matches claim a band."""
+    records, assessments, claimed = [], [], set()
+    prepared = []
+    for original in bands:
+        for band in method_subbands(gold, original):
+            label = band.get("label") or ""
+            if not label:
+                assessments.append({
+                    "band": band.get("band"),
+                    "cells": band.get("cells", []),
+                    "cell_keys": band.get("cell_keys", []),
+                    "label": "",
+                    "roles": [],
+                    "status": "unclassified",
+                    "reason": "blank_target_label",
+                })
+                continue
+            roles, role_context = method_roles_for_band(gold, band)
+            prepared.append({
+                "band": band,
+                "label": label,
+                "roles": roles,
+                "role_context": role_context,
+            })
+
+    # Propagate a role across nearby rows only when the copied formula shape is
+    # identical. This covers blocks labelled Acq. 1 ... Acq. 6 where only the
+    # block header carries the finance meaning. It cannot override a direct role.
+    for item in prepared:
+        if item["roles"]:
+            continue
+        band = item["band"]
+        nearby_roles = {
+            other["roles"][0]
+            for other in prepared
+            if len(other["roles"]) == 1
+            and other["band"].get("sheet") == band.get("sheet")
+            and other["band"].get("pattern") == band.get("pattern")
+            and abs(int(other["band"].get("row", 0)) - int(band.get("row", 0))) <= 6
+        }
+        if len(nearby_roles) == 1:
+            item["roles"] = list(nearby_roles)
+            item["role_context"] = item["role_context"] + ["role propagated from same-shape neighboring row"]
+
+    for item in prepared:
+        band = item["band"]
+        label = item["label"]
+        roles = item["roles"]
+        role_context = item["role_context"]
+        base = {
+            "band": band.get("band"),
+            "cells": band.get("cells", []),
+            "cell_keys": band.get("cell_keys", []),
+            "label": label,
+            "roles": roles,
+            "role_context": role_context,
+        }
+        if len(roles) != 1:
+            if roles:
+                assessments.append({
+                    **base, "status": "unclassified", "reason": "ambiguous_role"
+                })
+            else:
+                assessments.append({
+                    **base, "status": "unclassified", "reason": "no_method_role"
+                })
+            continue
+        entry_id = roles[0]
+        profile = formula_profile(gold, band)
+        if not profile.get("complete"):
+            assessments.append({
+                **base, "entry": entry_id, "status": "unclassified",
+                "reason": profile.get("error", "profile_incomplete"),
+            })
+            continue
+        variant = catalog_signature(entry_id, profile)
+        if variant:
+            assessments.append({
+                **base, "entry": entry_id, "status": "standard",
+                "variant": variant,
+            })
+            continue
+        plumbing = structural_reason(profile)
+        if plumbing:
+            assessments.append({
+                **base, "entry": entry_id, "status": "structural",
+                "reason": plumbing,
+            })
+            continue
+        custom_reason = confident_custom_reason(entry_id, profile)
+        if not custom_reason:
+            assessments.append({
+                **base, "entry": entry_id, "status": "unclassified",
+                "reason": "no_catalogue_match_but_no_positive_custom_signal",
+            })
+            continue
+        fields = custom_sentence_fields(profile, gold)
+        coverage_complete = bool(fields.pop("_coverage_complete", False))
+        rec = record(
+            entry_id,
+            "out_of_catalogue",
+            band.get("cell_keys", []),
+            profile["formula"],
+            registry().get(entry_id, {}).get("alternatives", []),
+            f"Out-of-catalogue {entry_id} method on row {label!r}.",
+            fields=fields,
+        )
+        rec.update({
+            "source": "custom_method_detector",
+            "custom_reason": custom_reason,
+            "coverage_complete": coverage_complete,
+            "method_profile": {
+                k: v for k, v in profile.items()
+                if k not in ("ast",)
+            },
+        })
+        records.append(rec)
+        claimed.update(rec.get("cell_keys", []))
+        assessments.append({
+            **base, "entry": entry_id, "status": "out_of_catalogue",
+            "reason": custom_reason,
+        })
+    return records, assessments, claimed
+
+
+def calibrate_legacy_custom(task_dir: Path, assessments: list[dict], selected: set[str]) -> dict:
+    """Compare deterministic outcomes with old custom_logic band labels.
+
+    The old prose is never imported. It is a labelled coverage set only, and is
+    deliberately not treated as a correctness oracle because 0523 proved it can
+    be wrong.
+    """
+    path = task_dir / "tests" / "formula_hints.json"
+    if not path.exists():
+        return {"bands": 0, "outcomes": {}}
+    hints = json.loads(path.read_text(encoding="utf-8")).get("hints", [])
+    old = [
+        band
+        for hint in hints
+        if "custom_logic" in hint.get("classes", [])
+        for band in hint.get("bands", [])
+    ]
+    rows = []
+    for band in old:
+        cells = cells_from_band_ref(band)
+        overlaps = [
+            a for a in assessments
+            if cells & set(a.get("cell_keys", []))
+        ]
+        statuses = sorted({a.get("status", "unknown") for a in overlaps})
+        if not (cells & selected):
+            outcome = "not_selected"
+        elif "out_of_catalogue" in statuses:
+            outcome = "out_of_catalogue"
+        elif "standard" in statuses:
+            outcome = "standard"
+        elif "structural" in statuses:
+            outcome = "structural"
+        elif "unclassified" in statuses:
+            outcome = "unclassified"
+        else:
+            outcome = "missed"
+        rows.append({"band": band, "outcome": outcome, "statuses": statuses})
+    return {
+        "bands": len(old),
+        "outcomes": dict(Counter(row["outcome"] for row in rows)),
+        "details": rows,
+    }
 
 
 # --------------------------------------------------------------------------- detectors
@@ -636,7 +1511,7 @@ def detect_npv_timing(gold: Book, scope: set[str]) -> list[dict]:
 
 
 def q(text: str) -> str:
-    return '"%s"' % text
+    return '"%s"' % str(text).replace('"', "'")
 
 
 def ingredient_phrase(gold: Book, evidence: str, cells: list[str], own_label: str = "") -> str:
@@ -997,7 +1872,11 @@ def registry() -> dict:
                 fields[current] = m.group(2).strip()
             elif current and line.startswith("  "):
                 fields[current] += "\n" + line.strip()
-        alts = [a.strip(" `") for a in fields.get("alternatives", "").split("|") if a.strip()]
+        alts = [
+            " ".join(a.split()).strip(" `")
+            for a in fields.get("alternatives", "").split("|")
+            if a.strip()
+        ]
         sentences = {
             (m.group(1) or m.group(2) or "").strip(): " ".join(m.group(3).split())
             for m in SENTENCE_RE.finditer(fields.get("sentence", ""))
@@ -1016,12 +1895,29 @@ def registry_always_ships(entry_id: str) -> bool:
 
 
 def check_registry_drift(detector_entries: set[str]) -> list[str]:
-    """Every detector must name a real entry; every conditional entry needs a predicate."""
+    """Prove detector -> registry and registry -> detector coverage."""
     known = set(registry())
     faults = [f"detector emits `{e}` with no registry entry" for e in sorted(detector_entries - known)]
+    expected = CONVENTION_ENTRY_IDS | METHOD_ENTRY_IDS
+    faults.extend(
+        f"registry entry `{entry_id}` has no detector mapping"
+        for entry_id in sorted(known - expected)
+    )
+    faults.extend(
+        f"detector mapping `{entry_id}` has no registry entry"
+        for entry_id in sorted(expected - known)
+    )
     for entry_id in sorted(detector_entries & known):
         if not registry_always_ships(entry_id) and entry_id not in SHIP_WHEN:
             faults.append(f"entry `{entry_id}` has a conditional Ship when but no predicate")
+    for entry_id in sorted(METHOD_ENTRY_IDS):
+        if entry_id not in SHIP_WHEN:
+            faults.append(f"method entry `{entry_id}` has no shared Ship when predicate")
+        entry = registry().get(entry_id, {})
+        if "out_of_catalogue" not in entry.get("alternatives", []):
+            faults.append(f"method entry `{entry_id}` has no out_of_catalogue alternative")
+        if "out_of_catalogue" not in entry.get("sentences", {}):
+            faults.append(f"method entry `{entry_id}` has no out_of_catalogue sentence")
     return faults
 
 
@@ -1126,6 +2022,31 @@ def ship_not_a_target(rec: dict, ctx: dict) -> bool:
     return not any(c in ctx["targets"] for c in rec.get("cell_keys") or [])
 
 
+def ship_custom_method(rec: dict, ctx: dict) -> bool:
+    """Shared gate for every out-of-catalogue method record.
+
+    Thresholds, long ingredient lists, mixed source bands, constants, and full
+    operator sequences are intentionally not decline reasons. They are rendered
+    deterministically and then audited. Only direct answer disclosure or a
+    sentence the parser could not build stops the record.
+    """
+    if any(c in ctx["targets"] for c in rec.get("cell_keys") or []):
+        rec["declined_reason"] = "method band is itself graded"
+        return False
+    referenced = set((rec.get("method_profile") or {}).get("references", []))
+    if referenced & ctx["targets"]:
+        rec["declined_reason"] = "method sentence would name another graded target"
+        return False
+    fields = rec.get("fields") or {}
+    if not fields.get("label") or not fields.get("steps"):
+        rec["declined_reason"] = "method sentence fields are incomplete"
+        return False
+    if not rec.get("coverage_complete"):
+        rec["declined_reason"] = "method sentence does not cover every reference and literal"
+        return False
+    return True
+
+
 def _origin(rec: dict):
     cells = rec.get("cell_keys") or []
     if not cells:
@@ -1140,6 +2061,7 @@ SHIP_WHEN = {
     "source_selection": ship_source_selection,
     "npv_timing": ship_not_a_target,
     "aggregate_scope": ship_not_a_target,
+    **{entry_id: ship_custom_method for entry_id in METHOD_ENTRY_IDS},
 }
 
 
@@ -1162,7 +2084,7 @@ def apply_ship_when(records: list[dict], ctx: dict) -> list[dict]:
         predicate = SHIP_WHEN.get(entry_id)
         if predicate is not None and not predicate(rec, ctx):
             rec["disposition"] = "suppressed"
-            rec["declined_reason"] = "Ship when declined for this band"
+            rec.setdefault("declined_reason", "Ship when declined for this band")
             continue
         rec["disposition"] = "disclosed"
     return records
@@ -1207,7 +2129,7 @@ def record(family, value, cells, evidence, alternatives, note, row_ref=None, fie
         "alternatives": alternatives,
         # Set by apply_ship_when once the registry has been consulted.
         "disposition": "pending",
-        "source": "detector",
+        "source": "convention_detector",
         "evidence": evidence,
         "note": note,
         "fields": fields or {},
@@ -1316,7 +2238,17 @@ def detect_records(args) -> dict:
     delivered = Book(Path(selection["delivered"]))
     scope = selected_keys(selection)
     targets = selection["target_keys"]
-    records = []
+    target_set = set(targets)
+
+    # Custom methods get first claim. Standard, ambiguous and uncertain
+    # assessments remain reviewer-visible but do not claim the band, so the
+    # convention detectors still get their normal chance.
+    method_records, method_assessments, custom_claimed = detect_custom_methods(
+        gold, delivered, selection.get("bands", []), target_set
+    )
+    custom_calibration = calibrate_legacy_custom(task_dir, method_assessments, scope)
+    convention_scope = scope - custom_claimed
+    convention_records = []
     for fn in (
         detect_discount_period,
         detect_inert_line,
@@ -1325,10 +2257,17 @@ def detect_records(args) -> dict:
         detect_stake_scaling,
         detect_source_selection,
     ):
-        records.extend(fn(gold, scope))
-    records.extend(detect_projection_rule(gold, delivered, scope))
-    records.extend(detect_row_populated(gold, delivered, scope, targets))
-    records.extend(detect_aggregate_scope(gold, delivered, targets))
+        convention_records.extend(fn(gold, convention_scope))
+    convention_records.extend(detect_projection_rule(gold, delivered, convention_scope))
+    convention_records.extend(detect_row_populated(
+        gold, delivered, convention_scope, targets
+    ))
+    convention_records.extend(detect_aggregate_scope(gold, delivered, targets))
+    convention_records = [
+        rec for rec in convention_records
+        if not (set(rec.get("cell_keys", [])) & custom_claimed)
+    ]
+    records = method_records + convention_records
 
     unique = []
     seen = set()
@@ -1341,10 +2280,8 @@ def detect_records(args) -> dict:
         unique.append(rec)
         claimed_keys.update(rec.get("cell_keys", []))
 
-    unique.extend(import_legacy_method_records(task_dir, delivered, claimed_keys))
     defects = detect_defects(gold, targets, scope)
 
-    target_set = set(targets)
     for rec in unique:
         rec["leak_flag"] = any(c in target_set for c in rec.get("cell_keys", []))
 
@@ -1367,6 +2304,8 @@ def detect_records(args) -> dict:
         "schema_version": "2.0",
         "task": task_dir.name,
         "records": sorted(unique, key=lambda r: (r["disposition"], r["family"], r["band"] or "")),
+        "method_assessments": method_assessments,
+        "custom_calibration": custom_calibration,
         "defects": defects,
         "summary": {
             "records": len(unique),
@@ -1379,6 +2318,11 @@ def detect_records(args) -> dict:
             "claimed_selected_cells": len(scope & claimed),
             "unexplained_cells": len(scope - claimed),
             "leak_flags": sum(1 for r in unique if r.get("leak_flag")),
+            "method_assessments": dict(Counter(
+                a.get("status", "unknown") for a in method_assessments
+            )),
+            "custom_claimed_cells": len(custom_claimed),
+            "legacy_custom_calibration": custom_calibration.get("outcomes", {}),
         },
     }
     return payload
@@ -1587,10 +2531,10 @@ def audit_text(section: str, task_dir: Path) -> list[str]:
         except ValueError:
             continue
         for target in targets:
-            # Small round integers collide with ordinary prose by accident. The
-            # old floor of 10000 was far too generous - graded targets of 420 and
-            # 1195 sat under it.
-            if float(target).is_integer() and abs(target) < 100:
+            # Zero/one are control literals in branches and collide with zero
+            # checks or boolean targets by accident. Larger integers receive the
+            # normal answer-collision audit.
+            if float(target).is_integer() and abs(target) <= 1:
                 continue
             if abs(val - target) <= 1e-12 * max(1.0, abs(target)):
                 faults.append(f"numeric literal {raw} matches target {target}")
@@ -1682,6 +2626,52 @@ def verify_task(task_dir: Path) -> dict:
             faults.append(f"stale agent-facing section remains: {heading}")
     if SECTION_START in text:
         section = SECTION_START + text.split(SECTION_START, 1)[1].split("\n## Output", 1)[0]
+    custom = [
+        r for r in payload.get("records", [])
+        if r.get("source") == "custom_method_detector"
+        and r.get("disposition") == "disclosed"
+        and not r.get("leak_flag")
+    ]
+    convention_cells = {
+        c for r in payload.get("records", [])
+        if r.get("source") == "convention_detector"
+        for c in r.get("cell_keys", [])
+    }
+    overlap = sorted({
+        c for r in custom for c in r.get("cell_keys", []) if c in convention_cells
+    })
+    if overlap:
+        faults.append(f"custom and convention records overlap on {len(overlap)} cell(s)")
+    missing_render = []
+    for rec in custom:
+        sentence = render_sentence(rec)
+        cells_text = compact_cells(rec.get("cells", []))
+        if not sentence or sentence not in section or cells_text not in section:
+            missing_render.append(rec.get("band"))
+        if not rec.get("coverage_complete"):
+            faults.append(f"custom record lacks AST coverage proof: {rec.get('band')}")
+    if missing_render:
+        faults.append(f"{len(missing_render)} custom record(s) did not render: {missing_render[:5]}")
+
+    if custom:
+        try:
+            gold = Book(find_golden(task_dir))
+            structural = []
+            for rec in custom:
+                profile = formula_profile(gold, {
+                    "band": rec.get("band"),
+                    "cell_keys": rec.get("cell_keys", []),
+                    "label": (rec.get("method_profile") or {}).get("label", ""),
+                    "pattern": (rec.get("method_profile") or {}).get("pattern", ""),
+                })
+                if profile.get("complete") and structural_reason(profile):
+                    structural.append(rec.get("band"))
+            if structural:
+                faults.append(
+                    f"{len(structural)} custom record(s) are hard structural: {structural[:5]}"
+                )
+        except Exception as exc:
+            faults.append(f"custom structural verification failed: {exc}")
     faults.extend(audit_text(section, task_dir))
     return {"task": task_dir.name, "passed": not faults, "faults": faults}
 

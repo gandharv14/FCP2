@@ -9,14 +9,17 @@ This skill writes the one agent-facing disclosure section for a workbook rebuild
 It replaces the custom-formula gate's post-run hint flow and the workbook conventions
 manifest's separate writer.
 
-## Rule
+## The three filters
 
-Only disclose a decision when all three are true:
+1. **Registry matching.** Custom methods run first: role from the row label, then formula
+   comparison against that role's catalogue variants. A confident out-of-catalogue match
+   claims the band; standard or uncertain formulas pass to the convention detectors.
+2. **`Ship when`.** The matched registry entry decides whether this band may be disclosed here.
+3. **Rendering and audit.** The same deterministic registry templates, writer, leak audit, and
+   verifier handle convention and custom-method records.
 
-1. A graded answer reads the cell in the golden workbook.
-2. The delivered workbook leaves that cell blank.
-3. A plausible alternative would move a graded answer, or the current evaluator cannot prove
-   otherwise.
+There is no model call. Custom prose is a deterministic English rendering of the parsed formula
+AST, including every reference, literal, branch, and operation.
 
 ## Workflow
 
@@ -54,6 +57,9 @@ Each stage writes to `runs/disclosure/<task>/`:
 - `verify.json`
 - `migration-summary.json`
 
+`records.json` carries `method_assessments` for every confidently roled band and
+`custom_calibration` against the old `custom_logic` band labels. The old prose is never reused.
+
 The writer creates two task artifacts:
 
 - `tests/disclosure.json`: reviewer copy with evidence and audit details.
@@ -68,11 +74,14 @@ The writer creates two task artifacts:
 - No agent-facing line contains a formula-shaped expression.
 - No numeric literal in the disclosure matches a graded target within tolerance.
 - No record names a graded target unless it is explicitly marked as accepted.
+- Every custom sentence covers every parsed reference and literal.
+- No custom and convention record claim the same cell.
 
 Layer-3 faithfulness review is intentionally separate: launch a fresh reviewer that did not
 write the disclosure and ask whether each bullet is true of the golden and safe for the agent.
 
 ## Taxonomy
 
-Read [TAXONOMY.md](TAXONOMY.md) before changing the detectors or writer.
+Read [TAXONOMY.md](TAXONOMY.md) for record labels and [REGISTRY.md](REGISTRY.md) for every
+permitted convention, method, `Ship when`, and sentence template.
 

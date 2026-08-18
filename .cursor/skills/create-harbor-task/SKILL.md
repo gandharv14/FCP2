@@ -1,6 +1,6 @@
 ---
 name: create-harbor-task
-description: Creates fail-closed MCP-backed Harbor workbook tasks. Use when asked to create or rebuild a Harbor task, package an .xlsx or workbook id, generate variable-source MCP inputs, or promote a tasks_outputs bundle.
+description: Creates fail-closed MCP-backed Harbor workbook tasks with unified pre-run task disclosure. Use when asked to create or rebuild a Harbor task, package an .xlsx or workbook id, generate variable-source MCP inputs, or promote a tasks_outputs bundle.
 disable-model-invocation: true
 ---
 
@@ -34,10 +34,11 @@ MCP="$RUN/mcp"
 STAGE_ROOT=tasks_outputs_mcp
 STAGED="$STAGE_ROOT/$WB-outputs"
 TASK="tasks_outputs/$WB-outputs"
+DISCLOSURE=.cursor/skills/task-disclosure/scripts/disclose.py
+DISCLOSURE_RUN="runs/disclosure/$WB-outputs"
 ```
 
 Expected artifacts:
-
 - `ast_out/$WB/{nodes.csv,edges.csv}`
 - `seg_out/$WB/{segments.json,curation.toml,lineage.json}`
 - `inputs_out/$WB-inputs.xlsx`: unredacted baseline inputs
@@ -47,6 +48,10 @@ Expected artifacts:
 - `mcp/{runtime,eval,server.py,Dockerfile,mask_cells.json,masked_inputs.json}`
 - `inputs_out_mcp/$WB-inputs.xlsx`: separately MCP-masked inputs
 - `tasks_outputs_mcp/$WB-outputs/`: staged bundle
+- `runs/disclosure/$WB-outputs/{bands,probe,records,context,verify}.json` and
+  `runs/$WB-variable-sources/disclosure-faithfulness.md`
+- `tasks_outputs_mcp/$WB-outputs/tests/disclosure.json`
+- one deterministic `## Workbook disclosure` section in staged `instruction.md`
 - `runs/$WB-variable-sources/oracle-report.json`
 
 For multiple requested workbooks, complete all gates serially. Do not share a
@@ -68,9 +73,20 @@ Stage all requested workbooks before promoting any of them.
 - Missing profile skill, unresolved draft rows, partial masking, source-profile
   validation failure, MCP failure, oracle failure, or grader failure is a
   blocker. Retain diagnostics and leave the current task untouched.
+- Missing task-disclosure skill, registry drift, disclosure audit failure,
+  mechanical verification failure, or blocking fresh-review finding is a
+  blocker. Never package the old custom-formula hint and conventions sections
+  as a fallback.
 - Never place the golden workbook, `eval/`, normalized specs, profile captures,
   snapshots, answer values, or source audit working files in `environment/`.
 
+## Disclosure integration
+`task-disclosure` is a **pre-run build gate**. Run it after `xl_output_task.py`
+creates the staged bundle, so it compares the golden against the exact
+MCP-masked workbook and updates the exact instruction that will ship. Run it
+before oracle, grader, and promotion. Custom methods run first, conventions
+check the residue, and both share one deterministic registry gate, writer,
+audit, and verifier. No Harbor rollout is used.
 ## Workflow
 
 ### 1. Preflight and AST
@@ -328,7 +344,37 @@ compose sidecar, extended timeout, research instructions, audit metadata, and
 `tests/masked_inputs.json`. Absence of any MCP artifact is failure; never rerun
 without `--mcp`.
 
-### 12. Run generalized HTTP oracle
+### 12. Build and verify unified task disclosure
+
+Run against the staged bundle and golden. Pass the AST root to `select`; later
+commands consume its staged artifacts.
+
+```bash
+test -f "$DISCLOSURE"
+python3 "$DISCLOSURE" select \
+  --task-dir "$STAGED" \
+  --golden "$SOURCE/$WB.xlsx" \
+  --ast-dir "$AST_ROOT"
+python3 "$DISCLOSURE" probe  --task-dir "$STAGED"
+python3 "$DISCLOSURE" detect --task-dir "$STAGED"
+python3 "$DISCLOSURE" context --task-dir "$STAGED"
+python3 "$DISCLOSURE" write  --task-dir "$STAGED"
+python3 "$DISCLOSURE" verify --task-dir "$STAGED"
+test -f "$DISCLOSURE_RUN/bands.json" &&
+  test -f "$DISCLOSURE_RUN/records.json" &&
+  test -f "$DISCLOSURE_RUN/verify.json" &&
+  test -f "$STAGED/tests/disclosure.json"
+rg -q '^## Workbook disclosure$' "$STAGED/instruction.md"
+```
+
+Require verification without `--force` or `--no-fail`, no old hint/manifest
+sections, and no formulas/evidence in the agent-facing instruction. Then launch
+a fresh reviewer with the golden, delivered workbook, staged instruction, and
+`tests/disclosure.json`. It must check every sentence against the golden and
+fail on false, incomplete, ambiguous, answer-leaking, or formula-like wording.
+Save `"$RUN/disclosure-faithfulness.md"` and stop on a blocking finding.
+
+### 13. Run generalized HTTP oracle
 
 Use the reusable oracle, not a workbook-specific script:
 
@@ -370,7 +416,7 @@ ship. Use an explicit reviewed allowlist only for legitimate unavoidable
 duplicates; unknown, duplicate, and unused entries fail rather than becoming
 report-only warnings.
 
-### 13. Smoke the exact-answer grader
+### 14. Smoke the exact-answer grader
 
 Use the staged answer key only in a verifier workspace and require discrete
 (exact-within-tolerance) score `1.0`:
@@ -399,7 +445,7 @@ print("exact-answer grader score: 1.0")
 PY
 ```
 
-### 14. Promote only after every gate passes
+### 15. Promote only after every gate passes
 
 If a requested set contains multiple workbooks, wait until every staged bundle
 passes before promoting the set. Promotion uses same-filesystem renames and
@@ -443,6 +489,9 @@ Report, per workbook:
 - maskability report path; `cells`, `extra_cells`, and total masked-cell counts
 - normalized spec, exclusions, profiles, and MCP paths; deterministic comparison
   and MCP validation/smoke summaries
+- disclosure run path; custom/convention disclosed, suppressed, standard, and
+  unclassified counts; mechanical verdict; fresh faithfulness-review path and
+  verdict
 - staged path, oracle report and result, exact grader score, final promoted path,
   previous-bundle backup path, and any retained diagnostics
 

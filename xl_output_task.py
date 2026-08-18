@@ -41,6 +41,10 @@ from xl_variable_source_audit import (
     DEFAULT_MODEL as DEFAULT_AUDIT_MODEL,
     generate_audit,
 )
+from xl_formula_hint_tasks import (
+    load_formula_artifacts,
+    render_section as render_custom_formula_section,
+)
 
 PIPELINE_VERSION = "1.0.0"
 TIMEOUT_BASE_SEC = 2400.0
@@ -498,6 +502,16 @@ round, rescale or convert percentages.
        hints_text, answer_example(targets), n_cells)
 
 
+def add_custom_formula_hints(instruction, spec):
+    section = render_custom_formula_section(spec)
+    if not section:
+        return instruction
+    marker = "\n## Output\n"
+    if marker not in instruction:
+        raise ValueError("generated instruction has no Output heading")
+    return instruction.replace(marker, "\n" + section + "## Output\n", 1)
+
+
 TIMEOUT_PER_MCP_VARIABLE_SEC = 15.0
 
 
@@ -513,7 +527,8 @@ def mcp_variable_count(mcp_dir):
 
 
 def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
-         nat_meta, hints=None, hint_style="", mcp_dir=None, audit_meta=None):
+         nat_meta, hints=None, hint_style="", mcp_dir=None, audit_meta=None,
+         formula_report=None, formula_hints=None):
     if out_dir.exists():
         shutil.rmtree(out_dir)
     (out_dir / "environment").mkdir(parents=True)
@@ -592,6 +607,14 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
                 (mcp_dir / "mask_cells.json").read_text(encoding="utf-8")
             ).__len__(),
         })
+    if formula_report is not None:
+        metadata.update({
+            "custom_formula_gate_model":
+                formula_report["generator"]["model"],
+            "custom_formula_gate_verdict": formula_report["verdict"],
+            "custom_formula_hint_groups":
+                len((formula_hints or {}).get("hints") or []),
+        })
 
     sections = [
         'schema_version = "1.4"',
@@ -661,6 +684,10 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
     if hints:
         with open(out_dir / "tests" / "hints.json", "w", encoding="utf-8") as fh:
             json.dump(hints, fh, indent=1)
+    if formula_hints is not None:
+        with open(out_dir / "tests" / "formula_hints.json",
+                  "w", encoding="utf-8") as fh:
+            json.dump(formula_hints, fh, indent=2)
     if mcp_dir is not None:
         # Audit map of masked inputs and their MCP evidence. tests/ is mounted
         # only at verification time, so like answer_key.json it never reaches
@@ -716,10 +743,37 @@ def main(argv=None):
              "inputs workbook must have been masked with the bundle's "
              "mask_cells.json.",
     )
+    parser.add_argument(
+        "--custom-formula-context",
+        default="",
+        help="extracted formula context paired with the Terra report and hints",
+    )
+    parser.add_argument(
+        "--custom-formula-report",
+        default="",
+        help="validated GPT-5.6 Terra custom-formula report for this workbook",
+    )
+    parser.add_argument(
+        "--custom-formula-hints",
+        default="",
+        help="validated method-only hint spec paired with --custom-formula-report",
+    )
     parser.add_argument("-o", "--out", default="tasks_outputs")
     args = parser.parse_args(argv)
     if args.hints and args.semantic_hints:
         parser.error("--hints and --semantic-hints are mutually exclusive")
+    formula_paths = (
+        args.custom_formula_context,
+        args.custom_formula_report,
+        args.custom_formula_hints,
+    )
+    if any(formula_paths) and not all(formula_paths):
+        parser.error(
+            "--custom-formula-context, --custom-formula-report, and "
+            "--custom-formula-hints are required together"
+        )
+    if args.custom_formula_report and len(args.workbooks) != 1:
+        parser.error("custom-formula artifacts require exactly one workbook")
 
     taxonomy = json.loads(Path(args.taxonomy).read_text(encoding="utf-8"))
     families = {Path(k).stem: v.get("primary", "") for k, v in taxonomy.items()}
@@ -741,6 +795,21 @@ def main(argv=None):
         family = families.get(workbook, "")
         outputs, targets = collect(workbook, args.source, args.seg_root,
                                    args.inputs_root)
+        formula_report = None
+        formula_hints = None
+        if args.custom_formula_report:
+            formula_report, formula_hints = load_formula_artifacts(
+                "%s-outputs" % workbook,
+                Path(args.custom_formula_report),
+                Path(args.custom_formula_hints),
+                [
+                    float(value)
+                    for value in targets.values()
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                ],
+                context_path=Path(args.custom_formula_context),
+            )
         artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
         audit_meta = None
         if not args.no_variable_source_audit:
@@ -783,6 +852,10 @@ def main(argv=None):
             text, artifact.name, outputs, targets, hints=hints,
             hint_style=hint_style, mcp=mcp_dir is not None,
         )
+        if formula_hints is not None:
+            instruction = add_custom_formula_hints(
+                instruction, formula_hints
+            )
         if args.semantic_hints:
             suffix = "outputs_semantic_hints"
         elif args.hints:
@@ -792,7 +865,8 @@ def main(argv=None):
         out_dir = out_root / ("%s-%s" % (workbook, suffix))
         emit(out_dir, workbook, family, artifact, instruction, targets,
              outputs, nat_meta, hints=hints, hint_style=hint_style,
-             mcp_dir=mcp_dir, audit_meta=audit_meta)
+             mcp_dir=mcp_dir, audit_meta=audit_meta,
+             formula_report=formula_report, formula_hints=formula_hints)
         n_vars = mcp_variable_count(mcp_dir) if mcp_dir is not None else 0
         print("%s  %-16s %2d outputs, %3d cells%s, timeout %.0fs -> %s"
               % (workbook, family, len(outputs), len(targets),

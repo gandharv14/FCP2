@@ -31,27 +31,29 @@ EXCLUSIONS="$RUN/exclusions.json"
 DISPOSITIONS="$RUN/normalization_report.json"
 PROFILES="$RUN/source_profiles.json"
 MCP="$RUN/mcp"
+DISCLOSURE=.cursor/skills/task-disclosure/scripts/disclose.py
+DISCLOSURE_RUN="runs/disclosure/$WB-outputs"
+NAT_RUN="runs/$WB-instruction-naturalization"
 STAGE_ROOT=tasks_outputs_mcp
 STAGED="$STAGE_ROOT/$WB-outputs"
 TASK="tasks_outputs/$WB-outputs"
-DISCLOSURE=.cursor/skills/task-disclosure/scripts/disclose.py
-DISCLOSURE_RUN="runs/disclosure/$WB-outputs"
 ```
 
 Expected artifacts:
+
 - `ast_out/$WB/{nodes.csv,edges.csv}`
 - `seg_out/$WB/{segments.json,curation.toml,lineage.json}`
 - `inputs_out/$WB-inputs.xlsx`: unredacted baseline inputs
+- `runs/disclosure/$WB-outputs/{bands,probe,records,context,verify}.json`
+- `runs/$WB-variable-sources/disclosure-faithfulness.md`
+- `tasks_outputs_mcp/$WB-outputs/tests/disclosure.json`
+- `runs/$WB-instruction-naturalization/{source.md,candidate.md,validation.json}`
 - `runs/$WB-variable-sources/$WB-inputs-variable-sources.{md,inventory.json,metadata.json}`
 - `draft.json`, `normalize_$WB.py`, `normalized.json`, `exclusions.json`,
   `normalization_report.json`, `source_profiles.json`, and profile captures
 - `mcp/{runtime,eval,server.py,Dockerfile,mask_cells.json,masked_inputs.json}`
 - `inputs_out_mcp/$WB-inputs.xlsx`: separately MCP-masked inputs
 - `tasks_outputs_mcp/$WB-outputs/`: staged bundle
-- `runs/disclosure/$WB-outputs/{bands,probe,records,context,verify}.json` and
-  `runs/$WB-variable-sources/disclosure-faithfulness.md`
-- `tasks_outputs_mcp/$WB-outputs/tests/disclosure.json`
-- one deterministic `## Workbook disclosure` section in staged `instruction.md`
 - `runs/$WB-variable-sources/oracle-report.json`
 
 For multiple requested workbooks, complete all gates serially. Do not share a
@@ -68,25 +70,21 @@ Stage all requested workbooks before promoting any of them.
   masking, packaging, or rollout is difficult.
 - Generate and package the GPT 5.6 Sol variable/source audit. Never pass
   `--no-variable-source-audit`.
+- Run `/task-disclosure` against the exact staged MCP workbook before
+  naturalization. Registry drift, audit failure, mechanical verification
+  failure, or a blocking fresh-review finding is a blocker.
+- Run `/naturalize-finance-task-instruction` after the complete instruction is
+  packaged. Any generation, validation, or semantic-review failure is a blocker.
 - Missing audit credentials or audit failure is a blocker, not permission to
   produce a plain task.
 - Missing profile skill, unresolved draft rows, partial masking, source-profile
   validation failure, MCP failure, oracle failure, or grader failure is a
   blocker. Retain diagnostics and leave the current task untouched.
-- Missing task-disclosure skill, registry drift, disclosure audit failure,
-  mechanical verification failure, or blocking fresh-review finding is a
-  blocker. Never package the old custom-formula hint and conventions sections
-  as a fallback.
+- Never package the old custom-formula hint and conventions sections as a
+  fallback for unified disclosure.
 - Never place the golden workbook, `eval/`, normalized specs, profile captures,
   snapshots, answer values, or source audit working files in `environment/`.
 
-## Disclosure integration
-`task-disclosure` is a **pre-run build gate**. Run it after `xl_output_task.py`
-creates the staged bundle, so it compares the golden against the exact
-MCP-masked workbook and updates the exact instruction that will ship. Run it
-before oracle, grader, and promotion. Custom methods run first, conventions
-check the residue, and both share one deterministic registry gate, writer,
-audit, and verifier. No Harbor rollout is used.
 ## Workflow
 
 ### 1. Preflight and AST
@@ -335,16 +333,17 @@ python3 xl_output_task.py "$WB" \
   --variable-source-audit-root runs \
   --variable-source-audit-model openai/gpt-5.6-sol \
   --mcp "$MCP" \
+  --no-naturalize \
   -o "$STAGE_ROOT"
 ```
 
 The audit must run or validly cache-reuse against baseline inputs, while the
 packaged artifact must come from MCP inputs. Require the MCP server declaration,
 compose sidecar, extended timeout, research instructions, audit metadata, and
-`tests/masked_inputs.json`. Absence of any MCP artifact is failure; never rerun
-without `--mcp`.
+`tests/masked_inputs.json`. Absence of any required artifact is failure; never
+rerun without `--mcp`.
 
-### 12. Build and verify unified task disclosure
+### 12. Build unified task disclosure
 
 Run against the staged bundle and golden. Pass the AST root to `select`; later
 commands consume its staged artifacts.
@@ -355,11 +354,11 @@ python3 "$DISCLOSURE" select \
   --task-dir "$STAGED" \
   --golden "$SOURCE/$WB.xlsx" \
   --ast-dir "$AST_ROOT"
-python3 "$DISCLOSURE" probe  --task-dir "$STAGED"
-python3 "$DISCLOSURE" detect --task-dir "$STAGED"
+python3 "$DISCLOSURE" probe   --task-dir "$STAGED"
+python3 "$DISCLOSURE" detect  --task-dir "$STAGED"
 python3 "$DISCLOSURE" context --task-dir "$STAGED"
-python3 "$DISCLOSURE" write  --task-dir "$STAGED"
-python3 "$DISCLOSURE" verify --task-dir "$STAGED"
+python3 "$DISCLOSURE" write   --task-dir "$STAGED"
+python3 "$DISCLOSURE" verify  --task-dir "$STAGED"
 test -f "$DISCLOSURE_RUN/bands.json" &&
   test -f "$DISCLOSURE_RUN/records.json" &&
   test -f "$DISCLOSURE_RUN/verify.json" &&
@@ -368,13 +367,30 @@ rg -q '^## Workbook disclosure$' "$STAGED/instruction.md"
 ```
 
 Require verification without `--force` or `--no-fail`, no old hint/manifest
-sections, and no formulas/evidence in the agent-facing instruction. Then launch
-a fresh reviewer with the golden, delivered workbook, staged instruction, and
-`tests/disclosure.json`. It must check every sentence against the golden and
-fail on false, incomplete, ambiguous, answer-leaking, or formula-like wording.
-Save `"$RUN/disclosure-faithfulness.md"` and stop on a blocking finding.
+sections, and no formulas/evidence in the agent-facing instruction.
 
-### 13. Run generalized HTTP oracle
+### 13. Naturalize the complete staged instruction
+
+Load and follow
+`.cursor/skills/naturalize-finance-task-instruction/SKILL.md`. Launch exactly
+one `generalPurpose` subagent with model `gpt-5.6-sol-high`, preserve every
+protected section—including `## Workbook disclosure`—byte-for-byte, and require
+deterministic plus clause-by-clause semantic validation before atomically
+replacing `"$STAGED/instruction.md"`.
+
+Require `"$NAT_RUN/validation.json"` to report `valid: true` and `applied: true`,
+and require `task.toml` to record model `gpt-5.6-sol-high`, endpoint
+`cursor-subagent`, the prompt version, and matching source/instruction hashes.
+This is the final content mutation; do not continue on fallback or uncertainty.
+
+Re-run `python3 "$DISCLOSURE" verify --task-dir "$STAGED"` against the final
+naturalized instruction. Then launch a fresh reviewer with the golden, delivered
+workbook, staged instruction, and `tests/disclosure.json`. It must check every
+sentence against the golden and fail on false, incomplete, ambiguous,
+answer-leaking, or formula-like wording. Save
+`"$RUN/disclosure-faithfulness.md"` and stop on a blocking finding.
+
+### 14. Run generalized HTTP oracle
 
 Use the reusable oracle, not a workbook-specific script:
 
@@ -416,7 +432,7 @@ ship. Use an explicit reviewed allowlist only for legitimate unavoidable
 duplicates; unknown, duplicate, and unused entries fail rather than becoming
 report-only warnings.
 
-### 14. Smoke the exact-answer grader
+### 15. Smoke the exact-answer grader
 
 Use the staged answer key only in a verifier workspace and require discrete
 (exact-within-tolerance) score `1.0`:
@@ -445,7 +461,7 @@ print("exact-answer grader score: 1.0")
 PY
 ```
 
-### 15. Promote only after every gate passes
+### 16. Promote only after every gate passes
 
 If a requested set contains multiple workbooks, wait until every staged bundle
 passes before promoting the set. Promotion uses same-filesystem renames and
@@ -481,6 +497,11 @@ Report, per workbook:
 
 - workbook id, golden path, AST path, segmentation `PASS`, and curation hash
 - curated output names/bands and confirmation that curation was preserved
+- disclosure run path; custom/convention disclosed, suppressed, standard, and
+  unclassified counts; mechanical verdict; fresh faithfulness-review path and
+  verdict
+- instruction naturalization source/candidate/report paths, pinned Sol model,
+  prompt version, source/instruction hashes, and semantic-review result
 - baseline input path/hash and separate MCP input path/hash
 - audit Markdown/inventory/metadata paths, model, inventory hash, and cache use
 - draft row count; included/excluded disposition counts; atomic variable count
@@ -489,9 +510,6 @@ Report, per workbook:
 - maskability report path; `cells`, `extra_cells`, and total masked-cell counts
 - normalized spec, exclusions, profiles, and MCP paths; deterministic comparison
   and MCP validation/smoke summaries
-- disclosure run path; custom/convention disclosed, suppressed, standard, and
-  unclassified counts; mechanical verdict; fresh faithfulness-review path and
-  verdict
 - staged path, oracle report and result, exact grader score, final promoted path,
   previous-bundle backup path, and any retained diagnostics
 

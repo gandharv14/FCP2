@@ -1,91 +1,71 @@
-# Unified Disclosure Taxonomy
+# Disclosure Taxonomy
 
-This taxonomy replaces the old split between `custom-formula-gate` and
-`workbook-conventions-manifest`. The controlling question is always:
+The decision tree and the record labels. All content - which decisions exist, what values they
+take, when they may ship, and how they read - lives in [REGISTRY.md](REGISTRY.md). Nothing is
+defined in both places.
 
-> Does a graded answer depend on this missing choice?
+## The decision tree
 
-A band is considered only when the golden workbook computes it, a graded answer reads it,
-and the delivered workbook leaves it blank.
+```mermaid
+flowchart TD
+    B["a band of deleted cells that a graded answer reads"] --> Q0{"is the golden itself broken here"}
+    Q0 -->|yes| DEFECT["defect: ship nothing"]
+    Q0 -->|no| Q1{"does perturbing it move any graded answer"}
+    Q1 -->|no| DROP["drop: ship nothing"]
+    Q1 -->|yes| Q2{"how many plausible things could a competent modeller have done here"}
+    Q2 -->|"exactly one"| RECOV1["recoverable: ship nothing"]
+    Q2 -->|"a short menu"| Q3{"do those alternatives give the same graded answers"}
+    Q3 -->|yes| RECOV2["recoverable: ship nothing"]
+    Q3 -->|no| Q4{"does a registry entry cover this decision, and does that entry allow disclosure here"}
+    Q2 -->|"unbounded"| Q4
+    Q4 -->|yes| SHIP["disclosed: ship the entry's sentence"]
+    Q4 -->|no| NOSHIP["ship nothing"]
+```
 
-## Dispositions
+The tree ends at Q4. There is no follow-up question.
 
-### `drop`
+### Q2 is answered from the workbook, not the registry
 
-The band is in the formula graph but should not be disclosed. Typical reasons:
+Q2 asks what a competent modeller looking at the golden and the delivered file could plausibly
+have done: one obvious answer, a small set of candidates, or an open space.
 
-- It is not blank in the delivered workbook.
-- It cannot move a graded answer.
-- It is only ordinary arithmetic with no modelling choice.
+It has to stay independent of the registry. If Q2 were a registry lookup, coverage would
+already be settled by the time control reached Q4 - always true on the short-menu path, always
+false on the unbounded path - and Q4's first half would never be a live question.
 
-### `recoverable`
+### Q4 has one no-exit
 
-Plausible alternatives were enumerated and they all produce the same graded answers within
-tolerance. Nothing is written to the instruction.
+Q4 asks two things at once, so a `no` can mean "nothing covers this" or "something covers it
+and refused". Both produce identical output: nothing ships, and `instruction.md` is
+byte-identical either way. The tree says that once.
 
-This is a measured conclusion, not a synonym for `structural` or `definitional`.
+The distinction lives on the record, not in the graph. A record carries `entry`, so "was this
+covered" is `entry is null`, and the backlog is a query over records rather than a terminal.
 
-### `convention`
+Terminals state the outcome and nothing else. A terminal that names a downstream queue will
+eventually be wrong for some path that reaches it.
 
-The band encodes a choice from a closed family. The instruction may state the chosen family
-value, never the formula or computed number.
+## Record labels
 
-Example: `discount_period = mid_year`.
+The tree has six terminals but only two outcomes: `SHIP`, and everything else, which ships
+nothing. These labels are written on records for reporting and triage.
 
-### `method`
+- `defect` - the golden is internally inconsistent here. Ships nothing.
+- `drop` - cannot move a graded answer. Dead branch, clamp that never binds, or unused.
+- `recoverable` - written two ways: only one plausible answer, or alternatives that all land in
+  the same place within tolerance.
+- `disclosed` - the only label on a shipped record.
+- `suppressed` - covered by an entry whose `Ship when` declined. The record keeps its `entry`.
+  Generates no work.
+- `unclassified` - no entry covered it. The record has no `entry`, and that is the backlog
+  query. Absorbs what an earlier taxonomy called `supplied`.
+- `convention` and `method` - metadata recording which registry section an entry came from. A
+  convention ships a value, a method ships a rule sentence. Both are `disclosed`.
 
-The band encodes a non-catalogue method that can be stated as a short rule over labelled
-inputs visible in the delivered workbook. The instruction may state the rule in prose.
+`supplied` no longer exists. The tree decides disclosure only, so it has no outcome that
+changes a task.
 
-The rule must bottom out in visible inputs. If it requires a number that exists only inside
-a deleted formula, it is not a method.
+## Citation
 
-### `supplied`
-
-The band is load-bearing, but the construction is not safely describable. The remedy is to
-rebuild the delivered workbook with an upstream driver preserved as an input, not to write a
-hint.
-
-### `defect`
-
-The golden itself is internally inconsistent or carries a target that no fair disclosure can
-repair. Escalate; never disclose.
-
-### `unclassified`
-
-The band appears load-bearing but no current family or method rule can name it. This blocks
-shipping unless explicitly accepted. Each `unclassified` case is taxonomy backlog.
-
-## Convention Families
-
-The current closed families are:
-
-- `discount_period`: `mid_year`, `year_end`, `day_weighted`
-- `inert_line`: `always_zero`, `charged_once`, `charged_every_period`
-- `terminal_value`: `absent`, `perpetuity_growth`, `exit_multiple`, `other`
-- `row_populated`: `unused`, `populated`
-- `npv_timing`: `excel_default_one_period_out`, `t0_added_separately`
-- `aggregate_scope`: member span or member row set for a total, never the graded target
-- `projection_rule`: `hold_level`, `hold_growth`, `average_window`, `ratio_to_driver`
-- `stake_scaling`: `applied`, `not_applied`
-- `source_selection`: source cell or source sheet family
-
-## Catalogue Methods
-
-`CATALOG.md` remains useful, but no longer decides pass or fail. It supplies roles and
-plausible alternatives for the residue after deterministic convention detection.
-
-The catalogue answers:
-
-> What else might a competent modeller have done here?
-
-The evaluator answers:
-
-> Would that alternative move a graded answer?
-
-## Ownership Rule
-
-Each selected band gets exactly one record. Deterministic convention detectors run first.
-Only unclaimed bands are eligible for method classification. This prevents the old
-`projection_rule` double-hinting failure.
-
+Every record carries `entry`, the registry id that authorised it. A record without one cannot
+ship. To add a new kind of hint, add a registry entry first, then implement its detector.

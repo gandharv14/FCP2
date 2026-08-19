@@ -383,7 +383,7 @@ def ast_closure_if_available(task_dir: Path, targets: list[str], ast_dir: Path |
         sys.path.insert(0, str(REPO_ROOT))
         from xl_seg import model, project  # type: ignore
 
-        graph = model.load(ast_dir, wb)
+        graph = model.load(graph_dir, wb)
         cg = project.build(graph)
         seen, order, queue = set(), [], deque(targets)
         while queue:
@@ -687,7 +687,7 @@ def formula_profile(gold: Book, band: dict) -> dict:
         label = gold.row_label(ref)
         if label and label not in labels:
             labels.append(label)
-    functions, operators, numbers, raw_references, literal_renderings = [], [], [], [], []
+    functions, operators, numbers, text_literals, raw_references, literal_renderings = [], [], [], [], [], []
     for node in walk_ast(ast):
         if node.kind == "ref" and node.name not in raw_references:
             raw_references.append(node.name)
@@ -700,6 +700,8 @@ def formula_profile(gold: Book, band: dict) -> dict:
                 numbers.append(float(node.shape))
             except (TypeError, ValueError):
                 pass
+        if node.kind == "const" and node.name == "text":
+            text_literals.append(str(node.shape))
         if node.kind == "const":
             rendered = describe_ast(node, gold, sheet, profile["label"])
             if rendered not in literal_renderings:
@@ -712,6 +714,7 @@ def formula_profile(gold: Book, band: dict) -> dict:
         "functions": functions,
         "operators": operators,
         "numbers": numbers,
+        "text_literals": text_literals,
         "raw_references": raw_references,
         "literal_renderings": literal_renderings,
         "ast_nodes": sum(1 for _ in walk_ast(ast)),
@@ -971,6 +974,10 @@ def structural_reason(profile: dict) -> str | None:
         return "link_sign_or_unit_scale"
     funcs = set(profile.get("functions", []))
     ops = set(profile.get("operators", []))
+    if funcs & {"INDEX", "MATCH", "VLOOKUP", "HLOOKUP", "XLOOKUP", "INDIRECT", "OFFSET"}:
+        return "lookup_or_transcription"
+    if profile.get("text_literals") and funcs & {"IF", "IFS", "OR", "AND", "ROUND"}:
+        return "diagnostic_or_warning_logic"
     if funcs <= {"SUM"} and ops <= {"+", "-"}:
         return "component_aggregation"
     if not funcs and ops and ops <= {"+", "-"}:
@@ -2534,7 +2541,9 @@ def audit_text(section: str, task_dir: Path) -> list[str]:
             # Zero/one are control literals in branches and collide with zero
             # checks or boolean targets by accident. Larger integers receive the
             # normal answer-collision audit.
-            if float(target).is_integer() and abs(target) <= 1:
+            if abs(float(target)) <= 1e-12 or (
+                float(target).is_integer() and abs(target) <= 1
+            ):
                 continue
             if abs(val - target) <= 1e-12 * max(1.0, abs(target)):
                 faults.append(f"numeric literal {raw} matches target {target}")

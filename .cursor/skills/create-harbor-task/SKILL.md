@@ -363,7 +363,16 @@ test -f "$DISCLOSURE_RUN/bands.json" &&
   test -f "$DISCLOSURE_RUN/records.json" &&
   test -f "$DISCLOSURE_RUN/verify.json" &&
   test -f "$STAGED/tests/disclosure.json"
-rg -q '^## Workbook disclosure$' "$STAGED/instruction.md"
+python3 - "$STAGED" <<'PY'
+import json, sys
+from pathlib import Path
+task = Path(sys.argv[1])
+records = json.load(open(task / "tests/disclosure.json", encoding="utf-8"))
+has_section = "## Workbook disclosure" in (
+    task / "instruction.md").read_text(encoding="utf-8")
+if has_section != bool(records.get("agent_records")):
+    raise SystemExit("disclosure heading/record presence mismatch")
+PY
 ```
 
 Require verification without `--force` or `--no-fail`, no old hint/manifest

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -630,6 +631,172 @@ def method_roles_for_band(gold: Book, band: dict) -> tuple[list[str], list[str]]
     return hits, context
 
 
+def role_triggers(label: str) -> dict[str, list[str]]:
+    """Patterns that actually assigned a role after excludes."""
+    lowered = (label or "").lower()
+    if not lowered:
+        return {}
+    hits = {}
+    for entry_id, patterns in METHOD_ROLE_PATTERNS.items():
+        matched = [pattern for pattern in patterns if re.search(pattern, lowered)]
+        if not matched:
+            continue
+        if any(re.search(pattern, lowered) for pattern in METHOD_ROLE_EXCLUDES.get(entry_id, ())):
+            continue
+        hits[entry_id] = matched
+    return hits
+
+
+def role_case_id(label: str, roles: list[str], role_context: list[str]) -> str:
+    key = json.dumps(
+        {
+            "label": label or "",
+            "roles": sorted(roles),
+            "role_context": list(role_context or []),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+
+
+def prepare_method_items(gold: Book, bands: list[dict]) -> list[dict]:
+    """Assign roles with the existing neighborhood rules. No arbitration yet."""
+    prepared = []
+    for original in bands:
+        for band in method_subbands(gold, original):
+            label = band.get("label") or ""
+            if not label:
+                prepared.append({
+                    "band": band,
+                    "label": "",
+                    "roles": [],
+                    "role_context": [],
+                    "blank_label": True,
+                })
+                continue
+            roles, role_context = method_roles_for_band(gold, band)
+            prepared.append({
+                "band": band,
+                "label": label,
+                "roles": roles,
+                "role_context": role_context,
+                "blank_label": False,
+            })
+    for item in prepared:
+        if item["blank_label"] or item["roles"]:
+            continue
+        band = item["band"]
+        nearby_roles = {
+            other["roles"][0]
+            for other in prepared
+            if not other.get("blank_label")
+            and len(other["roles"]) == 1
+            and other["band"].get("sheet") == band.get("sheet")
+            and other["band"].get("pattern") == band.get("pattern")
+            and abs(int(other["band"].get("row", 0)) - int(band.get("row", 0))) <= 6
+        }
+        if len(nearby_roles) == 1:
+            item["roles"] = list(nearby_roles)
+            item["role_context"] = item["role_context"] + [
+                "role propagated from same-shape neighboring row"
+            ]
+    return prepared
+
+
+def triggered_by_for_item(item: dict) -> dict:
+    own = item.get("label") or ""
+    own_hits = role_triggers(own)
+    neighbor_hits = {}
+    for ctx in item.get("role_context") or []:
+        if ctx == own or ctx == "role propagated from same-shape neighboring row":
+            continue
+        hits = role_triggers(ctx)
+        if hits:
+            neighbor_hits[ctx] = hits
+    return {"own_label": own_hits, "neighbors": neighbor_hits}
+
+
+def collect_ambiguous_role_cases(prepared: list[dict]) -> list[dict]:
+    """One case per unique (label, roles, role_context) with two or more roles."""
+    groups: dict[str, dict] = {}
+    for item in prepared:
+        if item.get("blank_label"):
+            continue
+        roles = item.get("roles") or []
+        if len(roles) <= 1:
+            continue
+        case_id = role_case_id(item["label"], roles, item.get("role_context") or [])
+        if case_id not in groups:
+            groups[case_id] = {
+                "case_id": case_id,
+                "label": item["label"],
+                "roles": sorted(roles),
+                "role_context": list(item.get("role_context") or []),
+                "band_count": 0,
+                "sample_bands": [],
+                "triggered_by": triggered_by_for_item(item),
+                "questions": {
+                    entry_id: registry().get(entry_id, {}).get("question", "")
+                    for entry_id in sorted(roles)
+                },
+            }
+        groups[case_id]["band_count"] += 1
+        band_id = item["band"].get("band")
+        samples = groups[case_id]["sample_bands"]
+        if band_id and band_id not in samples and len(samples) < 5:
+            samples.append(band_id)
+    return sorted(groups.values(), key=lambda c: (c["label"], c["case_id"]))
+
+
+def default_role_resolutions_path(task_dir: Path, runs_root: Path) -> Path:
+    return run_dir(task_dir, runs_root) / "role_resolutions.json"
+
+
+def load_role_resolutions(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    by_id = {}
+    for row in payload.get("resolutions") or []:
+        case_id = row.get("case_id")
+        if case_id:
+            by_id[case_id] = row
+    payload["by_id"] = by_id
+    return payload
+
+
+def require_role_resolutions(cases: list[dict], path: Path) -> dict:
+    """Fail closed when collisions exist without a complete resolutions file."""
+    payload = load_role_resolutions(path)
+    if payload is None:
+        raise SystemExit(
+            f"ambiguous-role cases exist but resolutions file is missing: {path}"
+        )
+    missing = [c["case_id"] for c in cases if c["case_id"] not in payload["by_id"]]
+    if missing:
+        raise SystemExit(
+            f"role_resolutions.json is incomplete; missing {len(missing)} case(s): "
+            + ", ".join(missing[:8])
+        )
+    return payload
+
+
+def apply_role_resolution(item: dict, payload: dict) -> None:
+    """Reduce a collision to one candidate when the agent picked a valid role."""
+    roles = item.get("roles") or []
+    if len(roles) <= 1:
+        return
+    case_id = role_case_id(item["label"], roles, item.get("role_context") or [])
+    row = (payload.get("by_id") or {}).get(case_id) or {}
+    chosen = row.get("chosen")
+    if chosen in roles:
+        item["roles"] = [chosen]
+        item["role_context"] = list(item.get("role_context") or []) + [
+            "role resolved by agent"
+        ]
+
+
 def walk_ast(node):
     if node is None:
         return
@@ -1216,54 +1383,39 @@ def custom_sentence_fields(profile: dict, gold: Book) -> dict:
     }
 
 
-def detect_custom_methods(gold: Book, delivered: Book, bands: list[dict], targets: set[str]):
+def detect_custom_methods(
+    gold: Book,
+    delivered: Book,
+    bands: list[dict],
+    targets: set[str],
+    resolutions_path: Path | None = None,
+):
     """Run before convention detectors; only confident no-matches claim a band."""
     records, assessments, claimed = [], [], set()
-    prepared = []
-    for original in bands:
-        for band in method_subbands(gold, original):
-            label = band.get("label") or ""
-            if not label:
-                assessments.append({
-                    "band": band.get("band"),
-                    "cells": band.get("cells", []),
-                    "cell_keys": band.get("cell_keys", []),
-                    "label": "",
-                    "roles": [],
-                    "status": "unclassified",
-                    "reason": "blank_target_label",
-                })
-                continue
-            roles, role_context = method_roles_for_band(gold, band)
-            prepared.append({
-                "band": band,
-                "label": label,
-                "roles": roles,
-                "role_context": role_context,
-            })
-
-    # Propagate a role across nearby rows only when the copied formula shape is
-    # identical. This covers blocks labelled Acq. 1 ... Acq. 6 where only the
-    # block header carries the finance meaning. It cannot override a direct role.
-    for item in prepared:
-        if item["roles"]:
-            continue
-        band = item["band"]
-        nearby_roles = {
-            other["roles"][0]
-            for other in prepared
-            if len(other["roles"]) == 1
-            and other["band"].get("sheet") == band.get("sheet")
-            and other["band"].get("pattern") == band.get("pattern")
-            and abs(int(other["band"].get("row", 0)) - int(band.get("row", 0))) <= 6
-        }
-        if len(nearby_roles) == 1:
-            item["roles"] = list(nearby_roles)
-            item["role_context"] = item["role_context"] + ["role propagated from same-shape neighboring row"]
-
+    prepared = prepare_method_items(gold, bands)
+    cases = collect_ambiguous_role_cases(prepared)
+    if cases:
+        if resolutions_path is None:
+            raise SystemExit(
+                "ambiguous-role cases exist but no role_resolutions.json path was given"
+            )
+        payload = require_role_resolutions(cases, resolutions_path)
+        for item in prepared:
+            apply_role_resolution(item, payload)
     for item in prepared:
         band = item["band"]
         label = item["label"]
+        if item.get("blank_label"):
+            assessments.append({
+                "band": band.get("band"),
+                "cells": band.get("cells", []),
+                "cell_keys": band.get("cell_keys", []),
+                "label": "",
+                "roles": [],
+                "status": "unclassified",
+                "reason": "blank_target_label",
+            })
+            continue
         roles = item["roles"]
         role_context = item["role_context"]
         base = {
@@ -1892,6 +2044,7 @@ def registry() -> dict:
             "alternatives": alts,
             "ship_when": fields.get("ship when", ""),
             "sentences": sentences,
+            "question": fields.get("question", ""),
         }
     _REGISTRY_CACHE = entries
     return entries
@@ -2250,8 +2403,14 @@ def detect_records(args) -> dict:
     # Custom methods get first claim. Standard, ambiguous and uncertain
     # assessments remain reviewer-visible but do not claim the band, so the
     # convention detectors still get their normal chance.
+    resolutions_path = getattr(args, "role_resolutions", None)
+    if resolutions_path:
+        resolutions_path = Path(resolutions_path)
+    else:
+        resolutions_path = default_role_resolutions_path(task_dir, Path(args.runs_root))
     method_records, method_assessments, custom_claimed = detect_custom_methods(
-        gold, delivered, selection.get("bands", []), target_set
+        gold, delivered, selection.get("bands", []), target_set,
+        resolutions_path=resolutions_path,
     )
     custom_calibration = calibrate_legacy_custom(task_dir, method_assessments, scope)
     convention_scope = scope - custom_claimed
@@ -2333,6 +2492,28 @@ def detect_records(args) -> dict:
         },
     }
     return payload
+
+
+def cmd_roles(args):
+    """Collect unique Filter 1 role collisions. No formulas or values."""
+    task_dir = Path(args.task_dir).resolve()
+    selection = read_stage(task_dir, "bands", Path(args.runs_root))
+    gold = Book(Path(selection["golden"]))
+    prepared = prepare_method_items(gold, selection.get("bands", []))
+    cases = collect_ambiguous_role_cases(prepared)
+    payload = {
+        "schema_version": "1.0",
+        "task": task_dir.name,
+        "cases": cases,
+        "case_count": len(cases),
+        "band_count": sum(c["band_count"] for c in cases),
+    }
+    out = Path(args.out) if args.out else run_dir(task_dir, Path(args.runs_root)) / "ambiguous_roles.json"
+    write_json(out, payload)
+    print(
+        f"{task_dir.name}: {payload['case_count']} ambiguous-role case(s) "
+        f"covering {payload['band_count']} band(s) -> {out}"
+    )
 
 
 def cmd_detect(args):
@@ -2799,8 +2980,10 @@ def ensure_pipeline(task: Path, args):
     a.ast_dir = args.ast_dir
     a.runs_root = args.runs_root
     a.out = None
+    a.role_resolutions = getattr(args, "role_resolutions", None)
     cmd_select(a)
     cmd_probe(a)
+    cmd_roles(a)
     cmd_detect(a)
     cmd_context(a)
 
@@ -2840,13 +3023,15 @@ def main(argv=None):
     b.add_argument("--tasks-root", default=str(DEFAULT_TASKS_ROOT))
     b.add_argument("--out", default=None)
 
-    for name in ("select", "probe", "detect", "context", "write", "verify"):
+    for name in ("select", "probe", "roles", "detect", "context", "write", "verify"):
         p = sub.add_parser(name)
         p.add_argument("--task-dir", required=True)
         p.add_argument("--out", default=None)
         if name == "select":
             p.add_argument("--golden", default=None)
             p.add_argument("--ast-dir", default=None)
+        if name == "detect":
+            p.add_argument("--role-resolutions", default=None)
         if name == "write":
             p.add_argument("--force", action="store_true")
             p.add_argument("--dry-run", action="store_true")
@@ -2858,12 +3043,14 @@ def main(argv=None):
     m.add_argument("--out", required=True)
     m.add_argument("--ast-dir", default=None)
     m.add_argument("--force", action="store_true")
+    m.add_argument("--role-resolutions", default=None)
 
     args = parser.parse_args(argv)
     {
         "bench": cmd_bench,
         "select": cmd_select,
         "probe": cmd_probe,
+        "roles": cmd_roles,
         "detect": cmd_detect,
         "context": cmd_context,
         "write": cmd_write,

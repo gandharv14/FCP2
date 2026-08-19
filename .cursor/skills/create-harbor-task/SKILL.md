@@ -346,7 +346,9 @@ rerun without `--mcp`.
 ### 12. Build unified task disclosure
 
 Run against the staged bundle and golden. Pass the AST root to `select`; later
-commands consume its staged artifacts.
+commands consume its staged artifacts. Follow `/task-disclosure` through the
+`roles` command and, when collisions exist, its one Sol High role-arbitration
+agent before `detect`.
 
 ```bash
 test -f "$DISCLOSURE"
@@ -355,6 +357,9 @@ python3 "$DISCLOSURE" select \
   --golden "$SOURCE/$WB.xlsx" \
   --ast-dir "$AST_ROOT"
 python3 "$DISCLOSURE" probe   --task-dir "$STAGED"
+python3 "$DISCLOSURE" roles   --task-dir "$STAGED"
+# Follow /task-disclosure: if ambiguous_roles.json has cases, launch one
+# gpt-5.6-sol-high subagent to write role_resolutions.json before detect.
 python3 "$DISCLOSURE" detect  --task-dir "$STAGED"
 python3 "$DISCLOSURE" context --task-dir "$STAGED"
 python3 "$DISCLOSURE" write   --task-dir "$STAGED"

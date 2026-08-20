@@ -29,7 +29,17 @@ def slug(text: str, fallback: str) -> str:
 
 
 def _toml_str(value: str) -> str:
-    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    # TOML basic strings cannot carry literal control characters, and workbook
+    # row labels routinely contain embedded newlines or tabs.
+    escaped = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+    )
+    return '"' + escaped + '"'
 
 
 def write_candidates(out_dir: Path, candidates, bg) -> None:

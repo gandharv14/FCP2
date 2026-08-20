@@ -49,8 +49,11 @@ def segment(wb: str, args) -> dict:
         if args.llm:
             key = adjudicate.read_key(Path(args.env_file))
             if not key:
-                raise SystemExit(f"--llm needs anthropic_api_key in {args.env_file}")
-            decisions = adjudicate.adjudicate(wb, candidates[: args.top], key, args.model)
+                raise SystemExit(
+                    f"--llm needs anthropic_api_key or lbx_api_key in {args.env_file}")
+            proxy = adjudicate.via_proxy(Path(args.env_file))
+            decisions = adjudicate.adjudicate(
+                wb, candidates[: args.top], key, args.model, proxy=proxy)
             flipped = adjudicate.apply_to_curation(curation_path, decisions)
             print(f"  adjudicator reviewed {len(decisions)} candidates, changed {flipped}")
     emit.write_candidates(out_dir, candidates, bg)

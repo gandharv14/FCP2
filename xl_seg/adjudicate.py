@@ -166,7 +166,11 @@ def apply_to_curation(path: Path, decisions: dict) -> int:
                 out.append(f"include = {new}  # heuristic: {previous}")
                 continue
             if stripped.startswith("name = ") and name:
-                out.append(f'name = "{name}"')
+                escaped = (
+                    str(name).replace("\\", "\\\\").replace('"', '\\"')
+                    .replace("\r", "\\r").replace("\n", "\\n")
+                )
+                out.append(f'name = "{escaped}"')
                 continue
         out.append(line)
     path.write_text("\n".join(out) + "\n", encoding="utf-8")

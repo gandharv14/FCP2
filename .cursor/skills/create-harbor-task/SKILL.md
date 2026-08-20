@@ -114,6 +114,16 @@ python3 xl_segment.py "$WB" --source "$SOURCE" \
   --ast-dir "$AST_ROOT" -o "$SEG_ROOT"
 ```
 
+When no curation exists and the heuristic auto-includes nothing, the segmenter
+escalates on its own: first the LLM adjudicator (when an API key is available),
+then a top-4 fallback whose picks carry an
+`include = true  # fallback: top-4 auto-include` marker. This auto-escalation
+only ever runs on a curation file written fresh in the same invocation -- a
+pre-existing curation is never escalated or overwritten, so a hash recorded
+above changing without approval is still a hard stop. Treat `# heuristic:` and
+`# fallback:` markers as legitimate machine provenance, not tampering, and call
+out fallback-selected outputs explicitly when summarizing.
+
 Summarize every included output and the strongest exclusions from
 `curation.toml`. Require user confirmation before continuing. If the user edits
 curation, re-run the same command. If an existing curation file changed without

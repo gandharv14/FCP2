@@ -143,6 +143,30 @@ def score_outputs(bg: BandGraph, cd: Condensed) -> list[Candidate]:
     return out
 
 
+def fallback_outputs(candidates, limit=4):
+    """Last-rung picks when neither the scorer nor the adjudicator included anything.
+
+    Guardrails: never a check/reconciliation cell, never unlabelled, one pick per
+    distinct label+sheet. Candidates whose label names a result (strong or weak
+    term) fill the slots first, so an axis or convention row cannot crowd out a
+    margin row that scored marginally lower.
+    """
+    preferred, other, seen = [], [], set()
+    for cand in candidates:
+        feats = cand.features
+        if feats.get("check_cell") or not cand.label.strip() or cand.score <= 0:
+            continue
+        key = (cand.label.strip().lower(), cand.sheet)
+        if key in seen:
+            continue
+        seen.add(key)
+        if feats.get("strong_term") or feats.get("weak_term"):
+            preferred.append(cand)
+        else:
+            other.append(cand)
+    return (preferred + other)[:limit]
+
+
 def ancestors(cd: Condensed, seeds) -> set:
     seen, stack = set(seeds), list(seeds)
     while stack:

@@ -93,6 +93,30 @@ def write_curation(out_dir: Path, wb: str, candidates, threshold: float, top: in
     return path
 
 
+def apply_fallback(path: Path, bands) -> int:
+    """Flip ``include`` on for the fallback picks, marking the rung that fired.
+
+    The marker rides the boolean line only: ``read_curation`` strips inline
+    comments from unquoted scalars but would swallow them into quoted values.
+    """
+    wanted = set(bands)
+    if not wanted or not path.exists():
+        return 0
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out, band, changed = [], None, 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("band = "):
+            band = stripped[len("band = "):].strip().strip('"')
+        if band in wanted and stripped.startswith("include = "):
+            out.append("include = true  # fallback: top-4 auto-include")
+            changed += 1
+            continue
+        out.append(line)
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return changed
+
+
 def read_curation(path: Path) -> list[dict]:
     """Minimal reader for the subset of TOML this file uses."""
     if not path.exists():

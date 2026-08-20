@@ -366,5 +366,222 @@ class EvaluatorRegressionTests(unittest.TestCase):
         self.assertEqual(ev.values[consumer.id], 5.0)
 
 
+class NewFunctionGoldenValueTests(unittest.TestCase):
+    """Golden values from Excel docs / numpy-financial (which mirrors Excel)."""
+
+    def setUp(self):
+        self.ev = evaluator([])
+
+    def test_pmt(self):
+        self.assertAlmostEqual(
+            self.ev._fn_pmt([0.075 / 12, 12 * 15, 200000]), -1854.0247200054619)
+        self.assertAlmostEqual(self.ev._fn_pmt([0, 10, 1000]), -100.0)
+
+    def test_ipmt_and_ppmt(self):
+        rate = 0.0824 / 12
+        self.assertAlmostEqual(self.ev._fn_ipmt([rate, 1, 12, 2500]), -17.166666666666668)
+        payment = self.ev._fn_pmt([rate, 12, 2500])
+        interest = self.ev._fn_ipmt([rate, 2, 12, 2500])
+        self.assertAlmostEqual(self.ev._fn_ppmt([rate, 2, 12, 2500]), payment - interest)
+        # Amortization identity: principal repayments sum to the whole loan.
+        total_principal = sum(
+            self.ev._fn_ppmt([rate, per, 12, 2500]) for per in range(1, 13))
+        self.assertAlmostEqual(total_principal, -2500.0)
+
+    def test_pv_fv_nper_roundtrip(self):
+        self.assertAlmostEqual(
+            self.ev._fn_fv([0.05 / 12, 10 * 12, -100, -100]), 15692.928894335748)
+        self.assertAlmostEqual(
+            self.ev._fn_pv([0.05 / 12, 10 * 12, -100, 15692.93]), -100.00067131625819)
+        self.assertAlmostEqual(
+            self.ev._fn_nper([0.07 / 12, -150, 8000]), 64.07334877066185)
+        payment = self.ev._fn_pmt([0.006, 240, 100000])
+        self.assertAlmostEqual(self.ev._fn_nper([0.006, payment, 100000]), 240.0)
+        self.assertAlmostEqual(self.ev._fn_pv([0.006, 240, payment]), 100000.0, places=6)
+
+    def test_rate(self):
+        self.assertAlmostEqual(
+            self.ev._fn_rate([10, 0, -3500, 10000]), 0.11069085371426901, places=8)
+        self.assertAlmostEqual(
+            self.ev._fn_rate([4 * 12, -200, 8000]), 0.007701472488201379, places=8)
+        # Round-trip: the rate that reproduces a known payment.
+        payment = self.ev._fn_pmt([0.05 / 12, 360, 200000])
+        self.assertAlmostEqual(
+            self.ev._fn_rate([360, payment, 200000]), 0.05 / 12, places=9)
+
+    def test_cumipmt_cumprinc(self):
+        args = [0.09 / 12, 30 * 12, 125000, 13, 24, 0]
+        self.assertAlmostEqual(self.ev._fn_cumipmt(args), -11135.232130750845, places=4)
+        self.assertAlmostEqual(self.ev._fn_cumprinc(args), -934.1071234, places=4)
+        self.assertEqual(self.ev._fn_cumipmt([0.01, 12, 1000, 5, 3, 0]).code, "#NUM!")
+
+    def test_mirr(self):
+        flows = RangeValues(
+            [-4500, -800, 800, 800, 600, 600, 800, 800, 700, 3000], rows=10, cols=1)
+        self.assertAlmostEqual(
+            self.ev._fn_mirr([flows, 0.08, 0.055]), 0.06659717503155349)
+
+    def test_xnpv(self):
+        flows = RangeValues([-10000, 2750, 4250, 3250, 2750], rows=5, cols=1)
+        dates = RangeValues([39448, 39508, 39751, 39859, 39904], rows=5, cols=1)
+        self.assertAlmostEqual(self.ev._fn_xnpv([0.09, flows, dates]), 2086.6476020315354, places=4)
+
+    def test_mod_uses_divisor_sign(self):
+        self.assertEqual(self.ev._fn_mod([3, 2]), 1.0)
+        self.assertEqual(self.ev._fn_mod([-3, 2]), 1.0)
+        self.assertEqual(self.ev._fn_mod([3, -2]), -1.0)
+        self.assertEqual(self.ev._fn_mod([3, 0]).code, "#DIV/0!")
+
+    def test_networkdays(self):
+        # 2012-10-01 .. 2013-03-01 (Excel doc example)
+        self.assertEqual(self.ev._fn_networkdays([41183, 41334]), 110.0)
+        holidays = RangeValues([41235], rows=1, cols=1)
+        self.assertEqual(self.ev._fn_networkdays([41183, 41334, holidays]), 109.0)
+        self.assertEqual(self.ev._fn_networkdays([41334, 41183]), -110.0)
+
+    def test_yearfrac(self):
+        # 2012-01-01 .. 2012-07-30 (Excel doc example)
+        self.assertAlmostEqual(self.ev._fn_yearfrac([40909, 41120]), 0.58055556, places=7)
+        self.assertAlmostEqual(self.ev._fn_yearfrac([40909, 41120, 1]), 0.57650273, places=7)
+        self.assertAlmostEqual(self.ev._fn_yearfrac([40909, 41120, 3]), 0.57808219, places=7)
+
+    def test_norm_dist_family(self):
+        self.assertAlmostEqual(
+            self.ev._fn_norm_dist([42, 40, 1.5, True]), 0.9087887802741321, places=7)
+        self.assertAlmostEqual(
+            self.ev._fn_norm_dist([42, 40, 1.5, False]), 0.10934004978399577, places=7)
+        self.assertAlmostEqual(
+            self.ev._fn_norm_s_dist([1.333333, True]), 0.9087887259176292, places=7)
+        self.assertAlmostEqual(
+            self.ev._fn_norm_inv([0.908789, 40, 1.5]), 42.00000200956616, places=5)
+        self.assertAlmostEqual(
+            self.ev._fn_norm_s_inv([0.908789]), 1.3333346730441074, places=5)
+        self.assertEqual(self.ev._fn_norm_dist([1, 0, 0, True]).code, "#NUM!")
+
+    def test_cheap_wins(self):
+        self.assertEqual(self.ev._fn_product([RangeValues([2, 3, 4], 3, 1)]), 24.0)
+        self.assertEqual(self.ev._fn_power([2, 10]), 1024.0)
+        self.assertAlmostEqual(self.ev._fn_exp([1]), 2.718281828459045)
+        self.assertAlmostEqual(self.ev._fn_ln([2.718281828459045]), 1.0)
+        self.assertEqual(self.ev._fn_ln([0]).code, "#NUM!")
+        self.assertEqual(self.ev._fn_concatenate(["a", 1.0, None, "b"]), "a1b")
+        self.assertTrue(self.ev._fn_isnumber([3.0]))
+        self.assertFalse(self.ev._fn_isnumber(["3"]))
+        self.assertFalse(self.ev._fn_isnumber([ExcelError("#N/A")]))
+        self.assertTrue(self.ev._fn_isblank([None]))
+        self.assertTrue(self.ev._fn_iserr([ExcelError("#DIV/0!")]))
+        self.assertFalse(self.ev._fn_iserr([ExcelError("#N/A")]))
+        self.assertTrue(self.ev._fn_isna([ExcelError("#N/A")]))
+        self.assertTrue(self.ev._fn_iserror([ExcelError("#N/A")]))
+
+
+class CensusLongTailTests(unittest.TestCase):
+    """The multi-workbook blockers surfaced by the FAIL-set census."""
+
+    def setUp(self):
+        self.ev = evaluator([])
+
+    def test_averageif(self):
+        pool = RangeValues([1, 2, 3, 4], 4, 1)
+        target = RangeValues([10, 20, 30, 40], 4, 1)
+        self.assertEqual(self.ev._fn_averageif([pool, ">2", target]), 35.0)
+        self.assertEqual(self.ev._fn_averageif([pool, ">2"]), 3.5)
+        self.assertEqual(self.ev._fn_averageif([pool, ">9"]).code, "#DIV/0!")
+
+    def test_days360(self):
+        # 2011-01-30 (40573) .. 2011-02-01 (40575): Excel doc example gives 1.
+        self.assertEqual(self.ev._fn_days360([40573, 40575]), 1.0)
+        # 2011-01-01 (40544) .. 2011-12-31 (40908) = 360.
+        self.assertEqual(self.ev._fn_days360([40544, 40908]), 360.0)
+
+    def test_lookup_vector_and_array_forms(self):
+        keys = RangeValues([1, 2, 3], 3, 1)
+        results = RangeValues(["a", "b", "c"], 3, 1)
+        self.assertEqual(self.ev._fn_lookup([2.5, keys, results]), "b")
+        table = RangeValues([1, 2, 3, "a", "b", "c"], rows=2, cols=3)
+        self.assertEqual(self.ev._fn_lookup([3, table]), "c")
+        self.assertEqual(self.ev._fn_lookup([0.5, keys, results]).code, "#N/A")
+
+    def test_subtotal_codes_including_hidden_variants(self):
+        rng = RangeValues([1, 2, 3, 4], 4, 1)
+        self.assertEqual(self.ev._fn_subtotal([9, rng]), 10.0)
+        self.assertEqual(self.ev._fn_subtotal([109, rng]), 10.0)
+        self.assertEqual(self.ev._fn_subtotal([1, rng]), 2.5)
+        self.assertEqual(self.ev._fn_subtotal([4, rng]), 4.0)
+
+    def test_maxifs_minifs_default_to_zero_on_no_match(self):
+        target = RangeValues([5, 7, 9], 3, 1)
+        crit = RangeValues(["x", "y", "x"], 3, 1)
+        self.assertEqual(self.ev._fn_maxifs([target, crit, "x"]), 9.0)
+        self.assertEqual(self.ev._fn_minifs([target, crit, "x"]), 5.0)
+        self.assertEqual(self.ev._fn_maxifs([target, crit, "z"]), 0.0)
+
+    def test_workday_and_weekday(self):
+        # 41183 = Mon 2012-10-01; +5 workdays = Mon 2012-10-08 (41190).
+        self.assertEqual(self.ev._fn_workday([41183, 5]), 41190.0)
+        self.assertEqual(self.ev._fn_workday([41183, -1]), 41180.0)
+        holidays = RangeValues([41184], 1, 1)
+        self.assertEqual(self.ev._fn_workday([41183, 1, holidays]), 41185.0)
+        self.assertEqual(self.ev._fn_weekday([41183]), 2.0)
+        self.assertEqual(self.ev._fn_weekday([41183, 2]), 1.0)
+
+    def test_int_n_and_misc(self):
+        self.assertEqual(self.ev._fn_int([-1.5]), -2.0)
+        self.assertEqual(self.ev._fn_n([True]), 1.0)
+        self.assertEqual(self.ev._fn_n(["text"]), 0.0)
+        self.assertEqual(self.ev._fn_n([7.5]), 7.5)
+        self.assertEqual(self.ev._fn_countblank([RangeValues([1, None, ""], 3, 1)]), 2.0)
+        self.assertEqual(self.ev._fn_rows([RangeValues([1, 2, 3, 4], 2, 2)]), 2.0)
+        self.assertEqual(self.ev._fn_trim(["  a   b  "]), "a b")
+        self.assertEqual(self.ev._fn_substitute(["a-b-c", "-", "+", 2]), "a-b+c")
+        self.assertEqual(self.ev._fn_small([RangeValues([9, 1, 5], 3, 1), 2]), 5)
+        self.assertEqual(self.ev._fn_quartile([RangeValues([1, 2, 3, 4], 4, 1), 2]), 2.5)
+
+    def test_array_constant_evaluates_as_horizontal_range(self):
+        constants = [
+            make_node(f"Sheet!A1#{i}:const", "const", owner="Sheet!A1",
+                      op="number", op_kind="const", value=v, expr=str(v))
+            for i, v in enumerate((1, 4, 7, 10))
+        ]
+        op = make_node("Sheet!A1#4:{}", "op", owner="Sheet!A1",
+                       op="{}", op_kind="func", arity=4, expr="{1,4,7,10}")
+        edges = [make_edge(node.id, op.id, i) for i, node in enumerate(constants)]
+        result = evaluator([*constants, op], edges)._apply(op)
+        self.assertIsInstance(result, RangeValues)
+        self.assertEqual(list(result), [1.0, 4.0, 7.0, 10.0])
+        self.assertEqual((result.rows, result.cols), (1, 4))
+
+
+class XlfnDispatchTests(unittest.TestCase):
+    """Prefixed future-function names must reach their bare-name handlers."""
+
+    def _apply_op(self, op_name, stub_args):
+        op = make_node(
+            f"Sheet!A1#0:{op_name}", "op", owner="Sheet!A1",
+            op=op_name, op_kind="func", arity=len(stub_args))
+        ev = evaluator([op])
+        ev._args = lambda node: stub_args
+        return ev._apply(op)
+
+    def test_prefixed_op_dispatches_to_bare_handler(self):
+        result = self._apply_op("_XLFN.NORM.DIST", [42, 40, 1.5, True])
+        self.assertAlmostEqual(result, 0.9087887802741321, places=7)
+
+    def test_prefix_only_handler_still_reachable(self):
+        result = self._apply_op("_XLFN.VSTACK", [1.0, 2.0])
+        self.assertIsInstance(result, RangeValues)
+        self.assertEqual(list(result), [1.0, 2.0])
+
+    def test_unknown_op_still_counted_under_raw_name(self):
+        op = make_node(
+            "Sheet!A1#0:_XLFN.NOSUCHFN", "op", owner="Sheet!A1",
+            op="_XLFN.NOSUCHFN", op_kind="func", arity=1)
+        ev = evaluator([op])
+        ev._args = lambda node: [1.0]
+        result = ev._apply(op)
+        self.assertIsInstance(result, Unresolved)
+        self.assertEqual(ev.unknown_ops.get("_XLFN.NOSUCHFN"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

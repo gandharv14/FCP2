@@ -70,6 +70,8 @@ try:
         VALUE_RE,
         attr,
         build_cell,
+        is_chart_part,
+        scrub_chart_caches,
         sheet_parts,
     )
 except ImportError:  # pragma: no cover
@@ -211,6 +213,19 @@ def output_values(bands_path, book):
     return values
 
 
+def output_cells(bands_path):
+    """``{(sheet, row, col)}`` for every curated output cell."""
+    cells = set()
+    with open(bands_path, newline="", encoding="utf-8") as fh:
+        for band in csv.DictReader(fh):
+            if band["bucket"] != "output":
+                continue
+            row = int(band["row"])
+            for col in range(int(band["col_lo"]), int(band["col_hi"]) + 1):
+                cells.add((band["sheet"], row, col))
+    return cells
+
+
 def formula_coordinates(src_path):
     """``{sheet: {(row, col)}}`` of every cell that carries a formula."""
     book = openpyxl.load_workbook(src_path, data_only=False)
@@ -226,20 +241,49 @@ def formula_coordinates(src_path):
     return coords
 
 
+TEXT_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
+
+
+def _sig4(value):
+    """The value rounded to 4 significant digits, for display-paste matching."""
+    return float("%.4g" % value)
+
+
 def pasted_answers(book, formula_coords, frontier, outputs):
     """Typed cells whose value duplicates a chosen output's value.
 
     Keeping every typed cell is what makes the mask safe, but a value-paste of
-    an answer would hand the rebuild its target. A full-precision float match
-    against an output value is no coincidence; trivial round numbers are left
-    alone because they collide by accident, not by paste.
+    an answer would hand the rebuild its target. Three classes are caught:
+
+    - a full-precision float match on a typed cell outside the input frontier
+      is no coincidence: it is blanked and reported, as before;
+    - a typed cell *inside* the frontier that equals an output, and a typed
+      cell agreeing with an output only to 4 significant digits (a paste
+      rounded for display), are reported as suspects for a human to arbitrate
+      -- blanking a frontier cell would break the proven-sufficient input set,
+      and a rounded collision can be legitimate;
+    - a text cell whose formatted rendering contains an output value (either
+      at face value or as a percentage, "23.4%" for 0.234) is likewise
+      reported as a suspect.
+
+    Trivial round integers (whole numbers under 10,000) are never matched:
+    they collide by accident, not by paste, and would drown the report.
     """
     deny = defaultdict(set)
     report = []
+    suspects = []
     interesting = [o for o in outputs
                    if not (float(o).is_integer() and abs(o) < 10000)]
     if not interesting:
-        return deny, report
+        return deny, report, suspects
+
+    def exact(v):
+        return next((t for t in interesting
+                     if abs(v - t) <= 1e-12 * max(1.0, abs(t))), None)
+
+    def rounded(v):
+        return next((t for t in interesting if _sig4(v) == _sig4(t)), None)
+
     for ws in book.worksheets:
         formulas = formula_coords.get(ws.title, set())
         safe = frontier.get(ws.title, set())
@@ -248,21 +292,49 @@ def pasted_answers(book, formula_coords, frontier, outputs):
             c for row in ws.iter_rows() for c in row)
         for cell in iterable:
             value = cell.value
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
-                continue
             spot = (cell.row, cell.column)
-            if spot in formulas or spot in safe:
+            if spot in formulas:
+                continue
+            where = "%s!%s%d" % (ws.title, get_column_letter(cell.column),
+                                 cell.row)
+
+            if isinstance(value, str):
+                for token in TEXT_NUMBER_RE.findall(value.replace(",", "")):
+                    try:
+                        x = float(token)
+                    except ValueError:  # pragma: no cover
+                        continue
+                    if x.is_integer() and abs(x) < 10000:
+                        continue
+                    hit = rounded(x) or rounded(x / 100.0)
+                    if hit is not None:
+                        suspects.append(
+                            "%s=%r renders output value %r" % (where, value, hit))
+                        break
+                continue
+
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
                 continue
             v = float(value)
             if float(v).is_integer() and abs(v) < 10000:
                 continue
-            for target in interesting:
-                if abs(v - target) <= 1e-12 * max(1.0, abs(target)):
-                    deny[ws.title].add(spot)
-                    report.append("%s!%s%d=%r" % (
-                        ws.title, get_column_letter(cell.column), cell.row, value))
-                    break
-    return deny, report
+            if spot in safe:
+                hit = exact(v)
+                if hit is not None:
+                    suspects.append(
+                        "%s=%r (input-frontier cell equals an output; "
+                        "review curation)" % (where, value))
+                continue
+            if exact(v) is not None:
+                deny[ws.title].add(spot)
+                report.append("%s=%r" % (where, value))
+                continue
+            hit = rounded(v)
+            if hit is not None:
+                suspects.append(
+                    "%s=%r matches output %r at 4 significant digits"
+                    % (where, value, hit))
+    return deny, report, suspects
 
 
 def load_mask_cells(path):
@@ -329,14 +401,89 @@ def embedded_assumptions(seg_dir):
     return rows
 
 
+MASKED_VALUE_NOTE = "(masked: retrieve via the research data service)"
+
+FORMULA_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
+
+
+def _value_matches(value, deny_numbers, deny_texts):
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        v = float(value)
+        return any(abs(abs(v) - abs(t)) <= 1e-9 * max(1.0, abs(t))
+                   for t in deny_numbers)
+    text = str(value).strip()
+    return bool(text) and text in deny_texts
+
+
+def _formula_mentions(formula, deny_numbers):
+    for token in FORMULA_NUMBER_RE.findall(str(formula)):
+        try:
+            v = float(token)
+        except ValueError:  # pragma: no cover
+            continue
+        if any(abs(v - abs(t)) <= 1e-9 * max(1.0, abs(t)) for t in deny_numbers):
+            return True
+    return False
+
+
+def _entry_host(entry):
+    """``(sheet, row, col)`` of an assumption entry's host cell, or None."""
+    host = entry.get("host", "")
+    sheet, _, coords = host.rpartition("!")
+    if not sheet or not coords:
+        return None
+    try:
+        row, col = coordinate_to_tuple(coords)
+    except ValueError:
+        return None
+    return (sheet, row, col)
+
+
+def redact_assumptions(rows, deny, deny_numbers, deny_texts, outputs):
+    """Withhold masked and answer-revealing content from the assumption rows.
+
+    The sheet documents constants hardcoded inside formulas, which creates two
+    side channels the grid mask cannot see. Mirroring the mask itself:
+
+    - an entry whose host cell is denied, or whose constant equals a denied
+      cell's value, loses both value and formula -- the value stays
+      retrievable, through the research tools instead of the sheet;
+    - an entry whose formula merely contains a denied value as a literal
+      loses the formula text;
+    - an entry hosted in a curated output cell loses the formula text, which
+      is the answer cell's exact derivation. Its constant is still an input
+      and stays.
+    """
+    redacted, stripped = [], []
+    out = []
+    for entry in rows:
+        entry = dict(entry)
+        where = _entry_host(entry)
+        host_denied = (where is not None
+                       and where[1:] in deny.get(where[0], set()))
+        formula = str(entry.get("formula", ""))
+        if host_denied or _value_matches(entry.get("value"), deny_numbers, deny_texts):
+            entry["value"] = MASKED_VALUE_NOTE
+            entry["formula"] = ""
+            redacted.append(entry.get("host", ""))
+        elif formula and (
+            (where is not None and where in outputs)
+            or _formula_mentions(formula, deny_numbers)
+        ):
+            entry["formula"] = ""
+            stripped.append(entry.get("host", ""))
+        out.append(entry)
+    return out, redacted, stripped
+
+
 def _xml_escape(text):
     return (str(text).replace("&", "&amp;").replace("<", "&lt;")
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def _assumptions_sheet_xml(rows, deny=None):
-    deny = deny or set()
-
+def _assumptions_sheet_xml(rows):
     def cell(ref, value):
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return '<c r="%s"><v>%.17g</v></c>' % (ref, value)
@@ -360,7 +507,7 @@ def _assumptions_sheet_xml(rows, deny=None):
         cells = "".join(
             cell("%s%d" % (get_column_letter(c), r), v)
             for c, v in enumerate(values, start=1)
-            if v != "" and (r, c) not in deny
+            if v != ""
         )
         body.append('<row r="%d">%s</row>' % (r, cells))
     xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -370,12 +517,13 @@ def _assumptions_sheet_xml(rows, deny=None):
     return xml.encode("utf-8")
 
 
-def inject_assumptions(out_path, rows, existing_sheets, deny=None):
-    """Append an assumptions sheet at the XML level, sparing charts and styles."""
+def inject_assumptions(out_path, rows, existing_sheets):
+    """Append an assumptions sheet at the XML level, sparing charts and styles.
+
+    ``rows`` must already have been through :func:`redact_assumptions`."""
     name = ASSUMPTIONS_SHEET
     while name in existing_sheets:
         name += " (pipeline)"
-    denied = (deny or {}).get(name, set())
 
     with zipfile.ZipFile(out_path) as src:
         items = [(item, src.read(item.filename)) for item in src.infolist()]
@@ -419,7 +567,7 @@ def inject_assumptions(out_path, rows, existing_sheets, deny=None):
             info.compress_type = item.compress_type
             info.external_attr = item.external_attr
             out.writestr(info, parts[item.filename])
-        out.writestr(ASSUMPTIONS_PART, _assumptions_sheet_xml(rows, denied))
+        out.writestr(ASSUMPTIONS_PART, _assumptions_sheet_xml(rows))
     os.replace(tmp, out_path)
     return name
 
@@ -493,6 +641,12 @@ def write_masked(src_path, out_path, keep, deny, tally):
                 if item.filename in part_keep:
                     sheet_keep, sheet_deny = part_keep[item.filename]
                     data = mask_sheet(data, sheet_keep, sheet_deny, tally)
+                elif is_chart_part(item.filename):
+                    # charts cache every plotted value, including cells the
+                    # mask just blanked; Excel rebuilds the cache from the
+                    # grid on open
+                    data, hits = scrub_chart_caches(item.filename, data)
+                    tally["chart_caches"] += hits
                 elif item.filename == "[Content_Types].xml":
                     data = CALC_OVERRIDE_RE.sub(b"", data)
                 elif item.filename == "xl/_rels/workbook.xml.rels":
@@ -508,23 +662,38 @@ def write_masked(src_path, out_path, keep, deny, tally):
 # ---------------------------------------------------------------------------
 
 def verify(out_path, src_path, keep, frontier, formula_coords, deny,
-           assumptions_sheet=None):
+           assumptions_sheet=None, deny_numbers=(), deny_texts=(),
+           forbidden_formulas=()):
     """Confirm the mask leaked nothing and cost nothing.
 
-    Four ways this can go wrong, all worth catching: a formula survives and
-    gives the answer away, a formula-derived number survives outside the keep
-    set, a redacted pasted answer survives, or a typed cell / input is lost or
-    changed so the workbook can no longer be rebuilt.
+    Ways this can go wrong, all worth catching: a formula survives and gives
+    the answer away, a formula-derived number survives outside the keep set, a
+    redacted pasted answer survives, a chart part still caches blanked values,
+    the assumptions sheet prints a masked value or an output cell's formula,
+    or a typed cell / input is lost or changed so the workbook can no longer
+    be rebuilt.
     """
     warnings.simplefilter("ignore")
     masked = openpyxl.load_workbook(out_path)
     original = openpyxl.load_workbook(src_path, data_only=True)
     faults = {"formula": [], "leaked": [], "lost": [], "changed": []}
 
+    # No chart part may still carry cached series values: re-scrubbing the
+    # written file must be a no-op.
+    with zipfile.ZipFile(out_path) as zf:
+        for name in zf.namelist():
+            if is_chart_part(name):
+                _, hits = scrub_chart_caches(name, zf.read(name))
+                if hits:
+                    faults["leaked"].append("%s (chart value cache)" % name)
+
+    forbidden_formulas = [f for f in forbidden_formulas if str(f).strip()]
+
     for ws in masked.worksheets:
         allowed = keep.get(ws.title, set())
         derived = formula_coords.get(ws.title, set())
         denied = deny.get(ws.title, set())
+        on_assumptions = assumptions_sheet is not None and ws.title == assumptions_sheet
         for row in ws.iter_rows():
             for cell in row:
                 value = cell.value
@@ -536,6 +705,18 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
                 if isinstance(value, str):
                     if value.startswith("="):
                         faults["formula"].append(where)
+                    elif any(f in value for f in forbidden_formulas):
+                        faults["formula"].append("%s (output cell formula text)"
+                                                 % where)
+                    elif on_assumptions and _value_matches(
+                            value, deny_numbers, deny_texts):
+                        faults["leaked"].append("%s=%r (masked value on "
+                                                "assumptions sheet)" % (where, value))
+                    continue
+                if on_assumptions:
+                    if _value_matches(value, deny_numbers, deny_texts):
+                        faults["leaked"].append("%s=%r (masked value on "
+                                                "assumptions sheet)" % (where, value))
                     continue
                 if spot in denied:
                     faults["leaked"].append("%s=%r (pasted answer)" % (where, value))
@@ -608,7 +789,8 @@ def process(wb_id, args):
 
     proof = frontier_proof(Path(args.seg_dir) / wb_id)
     outputs = output_values(bands, book)
-    deny, denied_report = pasted_answers(book, formula_coords, frontier, outputs)
+    deny, denied_report, paste_suspects = pasted_answers(
+        book, formula_coords, frontier, outputs)
 
     # Externally-sourced variables: blank them everywhere. Removing them from
     # ``keep``/``frontier`` blanks frozen formula hosts too and tells verify()
@@ -625,20 +807,44 @@ def process(wb_id, args):
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / ("%s-inputs%s" % (wb_id, source.suffix))
 
+    # Original values of every denied cell: the assumptions sheet must not
+    # print a number the grid mask just removed.
+    deny_numbers, deny_texts = set(), set()
+    for sheet, spots in deny.items():
+        if sheet not in book.sheetnames:
+            continue
+        ws = book[sheet]
+        for row, col in spots:
+            value = ws.cell(row=row, column=col).value
+            if value is None or isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                deny_numbers.add(float(value))
+            elif isinstance(value, str) and value.strip():
+                deny_texts.add(value.strip())
+
     tally = Counter()
     write_masked(source, out_path, keep, deny, tally)
 
+    outputs_at = output_cells(bands)
     assumptions = embedded_assumptions(Path(args.seg_dir) / wb_id)
+    # The exact derivations of answer cells must not appear anywhere as text.
+    forbidden_formulas = sorted({
+        str(e.get("formula", "")) for e in assumptions
+        if _entry_host(e) in outputs_at and str(e.get("formula", "")).strip()
+    })
+    assumptions, redacted_rows, stripped_rows = redact_assumptions(
+        assumptions, deny, deny_numbers, deny_texts, outputs_at
+    )
     assumptions_sheet = None
     if assumptions:
         with zipfile.ZipFile(source) as zf:
             existing = {name for name, _ in sheet_parts(zf)}
-        assumptions_sheet = inject_assumptions(
-            out_path, assumptions, existing, deny
-        )
+        assumptions_sheet = inject_assumptions(out_path, assumptions, existing)
 
     faults = verify(out_path, source, keep, frontier, formula_coords, deny,
-                    assumptions_sheet)
+                    assumptions_sheet, deny_numbers, deny_texts,
+                    forbidden_formulas)
     broken = sum(len(v) for v in faults.values())
     print("  %s  kept %d  frozen %d  blanked %d  redacted %d  ->  %s (%s)"
           % (wb_id, tally["kept"], tally["frozen"], tally["blanked"],
@@ -652,12 +858,29 @@ def process(wb_id, args):
     if denied_report:
         print("       redacted %d typed duplicate(s) of output values: %s"
               % (len(denied_report), ", ".join(denied_report[:6])))
+    if paste_suspects:
+        print("       WARNING: %d possible pasted answer(s) kept -- review "
+              "before shipping:" % len(paste_suspects))
+        for line in paste_suspects[:10]:
+            print("         %s" % line)
+        if len(paste_suspects) > 10:
+            print("         ... and %d more" % (len(paste_suspects) - 10))
     if masked_external:
         print("       masked %d externally-sourced cell(s) listed in %s"
               % (masked_external, args.mask_cells))
+    if tally["chart_caches"]:
+        print("       %d cached chart series scrubbed (values re-read from "
+              "the grid on open)" % tally["chart_caches"])
     if assumptions_sheet:
         print("       %d hardcoded formula constants -> sheet %r"
               % (len(assumptions), assumptions_sheet))
+    if redacted_rows:
+        print("       %d assumption row(s) redacted (masked values): %s"
+              % (len(redacted_rows), ", ".join(redacted_rows[:6])))
+    if stripped_rows:
+        print("       %d assumption formula(s) withheld (output cells or "
+              "masked literals): %s"
+              % (len(stripped_rows), ", ".join(stripped_rows[:6])))
     if admitted:
         derived = Counter(b for b in admitted.values()
                           if b in ("middle", "output"))

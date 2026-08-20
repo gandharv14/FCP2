@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 import re
 from datetime import date, timedelta
@@ -604,6 +605,17 @@ def validate_spec(spec: dict[str, Any]) -> None:
                         % (pid, value, variable["id"]))
 
 
+# The exact-answer grader accepts max(1e-6, 1e-6 * |expected|). A wrong value
+# closer to the truth than several of those bands would be a trap an agent
+# could fall into and still be graded correct, so every perturbed value must
+# clear the floor by an order of magnitude.
+GRADER_TOLERANCE = 1e-6
+
+
+def _grader_band_floor(value: float) -> float:
+    return 10 * max(GRADER_TOLERANCE, GRADER_TOLERANCE * abs(value))
+
+
 def perturb(variable: dict[str, Any], index: int) -> Any:
     """A plausible-but-wrong value for a distractor record."""
     alternatives = variable.get("alternatives") or []
@@ -613,15 +625,21 @@ def perturb(variable: dict[str, Any], index: int) -> Any:
     if isinstance(value, bool):
         return not value
     if isinstance(value, int):
-        return value + [1, -1, 2, -2, 5, -5][index % 6]
+        # The grader band is relative, so for large integers a +/-1..5 offset
+        # would sit inside it (e.g. +/-2 on a 15-million revenue figure).
+        step = max(1, math.ceil(2 * _grader_band_floor(float(value))))
+        return value + [1, -1, 2, -2, 5, -5][index % 6] * step
     if isinstance(value, float):
         factor = [0.9, 1.1, 0.96, 1.04, 0.75, 1.25][index % 6]
         candidate = round(value * factor, 12)
-        if candidate == value:
-            # Multiplication cannot perturb zero, and coarse rounding can leave
-            # very small values unchanged. Always emit a distinct stale value.
+        floor = _grader_band_floor(value)
+        if abs(candidate - value) <= floor:
+            # Multiplication cannot perturb zero, coarse rounding can leave
+            # very small values unchanged, and for tiny magnitudes even a 4%
+            # factor lands inside the grader's acceptance band. Emit a value
+            # that is unambiguously wrong.
             direction = [1, -1, 2, -2, 5, -5][index % 6]
-            step = max(abs(value) * 0.01, 1e-6)
+            step = max(abs(value) * 0.05, 2 * floor)
             candidate = round(value + direction * step, 12)
         return candidate
     date = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", str(value))
@@ -709,16 +727,17 @@ def make_record(dataset_id: str, source: str, document: str,
 
 
 def make_document(doc_id: str, source: dict[str, Any], row: dict[str, Any],
-                  kind: str, published: str, supersedes: str | None = None,
+                  kind: str, published: str,
                   superseded_by: str | None = None,
                   field_labels: dict[str, str] | None = None,
                   excerpt: dict[str, str] | None = None) -> dict[str, Any]:
+    # Every unsuperseded document -- supported record and distractors alike --
+    # carries the identical guidance sentence. A phrase found only in answer
+    # documents would let one search_documents call reveal every answer;
+    # supersession is conveyed by the record's superseded_by field alone.
     if superseded_by:
         lineage = ("SUPERSEDED: this release has been replaced by release %s. "
                    "Do not use it for current work." % superseded_by)
-    elif supersedes:
-        lineage = ("This release supersedes release %s and is the "
-                   "authoritative figure." % supersedes)
     else:
         lineage = ("Use this observation only when every dimension matches "
                    "the research question.")
@@ -1000,7 +1019,6 @@ def build(spec: dict[str, Any], output: Path) -> dict[str, Any]:
             doc_id, primary, supported,
             doc_kinds[0] if doc_kinds else "data-release",
             supported_date,
-            supersedes=release_ids[-2] if n_stale else None,
             field_labels=field_labels,
             excerpt=excerpts[0] if excerpts else None))
 

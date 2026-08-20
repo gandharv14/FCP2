@@ -631,6 +631,22 @@ class AstGraph:
                     text = value.text
                     if isinstance(text, str) and text.startswith("="):
                         formulas[(cell.row, cell.column)] = (text, True)
+                        # A multi-cell array (CSE or spill) formula lives only
+                        # on its master cell; the member cells it fills carry
+                        # nothing but a cached value in the file, and would
+                        # otherwise be classified as hand-typed inputs -- a
+                        # computed value handed to the rebuild as a given.
+                        # Register every member as owning the same formula so
+                        # it is a formula cell with real precedent edges.
+                        ref = str(getattr(value, "ref", "") or "")
+                        if ":" in ref:
+                            min_col, min_row, max_col, max_row = \
+                                range_boundaries(ref)
+                            for member_row in range(min_row, max_row + 1):
+                                for member_col in range(min_col, max_col + 1):
+                                    spot = (member_row, member_col)
+                                    if spot != (cell.row, cell.column):
+                                        formulas.setdefault(spot, (text, True))
                 elif cell.data_type == "f" and isinstance(value, str) and value.startswith("="):
                     formulas[(cell.row, cell.column)] = (value, False)
             idx.finalise()

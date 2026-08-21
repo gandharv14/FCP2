@@ -303,6 +303,38 @@ def semantic_hints(family):
     ]
 
 
+def verify_mcp_mask(mcp_dir, artifact):
+    """Every cell the MCP bundle serves must be blank in the shipped workbook.
+
+    Packaging is the last line of defense: if the bundle was rebuilt (new
+    mask_cells.json) without re-running xl_input_mask.py, "research-only"
+    variables would still be sitting in the sheets, silently defeating the
+    research component.
+    """
+    from xl_input_mask import load_mask_cells
+    mask_path = mcp_dir / "mask_cells.json"
+    if not mask_path.is_file():
+        raise SystemExit("--mcp bundle %s has no mask_cells.json" % mcp_dir)
+    book = openpyxl.load_workbook(artifact, data_only=True)
+    populated = []
+    for sheet, spots in load_mask_cells(mask_path).items():
+        if sheet not in book.sheetnames:
+            raise SystemExit(
+                "%s names unknown sheet %r" % (mask_path, sheet))
+        grid = book[sheet]
+        for row, col in sorted(spots):
+            if grid.cell(row=row, column=col).value is not None:
+                populated.append(
+                    "%s!%s%d" % (sheet, get_column_letter(col), row))
+    if populated:
+        raise SystemExit(
+            "%s was not masked with %s: %d MCP-served cell(s) are still "
+            "populated, e.g. %s -- re-run xl_input_mask.py --mask-cells "
+            "against this bundle"
+            % (artifact.name, mask_path, len(populated),
+               ", ".join(populated[:8])))
+
+
 def collect(workbook, source_dir, seg_root, inputs_root):
     """(outputs, targets) - curated figures and their golden cell values."""
     seg_dir = Path(seg_root) / workbook
@@ -822,6 +854,9 @@ def main(argv=None):
     mcp_dir = Path(args.mcp) if args.mcp else None
     if mcp_dir is not None and not (mcp_dir / "runtime").is_dir():
         parser.error("--mcp %s has no runtime/ directory" % mcp_dir)
+    if mcp_dir is not None and len(args.workbooks) != 1:
+        parser.error("an --mcp bundle is specific to one workbook; pass "
+                     "exactly one workbook id per invocation")
 
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -845,6 +880,8 @@ def main(argv=None):
                 context_path=Path(args.custom_formula_context),
             )
         artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
+        if mcp_dir is not None:
+            verify_mcp_mask(mcp_dir, artifact)
         audit_meta = None
         if not args.no_variable_source_audit:
             audit_artifact = (

@@ -3,7 +3,9 @@
 # Staging root tasks_outputs_mcp/ is shape-agnostic: MCP or plain.
 # Usage: build_one.sh <WB>
 set -uo pipefail
-cd /Users/henryhu/Documents/GDM_FCP/FCP2
+# Every gate path below is relative, so a failed cd would run all 15 gates --
+# and stamp BUILDOK -- against whatever tree the caller happens to be in.
+cd "$(dirname "$0")" || { echo "BUILDFAIL cd :: cannot cd to the pipeline root"; exit 1; }
 
 WB="$1"
 if [ -f "4-10 100/$WB.xlsx" ]; then SOURCE="4-10 100"; else SOURCE="batch-src"; fi

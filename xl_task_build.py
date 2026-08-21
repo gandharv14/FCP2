@@ -92,6 +92,12 @@ HURDLES = {
 
 TRAJECTORY_LABEL_RE = re.compile(r"margin|ratio|rate|%", re.I)
 
+# Rising is not always improving: a cost ratio or churn rate that goes up has
+# deteriorated. Metrics matching this pattern have their verdict inverted.
+LOWER_IS_BETTER_RE = re.compile(
+    r"cost|expense|churn|attrition|loss|debt|leverage|gearing|default|"
+    r"delinquen|burn|overhead|liabilit|payable|vacancy|write.?off", re.I)
+
 # a text header only counts as a period if it looks like one ("FY2027", "Q3",
 # "2026A", "Jan-27", "Year 5"); bare dashes and stray notes are skipped
 PERIOD_TEXT_RE = re.compile(
@@ -601,7 +607,9 @@ def build_judge_trajectory(spec, tpl, rng):
      first, p_first, p_last) = rng.choice(candidates)
     periods = "%s to %s" % (p_first, p_last)
     slots = {"metric": metric, "periods": periods}
-    verdict = "improving" if value > first else "deteriorating"
+    higher_is_better = not LOWER_IS_BETTER_RE.search(metric)
+    rose = value > first
+    verdict = "improving" if rose == higher_is_better else "deteriorating"
     return Instance(
         tpl["id"], tpl["financebench"], slots,
         scenario=tpl["prompt"].strip().format(**slots),
@@ -613,7 +621,9 @@ def build_judge_trajectory(spec, tpl, rng):
                     "verdict": verdict,
                     "first": jsonable(first), "last": jsonable(value),
                     "detail": {"first_ref": None,
-                               "last_ref": ref_str(sheet, row, col)}},
+                               "last_ref": ref_str(sheet, row, col),
+                               "polarity": "higher-is-better"
+                               if higher_is_better else "lower-is-better"}},
         answer_cells=[(sheet, row, col, level)],
         facts_required=[metric, p_first, p_last],
         facts_refs=[], forbidden=[fmt_number(value)])

@@ -239,13 +239,13 @@ class Book:
     def row_label(self, k: str) -> str:
         """The label governing this cell: nearest real name to its left on the row.
 
-        Two traps. Taking the leftmost text on the row names a different table
-        whenever a sheet carries side-by-side blocks. Taking the nearest text
-        names the units column, because these sheets park a `%` or a currency
-        marker between the label and the data. So scan leftward but step over
-        anything that is a unit stamp rather than a name, and return nothing when
-        no name is found - a caller that cannot name a row should say nothing
-        about it.
+        Side-by-side assumption blocks share a row (0042 Summary: B/C keys, D/F
+        areas, G/H unit costs, I/K fees). A sheet-wide "label column" list misses
+        a short block (I has five names and more numbers than text) and then the
+        nearest *accepted* column is a different table (K9 → D9 Parking Spaces).
+        So walk left from the cell itself. Skip blanks, numbers, formulas, unit
+        stamps, and repeating scenario markers. Take the first real name. Do not
+        jump to the leftmost column on the row.
         """
         if k in self._labels:
             return self._labels[k]
@@ -253,34 +253,24 @@ class Book:
         p = split_coord(coord)
         label = ""
         if p:
-            candidates = sorted(
-                (c for c in self.label_columns(sheet) if c < col_to_num(p[0])),
-                reverse=True,
-            )
-            if candidates:
-                # The nearest label column defines the local block boundary. If
-                # its cell is blank, a formula, or a repeated scenario marker,
-                # stop. Continuing left would borrow a name from an unrelated
-                # side-by-side table.
-                c = candidates[0]
-                v = self.value.get(key(sheet, "%s%d" % (num_to_col(c), p[1])))
-                if isinstance(v, str) and v.strip() and not v.startswith("="):
-                    text = v.strip()
-                    if re.fullmatch(r"scenario\s+\d+", text, re.I):
-                        # Some sheets put the selected scenario value immediately
-                        # beside a real "Scenario" label. Use the label, not the
-                        # selected value.
-                        for previous in candidates[1:]:
-                            pv = self.value.get(
-                                key(sheet, "%s%d" % (num_to_col(previous), p[1]))
-                            )
-                            if isinstance(pv, str) and re.fullmatch(
-                                r"scenario", pv.strip(), re.I
-                            ):
-                                label = pv.strip()
-                                break
-                    elif not is_unit_stamp(text) and self.is_row_name(sheet, c, text):
-                        label = text
+            col, row = col_to_num(p[0]), p[1]
+            # Own cell first: a label sitting in a short block (I9) is the name.
+            # Then walk left. Never jump to the leftmost column on the row.
+            for c in range(col, 0, -1):
+                v = self.value.get(key(sheet, "%s%d" % (num_to_col(c), row)))
+                if isinstance(v, (int, float)) or v is None:
+                    continue
+                if not isinstance(v, str) or not v.strip() or v.startswith("="):
+                    continue
+                text = v.strip()
+                if is_unit_stamp(text):
+                    continue
+                if re.fullmatch(r"scenario\s+\d+", text, re.I):
+                    continue
+                if not self.is_row_name(sheet, c, text):
+                    continue
+                label = text
+                break
         self._labels[k] = label
         return label
 
@@ -293,6 +283,7 @@ class Book:
 UNIT_TOKENS = {
     "aed", "usd", "eur", "gbp", "x", "%", "na", "n/a", "-", "bc",
     "000$", "$mm", "$bn", "$000s", "mm", "bn", "k", "m", "$", "yrs", "y",
+    "none", "nil", "null", "yes", "tbd", "n.m.", "nm",
 }
 
 
@@ -1679,8 +1670,10 @@ def ingredient_phrase(gold: Book, evidence: str, cells: list[str], own_label: st
     Returns empty when the result would not be a clean sentence, which is the
     signal for the record not to ship at all. Three cases fail: no labelled
     ingredient to name, more than two of them, or one that merely repeats the
-    target's own label. In each the sentence would be mush, and a mushy
-    disclosure is worse than silence.
+    target's own label on the same sheet. An off-sheet row with the same
+    visible name is a different cell and is named (and the tab is included).
+    In each failing case the sentence would be mush, and a mushy disclosure
+    is worse than silence.
     """
     if not cells:
         return ""
@@ -1694,14 +1687,20 @@ def ingredient_phrase(gold: Book, evidence: str, cells: list[str], own_label: st
         lab = gold.row_label(key(rsheet, "%s%d" % (num_to_col(rcol), rrow)))
         if not lab:
             return ""
-        if lab == own_label:
+        # Same-string on the same sheet is the target naming itself. Same-string
+        # on another sheet is a different row (0042: Summary I9 "Asset
+        # Management Fee" is the rate; Operations 146 is the calculated line).
+        if lab == own_label and rsheet == sheet:
             return ""
-        if lab not in labels:
-            labels.append(lab)
+        if rsheet != sheet:
+            piece = "the row labelled %s on the %s tab" % (q(lab), rsheet)
+        else:
+            piece = "the row labelled %s" % q(lab)
+        if piece not in labels:
+            labels.append(piece)
     if not labels or len(labels) > 2:
         return ""
-    named = ["the row labelled %s" % q(l) for l in labels]
-    return named[0] if len(named) == 1 else " and ".join(named)
+    return labels[0] if len(labels) == 1 else " and ".join(labels)
 
 
 def detect_projection_rule(gold: Book, delivered: Book, selected: set[str]) -> list[dict]:

@@ -192,8 +192,10 @@ Records from this section ship a value. Their record metadata is `convention`.
     is not a projection rule at all; the shape classifier fires on the multiplication inside
     the branch and mislabels genuinely custom logic.
   - **declines** when the ingredient rows carry no label, when there are more than two of
-    them, or when one merely repeats the target's own label. In each case the sentence would
-    be mush, and mush is worse than silence.
+    them, or when one merely repeats the target's own label **on the same sheet**. A
+    same-string label on another sheet is a different row and may be named. In the
+    same-sheet / unlabelled / too-many cases the sentence would be mush, and mush is
+    worse than silence.
   - **ships** when the ingredient is absent, unlabelled at reach, or on another sheet with no
     pointer.
   - for `hold_level`, which names no ingredient, **ships** only when no value on the row is

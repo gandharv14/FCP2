@@ -878,6 +878,12 @@ def toml_value(value):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return fmt_number(value) if isinstance(value, float) else str(value)
+    if isinstance(value, dict):
+        items = []
+        for key, inner in value.items():
+            safe = key if re.fullmatch(r"[A-Za-z0-9_-]+", str(key)) else '"%s"' % key
+            items.append("%s = %s" % (safe, toml_value(inner)))
+        return "{%s}" % ", ".join(items)
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(toml_value(v) for v in value) + "]"
     text = str(value).replace("\\", "\\\\").replace('"', '\\"')

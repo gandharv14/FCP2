@@ -44,18 +44,60 @@ def segment(wb: str, args) -> dict:
 
     candidates = frontier.score_outputs(bg, cd)
     curation_path = out_dir / "curation.toml"
-    if args.recurate or not curation_path.exists():
+    wrote_fresh = args.recurate or not curation_path.exists()
+    if wrote_fresh:
         emit.write_curation(out_dir, wb, candidates, args.threshold, args.top)
         if args.llm:
             key = adjudicate.read_key(Path(args.env_file))
             if not key:
-                raise SystemExit(f"--llm needs anthropic_api_key in {args.env_file}")
-            decisions = adjudicate.adjudicate(wb, candidates[: args.top], key, args.model)
+                raise SystemExit(
+                    f"--llm needs anthropic_api_key or lbx_api_key in {args.env_file}")
+            proxy = adjudicate.via_proxy(Path(args.env_file))
+            decisions = adjudicate.adjudicate(
+                wb, candidates[: args.top], key, args.model, proxy=proxy)
             flipped = adjudicate.apply_to_curation(curation_path, decisions)
             print(f"  adjudicator reviewed {len(decisions)} candidates, changed {flipped}")
     emit.write_candidates(out_dir, candidates, bg)
 
-    chosen = {e["band"] for e in emit.read_curation(curation_path) if e.get("include")}
+    def included_bands():
+        return {e["band"] for e in emit.read_curation(curation_path) if e.get("include")}
+
+    # Escalation ladder. Only a curation this run wrote is escalated; a
+    # pre-existing (possibly hand-edited) file with zero includes still aborts,
+    # because overriding a human decision is not this code's call to make.
+    chosen = included_bands()
+    rung = "llm" if args.llm else "heuristic"
+    if not chosen and wrote_fresh:
+        if not args.llm:
+            key = adjudicate.read_key(Path(args.env_file))
+            if key:
+                print(f"  {wb}: 0 auto-includes; escalating to LLM adjudicator")
+                try:
+                    decisions = adjudicate.adjudicate(
+                        wb, candidates[: args.top], key, args.model,
+                        proxy=adjudicate.via_proxy(Path(args.env_file)))
+                    adjudicate.apply_to_curation(curation_path, decisions)
+                    rung = "llm"
+                except (ValueError, OSError) as exc:
+                    print(f"  {wb}: WARNING adjudicator escalation failed ({exc})")
+            else:
+                print(f"  {wb}: 0 auto-includes and no API key in {args.env_file}")
+            # Re-read rather than trust the changed count: an adjudicator that
+            # runs cleanly but includes nothing must still fall through.
+            chosen = included_bands()
+        if not chosen:
+            picks = frontier.fallback_outputs(candidates[: args.top])
+            if picks:
+                emit.apply_fallback(curation_path, [c.band for c in picks])
+                rung = "fallback"
+                print(f"  {wb}: fallback auto-included top {len(picks)}: "
+                      + ", ".join(f"{c.band} ({c.label[:32]!r})" for c in picks))
+            chosen = included_bands()
+    tally = {"heuristic": 0, "llm": 0, "fallback": 0}
+    tally[rung] = len(chosen)
+    print(f"  {wb}: outputs {tally['heuristic']} heuristic / "
+          f"{tally['llm']} llm / {tally['fallback']} fallback")
+
     outputs = {cd.comp_of[b] for b in chosen if b in cd.comp_of}
     if not outputs:
         raise SystemExit(f"{wb}: no outputs selected in {curation_path}")

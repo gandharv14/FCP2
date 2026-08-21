@@ -1,14 +1,21 @@
 ---
 name: create-harbor-task
-description: Creates fail-closed MCP-backed Harbor workbook tasks. Use when asked to create or rebuild a Harbor task, package an .xlsx or workbook id, generate variable-source MCP inputs, or promote a tasks_outputs bundle.
+description: Creates fail-closed Harbor workbook tasks with unified pre-run task disclosure. MCP-backed when the audit yields maskable variables; a plain (no-MCP) task only when every audit row is genuinely excluded. Use when asked to create or rebuild a Harbor task, package an .xlsx or workbook id, generate variable-source MCP inputs, or promote a tasks_outputs bundle.
 disable-model-invocation: true
 ---
 
-# Create an MCP-backed Harbor task
+# Create a Harbor workbook task
 
 Run the financial-workbook pipeline for exactly one workbook at a time. The
 golden workbook is an answer key and build-time validation input; it must never
-enter the task environment. This workflow has no plain-task fallback.
+enter the task environment. Ship an MCP research sidecar when normalization
+produces maskable variables. A plain (no-MCP) task is permitted only when the
+hardened eligibility check in `plain_eligibility.py` passes: every draft row
+is excluded with a reason, none of the causes are extraction defects, no
+forced-exclusion file exists, the first normalization of the run was also
+empty, and the draft-row floor is met. An audit that yields no resolvable
+candidates is an audit failure, not a plain-task trigger. A spec that was
+non-empty and later emptied must never be downgraded to plain.
 
 ## Resolve paths
 
@@ -31,10 +38,8 @@ EXCLUSIONS="$RUN/exclusions.json"
 DISPOSITIONS="$RUN/normalization_report.json"
 PROFILES="$RUN/source_profiles.json"
 MCP="$RUN/mcp"
-FORMULA_RUN="runs/$WB-custom-formula-gate"
-FORMULA_CONTEXT="$FORMULA_RUN/context.json"
-FORMULA_REPORT="$FORMULA_RUN/report.json"
-FORMULA_HINTS="$FORMULA_RUN/hints.json"
+DISCLOSURE=.cursor/skills/task-disclosure/scripts/disclose.py
+DISCLOSURE_RUN="runs/disclosure/$WB-outputs"
 NAT_RUN="runs/$WB-instruction-naturalization"
 STAGE_ROOT=tasks_outputs_mcp
 STAGED="$STAGE_ROOT/$WB-outputs"
@@ -46,15 +51,20 @@ Expected artifacts:
 - `ast_out/$WB/{nodes.csv,edges.csv}`
 - `seg_out/$WB/{segments.json,curation.toml,lineage.json}`
 - `inputs_out/$WB-inputs.xlsx`: unredacted baseline inputs
-- `runs/$WB-custom-formula-gate/{context,report,hints}.json`
+- `runs/disclosure/$WB-outputs/{bands,probe,records,context,verify}.json`
+- `runs/$WB-variable-sources/disclosure-faithfulness.md`
+- `tasks_outputs_mcp/$WB-outputs/tests/disclosure.json`
 - `runs/$WB-instruction-naturalization/{source.md,candidate.md,validation.json}`
 - `runs/$WB-variable-sources/$WB-inputs-variable-sources.{md,inventory.json,metadata.json}`
 - `draft.json`, `normalize_$WB.py`, `normalized.json`, `exclusions.json`,
   `normalization_report.json`, `source_profiles.json`, and profile captures
 - `mcp/{runtime,eval,server.py,Dockerfile,mask_cells.json,masked_inputs.json}`
-- `inputs_out_mcp/$WB-inputs.xlsx`: separately MCP-masked inputs
-- `tasks_outputs_mcp/$WB-outputs/`: staged bundle
-- `runs/$WB-variable-sources/oracle-report.json`
+  (MCP mode only)
+- `inputs_out_mcp/$WB-inputs.xlsx`: separately MCP-masked inputs (MCP mode only)
+- `tasks_outputs_mcp/$WB-outputs/`: staged bundle (shape-agnostic name)
+- `runs/$WB-variable-sources/oracle-report.json` (MCP mode only)
+- `runs/$WB-variable-sources/{plain_eligibility.json,first_normalization.json}`
+  and, in plain mode, `tests/normalization_exclusions.json`
 
 For multiple requested workbooks, complete all gates serially. Do not share a
 normalized spec, MCP bundle, mask list, or staged task between workbook ids.
@@ -70,16 +80,20 @@ Stage all requested workbooks before promoting any of them.
   masking, packaging, or rollout is difficult.
 - Generate and package the GPT 5.6 Sol variable/source audit. Never pass
   `--no-variable-source-audit`.
-- Run `/custom-formula-gate` before packaging with exactly one
-  `gpt-5.6-terra-high` subagent. A missing, stale, differently modeled, invalid,
-  or `REVIEW` report is a blocker.
+- Run `/task-disclosure` against the exact staged workbook before
+  naturalization. Registry drift, audit failure, mechanical verification
+  failure, or a blocking fresh-review finding is a blocker.
 - Run `/naturalize-finance-task-instruction` after the complete instruction is
   packaged. Any generation, validation, or semantic-review failure is a blocker.
-- Missing audit credentials or audit failure is a blocker, not permission to
-  produce a plain task.
+- Missing audit credentials or audit failure is a blocker. An audit that
+  yields no resolvable candidates is an audit failure, not a plain-task trigger.
 - Missing profile skill, unresolved draft rows, partial masking, source-profile
-  validation failure, MCP failure, oracle failure, or grader failure is a
-  blocker. Retain diagnostics and leave the current task untouched.
+  validation failure, failure of an MCP build that was attempted, failure of
+  an oracle that was attempted, or grader failure is a blocker. Skipping MCP
+  build and oracle in a verified plain task is not an MCP failure. Retain
+  diagnostics and leave the current task untouched.
+- Never package the old custom-formula hint and conventions sections as a
+  fallback for unified disclosure.
 - Never place the golden workbook, `eval/`, normalized specs, profile captures,
   snapshots, answer values, or source audit working files in `environment/`.
 
@@ -112,6 +126,16 @@ python3 xl_segment.py "$WB" --source "$SOURCE" \
   --ast-dir "$AST_ROOT" -o "$SEG_ROOT"
 ```
 
+When no curation exists and the heuristic auto-includes nothing, the segmenter
+escalates on its own: first the LLM adjudicator (when an API key is available),
+then a top-4 fallback whose picks carry an
+`include = true  # fallback: top-4 auto-include` marker. This auto-escalation
+only ever runs on a curation file written fresh in the same invocation -- a
+pre-existing curation is never escalated or overwritten, so a hash recorded
+above changing without approval is still a hard stop. Treat `# heuristic:` and
+`# fallback:` markers as legitimate machine provenance, not tampering, and call
+out fallback-selected outputs explicitly when summarizing.
+
 Summarize every included output and the strongest exclusions from
 `curation.toml`. Require user confirmation before continuing. If the user edits
 curation, re-run the same command. If an existing curation file changed without
@@ -134,38 +158,7 @@ PY
 
 Do not weaken the verifier, use `--no-verify`, or special-case the workbook.
 
-### 3. Run the pre-package GPT 5.6 Terra formula gate
-
-First load and follow `.cursor/skills/custom-formula-gate/SKILL.md`. Extract the
-complete curated-output reverse closure:
-
-```bash
-python3 .cursor/skills/custom-formula-gate/scripts/extract_gate_context.py \
-  "$WB" --source "$SOURCE" --seg-dir "$SEG_ROOT/$WB" \
-  --output "$FORMULA_CONTEXT"
-```
-
-Launch exactly one `generalPurpose` subagent with model
-`gpt-5.6-terra-high`. Give it the context and catalog paths, require the
-key-variable-first and all-period textbook matching workflow from the skill,
-and require it to write `"$FORMULA_REPORT"` and `"$FORMULA_HINTS"`. Do not let
-the parent or another model replace, supplement, or silently repair Terra's
-classification.
-
-Validate the artifacts:
-
-```bash
-python3 .cursor/skills/custom-formula-gate/scripts/validate_gate_outputs.py \
-  "$FORMULA_CONTEXT" "$FORMULA_REPORT" "$FORMULA_HINTS"
-```
-
-`PASS` continues without custom hints. `FLAG` continues with every flagged
-series represented exactly once by an audited method-only hint. `REVIEW`,
-missing coverage, stale hashes, another model, formula/answer leakage, or any
-validator failure stops the workflow. Keep context and report under `runs/`;
-they contain golden evidence and must never be copied into the task.
-
-### 4. Build baseline inputs
+### 3. Build baseline inputs
 
 ```bash
 python3 xl_input_mask.py "$WB" --source "$SOURCE" \
@@ -178,7 +171,7 @@ The command must report verification `PASS`, zero surviving formulas, and all
 typed cells intact except its documented pasted-answer policy. Keep this file
 unchanged: it is the input to the audit even after MCP masking exists.
 
-### 5. Run the GPT 5.6 Sol audit
+### 4. Run the GPT 5.6 Sol audit
 
 ```bash
 python3 xl_variable_source_audit.py "$WB" \
@@ -193,7 +186,7 @@ Require complete metadata, matching inventory SHA-256, model
 invented references or values. Cache reuse is allowed only when the baseline
 inventory hash, model, and prompt version match.
 
-### 6. Import every Markdown row
+### 5. Import every Markdown row
 
 ```bash
 python3 xl_variable_mcp.py import "$AUDIT" "$DRAFT"
@@ -202,7 +195,7 @@ python3 xl_variable_mcp.py import "$AUDIT" "$DRAFT"
 Confirm `draft.json.row_count` equals the number of imported data rows and every
 row begins as `needs_review`. Import is preservation, not normalization.
 
-### 7. Normalize atomically and account for every row
+### 6. Normalize atomically and account for every row
 
 Create `"$RUN/normalize_$WB.py"` and execute it to write:
 
@@ -246,7 +239,13 @@ print("all %d draft rows resolved" % len(draft_ids))
 PY
 ```
 
-### 8. Profile public sources with GPT 5.6 Sol
+### 7. Profile public sources with GPT 5.6 Sol
+
+If `plain_eligibility.py` reports `mode: plain`, skip this step and step 8-10
+and 14. `validate-spec` rejects an empty variable list; profiling has nothing
+to attach. Record `n/a (plain)` for profile and maskability counts.
+
+If `mode: fail` (zero variables but ineligible), stop. Do not package.
 
 First load and follow `.cursor/skills/profile-mcp-sources/SKILL.md`. Launch one
 or more `generalPurpose` subagents with model `gpt-5.6-sol-high`, batching no
@@ -282,7 +281,7 @@ unmatched sources retain generic rendering. Then run:
 python3 xl_variable_mcp.py validate-spec "$NORMALIZED"
 ```
 
-### 9. Review maskability, duplicates, and extra cells
+### 8. Review maskability, duplicates, and extra cells
 
 Before build, inspect every included variable against the golden and baseline
 workbooks. Write `"$RUN/maskability_report.json"` and fail unless:
@@ -299,9 +298,10 @@ workbooks. Write `"$RUN/maskability_report.json"` and fail unless:
 - duplicate refs across variables are intentional, compatible, and documented
 
 Re-run the atomic normalizer and profile validator after any change. Do not use
-an allowlist to hide an unknown leak.
+an allowlist to hide an unknown leak. If this step empties a spec that was
+non-empty at first normalization, that is a blocker, not a plain task.
 
-### 10. Build, validate, and smoke deterministic MCP output
+### 9. Build, validate, and smoke deterministic MCP output
 
 Build twice in fresh sibling directories using the same normalized spec,
 profiles, seed, and golden workbook. The build is network-free.
@@ -335,7 +335,7 @@ acyclic provenance chains, conflicting broad queries, no runtime evaluation
 keys, valid reviewed profile references, and byte-identical builds. Keep `B`
 and all failed build directories as diagnostics until completion.
 
-### 11. Mask MCP inputs separately
+### 10. Mask MCP inputs separately
 
 ```bash
 BASE_SHA=$(shasum -a 256 "$BASE_INPUT_ROOT/$WB-inputs.xlsx" | awk '{print $1}')
@@ -350,7 +350,9 @@ test -f "$MCP_INPUT_ROOT/$WB-inputs.xlsx"
 Require all intended MCP cells blank, no formulas, no unintended typed-cell
 loss, and a non-empty mask. Never overwrite the baseline inputs workbook.
 
-### 12. Package to staging with MCP and baseline audit
+### 11. Package to staging
+
+MCP mode:
 
 ```bash
 test ! -e "$STAGED"
@@ -361,9 +363,6 @@ python3 xl_output_task.py "$WB" \
   --variable-source-audit-inputs-root "$BASE_INPUT_ROOT" \
   --variable-source-audit-root runs \
   --variable-source-audit-model openai/gpt-5.6-sol \
-  --custom-formula-context "$FORMULA_CONTEXT" \
-  --custom-formula-report "$FORMULA_REPORT" \
-  --custom-formula-hints "$FORMULA_HINTS" \
   --mcp "$MCP" \
   --no-naturalize \
   -o "$STAGE_ROOT"
@@ -372,25 +371,79 @@ python3 xl_output_task.py "$WB" \
 The audit must run or validly cache-reuse against baseline inputs, while the
 packaged artifact must come from MCP inputs. Require the MCP server declaration,
 compose sidecar, extended timeout, research instructions, audit metadata, and
-`tests/masked_inputs.json`. Also require custom-formula model/verdict metadata,
-the exact validated method-hint section when verdict is `FLAG`, and
-`tests/formula_hints.json`. Absence of any required artifact is failure; never
-rerun without `--mcp` or without the formula artifacts.
+`tests/masked_inputs.json`. Absence of any required artifact is failure.
+
+Plain mode: package with `--inputs-root "$BASE_INPUT_ROOT"` and **no** `--mcp`.
+Require `research_service = false`, `tests/normalization_exclusions.json`, no
+`environment/mcp-server`, no compose file, no `[[environment.mcp_servers]]`,
+and no `## Research data service`. Run `plain_eligibility.check_plain_environment`
+so `environment/` contains exactly `$WB-inputs.xlsx` and `Dockerfile`.
+
+### 12. Build unified task disclosure
+
+Run against the staged bundle and golden. Pass the AST root to `select`; later
+commands consume its staged artifacts. Follow `/task-disclosure` through the
+`roles` command and, when collisions exist, its one Sol High role-arbitration
+agent before `detect`.
+
+```bash
+test -f "$DISCLOSURE"
+python3 "$DISCLOSURE" select \
+  --task-dir "$STAGED" \
+  --golden "$SOURCE/$WB.xlsx" \
+  --ast-dir "$AST_ROOT"
+python3 "$DISCLOSURE" probe   --task-dir "$STAGED"
+python3 "$DISCLOSURE" roles   --task-dir "$STAGED"
+# Follow /task-disclosure: if ambiguous_roles.json has cases, launch one
+# gpt-5.6-sol-high subagent to write role_resolutions.json before detect.
+python3 "$DISCLOSURE" detect  --task-dir "$STAGED"
+python3 "$DISCLOSURE" context --task-dir "$STAGED"
+python3 "$DISCLOSURE" write   --task-dir "$STAGED"
+python3 "$DISCLOSURE" verify  --task-dir "$STAGED"
+test -f "$DISCLOSURE_RUN/bands.json" &&
+  test -f "$DISCLOSURE_RUN/records.json" &&
+  test -f "$DISCLOSURE_RUN/verify.json" &&
+  test -f "$STAGED/tests/disclosure.json"
+python3 - "$STAGED" <<'PY'
+import json, sys
+from pathlib import Path
+task = Path(sys.argv[1])
+records = json.load(open(task / "tests/disclosure.json", encoding="utf-8"))
+has_section = "## Workbook disclosure" in (
+    task / "instruction.md").read_text(encoding="utf-8")
+if has_section != bool(records.get("agent_records")):
+    raise SystemExit("disclosure heading/record presence mismatch")
+PY
+```
+
+Require verification without `--force` or `--no-fail`, no old hint/manifest
+sections, and no formulas/evidence in the agent-facing instruction.
 
 ### 13. Naturalize the complete staged instruction
 
 Load and follow
 `.cursor/skills/naturalize-finance-task-instruction/SKILL.md`. Launch exactly
 one `generalPurpose` subagent with model `gpt-5.6-sol-high`, preserve every
-protected section byte-for-byte, and require deterministic plus clause-by-clause
-semantic validation before atomically replacing `"$STAGED/instruction.md"`.
+protected section—including `## Workbook disclosure`—byte-for-byte, and require
+deterministic plus clause-by-clause semantic validation before atomically
+replacing `"$STAGED/instruction.md"`.
 
 Require `"$NAT_RUN/validation.json"` to report `valid: true` and `applied: true`,
 and require `task.toml` to record model `gpt-5.6-sol-high`, endpoint
 `cursor-subagent`, the prompt version, and matching source/instruction hashes.
 This is the final content mutation; do not continue on fallback or uncertainty.
 
+Re-run `python3 "$DISCLOSURE" verify --task-dir "$STAGED"` against the final
+naturalized instruction. Then launch a fresh reviewer with the golden, delivered
+workbook, staged instruction, and `tests/disclosure.json`. It must check every
+sentence against the golden and fail on false, incomplete, ambiguous,
+answer-leaking, or formula-like wording. Save
+`"$RUN/disclosure-faithfulness.md"` and stop on a blocking finding.
+
 ### 14. Run generalized HTTP oracle
+
+Skip this step in plain mode. The oracle requires MCP manifests. Packaging
+hygiene for a plain bundle is the closed-world `environment/` check in step 11.
 
 Use the reusable oracle, not a workbook-specific script:
 
@@ -497,20 +550,24 @@ Report, per workbook:
 
 - workbook id, golden path, AST path, segmentation `PASS`, and curation hash
 - curated output names/bands and confirmation that curation was preserved
-- formula context/report/hints paths, pinned Terra model, key-variable count,
-  verdict, class counts, and packaged custom-hint count
+- disclosure run path; custom/convention disclosed, suppressed, standard, and
+  unclassified counts; mechanical verdict; fresh faithfulness-review path and
+  verdict
 - instruction naturalization source/candidate/report paths, pinned Sol model,
   prompt version, source/instruction hashes, and semantic-review result
-- baseline input path/hash and separate MCP input path/hash
+- MCP or plain mode; if plain, the eligibility reason and exclusion-code
+  histogram; if MCP, the separate MCP input path/hash
+- baseline input path/hash
 - audit Markdown/inventory/metadata paths, model, inventory hash, and cache use
 - draft row count; included/excluded disposition counts; atomic variable count
 - profile count, reviewed count, captured public count, and every
-  skipped-auth/paywall/blocked/unreachable source
+  skipped-auth/paywall/blocked/unreachable source (`n/a (plain)` in plain mode)
 - maskability report path; `cells`, `extra_cells`, and total masked-cell counts
+  (`n/a (plain)` in plain mode)
 - normalized spec, exclusions, profiles, and MCP paths; deterministic comparison
-  and MCP validation/smoke summaries
-- staged path, oracle report and result, exact grader score, final promoted path,
-  previous-bundle backup path, and any retained diagnostics
+  and MCP validation/smoke summaries (`n/a (plain)` for MCP build/oracle)
+- staged path, oracle report and result (`n/a (plain)`), exact grader score,
+  final promoted path, previous-bundle backup path, and any retained diagnostics
 
-Completion requires all gates to pass. Otherwise report the first blocker and
-leave existing task bundles untouched.
+Completion requires every gate that applies to the chosen mode to pass.
+Otherwise report the first blocker and leave existing task bundles untouched.

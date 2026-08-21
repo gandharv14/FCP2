@@ -904,6 +904,19 @@ def validate_task_rows(
     current_value = json_key(supported.get("value"))
     if any(json_key(row.get("value")) == current_value for row in stale):
         errors.append("a stale release duplicates the current value")
+    # Even a non-identical stale value is a leak when it sits inside the
+    # grader's acceptance band: picking it would still be graded correct.
+    if isinstance(supported.get("value"), (int, float)) and not isinstance(
+            supported.get("value"), bool):
+        expected = float(supported["value"])
+        band = 10 * max(1e-6, 1e-6 * abs(expected))
+        for row in stale:
+            value = row.get("value")
+            if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                    and abs(float(value) - expected) <= band:
+                errors.append(
+                    "stale release %s is within grader tolerance of the "
+                    "current value" % row.get("release"))
     return list(dict.fromkeys(errors)), {
         "task_id": task_id,
         "rows": len(rows),
@@ -957,16 +970,28 @@ async def validate_documents(
             errors.append("%s does not attribute successor %s" % (
                 document_id, successor
             ))
+        # The current release's document must carry no marker that
+        # distinguishes it from distractor documents: no supersession
+        # narrative, no predecessor release ids, no 'authoritative figure'
+        # phrase. Any of those would make the answer documents searchable in
+        # one query; the chain is conveyed by the records' superseded_by
+        # fields and the SUPERSEDED banner on stale documents alone.
         predecessors = by_successor.get(row.get("release"), [])
-        if row.get("release") == evidence_release and predecessors:
-            if (
-                predecessors[0] not in content
-                or "supersed" not in content.casefold()
-            ):
+        if not successor:
+            lowered = content.casefold()
+            if "authoritative figure" in lowered:
                 errors.append(
-                    "%s does not attribute predecessor %s"
-                    % (document_id, predecessors[0])
-                )
+                    "%s carries the 'authoritative figure' answer marker"
+                    % document_id)
+            if "supersed" in lowered:
+                errors.append(
+                    "unsuperseded document %s carries supersession text"
+                    % document_id)
+            for predecessor in predecessors:
+                if predecessor in content:
+                    errors.append(
+                        "%s names its predecessor release %s"
+                        % (document_id, predecessor))
     return errors, check_rendered_profile_excerpts(
         sources, datasets, fetched, targets
     )

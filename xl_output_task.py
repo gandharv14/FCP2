@@ -526,9 +526,36 @@ def mcp_variable_count(mcp_dir):
     return sum(1 for line in tasks.splitlines() if line.strip())
 
 
+def load_plain_meta(workbook, audit_root="runs"):
+    """In-bundle marker fields for a no-MCP task, plus the exclusions path."""
+    run = Path(audit_root) / ("%s-variable-sources" % workbook)
+    report_path = run / "normalization_report.json"
+    if not report_path.is_file():
+        return None, None
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    elig_path = run / "plain_eligibility.json"
+    elig = {}
+    if elig_path.is_file():
+        elig = json.loads(elig_path.read_text(encoding="utf-8"))
+    codes = report.get("exclusion_reason_codes") or {}
+    reason = elig.get("plain_reason") or elig.get("reason") or (
+        "all %s audit rows excluded" % report.get("excluded_rows", 0)
+    )
+    meta = {
+        "research_service": False,
+        "n_mcp_variables": 0,
+        "draft_rows": report.get("draft_rows"),
+        "excluded_rows": report.get("excluded_rows"),
+        "exclusion_reason_codes": codes,
+        "plain_reason": reason,
+    }
+    exclusions = run / "exclusions.json"
+    return meta, exclusions if exclusions.is_file() else None
+
+
 def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
          nat_meta, hints=None, hint_style="", mcp_dir=None, audit_meta=None,
-         formula_report=None, formula_hints=None):
+         formula_report=None, formula_hints=None, audit_root="runs"):
     if out_dir.exists():
         shutil.rmtree(out_dir)
     (out_dir / "environment").mkdir(parents=True)
@@ -607,6 +634,13 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
                 (mcp_dir / "mask_cells.json").read_text(encoding="utf-8")
             ).__len__(),
         })
+    else:
+        plain_meta, exclusions_path = load_plain_meta(workbook, audit_root)
+        if plain_meta:
+            metadata.update(plain_meta)
+        if exclusions_path is not None:
+            shutil.copy2(exclusions_path,
+                         out_dir / "tests" / "normalization_exclusions.json")
     if formula_report is not None:
         metadata.update({
             "custom_formula_gate_model":
@@ -866,7 +900,8 @@ def main(argv=None):
         emit(out_dir, workbook, family, artifact, instruction, targets,
              outputs, nat_meta, hints=hints, hint_style=hint_style,
              mcp_dir=mcp_dir, audit_meta=audit_meta,
-             formula_report=formula_report, formula_hints=formula_hints)
+             formula_report=formula_report, formula_hints=formula_hints,
+             audit_root=args.variable_source_audit_root)
         n_vars = mcp_variable_count(mcp_dir) if mcp_dir is not None else 0
         print("%s  %-16s %2d outputs, %3d cells%s, timeout %.0fs -> %s"
               % (workbook, family, len(outputs), len(targets),

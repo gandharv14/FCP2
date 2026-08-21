@@ -188,12 +188,16 @@ def _edate(start, months):
     return (datetime(year, month, day) - EPOCH).days
 
 
-def _solve_rate(exponents, values, guess=0.1):
+def _solve_rate(exponents, values, guess=0.1, scan=True):
     """Excel-compatible rate solve.
 
     A cash flow series can cross zero more than once, so bisecting a wide bracket
     is liable to land on a root Excel never reports. Excel runs Newton from the
     guess and returns the root nearest it; bisection is only the fallback.
+
+    ``scan=False`` skips the grid scan when the caller has proven the root is
+    unique (a single sign change in the series); RATE-heavy workbooks call this
+    hundreds of times and the unconditional scan would dominate the run.
     """
     def npv(rate):
         return sum(v * (1.0 + rate) ** -t for v, t in zip(values, exponents))
@@ -220,6 +224,13 @@ def _solve_rate(exponents, values, guess=0.1):
         rate = nxt
     else:
         newton_root = rate
+
+    if not scan and newton_root is not None and newton_root > -1.0:
+        try:
+            if abs(npv(newton_root)) < 1e-7:
+                return newton_root
+        except (OverflowError, ZeroDivisionError, ValueError):
+            pass
 
     # Multiple sign changes yield multiple mathematically valid IRRs. Excel
     # selects the root nearest the supplied guess; an unconstrained Newton step
@@ -271,6 +282,155 @@ def _xirr(values, dates, guess=0.1):
 
 def _div(a, b):
     return ExcelError("#DIV/0!") if b == 0 else a / b
+
+
+def _fv_value(rate, nper, pmt, pv, ptype):
+    """Balance after ``nper`` periods (Excel FV sign convention)."""
+    if rate == 0.0:
+        return -(pv + pmt * nper)
+    growth = (1.0 + rate) ** nper
+    return -(pv * growth + pmt * (1.0 + rate * ptype) * (growth - 1.0) / rate)
+
+
+def _pmt_value(rate, nper, pv, fv, ptype):
+    if nper == 0:
+        return ExcelError("#DIV/0!")
+    if rate == 0.0:
+        return -(pv + fv) / nper
+    growth = (1.0 + rate) ** nper
+    denominator = (growth - 1.0) * (1.0 + rate * ptype)
+    if denominator == 0:
+        return ExcelError("#DIV/0!")
+    return -(pv * growth + fv) * rate / denominator
+
+
+def _ipmt_value(rate, per, nper, pv, fv, ptype):
+    """Interest share of period ``per``: rate on the balance carried into it."""
+    payment = _pmt_value(rate, nper, pv, fv, ptype)
+    if isinstance(payment, ExcelError):
+        return payment
+    if per < 1 or per > nper:
+        return ExcelError("#NUM!")
+    if ptype and per == 1:
+        return 0.0
+    balance = _fv_value(rate, per - 1, payment, pv, ptype)
+    interest = balance * rate
+    return interest / (1.0 + rate) if ptype else interest
+
+
+_RATE_CACHE: dict = {}
+
+
+def _rate_value(nper, pmt, pv, fv, ptype, guess):
+    """RATE as a root of the same NPV equation IRR solves.
+
+    The flow series is ``pv`` now, ``pmt`` each period (shifted one period
+    earlier when payments are due at the start), and ``fv`` at the end.
+    """
+    if nper <= 0:
+        return ExcelError("#NUM!")
+    key = (nper, pmt, pv, fv, ptype, guess)
+    if key in _RATE_CACHE:
+        return _RATE_CACHE[key]
+    periods = int(nper)
+    if periods == nper:
+        shift = 1.0 if ptype else 0.0
+        exponents = [0.0] + [t - shift for t in range(1, periods + 1)] + [float(periods)]
+        values = [pv] + [pmt] * periods + [fv]
+        nonzero = [v for v in values if v]
+        changes = sum(1 for a, b in zip(nonzero, nonzero[1:]) if a * b < 0)
+        result = _solve_rate(exponents, values, guess, scan=changes > 1)
+    else:
+        # Fractional periods have no discrete flow series; Newton on the
+        # closed-form annuity equation, which is what Excel evaluates.
+        def balance(rate):
+            if rate == 0.0:
+                return pv + pmt * nper + fv
+            growth = (1.0 + rate) ** nper
+            return pv * growth + pmt * (1.0 + rate * ptype) * (growth - 1.0) / rate + fv
+
+        rate = guess
+        result = ExcelError("#NUM!")
+        for _ in range(100):
+            try:
+                value = balance(rate)
+                step = max(abs(rate), 1e-5) * 1e-6
+                derivative = (balance(rate + step) - balance(rate - step)) / (2.0 * step)
+            except (OverflowError, ZeroDivisionError, ValueError):
+                break
+            if abs(derivative) < 1e-14:
+                break
+            nxt = rate - value / derivative
+            if nxt <= -1.0:
+                nxt = (rate - 1.0) / 2.0
+            if abs(nxt - rate) < 1e-12:
+                result = nxt
+                break
+            rate = nxt
+    if len(_RATE_CACHE) > 4096:
+        _RATE_CACHE.clear()
+    _RATE_CACHE[key] = result
+    return result
+
+
+def _norm_cdf(z):
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _norm_pdf(z):
+    return math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+
+
+def _norm_s_inv(p):
+    """Acklam's rational approximation, polished with one Halley step."""
+    if not 0.0 < p < 1.0:
+        return ExcelError("#NUM!")
+    a = (-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00)
+    b = (-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00)
+    d = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00)
+    p_low, p_high = 0.02425, 1.0 - 0.02425
+    if p < p_low:
+        q = math.sqrt(-2.0 * math.log(p))
+        z = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    elif p <= p_high:
+        q = p - 0.5
+        r = q * q
+        z = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
+            (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+    else:
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        z = -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    error = _norm_cdf(z) - p
+    density = _norm_pdf(z)
+    if density > 0:
+        u = error / density
+        z -= u / (1.0 + z * u / 2.0)
+    return z
+
+
+def _day_count_30_360(start: datetime, end: datetime, european: bool):
+    d1, d2 = start.day, end.day
+    if european:
+        d1, d2 = min(d1, 30), min(d2, 30)
+    else:
+        start_feb_end = start.month == 2 and d1 == monthrange(start.year, 2)[1]
+        end_feb_end = end.month == 2 and d2 == monthrange(end.year, 2)[1]
+        if start_feb_end and end_feb_end:
+            d2 = 30
+        if start_feb_end:
+            d1 = 30
+        if d2 == 31 and d1 >= 30:
+            d2 = 30
+        if d1 == 31:
+            d1 = 30
+    return (end.year - start.year) * 360 + (end.month - start.month) * 30 + (d2 - d1)
 
 
 def snap(result: float, *operands: float) -> float:
@@ -500,9 +660,19 @@ class Evaluator:
             return bad
         err = next((a for a in flatten(args) if isinstance(a, ExcelError)), None)
         if err is not None and op not in (
-            "COUNTIF", "COUNTIFS", "SUMIF", "SUMIFS", "AVERAGEIFS", *selective
+            "COUNTIF", "COUNTIFS", "SUMIF", "SUMIFS", "AVERAGEIFS", "AVERAGEIF",
+            "MAXIFS", "_XLFN.MAXIFS", "MINIFS", "_XLFN.MINIFS",
+            "ISERR", "ISERROR", "ISNA", "ISNUMBER", "IFNA", "_XLFN.IFNA",
+            *selective
         ):
             return err
+        if op == "{}":
+            # Array constants; the parser flattens rows, so only 1-D literals
+            # (the ones that actually appear) can be reshaped faithfully.
+            if ";" in (node.expr or ""):
+                return Unresolved("2d-array-constant")
+            values = list(flatten(args))
+            return RangeValues(values, 1, len(values))
         if node.op_kind in ("infix",) and op in BINARY:
             return BINARY[op](args[0], args[1]) if len(args) > 1 else Unresolved("arity")
         if node.op_kind in ("prefix", "postfix") and op in UNARY:
@@ -515,7 +685,17 @@ class Evaluator:
                     args[0].cols,
                 )
             return UNARY[op](args[0])
-        handler = getattr(self, f"_fn_{op.replace('.', '_').lower()}", None)
+        # Excel stores post-2007 functions with a future-function prefix
+        # (``_xlfn.NORM.DIST``), which the tokenizer keeps verbatim. Try the
+        # bare name first, but keep the raw lookup as fallback: handlers like
+        # ``_fn__xlfn_vstack`` exist only under the prefixed spelling.
+        bare = op
+        for prefix in ("_XLFN.", "_XLWS."):
+            if bare.startswith(prefix):
+                bare = bare[len(prefix):]
+        handler = getattr(self, f"_fn_{bare.replace('.', '_').lower()}", None)
+        if handler is None and bare != op:
+            handler = getattr(self, f"_fn_{op.replace('.', '_').lower()}", None)
         if handler is None:
             self.unknown_ops[op] += 1
             return Unresolved(f"unsupported:{op}")
@@ -918,6 +1098,579 @@ class Evaluator:
             return ExcelError("#NUM!")
         pairs = [(num(v, 0.0), num(d, 0.0)) for v, d in zip(flows, dates)]
         return _xirr([p[0] for p in pairs], [p[1] for p in pairs])
+
+    def _fn_xnpv(self, args):
+        rate = num(args[0])
+        flows = list(flatten([args[1]])) if len(args) > 1 else []
+        dates = list(flatten([args[2]])) if len(args) > 2 else []
+        if not flows or len(flows) != len(dates) or rate <= -1.0:
+            return ExcelError("#NUM!")
+        start = num(dates[0], 0.0)
+        try:
+            return sum(
+                num(value, 0.0) * (1.0 + rate) ** (-(num(date, 0.0) - start) / 365.0)
+                for value, date in zip(flows, dates)
+            )
+        except (OverflowError, ZeroDivisionError, ValueError):
+            return ExcelError("#NUM!")
+
+    def _fn_mirr(self, args):
+        flows = [
+            num(v) for v in flatten([args[0]])
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
+        finance_rate = num(args[1]) if len(args) > 1 else 0.0
+        reinvest_rate = num(args[2]) if len(args) > 2 else 0.0
+        n = len(flows)
+        npv_positive = sum(
+            v / (1.0 + reinvest_rate) ** i for i, v in enumerate(flows) if v > 0
+        )
+        npv_negative = sum(
+            v / (1.0 + finance_rate) ** i for i, v in enumerate(flows) if v < 0
+        )
+        if n < 2 or npv_positive == 0 or npv_negative == 0:
+            return ExcelError("#DIV/0!")
+        try:
+            ratio = npv_positive / -npv_negative
+            return ratio ** (1.0 / (n - 1)) * (1.0 + reinvest_rate) - 1.0
+        except (OverflowError, ZeroDivisionError, ValueError):
+            return ExcelError("#NUM!")
+
+    def _fn_pmt(self, args):
+        fv = num(args[3]) if len(args) > 3 else 0.0
+        ptype = 1 if len(args) > 4 and truthy(args[4]) else 0
+        return _pmt_value(num(args[0]), num(args[1]), num(args[2]), fv, ptype)
+
+    def _fn_ipmt(self, args):
+        fv = num(args[4]) if len(args) > 4 else 0.0
+        ptype = 1 if len(args) > 5 and truthy(args[5]) else 0
+        return _ipmt_value(
+            num(args[0]), int(num(args[1])), num(args[2]), num(args[3]), fv, ptype)
+
+    def _fn_ppmt(self, args):
+        fv = num(args[4]) if len(args) > 4 else 0.0
+        ptype = 1 if len(args) > 5 and truthy(args[5]) else 0
+        rate, per = num(args[0]), int(num(args[1]))
+        nper, pv = num(args[2]), num(args[3])
+        payment = _pmt_value(rate, nper, pv, fv, ptype)
+        interest = _ipmt_value(rate, per, nper, pv, fv, ptype)
+        if isinstance(payment, ExcelError):
+            return payment
+        if isinstance(interest, ExcelError):
+            return interest
+        return payment - interest
+
+    def _fn_pv(self, args):
+        rate, nper, pmt = num(args[0]), num(args[1]), num(args[2])
+        fv = num(args[3]) if len(args) > 3 else 0.0
+        ptype = 1 if len(args) > 4 and truthy(args[4]) else 0
+        if rate == 0.0:
+            return -(fv + pmt * nper)
+        try:
+            growth = (1.0 + rate) ** nper
+        except (OverflowError, ZeroDivisionError, ValueError):
+            return ExcelError("#NUM!")
+        return -(fv + pmt * (1.0 + rate * ptype) * (growth - 1.0) / rate) / growth
+
+    def _fn_fv(self, args):
+        rate, nper, pmt = num(args[0]), num(args[1]), num(args[2])
+        pv = num(args[3]) if len(args) > 3 else 0.0
+        ptype = 1 if len(args) > 4 and truthy(args[4]) else 0
+        try:
+            return _fv_value(rate, nper, pmt, pv, ptype)
+        except (OverflowError, ZeroDivisionError, ValueError):
+            return ExcelError("#NUM!")
+
+    def _fn_nper(self, args):
+        rate, pmt, pv = num(args[0]), num(args[1]), num(args[2])
+        fv = num(args[3]) if len(args) > 3 else 0.0
+        ptype = 1 if len(args) > 4 and truthy(args[4]) else 0
+        if rate == 0.0:
+            return ExcelError("#DIV/0!") if pmt == 0 else -(pv + fv) / pmt
+        adjusted = pmt * (1.0 + rate * ptype) / rate
+        denominator = adjusted + pv
+        if denominator == 0:
+            return ExcelError("#DIV/0!")
+        ratio = (adjusted - fv) / denominator
+        if ratio <= 0 or rate <= -1.0:
+            return ExcelError("#NUM!")
+        return math.log(ratio) / math.log(1.0 + rate)
+
+    def _fn_rate(self, args):
+        nper, pmt, pv = num(args[0]), num(args[1]), num(args[2])
+        fv = num(args[3]) if len(args) > 3 else 0.0
+        ptype = 1 if len(args) > 4 and truthy(args[4]) else 0
+        guess = num(args[5], 0.1) if len(args) > 5 else 0.1
+        return _rate_value(nper, pmt, pv, fv, ptype, guess)
+
+    def _fn_cumipmt(self, args):
+        rate, nper, pv = num(args[0]), num(args[1]), num(args[2])
+        start, end = int(num(args[3])), int(num(args[4]))
+        ptype = 1 if len(args) > 5 and truthy(args[5]) else 0
+        if rate <= 0 or nper <= 0 or pv <= 0 or start < 1 or end < start or end > nper:
+            return ExcelError("#NUM!")
+        total = 0.0
+        for per in range(start, end + 1):
+            interest = _ipmt_value(rate, per, nper, pv, 0.0, ptype)
+            if isinstance(interest, ExcelError):
+                return interest
+            total += interest
+        return total
+
+    def _fn_cumprinc(self, args):
+        rate, nper, pv = num(args[0]), num(args[1]), num(args[2])
+        start, end = int(num(args[3])), int(num(args[4]))
+        ptype = 1 if len(args) > 5 and truthy(args[5]) else 0
+        if rate <= 0 or nper <= 0 or pv <= 0 or start < 1 or end < start or end > nper:
+            return ExcelError("#NUM!")
+        payment = _pmt_value(rate, nper, pv, 0.0, ptype)
+        if isinstance(payment, ExcelError):
+            return payment
+        total = 0.0
+        for per in range(start, end + 1):
+            interest = _ipmt_value(rate, per, nper, pv, 0.0, ptype)
+            if isinstance(interest, ExcelError):
+                return interest
+            total += payment - interest
+        return total
+
+    def _fn_mod(self, args):
+        divisor = num(args[1]) if len(args) > 1 else 0.0
+        if divisor == 0:
+            return ExcelError("#DIV/0!")
+        return num(args[0]) % divisor
+
+    def _fn_networkdays(self, args):
+        start, end = int(num(args[0])), int(num(args[1]))
+        holidays = set()
+        if len(args) > 2 and args[2] is not None:
+            for value in flatten([args[2]]):
+                serial = num(value, math.nan)
+                if not math.isnan(serial):
+                    holidays.add(int(serial))
+        sign = 1
+        if start > end:
+            start, end, sign = end, start, -1
+        count = sum(
+            1 for serial in range(start, end + 1)
+            if (EPOCH + timedelta(days=serial)).weekday() < 5
+            and serial not in holidays
+        )
+        return float(sign * count)
+
+    def _fn_yearfrac(self, args):
+        start_serial = num(args[0])
+        end_serial = num(args[1]) if len(args) > 1 else 0.0
+        basis = int(num(args[2])) if len(args) > 2 and args[2] is not None else 0
+        if start_serial > end_serial:
+            start_serial, end_serial = end_serial, start_serial
+        start = EPOCH + timedelta(days=int(start_serial))
+        end = EPOCH + timedelta(days=int(end_serial))
+        actual_days = int(end_serial) - int(start_serial)
+        if basis == 0:
+            return _day_count_30_360(start, end, european=False) / 360.0
+        if basis == 4:
+            return _day_count_30_360(start, end, european=True) / 360.0
+        if basis == 2:
+            return actual_days / 360.0
+        if basis == 3:
+            return actual_days / 365.0
+        if basis == 1:
+            def leap(year):
+                return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+            if start.year == end.year:
+                denominator = 366.0 if leap(start.year) else 365.0
+            elif end <= start.replace(year=start.year + 1, day=min(start.day, 28)) \
+                    or (end - start).days <= 366:
+                feb29_hit = any(
+                    leap(year)
+                    and start <= datetime(year, 2, 29) <= end
+                    for year in (start.year, end.year)
+                )
+                denominator = 366.0 if feb29_hit else 365.0
+            else:
+                years = range(start.year, end.year + 1)
+                denominator = sum(366.0 if leap(y) else 365.0 for y in years) / len(years)
+            return actual_days / denominator
+        return ExcelError("#NUM!")
+
+    def _fn_norm_dist(self, args):
+        x, mean, sd = num(args[0]), num(args[1]), num(args[2])
+        if sd <= 0:
+            return ExcelError("#NUM!")
+        cumulative = truthy(args[3]) if len(args) > 3 else True
+        z = (x - mean) / sd
+        return _norm_cdf(z) if cumulative else _norm_pdf(z) / sd
+
+    _fn_normdist = _fn_norm_dist
+
+    def _fn_norm_s_dist(self, args):
+        # Legacy NORMSDIST takes no flag and is always cumulative; NORM.S.DIST
+        # passes one, so a missing second argument defaults to cumulative.
+        z = num(args[0])
+        cumulative = truthy(args[1]) if len(args) > 1 and args[1] is not None else True
+        return _norm_cdf(z) if cumulative else _norm_pdf(z)
+
+    _fn_normsdist = _fn_norm_s_dist
+
+    def _fn_norm_inv(self, args):
+        p, mean, sd = num(args[0]), num(args[1]), num(args[2])
+        if sd <= 0:
+            return ExcelError("#NUM!")
+        z = _norm_s_inv(p)
+        return z if isinstance(z, ExcelError) else mean + sd * z
+
+    _fn_norminv = _fn_norm_inv
+
+    def _fn_norm_s_inv(self, args):
+        return _norm_s_inv(num(args[0]))
+
+    _fn_normsinv = _fn_norm_s_inv
+
+    def _fn_product(self, args):
+        vals = numbers(args)
+        return math.prod(vals) if vals else 0.0
+
+    def _fn_power(self, args):
+        return _power(num(args[0]), num(args[1]) if len(args) > 1 else 0.0)
+
+    def _fn_exp(self, args):
+        try:
+            return math.exp(num(args[0]))
+        except OverflowError:
+            return ExcelError("#NUM!")
+
+    def _fn_ln(self, args):
+        value = num(args[0])
+        return math.log(value) if value > 0 else ExcelError("#NUM!")
+
+    def _fn_concatenate(self, args):
+        return "".join(_text(value) for value in flatten(args))
+
+    # -- census-driven long tail -------------------------------------------
+    def _fn_averageif(self, args):
+        pool = list(flatten([args[0]]))
+        target = list(flatten([args[2]])) if len(args) > 2 and args[2] is not None else pool
+        vals = [
+            num(target[i]) for i, value in enumerate(pool)
+            if _matches(value, args[1]) and i < len(target)
+            and isinstance(target[i], (int, float)) and not isinstance(target[i], bool)
+        ]
+        return sum(vals) / len(vals) if vals else ExcelError("#DIV/0!")
+
+    def _fn_maxifs(self, args):
+        target = list(flatten([args[0]])) if args else []
+        matches = self._criteria_matches(args, 1)
+        vals = [
+            num(target[i]) for i, matched in enumerate(matches)
+            if matched and i < len(target)
+            and isinstance(target[i], (int, float)) and not isinstance(target[i], bool)
+        ]
+        return max(vals) if vals else 0.0
+
+    def _fn_minifs(self, args):
+        target = list(flatten([args[0]])) if args else []
+        matches = self._criteria_matches(args, 1)
+        vals = [
+            num(target[i]) for i, matched in enumerate(matches)
+            if matched and i < len(target)
+            and isinstance(target[i], (int, float)) and not isinstance(target[i], bool)
+        ]
+        return min(vals) if vals else 0.0
+
+    def _fn_days360(self, args):
+        start = EPOCH + timedelta(days=int(num(args[0])))
+        end = EPOCH + timedelta(days=int(num(args[1] if len(args) > 1 else None)))
+        european = len(args) > 2 and truthy(args[2])
+        return float(_day_count_30_360(start, end, european))
+
+    def _fn_lookup(self, args):
+        lookup = args[0]
+        table = args[1] if len(args) > 1 else []
+        if isinstance(table, RangeValues) and table.rows > 1 and table.cols > 1:
+            # Array form: search the longer edge, return the opposite edge.
+            values = list(table)
+            if table.cols >= table.rows:
+                keys = values[: table.cols]
+                results = values[(table.rows - 1) * table.cols:]
+            else:
+                keys = values[:: table.cols]
+                results = values[table.cols - 1:: table.cols]
+        else:
+            keys = list(flatten([table]))
+            results = list(flatten([args[2]])) if len(args) > 2 and args[2] is not None else keys
+        selected = None
+        for index, key in enumerate(keys):
+            if _equal(key, lookup):
+                selected = index
+                break
+            if isinstance(key, (int, float)) and not isinstance(key, bool) \
+                    and key <= num(lookup):
+                selected = index
+        if selected is None or selected >= len(results):
+            return ExcelError("#N/A")
+        return results[selected]
+
+    def _fn_subtotal(self, args):
+        # Hidden-row variants (1xx) computed over everything: the graph has no
+        # visibility data, and models that hide rows fail verification honestly.
+        code = int(num(args[0])) % 100
+        rest = args[1:]
+        if code == 1:
+            return self._fn_average(rest)
+        if code == 2:
+            return self._fn_count(rest)
+        if code == 3:
+            values = list(flatten(rest))
+            return float(sum(v is not None and v != "" for v in values))
+        if code == 4:
+            return self._fn_max(rest)
+        if code == 5:
+            return self._fn_min(rest)
+        if code == 6:
+            return self._fn_product(rest)
+        if code == 9:
+            return self._fn_sum(rest)
+        return Unresolved(f"unsupported:SUBTOTAL({code})")
+
+    def _fn_int(self, args):
+        return float(math.floor(num(args[0])))
+
+    def _fn_n(self, args):
+        value = self._scalar(args[0] if args else None)
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        return 0.0
+
+    def _fn_now(self, args):
+        delta = datetime.now() - EPOCH
+        return delta.days + delta.seconds / 86400.0
+
+    def _fn_workday(self, args):
+        serial = int(num(args[0]))
+        remaining = int(num(args[1] if len(args) > 1 else None))
+        holidays = set()
+        if len(args) > 2 and args[2] is not None:
+            for value in flatten([args[2]]):
+                day = num(value, math.nan)
+                if not math.isnan(day):
+                    holidays.add(int(day))
+        step = 1 if remaining >= 0 else -1
+        remaining = abs(remaining)
+        while remaining:
+            serial += step
+            if (EPOCH + timedelta(days=serial)).weekday() < 5 and serial not in holidays:
+                remaining -= 1
+        return float(serial)
+
+    def _fn_weekday(self, args):
+        monday0 = (EPOCH + timedelta(days=int(num(args[0])))).weekday()
+        mode = int(num(args[1], 1.0)) if len(args) > 1 and args[1] is not None else 1
+        if mode == 1:
+            return float((monday0 + 1) % 7 + 1)
+        if mode == 2:
+            return float(monday0 + 1)
+        if mode == 3:
+            return float(monday0)
+        return ExcelError("#NUM!")
+
+    def _fn_datedif(self, args):
+        start = EPOCH + timedelta(days=int(num(args[0])))
+        end = EPOCH + timedelta(days=int(num(args[1] if len(args) > 1 else None)))
+        unit = _text(args[2] if len(args) > 2 else "").strip().upper()
+        if end < start:
+            return ExcelError("#NUM!")
+        months = (end.year - start.year) * 12 + end.month - start.month
+        if end.day < start.day:
+            months -= 1
+        if unit == "D":
+            return float((end - start).days)
+        if unit == "Y":
+            return float(months // 12)
+        if unit == "M":
+            return float(months)
+        if unit == "YM":
+            return float(months % 12)
+        if unit == "MD":
+            anchor = _edate((start - EPOCH).days, months)
+            return float((end - EPOCH).days - anchor)
+        if unit == "YD":
+            anchor = _edate((start - EPOCH).days, (months // 12) * 12)
+            return float((end - EPOCH).days - anchor)
+        return ExcelError("#NUM!")
+
+    def _fn_rows(self, args):
+        source = args[0] if args else None
+        return float(source.rows) if isinstance(source, RangeValues) else 1.0
+
+    def _fn_columns(self, args):
+        source = args[0] if args else None
+        return float(source.cols) if isinstance(source, RangeValues) else 1.0
+
+    def _fn_countblank(self, args):
+        values = list(flatten(args))
+        return float(sum(v is None or v == "" for v in values))
+
+    def _fn_mina(self, args):
+        vals = [num(v) for v in flatten(args) if v is not None]
+        return min(vals) if vals else 0.0
+
+    def _fn_maxa(self, args):
+        vals = [num(v) for v in flatten(args) if v is not None]
+        return max(vals) if vals else 0.0
+
+    def _fn_small(self, args):
+        vals = sorted(numbers([args[0]]))
+        k = int(num(args[1])) if len(args) > 1 else 1
+        return vals[k - 1] if 1 <= k <= len(vals) else ExcelError("#NUM!")
+
+    def _fn_large(self, args):
+        vals = sorted(numbers([args[0]]), reverse=True)
+        k = int(num(args[1])) if len(args) > 1 else 1
+        return vals[k - 1] if 1 <= k <= len(vals) else ExcelError("#NUM!")
+
+    def _fn_quartile(self, args):
+        vals = sorted(numbers([args[0]]))
+        quart = int(num(args[1])) if len(args) > 1 else 0
+        if not vals or not 0 <= quart <= 4:
+            return ExcelError("#NUM!")
+        position = quart / 4.0 * (len(vals) - 1)
+        low = int(math.floor(position))
+        frac = position - low
+        if low + 1 < len(vals):
+            return vals[low] + frac * (vals[low + 1] - vals[low])
+        return vals[low]
+
+    _fn_quartile_inc = _fn_quartile
+
+    def _fn_gcd(self, args):
+        vals = [int(num(v)) for v in flatten(args)
+                if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if not vals or any(v < 0 for v in vals):
+            return ExcelError("#NUM!")
+        out = 0
+        for v in vals:
+            out = math.gcd(out, v)
+        return float(out)
+
+    def _fn_slope(self, args):
+        known_y = numbers([args[0]]) if args else []
+        known_x = numbers([args[1]]) if len(args) > 1 else []
+        if not known_y or len(known_y) != len(known_x):
+            return ExcelError("#N/A")
+        mean_x = sum(known_x) / len(known_x)
+        mean_y = sum(known_y) / len(known_y)
+        denominator = sum((x - mean_x) ** 2 for x in known_x)
+        if denominator == 0:
+            return ExcelError("#DIV/0!")
+        return sum((x - mean_x) * (y - mean_y)
+                   for x, y in zip(known_x, known_y)) / denominator
+
+    def _fn_rsq(self, args):
+        known_y = numbers([args[0]]) if args else []
+        known_x = numbers([args[1]]) if len(args) > 1 else []
+        if not known_y or len(known_y) != len(known_x):
+            return ExcelError("#N/A")
+        mean_x = sum(known_x) / len(known_x)
+        mean_y = sum(known_y) / len(known_y)
+        var_x = sum((x - mean_x) ** 2 for x in known_x)
+        var_y = sum((y - mean_y) ** 2 for y in known_y)
+        if var_x == 0 or var_y == 0:
+            return ExcelError("#DIV/0!")
+        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(known_x, known_y))
+        return cov * cov / (var_x * var_y)
+
+    def _fn_avedev(self, args):
+        vals = numbers(args)
+        if not vals:
+            return ExcelError("#NUM!")
+        mean = sum(vals) / len(vals)
+        return sum(abs(v - mean) for v in vals) / len(vals)
+
+    def _fn_trim(self, args):
+        return re.sub(r" +", " ", _text(args[0])).strip(" ")
+
+    def _fn_left(self, args):
+        count = int(num(args[1])) if len(args) > 1 and args[1] is not None else 1
+        return _text(args[0])[:count] if count >= 0 else ExcelError("#VALUE!")
+
+    def _fn_lower(self, args):
+        return _text(args[0]).lower()
+
+    def _fn_substitute(self, args):
+        text = _text(args[0])
+        old = _text(args[1] if len(args) > 1 else "")
+        new = _text(args[2] if len(args) > 2 else "")
+        if not old:
+            return text
+        if len(args) > 3 and args[3] is not None:
+            instance = int(num(args[3]))
+            if instance < 1:
+                return ExcelError("#VALUE!")
+            parts = text.split(old)
+            if instance >= len(parts):
+                return text
+            return old.join(parts[:instance]) + new + old.join(parts[instance:])
+        return text.replace(old, new)
+
+    def _fn_search(self, args):
+        start = int(num(args[2], 1.0)) if len(args) > 2 and args[2] is not None else 1
+        haystack = _text(args[1] if len(args) > 1 else "").lower()
+        position = haystack.find(_text(args[0]).lower(), max(start - 1, 0))
+        return float(position + 1) if position >= 0 else ExcelError("#VALUE!")
+
+    def _fn_fixed(self, args):
+        decimals = int(num(args[1], 2.0)) if len(args) > 1 and args[1] is not None else 2
+        no_commas = len(args) > 2 and truthy(args[2])
+        value = round(num(args[0]), decimals)
+        rendered = f"{value:.{max(decimals, 0)}f}" if no_commas else \
+            f"{value:,.{max(decimals, 0)}f}"
+        return rendered
+
+    def _fn_textjoin(self, args):
+        delimiter = _text(args[0] if args else "")
+        ignore_empty = truthy(args[1]) if len(args) > 1 else True
+        parts = [_text(v) for v in flatten(args[2:])]
+        if ignore_empty:
+            parts = [p for p in parts if p != ""]
+        return delimiter.join(parts)
+
+    def _fn_concat(self, args):
+        return self._fn_concatenate(args)
+
+    def _fn_ifna(self, args):
+        value = args[0] if args else None
+        if isinstance(value, ExcelError) and value.code == "#N/A":
+            fallback = args[1] if len(args) > 1 else None
+            return 0.0 if fallback is None else fallback
+        return value
+
+    @staticmethod
+    def _scalar(value):
+        """Implicit intersection for predicates handed a range."""
+        if isinstance(value, RangeValues):
+            return value[0] if value else None
+        return value
+
+    def _fn_isnumber(self, args):
+        value = self._scalar(args[0] if args else None)
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def _fn_isblank(self, args):
+        return self._scalar(args[0] if args else None) is None
+
+    def _fn_iserr(self, args):
+        value = self._scalar(args[0] if args else None)
+        return isinstance(value, ExcelError) and value.code != "#N/A"
+
+    def _fn_iserror(self, args):
+        return isinstance(self._scalar(args[0] if args else None), ExcelError)
+
+    def _fn_isna(self, args):
+        value = self._scalar(args[0] if args else None)
+        return isinstance(value, ExcelError) and value.code == "#N/A"
 
     def _cell_info(self, node):
         """Only ``CELL("filename", ...)`` appears here, feeding sheet-title cells."""

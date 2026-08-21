@@ -54,7 +54,7 @@ run the pipeline against your own source folder.
 
 | Path | Role |
 | --- | --- |
-| `.cursor/skills/create-harbor-task/` | `/create-harbor-task`: fail-closed raw workbook → segmented, normalized, source-profiled, MCP-backed, oracle-validated Harbor task. |
+| `.cursor/skills/create-harbor-task/` | `/create-harbor-task`: fail-closed raw workbook → segmented, normalized, source-profiled Harbor task; MCP-backed and oracle-validated when variables exist, otherwise a checked plain (no-MCP) task. |
 | `.cursor/skills/profile-mcp-sources/` | `/profile-mcp-sources`: bounded GPT 5.6 Sol public reads → reviewed source terminology/structure profiles; auth and blocked pages are skipped. |
 | `.cursor/skills/custom-formula-gate/` | `/custom-formula-gate`: pinned GPT-5.6 Terra pre-package classification of key golden variables against the closed textbook catalog, with deterministic extraction and output validation. |
 | `.cursor/skills/naturalize-finance-task-instruction/` | `/naturalize-finance-task-instruction`: pinned GPT-5.6 Sol final-instruction rewrite with protected sections, deterministic validation, semantic review, and atomic application. |

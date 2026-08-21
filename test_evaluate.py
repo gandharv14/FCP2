@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from xl_seg.evaluate import ExcelError, Evaluator, RangeValues, Unresolved
+from xl_seg.evaluate import ExcelError, Evaluator, RangeValues, Unresolved, compare
 from xl_seg.model import Edge, Graph, Node
 from xl_seg.project import CellGraph
 
@@ -364,6 +364,105 @@ class EvaluatorRegressionTests(unittest.TestCase):
         ev.values.update({source.id: 5.0, consumer.id: 0.0})
         ev._stabilize([consumer.id], {source.id})
         self.assertEqual(ev.values[consumer.id], 5.0)
+
+    def test_if_omitted_then_branch_returns_zero_like_excel(self):
+        cond = make_node("Sheet!D5#0:const", "const", owner="Sheet!D5",
+                         op="logical", op_kind="const", value=True, expr="TRUE")
+        op = make_node("Sheet!D5#1:IF", "op", owner="Sheet!D5",
+                       op="IF", op_kind="func", arity=3)
+        ev = evaluator([cond, op], [make_edge(cond.id, op.id, 0)])
+        self.assertEqual(ev._apply(op), 0.0)
+
+    def test_if_omitted_else_branch_returns_false_like_excel(self):
+        cond = make_node("Sheet!D5#0:const", "const", owner="Sheet!D5",
+                         op="logical", op_kind="const", value=False, expr="FALSE")
+        then = make_node("Sheet!D5#1:const", "const", owner="Sheet!D5",
+                         op="number", op_kind="const", value=7, expr="7")
+        op = make_node("Sheet!D5#2:IF", "op", owner="Sheet!D5",
+                       op="IF", op_kind="func", arity=3)
+        edges = [make_edge(cond.id, op.id, 0), make_edge(then.id, op.id, 1)]
+        ev = evaluator([cond, then, op], edges)
+        self.assertIs(ev._apply(op), False)
+
+    def test_lookup_propagates_an_unresolved_key(self):
+        op = make_node("Sheet!D5#0:VLOOKUP", "op", owner="Sheet!D5",
+                       op="VLOOKUP", op_kind="func", arity=4)
+        ev = evaluator([op])
+        table = RangeValues(["A", 10, "B", 20], rows=2, cols=2)
+        ev._args = lambda node: [Unresolved("uncomputed-precedent"), table, 2, False]
+        result = ev._apply(op)
+        self.assertIsInstance(result, Unresolved)
+
+    def test_match_propagates_an_error_key(self):
+        op = make_node("Sheet!D5#0:MATCH", "op", owner="Sheet!D5",
+                       op="MATCH", op_kind="func", arity=3)
+        ev = evaluator([op])
+        pool = RangeValues([1, 2, 3], rows=3, cols=1)
+        ev._args = lambda node: [ExcelError("#REF!"), pool, 0]
+        result = ev._apply(op)
+        self.assertIsInstance(result, ExcelError)
+
+    def test_lookup_still_tolerates_bad_values_inside_the_range(self):
+        op = make_node("Sheet!D5#0:VLOOKUP", "op", owner="Sheet!D5",
+                       op="VLOOKUP", op_kind="func", arity=4)
+        ev = evaluator([op])
+        table = RangeValues(
+            ["A", 10, "B", 20, "C", Unresolved("range-uncomputed")],
+            rows=3, cols=2,
+        )
+        ev._args = lambda node: ["B", table, 2, False]
+        self.assertEqual(ev._apply(op), 20)
+
+    def test_compare_reports_blank_cache_as_unverifiable(self):
+        self.assertEqual(compare("", 0.0), ("unverifiable", None))
+        self.assertEqual(compare("", None), ("unverifiable", None))
+        self.assertEqual(compare("", False), ("unverifiable", None))
+        self.assertEqual(compare("", 123.0), ("unverifiable", None))
+
+    def test_oracle_fallback_reads_are_recorded_with_their_consumer(self):
+        graph = Graph("book", {}, [])
+        ev = Evaluator(graph, CellGraph(graph, {}),
+                       oracle=lambda sheet, row, col: 42.0)
+        ev._current_cell = "Sheet!A1"
+        self.assertEqual(ev._read("Sheet!Z9"), 42.0)
+        self.assertEqual(ev.oracle_reads, {"Sheet!Z9": {"Sheet!A1"}})
+
+    def test_oracle_reads_of_empty_cells_are_not_recorded(self):
+        graph = Graph("book", {}, [])
+        ev = Evaluator(graph, CellGraph(graph, {}),
+                       oracle=lambda sheet, row, col: None)
+        ev._current_cell = "Sheet!A1"
+        self.assertIsNone(ev._read("Sheet!Z9"))
+        self.assertEqual(ev.oracle_reads, {})
+
+    def test_run_exposes_runtime_edges_for_offset_targets(self):
+        owner = make_node("Sheet!D5", "formula", row=5, col=4, value=42)
+        base = make_node("Sheet!A1", "input", row=1, col=1, value=1)
+        target = make_node("Sheet!B2", "input", row=2, col=2, value=42)
+        op = make_node(
+            "Sheet!D5#2:OFFSET", "op", owner=owner.id,
+            op="OFFSET", op_kind="func", arity=3, expr="OFFSET(A1,1,1)",
+        )
+        constants = [
+            make_node(f"Sheet!D5#{index}:const", "const", owner=owner.id,
+                      op="number", op_kind="const", value=1, expr="1")
+            for index in (0, 1)
+        ]
+        edges = [
+            make_edge(base.id, op.id, 0),
+            make_edge(constants[0].id, op.id, 1),
+            make_edge(constants[1].id, op.id, 2),
+            make_edge(op.id, owner.id, 0),
+        ]
+        ev = evaluator([owner, base, target, op, *constants], edges)
+        for node in (owner, base, target):
+            ev.cg.info[node.id] = SimpleNamespace(
+                node=node, empty_ref=False, is_literal=False
+            )
+        result = ev.run({base.id, target.id})
+        self.assertEqual(result.values[owner.id], 42.0)
+        # The static graph has no edge from B2 to D5; the runtime graph must.
+        self.assertIn(target.id, result.runtime_radj.get(owner.id, set()))
 
 
 class NewFunctionGoldenValueTests(unittest.TestCase):

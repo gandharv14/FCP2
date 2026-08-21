@@ -149,7 +149,7 @@ def _verify(cg, result, input_cells, output_cells, part, cd, bg, args):
     sample = middle_cells if len(middle_cells) <= args.sample else rng.sample(middle_cells, args.sample)
 
     def grade(cells):
-        tally = {"match": 0, "mismatch": 0, "unresolved": 0}
+        tally = {"match": 0, "mismatch": 0, "unresolved": 0, "unverifiable": 0}
         worst = []
         for cid in cells:
             info = cg.info.get(cid)
@@ -157,7 +157,7 @@ def _verify(cg, result, input_cells, output_cells, part, cd, bg, args):
                 continue
             verdict, diff = evaluate.compare(info.node.value, result.values.get(cid))
             tally[verdict] += 1
-            if verdict != "match":
+            if verdict in ("mismatch", "unresolved"):
                 worst.append({
                     "cell": cid, "verdict": verdict, "label": info.node.label,
                     "formula": info.node.formula, "workbook": info.node.value,
@@ -170,19 +170,33 @@ def _verify(cg, result, input_cells, output_cells, part, cd, bg, args):
     # Some cells have to be seeded because nothing computes them: typed values,
     # labels, and formulas whose only references are empty. They should all sit
     # outside the output cone, so check rather than assume -- a leak would mean an
-    # output was handed a cached answer instead of recomputing it.
+    # output was handed a cached answer instead of recomputing it. The cone is
+    # walked over the static edges plus the evaluator's runtime-resolved edges,
+    # because dynamic references (OFFSET) read cells the static graph never saw.
     extra = {
         cid for cid, info in cg.info.items()
         if cid not in input_cells and (info.node.kind in ("input", "label") or info.is_literal)
     }
+    runtime_radj = result.runtime_radj or {}
     cone, stack = set(output_cells), list(output_cells)
     while stack:
         node = stack.pop()
-        for pred in cg.radj.get(node, ()):
+        preds = set(cg.radj.get(node, ()))
+        preds.update(runtime_radj.get(node, ()))
+        for pred in preds:
             if pred not in cone:
                 cone.add(pred)
                 stack.append(pred)
     leaked = sorted(extra & cone)
+
+    # Cells the evaluator read straight from the workbook cache because the
+    # graph never recorded them (parse failures, adoption gaps). One of these
+    # feeding the output cone means an output was partly handed its answer.
+    oracle_reads = result.oracle_reads or {}
+    oracle_leaks = sorted(
+        cid for cid, consumers in oracle_reads.items()
+        if any(consumer is None or consumer in cone for consumer in consumers)
+    )
 
     return {
         "skipped": False,
@@ -190,6 +204,9 @@ def _verify(cg, result, input_cells, output_cells, part, cd, bg, args):
         "uncomputable_cells_outside_frontier": len(extra),
         "seeded_inside_output_cone": leaked[:20],
         "seeded_inside_output_cone_count": len(leaked),
+        "oracle_fallback_cells": len(oracle_reads),
+        "oracle_fallback_inside_output_cone": oracle_leaks[:20],
+        "oracle_fallback_inside_output_cone_count": len(oracle_leaks),
         "outputs": out_tally,
         "middle_sample": mid_tally,
         "middle_sample_size": len(sample),
@@ -198,7 +215,8 @@ def _verify(cg, result, input_cells, output_cells, part, cd, bg, args):
         "unknown_functions": result.coverage["unknown_ops"],
         "failures": out_bad + mid_bad,
         "passed": (out_tally["mismatch"] == 0 and out_tally["unresolved"] == 0
-                   and not leaked),
+                   and out_tally["unverifiable"] == 0
+                   and not leaked and not oracle_leaks),
     }
 
 
@@ -217,11 +235,18 @@ def _report(wb, payload, part, verify, traces, out_dir):
         out, mid = verify["outputs"], verify["middle_sample"]
         status = "PASS" if verify["passed"] else "FAIL"
         print(f"  verification {status}: outputs {out['match']} match, "
-              f"{out['mismatch']} mismatch, {out['unresolved']} unresolved; "
+              f"{out['mismatch']} mismatch, {out['unresolved']} unresolved, "
+              f"{out['unverifiable']} unverifiable; "
               f"middle sample {mid['match']}/{verify['middle_sample_size']} match")
         if verify["seeded_inside_output_cone_count"]:
             print(f"  WARNING: {verify['seeded_inside_output_cone_count']} seeded cells "
                   f"sit inside the output cone; the frontier is incomplete")
+        if verify["oracle_fallback_inside_output_cone_count"]:
+            print(f"  WARNING: {verify['oracle_fallback_inside_output_cone_count']} cells "
+                  f"missing from the graph fed the output cone from the workbook cache")
+        if out["unverifiable"]:
+            print(f"  WARNING: {out['unverifiable']} output cells have no cached "
+                  f"value to verify against")
         for block in verify["iterative_blocks"]:
             print(f"  circular block of {block['size']} cells: "
                   f"{block['iterations']} iterations, converged={block['converged']}")

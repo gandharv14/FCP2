@@ -15,7 +15,7 @@ import math
 import re
 from calendar import monthrange
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta
 
 from .condense import strongly_connected, topo_order
@@ -333,6 +333,13 @@ class EvalResult:
     unresolved: dict
     iterated: list
     coverage: dict
+    # target cell -> source cells actually read on the final evaluation pass,
+    # including dynamic references (OFFSET) invisible to the static graph.
+    runtime_radj: dict = dataclass_field(default_factory=dict)
+    # cell id served by the workbook cached-value oracle -> the formula cells
+    # that consumed it. Every entry is a value the evaluator could not derive
+    # and copied from the golden workbook instead.
+    oracle_reads: dict = dataclass_field(default_factory=dict)
 
 
 class Evaluator:
@@ -344,6 +351,8 @@ class Evaluator:
         self.unresolved: dict = {}
         self.unknown_ops: dict = defaultdict(int)
         self._arg_cache: dict = {}
+        self.oracle_reads: dict = {}
+        self._current_cell = None
 
     # -- AST walking ------------------------------------------------------
     def _arg_specs(self, node):
@@ -412,7 +421,14 @@ class Evaluator:
             return Unresolved("range-uncomputed")
         if self.oracle is not None:
             raw = self.oracle(*_split(cid))
-            return literal(raw) if isinstance(raw, str) else raw
+            value = literal(raw) if isinstance(raw, str) else raw
+            if value is not None:
+                # A populated cell the graph never recorded: its value comes
+                # straight from the golden workbook's cache, not from any
+                # rebuild. Record who consumed it so verification can refuse
+                # to count outputs fed this way.
+                self.oracle_reads.setdefault(cid, set()).add(self._current_cell)
+            return value
         return None
 
     def _eval_node(self, node_id):
@@ -471,7 +487,11 @@ class Evaluator:
                 return cond
             chosen = 1 if truthy(cond) else 2
             value = self._arg(node, chosen)
-            return value if value is not None else (False if chosen == 2 else True)
+            if value is not None:
+                return value
+            # Excel: an omitted value_if_true yields 0, an omitted
+            # value_if_false yields FALSE.
+            return False if chosen == 2 else 0.0
         if op == "CHOOSE":
             index = self._arg(node, 0)
             if index is None:
@@ -495,6 +515,19 @@ class Evaluator:
         selective = (
             "VLOOKUP", "HLOOKUP", "XLOOKUP", "_XLFN.XLOOKUP", "MATCH", "INDEX"
         )
+        if op in selective:
+            # Lookups tolerate bad values inside the searched range -- only the
+            # matched row matters -- but a bad key/index/mode must poison the
+            # result. Letting it fall through to num() would silently search
+            # for 0 and fabricate a match Excel never produces.
+            scalar_slots = {
+                "VLOOKUP": (0, 2, 3), "HLOOKUP": (0, 2, 3),
+                "XLOOKUP": (0,), "_XLFN.XLOOKUP": (0,),
+                "MATCH": (0, 2), "INDEX": (1, 2),
+            }[op]
+            for slot in scalar_slots:
+                if slot < len(args) and is_bad(args[slot]):
+                    return args[slot]
         bad = next((a for a in flatten(args) if isinstance(a, Unresolved)), None)
         if bad is not None and op not in selective:
             return bad
@@ -1098,6 +1131,7 @@ class Evaluator:
             root = self.graph.root_of(target)
             if root is None:
                 continue
+            self._current_cell = target
             for source in self._active_node_sources(root):
                 if source not in known:
                     continue
@@ -1280,7 +1314,17 @@ class Evaluator:
                 for diagnostic in cycle_diagnostics
             ),
         }
-        return EvalResult(self.values, self.unresolved, iterated, coverage)
+        # The final pass's active graph carries the dependencies actually read,
+        # including runtime-resolved dynamic references (OFFSET targets) that
+        # the static edge list cannot see. Verification walks the output cone
+        # over these edges as well as the static ones.
+        runtime_radj = {
+            target: set(sources) for target, sources in active_radj.items()
+        }
+        return EvalResult(
+            self.values, self.unresolved, iterated, coverage,
+            runtime_radj=runtime_radj, oracle_reads=self.oracle_reads,
+        )
 
     @staticmethod
     def _value_change(before, after):
@@ -1391,6 +1435,7 @@ class Evaluator:
                 break
 
     def _eval_cell(self, cid: str):
+        self._current_cell = cid
         info = self.cg.info[cid]
         root = self.graph.root_of(cid)
         if root is not None:
@@ -1445,10 +1490,14 @@ def compare(expected: str, actual, tolerance=1e-6):
     if isinstance(actual, Unresolved):
         return "unresolved", None
     want = literal(expected)
+    if want is None:
+        # The workbook cached no value, so there is no ground truth to compare
+        # against. Calling a recomputed 0/blank a "match" here would verify
+        # nothing (and Python's False == 0.0 made even FALSE pass); report the
+        # cell as unverifiable instead of inflating the match count.
+        return "unverifiable", None
     if isinstance(want, str) or isinstance(actual, str):
         return ("match" if _text(want).strip() == _text(actual).strip() else "mismatch"), None
-    if want is None and actual in (None, 0.0):
-        return "match", 0.0
     got, ref = num(actual, math.nan), num(want, math.nan)
     if math.isnan(got) or math.isnan(ref):
         return "unresolved", None

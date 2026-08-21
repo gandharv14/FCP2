@@ -18,6 +18,35 @@ FORBIDDEN_KEYS = {"gold", "gold_evidence", "is_truth", "correct_answer",
 
 TOKEN_RE = re.compile(r"[a-z0-9.]+")
 
+# The exact-answer grader accepts max(1e-6, 1e-6 * |expected|); a wrong value
+# inside a few of those bands solves the task. Builder guarantees a 10x floor.
+GRADER_TOLERANCE = 1e-6
+
+WORD_RE = re.compile(r"[a-z]{4,}")
+EXCERPT_MARKER = "Short attributed excerpt"
+
+
+def within_grader_band(candidate: Any, expected: Any) -> bool:
+    if isinstance(candidate, bool) or isinstance(expected, bool):
+        return candidate is expected
+    if not isinstance(candidate, (int, float)) or not isinstance(expected, (int, float)):
+        return False
+    return abs(float(candidate) - float(expected)) <= 10 * max(
+        GRADER_TOLERANCE, GRADER_TOLERANCE * abs(float(expected)))
+
+
+def content_words(document: dict[str, Any]) -> set[str]:
+    """Alphabetic tokens of a document's own prose, excerpt text excluded.
+
+    Excerpts rotate across a dataset's documents, so an excerpt attached to an
+    answer document is not a searchable marker of correctness the way a
+    structural phrase difference is."""
+    content = str(document.get("content") or "")
+    cut = content.find(EXCERPT_MARKER)
+    if cut != -1:
+        content = content[:cut]
+    return set(WORD_RE.findall(content.casefold()))
+
 
 def server_matches(actual: Any, expected: str) -> bool:
     """Replica of the served Store.matches token-containment semantics."""
@@ -210,13 +239,22 @@ def validate(root: Path) -> dict[str, Any]:
                     % task["task_id"])
         if len(exact) > 1:
             chained += 1
-        # A stale release must not silently agree with the current value.
+        # A stale release must not silently agree with the current value --
+        # neither exactly nor within the grader's acceptance band, where a
+        # wrong pick would still be graded correct.
+        stale_rows = [row for row in exact if row.get("superseded_by")]
         stale_values = {json.dumps(row["value"], sort_keys=True)
-                        for row in exact if row.get("superseded_by")}
+                        for row in stale_rows}
         if json.dumps(current[0]["value"], sort_keys=True) in stale_values:
             raise ValueError(
                 "Task %s has a stale release with the current value"
                 % task["task_id"])
+        for row in stale_rows:
+            if within_grader_band(row["value"], current[0]["value"]):
+                raise ValueError(
+                    "Task %s has a stale release within grader tolerance of "
+                    "the current value (%r vs %r)"
+                    % (task["task_id"], row["value"], current[0]["value"]))
         metric = current[0]["metric"]
         broad = [row for row in records
                  if row["dataset_id"] == evidence["dataset_id"]
@@ -225,6 +263,35 @@ def validate(root: Path) -> dict[str, Any]:
             raise ValueError(
                 "Task %s has no conflicting metric distractor" % task["task_id"])
         ambiguous_broad += 1
+
+    # No searchable phrase may mark the answer documents. Every alphabetic
+    # token in a supported record's document prose must also occur either in
+    # some non-answer document or in that record's own field values; a token
+    # unique to the answer documents would let one search_documents call
+    # reveal every answer.
+    records_by_id = {row["id"]: row for row in records}
+    supported_doc_ids = {task["evidence"]["document_id"] for task in tasks}
+    supported_record_of = {task["evidence"]["document_id"]:
+                           task["evidence"]["record_id"] for task in tasks}
+    non_answer_words: set[str] = set()
+    for document in documents:
+        if document["id"] not in supported_doc_ids:
+            non_answer_words |= content_words(document)
+    for document in documents:
+        if document["id"] not in supported_doc_ids:
+            continue
+        if "authoritative figure" in str(document.get("content") or ""):
+            raise ValueError(
+                "Document %s carries the 'authoritative figure' answer marker"
+                % document["id"])
+        record = records_by_id.get(supported_record_of[document["id"]], {})
+        own = set(WORD_RE.findall(
+            json.dumps(record, sort_keys=True).casefold()))
+        unique = content_words(document) - non_answer_words - own
+        if unique:
+            raise ValueError(
+                "Document %s contains tokens unique to answer documents: %s"
+                % (document["id"], sorted(unique)[:8]))
 
     return {"valid": True, "tasks": len(tasks), "documents": len(documents),
             "records": len(records),

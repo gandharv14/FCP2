@@ -55,6 +55,50 @@ NUMERIC_ENTITY_RE = re.compile(r"&#(x[0-9a-fA-F]+|\d+);")
 
 CALC_CHAIN = "xl/calcChain.xml"
 
+# Chart parts keep their own cached copy of every plotted value. In a masked or
+# level-cut workbook those caches hold numbers whose grid cells were just
+# blanked, so they must go: Excel rebuilds them from the sheet on open. The
+# element names are matched under any namespace prefix (c:, c15:, ...).
+CHART_NUM_CACHE_RE = re.compile(
+    rb"<(?:[A-Za-z0-9]+:)?numCache>.*?</(?:[A-Za-z0-9]+:)?numCache>", re.S)
+CHART_STR_CACHE_RE = re.compile(
+    rb"<(?:[A-Za-z0-9]+:)?strCache>.*?</(?:[A-Za-z0-9]+:)?strCache>", re.S)
+CHART_MULTI_CACHE_RE = re.compile(
+    rb"<(?:[A-Za-z0-9]+:)?multiLvlStrCache>.*?</(?:[A-Za-z0-9]+:)?multiLvlStrCache>",
+    re.S)
+# Modern chartEx parts store the cached points directly as <cx:pt> inside
+# numeric/string dimensions instead of a *Cache element.
+CHARTEX_PT_RE = re.compile(
+    rb"<(?:[A-Za-z0-9]+:)?pt(?:\s[^>]*)?(?:/>|>.*?</(?:[A-Za-z0-9]+:)?pt>)", re.S)
+
+
+def is_chart_part(name):
+    return name.startswith("xl/charts/") and name.endswith(".xml")
+
+
+def scrub_chart_caches(name, data):
+    """Drop cached series values from a chart part; returns (data, hits).
+
+    Classic charts lose their numCache/strCache elements (optional children of
+    the series references); chartEx parts lose the cached <pt> entries. The
+    cell references that drive the chart survive, so Excel simply re-reads the
+    grid -- which is exactly the set of values the mask decided may be seen.
+    """
+    hits = 0
+
+    def cut(pattern, blob):
+        nonlocal hits
+        blob, n = pattern.subn(b"", blob)
+        hits += n
+        return blob
+
+    data = cut(CHART_NUM_CACHE_RE, data)
+    data = cut(CHART_STR_CACHE_RE, data)
+    data = cut(CHART_MULTI_CACHE_RE, data)
+    if "chartex" in name.lower():
+        data = cut(CHARTEX_PT_RE, data)
+    return data, hits
+
 
 def attr(tag, name):
     """Value of an XML attribute inside a raw start tag, or None."""
@@ -253,6 +297,9 @@ def write_snapshot(src, out_path, part_levels, cutoff, tally):
             data = src.read(item.filename)
             if item.filename in part_levels:
                 data = rewrite_sheet(data, part_levels[item.filename], cutoff, tally)
+            elif is_chart_part(item.filename):
+                data, hits = scrub_chart_caches(item.filename, data)
+                tally["chart_caches"] += hits
             elif item.filename == "[Content_Types].xml":
                 data = CALC_OVERRIDE_RE.sub(b"", data)
             elif item.filename == "xl/_rels/workbook.xml.rels":

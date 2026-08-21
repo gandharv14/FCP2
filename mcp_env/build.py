@@ -690,7 +690,11 @@ def source_id(source: dict[str, Any]) -> str:
 
 def display_value(value: Any, unit: str) -> str:
     if isinstance(value, float):
-        text = "%.12g" % value
+        # repr is the shortest round-trip representation: the document must
+        # show exactly the record's value, because agents are told to rely
+        # on fetched documents and the grader tolerance is 1e-6 -- a
+        # 12-significant-digit rounding can already exceed that band.
+        text = repr(value)
     else:
         text = str(value)
     if str(unit).casefold() == "percent":
@@ -865,15 +869,21 @@ def _shift_months(value: date, months: int) -> date:
 
 def release_dates(variable: dict[str, Any], n_stale: int,
                   dataset: dict[str, Any] | None) -> tuple[list[str], str]:
+    """Stale-release dates, always strictly before the supported release.
+
+    Fixed calendar constants would let a historically-dated variable produce
+    a "superseded" release published after its successor -- a chronology the
+    oracle rightly rejects -- so every path derives the stale dates backwards
+    from the supported published_at (yearly steps when no cadence is
+    profiled).
+    """
     supported = str(variable.get("published_at", "2019-12-18"))
-    if not dataset or not dataset.get("release_cadence"):
-        return ["%d-06-30" % (2017 + k) for k in range(n_stale)], supported
     try:
         current = date.fromisoformat(supported)
     except ValueError as exc:
         raise ValueError("%s has invalid published_at %s"
                          % (variable["id"], supported)) from exc
-    cadence = dataset["release_cadence"]
+    cadence = (dataset or {}).get("release_cadence")
     dates = []
     for distance in range(n_stale, 0, -1):
         if cadence == "daily":

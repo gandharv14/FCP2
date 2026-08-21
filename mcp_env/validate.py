@@ -49,10 +49,29 @@ def content_words(document: dict[str, Any]) -> set[str]:
 
 
 def server_matches(actual: Any, expected: str) -> bool:
-    """Replica of the served Store.matches token-containment semantics."""
-    left = " ".join(TOKEN_RE.findall(str(actual).casefold()))
-    right = " ".join(TOKEN_RE.findall(str(expected).casefold()))
-    return left == right or right in left
+    """Replica of the served Store.matches token-aligned containment: the
+    expected tokens must appear as a contiguous run of the actual tokens,
+    and a value that tokenizes to nothing matches nothing."""
+    left = TOKEN_RE.findall(str(actual).casefold())
+    right = TOKEN_RE.findall(str(expected).casefold())
+    if not right:
+        return False
+    if left == right:
+        return True
+    span = len(right)
+    return any(left[i:i + span] == right for i in range(len(left) - span + 1))
+
+
+def server_matches_field(row: dict[str, Any], field: str, expected: str) -> bool:
+    """Replica of Store.query's per-field matching: the metric dimension also
+    matches against each record's metric_aliases, exactly like the live
+    server, so build-time resolution and served resolution cannot disagree."""
+    if server_matches(row.get(field), expected):
+        return True
+    if field == "metric":
+        return any(server_matches(alias, expected)
+                   for alias in row.get("metric_aliases", []))
+    return False
 
 
 def load(path: Path) -> Any:
@@ -186,13 +205,20 @@ def validate(root: Path) -> dict[str, Any]:
                 evidence["source_id"] not in source_ids:
             raise ValueError("Missing evidence for task %s" % task["task_id"])
         wanted = task["required_dimensions"]
-        # Filter with the live server's token-containment semantics, so an
-        # "alternate unit" that merely contains the true unit cannot slip a
-        # distractor into a fully-filtered query.
+        for field, value in wanted.items():
+            if not TOKEN_RE.findall(str(value).casefold()):
+                raise ValueError(
+                    "Task %s dimension %r value %r contains no letters or "
+                    "digits; the live server would reject it as a filter"
+                    % (task["task_id"], field, value))
+        # Filter with the live server's token-containment semantics (metric
+        # aliases included), so an "alternate unit" that merely contains the
+        # true unit cannot slip a distractor into a fully-filtered query and
+        # an alias collision cannot make the served resolution ambiguous.
         exact = [
             row for row in records
             if row["dataset_id"] == evidence["dataset_id"]
-            and all(server_matches(row[field], str(value))
+            and all(server_matches_field(row, field, str(value))
                     for field, value in wanted.items())
         ]
         # Resolution rule: among the rows matching every dimension, exactly one
@@ -227,6 +253,17 @@ def validate(root: Path) -> dict[str, Any]:
             raise ValueError(
                 "Task %s has duplicate provenance publication dates"
                 % task["task_id"])
+        # Chains must be chronological on every path (the oracle enforces
+        # this against the live server): a superseded release published
+        # after its successor is a self-contradictory provenance story.
+        for row in exact:
+            successor = by_release.get(row.get("superseded_by") or "")
+            if successor is not None and \
+                    str(successor["published_at"]) <= str(row["published_at"]):
+                raise ValueError(
+                    "Task %s: release %s is not older than the release "
+                    "that supersedes it (%s)"
+                    % (task["task_id"], row["release"], successor["release"]))
         if datasets_by_id[evidence["dataset_id"]].get("profile_id"):
             if any(not row.get("release_label") for row in exact):
                 raise ValueError(

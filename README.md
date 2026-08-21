@@ -1866,11 +1866,13 @@ in the graph to begin with (section 3.10).
 
 ## 21. `/create-harbor-task`
 
-Package a raw golden workbook into a verified MCP-backed Harbor task. The
-Cursor skill at `.cursor/skills/create-harbor-task/` is fail-closed: no plain
-task fallback, no skipped segmentation proof, and no promotion before the live
-sidecar oracle and grader pass. The golden `.xlsx` stays outside the task
-environment.
+Package a raw golden workbook into a verified Harbor task. The Cursor skill at
+`.cursor/skills/create-harbor-task/` is fail-closed: no skipped segmentation
+proof, and no promotion before the grader pass. When normalization yields
+maskable variables the task is MCP-backed and must also pass the live sidecar
+oracle. When every audit row is genuinely excluded, a plain (no-MCP) task may
+ship after `plain_eligibility.py` passes. The golden `.xlsx` stays outside the
+task environment.
 
 Accepts a path like `4-10 100/0256.xlsx`, a file under the default source
 folder, or a workbook id such as `0256`.
@@ -1895,13 +1897,16 @@ folder, or a workbook id such as `0256`.
    golden-value mismatch aborts.
 8. **Smoke-test** the generated FastMCP server.
 9. **MCP mask** to a separate `inputs_out_mcp/` workbook.
-10. **Package one workbook** with `--mcp` and the validated formula artifacts
-    under `tasks_outputs_mcp/`; custom method hints enter `instruction.md`.
+10. **Package one workbook** under `tasks_outputs_mcp/` (shape-agnostic name)
+    with `--mcp` when variables exist, or without `--mcp` from `inputs_out/`
+    when the task is plain; custom method hints enter `instruction.md`.
 11. **Naturalize the complete instruction** with pinned `gpt-5.6-sol-high`.
     Only the opening and `Input` prose may change; every other section remains
     byte-identical. Deterministic invariants and a clause-level semantic review
     must pass before the candidate is atomically applied.
-12. **Live oracle** the shipped Docker sidecar with `xl_mcp_oracle.py`.
+12. **Live oracle** the shipped Docker sidecar with `xl_mcp_oracle.py` (MCP
+    mode). Plain tasks skip the oracle and run the closed-world `environment/`
+    check instead.
 13. **Grade an exact submission** and structurally inspect the bundle.
 14. **Promote** into `tasks_outputs/` only after every requested workbook passes.
 

@@ -1,5 +1,6 @@
 #!/bin/bash
 # Drive one workbook through gates 5-15 of create-harbor-task.
+# Staging root tasks_outputs_mcp/ is shape-agnostic: MCP or plain.
 # Usage: build_one.sh <WB>
 set -uo pipefail
 cd /Users/henryhu/Documents/GDM_FCP/FCP2
@@ -16,6 +17,7 @@ mkdir -p /tmp/build
 fail() { echo "BUILDFAIL $WB gate=$1 :: $2"; exit 1; }
 
 (
+PLAIN=0
 # ---- gate 5: import ------------------------------------------------------
 python3 xl_variable_mcp.py import "$RUN/$WB-inputs-variable-sources.md" \
   "$RUN/draft.json" >/dev/null 2>&1 || exit 91
@@ -43,6 +45,20 @@ for row in rows:
         raise SystemExit(1)
 PY
 
+python3 plain_eligibility.py "$RUN" >/tmp/build/$WB.mode || exit 114
+MODE=$(cat /tmp/build/$WB.mode)
+if [ "$MODE" = plain ]; then
+  PLAIN=1
+  python3 - "$RUN/normalized.json" <<'PY' >/dev/null 2>&1 || exit 115
+import json, sys
+spec = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if spec.get("variables") == [] else 1)
+PY
+  rm -rf "$RUN/mcp" "$RUN/mcp-build-a" "$RUN/mcp-build-b"
+  rm -f "inputs_out_mcp/$WB-inputs.xlsx"
+fi
+
+if [ "$PLAIN" -eq 0 ]; then
 # ---- gate 7: spec validation --------------------------------------------
 python3 xl_variable_mcp.py validate-spec "$RUN/normalized.json" >/dev/null 2>&1 || exit 95
 
@@ -74,19 +90,59 @@ python3 xl_input_mask.py "$WB" --source "$SOURCE" --seg-dir seg_out \
 NOW=$(shasum -a 256 "inputs_out/$WB-inputs.xlsx" | awk '{print $1}')
 [ "$BASE_SHA" = "$NOW" ] || exit 102
 [ -f "inputs_out_mcp/$WB-inputs.xlsx" ] || exit 103
+fi
 
 # ---- gate 11: package to staging ---------------------------------------
 rm -rf "$STAGED"
-python3 xl_output_task.py "$WB" --source "$SOURCE" --seg-root seg_out \
-  --inputs-root inputs_out_mcp \
-  --variable-source-audit-inputs-root inputs_out \
-  --variable-source-audit-root runs \
-  --variable-source-audit-model openai/gpt-5.6-sol \
-  --mcp "$RUN/mcp" --no-naturalize -o tasks_outputs_mcp >/dev/null 2>&1 || exit 104
-for f in instruction.md task.toml tests/answer_key.json tests/masked_inputs.json \
-         "environment/$WB-inputs.xlsx"; do
-  [ -e "$STAGED/$f" ] || exit 105
-done
+if [ "$PLAIN" -eq 1 ]; then
+  python3 xl_output_task.py "$WB" --source "$SOURCE" --seg-root seg_out \
+    --inputs-root inputs_out \
+    --variable-source-audit-inputs-root inputs_out \
+    --variable-source-audit-root runs \
+    --variable-source-audit-model openai/gpt-5.6-sol \
+    --no-naturalize -o tasks_outputs_mcp >/dev/null 2>&1 || exit 104
+  for f in instruction.md task.toml tests/answer_key.json tests/outputs.json \
+           tests/test.sh tests/finance_grader tests/normalization_exclusions.json \
+           "environment/$WB-inputs.xlsx" environment/Dockerfile; do
+    [ -e "$STAGED/$f" ] || exit 105
+  done
+  python3 - "$STAGED" "$WB" <<'PY' >/dev/null 2>&1 || exit 116
+import sys
+from pathlib import Path
+task, wb = Path(sys.argv[1]), sys.argv[2]
+toml = (task / "task.toml").read_text(encoding="utf-8")
+text = (task / "instruction.md").read_text(encoding="utf-8")
+if (task / "environment" / "mcp-server").exists():
+    raise SystemExit("mcp-server leaked into plain bundle")
+if (task / "environment" / "docker-compose.yaml").exists() or (
+        task / "environment" / "docker-compose.yml").exists():
+    raise SystemExit("compose leaked into plain bundle")
+if "[[environment.mcp_servers]]" in toml:
+    raise SystemExit("mcp_servers leaked into plain bundle")
+if "## Research data service" in text:
+    raise SystemExit("research section leaked into plain instruction")
+if (task / "tests" / "masked_inputs.json").exists():
+    raise SystemExit("masked_inputs.json leaked into plain bundle")
+PY
+  python3 - "$STAGED" "$WB" <<'PY' >/dev/null 2>&1 || exit 117
+import sys
+from pathlib import Path
+from plain_eligibility import check_plain_environment
+report = check_plain_environment(Path(sys.argv[1]), sys.argv[2])
+raise SystemExit(0 if report.get("valid") else 1)
+PY
+else
+  python3 xl_output_task.py "$WB" --source "$SOURCE" --seg-root seg_out \
+    --inputs-root inputs_out_mcp \
+    --variable-source-audit-inputs-root inputs_out \
+    --variable-source-audit-root runs \
+    --variable-source-audit-model openai/gpt-5.6-sol \
+    --mcp "$RUN/mcp" --no-naturalize -o tasks_outputs_mcp >/dev/null 2>&1 || exit 104
+  for f in instruction.md task.toml tests/answer_key.json tests/masked_inputs.json \
+           "environment/$WB-inputs.xlsx"; do
+    [ -e "$STAGED/$f" ] || exit 105
+  done
+fi
 
 # ---- gate 12: unified disclosure ---------------------------------------
 python3 "$D" select --task-dir "$STAGED" --golden "$SOURCE/$WB.xlsx" \
@@ -155,13 +211,24 @@ RC=$?
 case $RC in
   0)   V=$(python3 -c "
 import json
+from pathlib import Path
 s=json.load(open('$RUN/normalized.json'))
 r=json.load(open('$RUN/normalization_report.json'))
-m=json.load(open('$RUN/mcp/mask_cells.json'))
 d=json.load(open('$STAGED/tests/disclosure.json'))
-print('%d vars, %d masked, %d disclosure records, %d incl/%d excl'%(
-  len(s['variables']),len(m),len(d.get('agent_records') or []),
-  r['included_rows'],r['excluded_rows']))")
+elig={}
+p=Path('$RUN/plain_eligibility.json')
+if p.is_file():
+    elig=json.loads(p.read_text())
+if elig.get('mode')=='plain':
+    print('plain, 0 vars, %d disclosure records, %d excl (%s)'%(
+      len(d.get('agent_records') or []), r['excluded_rows'],
+      elig.get('plain_reason') or elig.get('reason') or 'excluded'))
+else:
+    m=json.load(open('$RUN/mcp/mask_cells.json'))
+    print('%d vars, %d masked, %d disclosure records, %d incl/%d excl'%(
+      len(s['variables']),len(m),len(d.get('agent_records') or []),
+      r['included_rows'],r['excluded_rows']))
+")
        echo "BUILDOK $WB :: $V" ;;
   91)  fail 5  "import failed" ;;
   92)  fail 6  "normalizer generation or execution failed" ;;
@@ -186,5 +253,9 @@ print('%d vars, %d masked, %d disclosure records, %d incl/%d excl'%(
   111) fail 15 "answer key extraction failed" ;;
   112) fail 15 "grader run failed" ;;
   113) fail 15 "grader score != 1.0" ;;
+  114) fail 6  "zero variables but not plain-eligible" ;;
+  115) fail 6  "plain path reached with a non-empty spec" ;;
+  116) fail 11 "MCP artifact leaked into a plain bundle" ;;
+  117) fail 11 "plain environment hygiene failed" ;;
   *)   fail ?  "unexpected rc=$RC" ;;
 esac

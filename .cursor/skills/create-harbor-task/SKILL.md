@@ -1,14 +1,21 @@
 ---
 name: create-harbor-task
-description: Creates fail-closed MCP-backed Harbor workbook tasks with unified pre-run task disclosure. Use when asked to create or rebuild a Harbor task, package an .xlsx or workbook id, generate variable-source MCP inputs, or promote a tasks_outputs bundle.
+description: Creates fail-closed Harbor workbook tasks with unified pre-run task disclosure. MCP-backed when the audit yields maskable variables; a plain (no-MCP) task only when every audit row is genuinely excluded. Use when asked to create or rebuild a Harbor task, package an .xlsx or workbook id, generate variable-source MCP inputs, or promote a tasks_outputs bundle.
 disable-model-invocation: true
 ---
 
-# Create an MCP-backed Harbor task
+# Create a Harbor workbook task
 
 Run the financial-workbook pipeline for exactly one workbook at a time. The
 golden workbook is an answer key and build-time validation input; it must never
-enter the task environment. This workflow has no plain-task fallback.
+enter the task environment. Ship an MCP research sidecar when normalization
+produces maskable variables. A plain (no-MCP) task is permitted only when the
+hardened eligibility check in `plain_eligibility.py` passes: every draft row
+is excluded with a reason, none of the causes are extraction defects, no
+forced-exclusion file exists, the first normalization of the run was also
+empty, and the draft-row floor is met. An audit that yields no resolvable
+candidates is an audit failure, not a plain-task trigger. A spec that was
+non-empty and later emptied must never be downgraded to plain.
 
 ## Resolve paths
 
@@ -52,9 +59,12 @@ Expected artifacts:
 - `draft.json`, `normalize_$WB.py`, `normalized.json`, `exclusions.json`,
   `normalization_report.json`, `source_profiles.json`, and profile captures
 - `mcp/{runtime,eval,server.py,Dockerfile,mask_cells.json,masked_inputs.json}`
-- `inputs_out_mcp/$WB-inputs.xlsx`: separately MCP-masked inputs
-- `tasks_outputs_mcp/$WB-outputs/`: staged bundle
-- `runs/$WB-variable-sources/oracle-report.json`
+  (MCP mode only)
+- `inputs_out_mcp/$WB-inputs.xlsx`: separately MCP-masked inputs (MCP mode only)
+- `tasks_outputs_mcp/$WB-outputs/`: staged bundle (shape-agnostic name)
+- `runs/$WB-variable-sources/oracle-report.json` (MCP mode only)
+- `runs/$WB-variable-sources/{plain_eligibility.json,first_normalization.json}`
+  and, in plain mode, `tests/normalization_exclusions.json`
 
 For multiple requested workbooks, complete all gates serially. Do not share a
 normalized spec, MCP bundle, mask list, or staged task between workbook ids.
@@ -70,16 +80,18 @@ Stage all requested workbooks before promoting any of them.
   masking, packaging, or rollout is difficult.
 - Generate and package the GPT 5.6 Sol variable/source audit. Never pass
   `--no-variable-source-audit`.
-- Run `/task-disclosure` against the exact staged MCP workbook before
+- Run `/task-disclosure` against the exact staged workbook before
   naturalization. Registry drift, audit failure, mechanical verification
   failure, or a blocking fresh-review finding is a blocker.
 - Run `/naturalize-finance-task-instruction` after the complete instruction is
   packaged. Any generation, validation, or semantic-review failure is a blocker.
-- Missing audit credentials or audit failure is a blocker, not permission to
-  produce a plain task.
+- Missing audit credentials or audit failure is a blocker. An audit that
+  yields no resolvable candidates is an audit failure, not a plain-task trigger.
 - Missing profile skill, unresolved draft rows, partial masking, source-profile
-  validation failure, MCP failure, oracle failure, or grader failure is a
-  blocker. Retain diagnostics and leave the current task untouched.
+  validation failure, failure of an MCP build that was attempted, failure of
+  an oracle that was attempted, or grader failure is a blocker. Skipping MCP
+  build and oracle in a verified plain task is not an MCP failure. Retain
+  diagnostics and leave the current task untouched.
 - Never package the old custom-formula hint and conventions sections as a
   fallback for unified disclosure.
 - Never place the golden workbook, `eval/`, normalized specs, profile captures,
@@ -229,6 +241,12 @@ PY
 
 ### 7. Profile public sources with GPT 5.6 Sol
 
+If `plain_eligibility.py` reports `mode: plain`, skip this step and step 8-10
+and 14. `validate-spec` rejects an empty variable list; profiling has nothing
+to attach. Record `n/a (plain)` for profile and maskability counts.
+
+If `mode: fail` (zero variables but ineligible), stop. Do not package.
+
 First load and follow `.cursor/skills/profile-mcp-sources/SKILL.md`. Launch one
 or more `generalPurpose` subagents with model `gpt-5.6-sol-high`, batching no
 more than six canonical URLs per subagent as that skill requires. Pass only its
@@ -280,7 +298,8 @@ workbooks. Write `"$RUN/maskability_report.json"` and fail unless:
 - duplicate refs across variables are intentional, compatible, and documented
 
 Re-run the atomic normalizer and profile validator after any change. Do not use
-an allowlist to hide an unknown leak.
+an allowlist to hide an unknown leak. If this step empties a spec that was
+non-empty at first normalization, that is a blocker, not a plain task.
 
 ### 9. Build, validate, and smoke deterministic MCP output
 
@@ -331,7 +350,9 @@ test -f "$MCP_INPUT_ROOT/$WB-inputs.xlsx"
 Require all intended MCP cells blank, no formulas, no unintended typed-cell
 loss, and a non-empty mask. Never overwrite the baseline inputs workbook.
 
-### 11. Package to staging with MCP and baseline audit
+### 11. Package to staging
+
+MCP mode:
 
 ```bash
 test ! -e "$STAGED"
@@ -350,8 +371,13 @@ python3 xl_output_task.py "$WB" \
 The audit must run or validly cache-reuse against baseline inputs, while the
 packaged artifact must come from MCP inputs. Require the MCP server declaration,
 compose sidecar, extended timeout, research instructions, audit metadata, and
-`tests/masked_inputs.json`. Absence of any required artifact is failure; never
-rerun without `--mcp`.
+`tests/masked_inputs.json`. Absence of any required artifact is failure.
+
+Plain mode: package with `--inputs-root "$BASE_INPUT_ROOT"` and **no** `--mcp`.
+Require `research_service = false`, `tests/normalization_exclusions.json`, no
+`environment/mcp-server`, no compose file, no `[[environment.mcp_servers]]`,
+and no `## Research data service`. Run `plain_eligibility.check_plain_environment`
+so `environment/` contains exactly `$WB-inputs.xlsx` and `Dockerfile`.
 
 ### 12. Build unified task disclosure
 
@@ -415,6 +441,9 @@ answer-leaking, or formula-like wording. Save
 `"$RUN/disclosure-faithfulness.md"` and stop on a blocking finding.
 
 ### 14. Run generalized HTTP oracle
+
+Skip this step in plain mode. The oracle requires MCP manifests. Packaging
+hygiene for a plain bundle is the closed-world `environment/` check in step 11.
 
 Use the reusable oracle, not a workbook-specific script:
 
@@ -526,16 +555,19 @@ Report, per workbook:
   verdict
 - instruction naturalization source/candidate/report paths, pinned Sol model,
   prompt version, source/instruction hashes, and semantic-review result
-- baseline input path/hash and separate MCP input path/hash
+- MCP or plain mode; if plain, the eligibility reason and exclusion-code
+  histogram; if MCP, the separate MCP input path/hash
+- baseline input path/hash
 - audit Markdown/inventory/metadata paths, model, inventory hash, and cache use
 - draft row count; included/excluded disposition counts; atomic variable count
 - profile count, reviewed count, captured public count, and every
-  skipped-auth/paywall/blocked/unreachable source
+  skipped-auth/paywall/blocked/unreachable source (`n/a (plain)` in plain mode)
 - maskability report path; `cells`, `extra_cells`, and total masked-cell counts
+  (`n/a (plain)` in plain mode)
 - normalized spec, exclusions, profiles, and MCP paths; deterministic comparison
-  and MCP validation/smoke summaries
-- staged path, oracle report and result, exact grader score, final promoted path,
-  previous-bundle backup path, and any retained diagnostics
+  and MCP validation/smoke summaries (`n/a (plain)` for MCP build/oracle)
+- staged path, oracle report and result (`n/a (plain)`), exact grader score,
+  final promoted path, previous-bundle backup path, and any retained diagnostics
 
-Completion requires all gates to pass. Otherwise report the first blocker and
-leave existing task bundles untouched.
+Completion requires every gate that applies to the chosen mode to pass.
+Otherwise report the first blocker and leave existing task bundles untouched.

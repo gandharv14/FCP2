@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import pprint
 import re
 import sys
@@ -27,26 +28,98 @@ from pathlib import Path
 import openpyxl
 from openpyxl.utils import column_index_from_string as ci, get_column_letter as gl
 
-REF = re.compile(
-    r"([A-Za-z0-9_&.\-][A-Za-z0-9_&.\- ]*!\$?[A-Z]{1,3}\$?\d+"
-    r"(?::\$?[A-Z]{1,3}\$?\d+)?)"
-)
+# Locate !A1 / !A1:B2, then take the sheet name immediately before the bang.
+# Excel sheet names are at most 31 characters and cannot contain \ / ? * [ ] : !
+CELL = r"\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?"
+CELL_AT = re.compile(r"!(" + CELL + r")")
+SHEET_BREAK = re.compile(r"`|<br\s*/?>|[\n;]", re.I)
 PICKLIST = re.compile(r"data\s*validation|validation|dropdown|^lists?$|picklist"
                       r"|embedded\s*assumptions", re.I)
+
+CAUSE_PRIORITY = (
+    "unparsable_reference",
+    "unknown_sheet",
+    "formula_cell",
+    "blank_in_baseline",
+    "duplicate_value_leak",
+    "forced_exclusion",
+)
+
+CAUSE_PROSE = {
+    "unparsable_reference": (
+        "No workbook cell reference could be parsed from the audit row."
+    ),
+    "unknown_sheet": (
+        "Audit row references a sheet that does not exist in the golden workbook."
+    ),
+    "formula_cell": (
+        "Audit row references a formula cell; it cannot be masked as a typed input."
+    ),
+    "blank_in_baseline": (
+        "Audit row references a cell already blank in the baseline inputs; "
+        "it cannot be masked as a typed input."
+    ),
+    "duplicate_value_leak": (
+        "Value also occurs in typed cell(s) that carry unrelated modelling "
+        "content, so the variable cannot be masked completely."
+    ),
+    "forced_exclusion": (
+        "The delivered bundle exposes this value in a packager-generated "
+        "cell that cannot be masked without removing task disclosure, so "
+        "the variable is excluded (oracle feedback)."
+    ),
+}
+
+
 def _source_root(wb):
     from pathlib import Path as _P
     return "4-10 100" if _P(f"4-10 100/{wb}.xlsx").exists() else "batch-src"
 
 
+def extract_refs(text, sheets=None):
+    """Return ``Sheet!A1`` / ``Sheet!A1:B2`` strings from audit prose."""
+    refs = []
+    seen = set()
+    keys = {k.strip().upper(): k for k in (sheets or {})}
+    for match in CELL_AT.finditer(text or ""):
+        cell = match.group(1)
+        prefix = text[: match.start()]
+        quoted = re.search(r"'([^']+)'\s*$", prefix)
+        if quoted:
+            sheet = quoted.group(1).strip()
+        else:
+            chunk = SHEET_BREAK.split(prefix)[-1]
+            sheet = chunk[-31:].strip(" \t\"=[")
+        if not sheet or not cell:
+            continue
+        if keys:
+            upper = sheet.strip().upper()
+            if upper not in keys:
+                resolved = None
+                for length in range(len(upper), 0, -1):
+                    cand = upper[-length:].strip()
+                    if cand in keys:
+                        resolved = keys[cand]
+                        break
+                if resolved is not None:
+                    sheet = resolved
+        ref = f"{sheet}!{cell}"
+        if ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    return refs
+
+
 def expand(ref, sheets):
-    ref = ref.strip().replace("$", "")
-    m = re.match(r"^(.+?)!([A-Z]{1,3})(\d+)(?::([A-Z]{1,3})(\d+))?$", ref)
+    ref = ref.strip().replace("$", "").strip("'").strip("`")
+    m = re.match(r"^(.+?)!([A-Z]{1,3})(\d+)(?::([A-Z]{1,3})(\d+))?$", ref, re.I)
     if not m:
         return None, []
     sh, c1, r1, c2, r2 = m.groups()
     real = sheets.get(sh.strip().upper())
     if real is None:
         return None, []
+    c1, c2 = c1.upper(), (c2.upper() if c2 else None)
     if not c2:
         return real, [f"{c1}{r1}"]
     return real, [
@@ -54,6 +127,14 @@ def expand(ref, sheets):
         for c in range(ci(c1), ci(c2) + 1)
         for r in range(int(r1), int(r2) + 1)
     ]
+
+
+def primary_code(codes):
+    present = [c for c in codes if c]
+    for code in CAUSE_PRIORITY:
+        if code in present:
+            return code
+    return present[0] if present else None
 
 
 def slug(text, fallback="variable"):
@@ -84,6 +165,17 @@ def unit_for(value, name):
     if any(k in low for k in ("month",)):
         return "months", False
     return "value", False
+
+
+def atomic_json(path, payload):
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
 
 
 def analyse(wb):
@@ -119,30 +211,40 @@ def analyse(wb):
     rows = []
     for row in draft["rows"]:
         cells = []
-        ok = True
-        for ref in REF.findall(row["value_text"]):
+        codes = []
+        refs = extract_refs(row["value_text"], sheets)
+        if not refs:
+            codes.append("unparsable_reference")
+        for ref in refs:
             sh, cs = expand(ref, sheets)
             if sh is None:
-                ok = False
+                codes.append("unknown_sheet")
                 continue
             for c in cs:
                 gf = G[sh][c].value
                 if isinstance(gf, str) and gf.startswith("="):
-                    ok = False
+                    codes.append("formula_cell")
                     continue
                 if BI[sh][c].value is None:
-                    ok = False
+                    codes.append("blank_in_baseline")
                     continue
                 cells.append((sh, c, GV[sh][c].value))
-        rows.append({"row": row, "cells": cells, "clean": ok and bool(cells)})
+        unique_codes = []
+        for code in codes:
+            if code not in unique_codes:
+                unique_codes.append(code)
+        rows.append({
+            "row": row,
+            "cells": cells,
+            "codes": unique_codes,
+            "clean": bool(cells) and not unique_codes,
+        })
 
     for r in rows:
         if not r["clean"]:
-            r["reason"] = (
-                "Audit row references a formula cell, a cell already blank in the "
-                "baseline inputs, or an unresolvable reference; it cannot be masked "
-                "as a typed input."
-            )
+            code = primary_code(r["codes"])
+            r["code"] = code
+            r["reason"] = CAUSE_PROSE.get(code, CAUSE_PROSE["unparsable_reference"])
         r["extra"] = []
 
     # Dropping a row un-covers the values it was masking, which can create a new
@@ -178,6 +280,8 @@ def analyse(wb):
             if leaks:
                 r["clean"] = False
                 r["leaks"] = sorted(set(leaks))
+                r["code"] = "duplicate_value_leak"
+                r["codes"] = list(r.get("codes") or []) + ["duplicate_value_leak"]
                 r["reason"] = (
                     "Value also occurs in typed cell(s) %s that carry unrelated "
                     "modelling content, so the variable cannot be masked completely."
@@ -196,10 +300,13 @@ def emit(wb, draft, rows):
     forced = set()
     fp = Path(f"runs/{wb}-variable-sources/oracle_forced_exclusions.json")
     if fp.exists():
-        forced = set(json.loads(fp.read_text(encoding="utf-8")))
+        raw = json.loads(fp.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
+            forced = set(raw)
+        elif isinstance(raw, dict):
+            forced = set(raw.get("ids") or raw.get("exclusions") or [])
 
     included = [r for r in rows if r["clean"]]
-    excluded = [r for r in rows if not r["clean"]]
 
     var_defs, inc_map, reasons = [], {}, {}
     used = set()
@@ -207,13 +314,11 @@ def emit(wb, draft, rows):
         ids = []
         multi = len(r["cells"]) > 1
         base = slug(r["row"]["draft_id"])
-        if base in forced:
+        if base in forced or r["row"]["draft_id"] in forced:
             r["clean"] = False
-            r["reason"] = (
-                "The delivered bundle exposes this value in a packager-generated "
-                "cell that cannot be masked without removing task disclosure, so "
-                "the variable is excluded (oracle feedback)."
-            )
+            r["code"] = "forced_exclusion"
+            r["codes"] = list(r.get("codes") or []) + ["forced_exclusion"]
+            r["reason"] = CAUSE_PROSE["forced_exclusion"]
             continue
         for sh, c, raw_val in r["cells"]:
             val, is_date = coerce(raw_val)
@@ -249,12 +354,35 @@ def emit(wb, draft, rows):
                 "masked so it cannot reveal the removed assumption."
             )
     excluded = [r for r in rows if not r["clean"]]
-    exc_map = {r["row"]["draft_id"]: r["reason"] for r in excluded}
+    exc_map = {}
+    for r in excluded:
+        code = r.get("code") or primary_code(r.get("codes") or []) or "unparsable_reference"
+        exc_map[r["row"]["draft_id"]] = {
+            "reason": r.get("reason") or CAUSE_PROSE[code],
+            "code": code,
+        }
     inc_map = {k: v for k, v in inc_map.items() if k not in exc_map}
     keep = {i for ids in inc_map.values() for i in ids}
     var_defs = [v for v in var_defs if v["id"] in keep]
 
+    histogram = collections.Counter(item["code"] for item in exc_map.values())
+
     run = Path(f"runs/{wb}-variable-sources")
+    first_path = run / "first_normalization.json"
+    snapshot = {
+        "schema_version": "1.0",
+        "workbook": wb,
+        "atomic_variables": len(var_defs),
+        "draft_rows": len(draft["rows"]),
+        "included_rows": len(inc_map),
+        "excluded_rows": len(exc_map),
+        "exclusion_reason_codes": dict(sorted(histogram.items())),
+        "forced_exclusions": sorted(forced),
+    }
+    if not first_path.exists():
+        atomic_json(first_path, snapshot)
+    first = json.loads(first_path.read_text(encoding="utf-8"))
+
     script = run / f"normalize_{wb}.py"
     script.write_text(TEMPLATE.format(
         wb=wb,
@@ -263,6 +391,10 @@ def emit(wb, draft, rows):
         included=pprint.pformat(inc_map, indent=4, width=96, sort_dicts=True),
         excluded=pprint.pformat(exc_map, indent=4, width=96, sort_dicts=True),
         reasons=pprint.pformat(reasons, indent=4, width=96, sort_dicts=True),
+        codes=pprint.pformat(dict(sorted(histogram.items())), indent=4,
+                             width=96, sort_dicts=True),
+        first_atomic=int(first.get("atomic_variables") or 0),
+        forced=pprint.pformat(sorted(forced), indent=4, width=96),
     ), encoding="utf-8")
     print(f"{wb}: {len(draft['rows'])} draft rows -> {len(inc_map)} included, "
           f"{len(exc_map)} excluded, {len(var_defs)} atomic variables, "
@@ -302,6 +434,12 @@ EXCLUDED = {excluded}
 
 EXTRA_CELL_REASONS = {reasons}
 
+EXCLUSION_REASON_CODES = {codes}
+
+FIRST_ATOMIC_VARIABLES = {first_atomic}
+
+FORCED_EXCLUSIONS = {forced}
+
 
 def build_variables():
     out = []
@@ -338,6 +476,13 @@ def atomic_json(path, payload):
     os.replace(tmp, path)
 
 
+def excluded_entry(draft_id):
+    item = EXCLUDED[draft_id]
+    if isinstance(item, dict):
+        return item["reason"], item.get("code")
+    return item, None
+
+
 def main():
     draft = json.loads(DRAFT.read_text(encoding="utf-8"))
     draft_ids = [row["draft_id"] for row in draft["rows"]]
@@ -350,11 +495,15 @@ def main():
                 "variable_ids": INCLUDED[draft_id],
             }})
         elif draft_id in EXCLUDED:
-            dispositions.append({{
+            reason, code = excluded_entry(draft_id)
+            row = {{
                 "draft_id": draft_id,
                 "status": "excluded",
-                "reason": EXCLUDED[draft_id],
-            }})
+                "reason": reason,
+            }}
+            if code:
+                row["code"] = code
+            dispositions.append(row)
         else:
             raise SystemExit("unresolved draft row: %s" % draft_id)
 
@@ -384,7 +533,11 @@ def main():
         "schema_version": "1.0",
         "workbook": "{wb}",
         "exclusions": [
-            {{"draft_id": k, "reason": v}} for k, v in sorted(EXCLUDED.items())
+            {{
+                "draft_id": k,
+                **({{"reason": v, "code": None}} if not isinstance(v, dict) else v),
+            }}
+            for k, v in sorted(EXCLUDED.items())
         ],
     }})
     atomic_json(REPORT, {{
@@ -394,6 +547,9 @@ def main():
         "included_rows": len(INCLUDED),
         "excluded_rows": len(EXCLUDED),
         "atomic_variables": len(variables),
+        "first_atomic_variables": FIRST_ATOMIC_VARIABLES,
+        "exclusion_reason_codes": EXCLUSION_REASON_CODES,
+        "forced_exclusions": FORCED_EXCLUSIONS,
         "extra_cell_reasons": EXTRA_CELL_REASONS,
         "dispositions": dispositions,
     }})
@@ -409,5 +565,4 @@ if __name__ == "__main__":
 if __name__ == "__main__":
     wb = sys.argv[1]
     draft, rows = analyse(wb)
-    n = emit(wb, draft, rows)
-    sys.exit(0 if n else 1)
+    emit(wb, draft, rows)

@@ -40,8 +40,18 @@ def jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def matches(actual: Any, expected: str) -> bool:
-    left, right = " ".join(tokenize(str(actual))), " ".join(tokenize(expected))
-    return left == right or right in left
+    """Token-aligned containment: the expected tokens must appear as a
+    contiguous run of the actual tokens. Comparing joined strings with a
+    substring test would let "fund ii" match "fund iii" and "2024" match
+    "2024.5"; a value that tokenizes to nothing (a bare symbol such as "%")
+    matches nothing rather than everything."""
+    left, right = tokenize(str(actual)), tokenize(expected)
+    if not right:
+        return False
+    if left == right:
+        return True
+    span = len(right)
+    return any(left[i:i + span] == right for i in range(len(left) - span + 1))
 
 
 class Store:
@@ -103,6 +113,12 @@ class Store:
         if dataset_id not in self.dataset_ids:
             raise KeyError("Unknown dataset_id: %s" % dataset_id)
         active = [field for field, expected in filters.items() if expected]
+        degenerate = [field for field in active if not tokenize(filters[field])]
+        if degenerate:
+            raise ValueError(
+                "Filter value(s) for %s contain no letters or digits and "
+                "cannot match any row; use a textual value such as "
+                "'percent' instead of a bare symbol." % ", ".join(degenerate))
         if len(active) < self.MIN_FILTER_DIMENSIONS:
             raise ValueError(
                 "query_records requires at least %d filter dimensions "

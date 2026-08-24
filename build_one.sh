@@ -1,5 +1,7 @@
 #!/bin/bash
 # Drive one workbook through gates 5-15 of create-harbor-task.
+# Gate 15.5 (additional-assumptions-dialogue) is agent-only and is not part of
+# this shell automation.
 # Staging root tasks_outputs_mcp/ is shape-agnostic: MCP or plain.
 # Usage: build_one.sh <WB>
 set -uo pipefail
@@ -193,6 +195,8 @@ rm -rf "$NAT_RUN"; mkdir -p "$NAT_RUN"
 cp "$STAGED/instruction.md" "$NAT_RUN/source.md"
 
 # ---- gate 15: exact-answer grader smoke --------------------------------
+# Gate 15.5 (additional-assumptions-dialogue writer/reviewer/apply) is not
+# automated here.
 GS="$RUN/grader-smoke"; rm -rf "$GS"; mkdir -p "$GS/workspace" "$GS/output"
 python3 - "$STAGED/tests/answer_key.json" "$GS/workspace/answers.json" <<'PY' || exit 111
 import json, sys

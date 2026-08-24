@@ -44,6 +44,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from plain_eligibility import DIALOGUE_NOTES_NAME, dialogue_notes_expected
+
 
 DIMENSIONS = ("metric", "entity", "period", "scenario", "basis", "unit", "status")
 FORBIDDEN_RUNTIME_KEYS = {
@@ -436,6 +438,8 @@ def check_environment(bundle: Path, workbook: Path) -> dict[str, Any]:
     }
     if len(compose_candidates) == 1:
         expected.add(compose_candidates[0])
+    if dialogue_notes_expected(bundle):
+        expected.add(DIALOGUE_NOTES_NAME)
 
     actual: set[str] = set()
     symlinks: list[str] = []

@@ -1,15 +1,16 @@
 ---
 name: additional-assumptions-dialogue
-description: Optional post-packaging skill. Rewrites shipped Workbook disclosure bullets into a colleagues Q&A file in environment/, points instruction.md at that file, and COPY's it into the Harbor image. Use after create-harbor-task. Do not invoke from create-harbor-task.
+description: Rewrites Workbook disclosure bullets into a colleagues Q&A file in environment/, points instruction.md at that file, and COPY's it into the Harbor image. Invoked as create-harbor-task step 15.5 on the staged bundle, or standalone on an already-promoted task directory.
 disable-model-invocation: true
 ---
 
 # Additional assumptions as a colleagues Q&A file
 
-Run this **after** `/create-harbor-task` has shipped a bundle. It does not
-re-detect conventions and does not edit `create-harbor-task`. Empty
-`agent_records` is a no-op: do not invent a conversation, do not launch either
-agent, do not touch the Dockerfile.
+Run this as create-harbor-task **step 15.5** on `$STAGED`, or standalone on an
+already-promoted task directory. It does not re-detect conventions and does
+not inline its loop into `create-harbor-task`. Empty `agent_records` is a
+no-op: do not invent a conversation, do not launch either agent, do not touch
+the Dockerfile.
 
 The solving agent is a junior on the deal. The file is notes from a conversation
 with colleagues. Juniors are building a **new** model from scratch. Seniors
@@ -320,20 +321,24 @@ Harbor must build the image from the mutated `environment/`. An image built
 before this skill will not contain the file.
 
 Do not put the notes in `tests/` (except the mutation marker) or in
-`mcp-server/runtime/`. Run this skill last. After it applies, do **not** re-run
-any of these on the mutated bundle — they undo the work or fail closed on the
-extra root file:
+`mcp-server/runtime/`. Run this after disclosure, naturalization, MCP oracle,
+and grader smoke. After it applies, do **not** re-run any of these on the
+mutated bundle — they undo the work or restore `## Workbook disclosure`:
 
-- `/create-harbor-task` (stock Dockerfile + restored `## Workbook disclosure`)
 - `disclose.py write` (restores bullets beside the Q&A — dual-shipping)
 - `disclose.py verify` (still looks for `## Workbook disclosure`)
-- `plain_eligibility.check_plain_environment`
-- `xl_mcp_oracle.check_environment`
 - `xl_output_task.py` / `xl_harbor_prep.py` (xlsx-only Dockerfile)
+- create-harbor-task steps 11–15 (repackaging, disclose write/verify,
+  naturalize, oracle env check before this step)
 
-Read `tests/dialogue-applied.json` before those commands. If it is present, the
-bundle was mutated by this skill. Re-run this skill after any full Harbor
-repackaging.
+`plain_eligibility.check_plain_environment` and
+`xl_mcp_oracle.check_environment` may run after apply: they allow
+`additional-assumptions.md` only when `tests/dialogue-applied.json` exists
+and the Dockerfile copies the notes to `/app`.
+
+Read `tests/dialogue-applied.json` before those commands. If it is present,
+the bundle was mutated by this skill. Re-run this skill after any full Harbor
+repackaging that stages a fresh bundle.
 
 ## Done when
 

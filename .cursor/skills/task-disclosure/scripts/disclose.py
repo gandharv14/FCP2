@@ -111,7 +111,8 @@ def parse_ref(ref: str, default_sheet: str) -> str:
     return key(default_sheet, ref)
 
 
-def expand(sheet: str, a: str, b: str | None, cap: int = 50000) -> list[str]:
+def expand(sheet: str, a: str, b: str | None, cap: int = 50000,
+           truncated: set | None = None) -> list[str]:
     pa = split_coord(a)
     if not pa:
         return []
@@ -123,6 +124,8 @@ def expand(sheet: str, a: str, b: str | None, cap: int = 50000) -> list[str]:
     c1, c2 = sorted([col_to_num(pa[0]), col_to_num(pb[0])])
     r1, r2 = sorted([pa[1], pb[1]])
     if (c2 - c1 + 1) * (r2 - r1 + 1) > cap:
+        if truncated is not None:
+            truncated.add(sheet)
         return []
     return [
         key(sheet, "%s%d" % (num_to_col(c), r))
@@ -131,7 +134,7 @@ def expand(sheet: str, a: str, b: str | None, cap: int = 50000) -> list[str]:
     ]
 
 
-def refs_in(formula: str, default_sheet: str) -> list[str]:
+def refs_in(formula: str, default_sheet: str, truncated: set | None = None) -> list[str]:
     if not isinstance(formula, str) or not formula.startswith("="):
         return []
     body = STRING_RE.sub('""', formula)
@@ -141,7 +144,7 @@ def refs_in(formula: str, default_sheet: str) -> list[str]:
         if a.upper() in NOT_A_REF:
             continue
         sheet = unquote_sheet(m.group("sheet")) if m.group("sheet") else default_sheet
-        out.extend(expand(sheet, a, m.group("b")))
+        out.extend(expand(sheet, a, m.group("b"), truncated=truncated))
     return list(dict.fromkeys(out))
 
 
@@ -288,7 +291,27 @@ UNIT_TOKENS = {
 
 
 def is_unit_stamp(text: str) -> bool:
-    return text.strip().lower() in UNIT_TOKENS or len(text.strip()) < 3
+    """Reject units, scale, and marker tokens so the reader keeps walking left.
+
+    Exact listed tokens plus length < 3 are the original filter. The class
+    matches below are what that filter missed: `flag`, `days`, `EURm`, `USD k`,
+    `p&L`.
+    """
+    raw = text.strip()
+    lowered = raw.lower()
+    if lowered in UNIT_TOKENS or len(raw) < 3:
+        return True
+    if re.fullmatch(r"flags?", lowered):
+        return True
+    if re.fullmatch(r"days?", lowered):
+        return True
+    if re.fullmatch(r"p\s*&\s*l", lowered):
+        return True
+    if re.fullmatch(r"(usd|eur|gbp|aed)[kmbn]+", lowered):
+        return True
+    if re.fullmatch(r"(usd|eur|gbp|aed|\$)\s*['’]?(k|m|mm|bn|000s?)?", lowered):
+        return True
+    return False
 
 
 def jsonable(value):
@@ -505,7 +528,7 @@ def select_payload(args) -> dict:
 
 def cmd_select(args):
     payload = select_payload(args)
-    out = Path(args.out) if args.out else run_dir(Path(args.task_dir)) / "bands.json"
+    out = Path(args.out) if args.out else run_dir(Path(args.task_dir), Path(args.runs_root)) / "bands.json"
     write_json(out, payload)
     print(
         f"{payload['task']}: {payload['selection']['selected_cells']} selected cells, "
@@ -570,9 +593,17 @@ METHOD_ROLE_EXCLUDES = {
 METHOD_ENTRY_IDS = set(METHOD_ROLE_PATTERNS)
 CONVENTION_ENTRY_IDS = {
     "discount_period", "inert_line", "terminal_value", "row_populated",
-    "npv_timing", "aggregate_scope", "projection_rule", "stake_scaling",
-    "source_selection",
+    "npv_timing", "aggregate_scope", "projection_rule", "distribution_policy",
+    "liquidation_preference", "stake_scaling", "source_selection",
 }
+DISTRIBUTION_LABELS = ("dividend", "distribution", "shareholder payment")
+# Wider than the entry's name, because the observed rows are labelled by what
+# they pay out rather than by the convention that splits them: 0668's waterfall
+# rows both read "Exit Equity Value".
+EXIT_SPLIT_LABELS = (
+    "preference", "preferred", "liquidation", "waterfall", "senior equity",
+    "exit equity value", "exit proceeds", "proceeds to holders",
+)
 BORING_METHOD_LITERALS = {
     0.0, 1.0, -1.0, 2.0, 3.0, 4.0, 12.0, 100.0, 360.0, 365.0,
     1000.0, 10000.0, 1000000.0,
@@ -758,18 +789,14 @@ def load_role_resolutions(path: Path) -> dict | None:
 
 
 def require_role_resolutions(cases: list[dict], path: Path) -> dict:
-    """Fail closed when collisions exist without a complete resolutions file."""
+    """Load resolutions when present. Missing or incomplete is not a hard stop.
+
+    REGISTRY.md arbitration: try candidates in order and fall through on a
+    decline. A resolutions file can still pin the first candidate.
+    """
     payload = load_role_resolutions(path)
     if payload is None:
-        raise SystemExit(
-            f"ambiguous-role cases exist but resolutions file is missing: {path}"
-        )
-    missing = [c["case_id"] for c in cases if c["case_id"] not in payload["by_id"]]
-    if missing:
-        raise SystemExit(
-            f"role_resolutions.json is incomplete; missing {len(missing)} case(s): "
-            + ", ".join(missing[:8])
-        )
+        return {"by_id": {}, "resolutions": []}
     return payload
 
 
@@ -1385,11 +1412,7 @@ def detect_custom_methods(
     records, assessments, claimed = [], [], set()
     prepared = prepare_method_items(gold, bands)
     cases = collect_ambiguous_role_cases(prepared)
-    if cases:
-        if resolutions_path is None:
-            raise SystemExit(
-                "ambiguous-role cases exist but no role_resolutions.json path was given"
-            )
+    if cases and resolutions_path is not None:
         payload = require_role_resolutions(cases, resolutions_path)
         for item in prepared:
             apply_role_resolution(item, payload)
@@ -1417,72 +1440,86 @@ def detect_custom_methods(
             "roles": roles,
             "role_context": role_context,
         }
-        if len(roles) != 1:
-            if roles:
-                assessments.append({
-                    **base, "status": "unclassified", "reason": "ambiguous_role"
-                })
-            else:
-                assessments.append({
-                    **base, "status": "unclassified", "reason": "no_method_role"
-                })
-            continue
-        entry_id = roles[0]
-        profile = formula_profile(gold, band)
-        if not profile.get("complete"):
+        if not roles:
             assessments.append({
-                **base, "entry": entry_id, "status": "unclassified",
-                "reason": profile.get("error", "profile_incomplete"),
+                **base, "status": "unclassified", "reason": "no_method_role"
             })
             continue
-        variant = catalog_signature(entry_id, profile)
-        if variant:
-            assessments.append({
-                **base, "entry": entry_id, "status": "standard",
-                "variant": variant,
-            })
-            continue
-        plumbing = structural_reason(profile)
-        if plumbing:
-            assessments.append({
-                **base, "entry": entry_id, "status": "structural",
-                "reason": plumbing,
-            })
-            continue
-        custom_reason = confident_custom_reason(entry_id, profile)
-        if not custom_reason:
-            assessments.append({
-                **base, "entry": entry_id, "status": "unclassified",
-                "reason": "no_catalogue_match_but_no_positive_custom_signal",
-            })
-            continue
-        fields = custom_sentence_fields(profile, gold)
-        coverage_complete = bool(fields.pop("_coverage_complete", False))
-        rec = record(
-            entry_id,
-            "out_of_catalogue",
-            band.get("cell_keys", []),
-            profile["formula"],
-            registry().get(entry_id, {}).get("alternatives", []),
-            f"Out-of-catalogue {entry_id} method on row {label!r}.",
-            fields=fields,
-        )
-        rec.update({
-            "source": "custom_method_detector",
-            "custom_reason": custom_reason,
-            "coverage_complete": coverage_complete,
-            "method_profile": {
-                k: v for k, v in profile.items()
-                if k not in ("ast",)
-            },
-        })
-        records.append(rec)
-        claimed.update(rec.get("cell_keys", []))
-        assessments.append({
-            **base, "entry": entry_id, "status": "out_of_catalogue",
-            "reason": custom_reason,
-        })
+        # Registry order within Section 2. A resolutions file, when it chooses,
+        # only pins the first candidate; a miss still falls through.
+        ordered = [r for r in METHOD_ROLE_PATTERNS if r in roles]
+        last_assessment = None
+        claimed_here = False
+        for entry_id in ordered:
+            rec, assessment = try_custom_role(gold, band, label, base, entry_id)
+            last_assessment = assessment
+            if rec is not None:
+                records.append(rec)
+                claimed.update(rec.get("cell_keys", []))
+                assessments.append(assessment)
+                claimed_here = True
+                break
+        if not claimed_here and last_assessment is not None:
+            if len(ordered) > 1:
+                last_assessment = {
+                    **base, "status": "unclassified", "reason": "ambiguous_role",
+                    "tried": ordered,
+                    "last": last_assessment,
+                }
+            assessments.append(last_assessment)
     return records, assessments, claimed
+
+
+def try_custom_role(gold: Book, band: dict, label: str, base: dict, entry_id: str):
+    """One method-entry attempt. A None record means fall through to the next."""
+    profile = formula_profile(gold, band)
+    if not profile.get("complete"):
+        return None, {
+            **base, "entry": entry_id, "status": "unclassified",
+            "reason": profile.get("error", "profile_incomplete"),
+        }
+    variant = catalog_signature(entry_id, profile)
+    if variant:
+        return None, {
+            **base, "entry": entry_id, "status": "standard",
+            "variant": variant,
+        }
+    plumbing = structural_reason(profile)
+    if plumbing:
+        return None, {
+            **base, "entry": entry_id, "status": "structural",
+            "reason": plumbing,
+        }
+    custom_reason = confident_custom_reason(entry_id, profile)
+    if not custom_reason:
+        return None, {
+            **base, "entry": entry_id, "status": "unclassified",
+            "reason": "no_catalogue_match_but_no_positive_custom_signal",
+        }
+    fields = custom_sentence_fields(profile, gold)
+    coverage_complete = bool(fields.pop("_coverage_complete", False))
+    rec = record(
+        entry_id,
+        "out_of_catalogue",
+        band.get("cell_keys", []),
+        profile["formula"],
+        registry().get(entry_id, {}).get("alternatives", []),
+        f"Out-of-catalogue {entry_id} method on row {label!r}.",
+        fields=fields,
+    )
+    rec.update({
+        "source": "custom_method_detector",
+        "custom_reason": custom_reason,
+        "coverage_complete": coverage_complete,
+        "method_profile": {
+            k: v for k, v in profile.items()
+            if k not in ("ast",)
+        },
+    })
+    return rec, {
+        **base, "entry": entry_id, "status": "out_of_catalogue",
+        "reason": custom_reason,
+    }
 
 
 def calibrate_legacy_custom(task_dir: Path, assessments: list[dict], selected: set[str]) -> dict:
@@ -1581,8 +1618,14 @@ def detect_discount_period(gold: Book, scope: set[str]) -> list[dict]:
 def detect_inert_line(gold: Book, scope: set[str]) -> list[dict]:
     out, seen_rows = [], set()
     for k in sorted(scope):
-        label = gold.row_label(k).lower()
-        if not any(t in label for t in ("minimum cash", "less: minimum")):
+        label = gold.row_label(k)
+        if not label or len(label) < 4 or HEADER_RE.search(label) or label.isupper():
+            continue
+        if not re.search(
+            r"waterfall|guard|flag|minimum cash|less:\s*minimum|closing balance|"
+            r"cash closing|reserve|trap",
+            label, re.I,
+        ):
             continue
         sheet, coord = k.split("!", 1)
         p = split_coord(coord)
@@ -1592,13 +1635,16 @@ def detect_inert_line(gold: Book, scope: set[str]) -> list[dict]:
         row = [c for c in gold.row_cells(sheet, p[1]) if c in gold.formula]
         vals = [gold.value.get(c) for c in row]
         nums = [v for v in vals if isinstance(v, (int, float))]
-        if row and nums and all(abs(v) < 1e-9 for v in nums):
-            out.append(record(
-                "inert_line", "always_zero", row, gold.formula[row[0]],
-                ["always_zero", "charged_once", "charged_every_period"],
-                f"Row labelled {gold.row_label(k)!r} evaluates to zero in all periods.",
-                fields={"label": q(gold.row_label(k))},
-            ))
+        if not row or len(nums) < 2:
+            continue
+        if not all(abs(v) < 1e-9 for v in nums):
+            continue
+        out.append(record(
+            "inert_line", "always_zero", row, gold.formula[row[0]],
+            ["always_zero", "charged_once", "charged_every_period"],
+            f"Row labelled {label!r} evaluates to zero in all periods.",
+            fields={"label": q(label)},
+        ))
     return out
 
 
@@ -1638,6 +1684,219 @@ def detect_terminal_value(gold: Book, scope: set[str]) -> list[dict]:
             fields={"label": q(row_label)},
         ))
     return out
+
+
+def _row_once(gold: Book, k: str, seen_rows: set) -> tuple | None:
+    """Resolve a scope cell to its sheet, row number and formula cells, once."""
+    sheet, coord = k.split("!", 1)
+    p = split_coord(coord)
+    if not p or (sheet, p[1]) in seen_rows:
+        return None
+    seen_rows.add((sheet, p[1]))
+    row = [c for c in gold.row_cells(sheet, p[1]) if c in gold.formula]
+    return (sheet, p[1], col_to_num(p[0]), row) if row else None
+
+
+def _ingredient_labels(gold: Book, formula: str, sheet: str, row: int, col: int) -> list[str]:
+    return [
+        gold.row_label(key(rs, "%s%d" % (num_to_col(rc), rr))).lower()
+        for rs, rc, rr in _ingredients(formula, sheet, row, col)
+    ]
+
+
+def detect_distribution_policy(gold: Book, scope: set[str]) -> list[dict]:
+    """Which rule sizes a dividend or distribution row.
+
+    A residual and a payout ratio are both ordinary practice and the delivered
+    file keeps neither formula, so the choice is invisible. Worse, a surviving
+    payout-ratio row on another sheet actively points at the wrong one.
+    """
+    values = [
+        "residual_cash_floored", "residual_cash_unfloored", "payout_ratio",
+        "capped_at_retained_earnings", "first_period_only",
+    ]
+    out, seen_rows = [], set()
+    for k in sorted(scope):
+        label = gold.row_label(k)
+        lowered = label.lower()
+        if not any(t in lowered for t in DISTRIBUTION_LABELS):
+            continue
+        # "Available cash for dividends" contains the word but is the pool,
+        # not the payment. 0638 rows 117-118 are that trap; row 119 is the
+        # distribution.
+        if re.search(r"available (cash|for)|cash available|retained earnings", lowered):
+            continue
+        resolved = _row_once(gold, k, seen_rows)
+        if not resolved:
+            continue
+        sheet, rownum, col, row = resolved
+        # Not the leftmost formula. 0638 row 119 holds `=BC` in D (a named
+        # unit) and `=SUM(H119:AD119)` in F; the period cells `=H118` are
+        # the residual. Classify on the strongest payment shape present.
+        def dist_rank(cell: str) -> int:
+            f = gold.formula[cell]
+            u = f.upper()
+            c = split_coord(cell.split("!", 1)[1])
+            labs = _ingredient_labels(
+                gold, f, sheet, rownum, col_to_num(c[0]) if c else col
+            )
+            cash = any(
+                (
+                    "cash available" in l
+                    or "available cash" in l
+                    or "cash left" in l
+                    or "available for distribution" in l
+                    or "available for dividend" in l
+                )
+                for l in labs
+            )
+            if cash and "MAX(" in u and re.search(r",\s*0\s*\)", u):
+                return 5
+            if "MIN(" in u and any("retained" in l for l in labs):
+                return 4
+            if any(("payout" in l or "dividend per" in l) for l in labs) and "*" in f:
+                return 3
+            if cash:
+                return 2
+            if re.match(r"^=\s*SUM\(", f.strip(), re.I) or not refs_in(f, sheet):
+                return -1
+            return 0
+
+        cell = max(row, key=dist_rank)
+        if dist_rank(cell) < 0:
+            continue
+        formula = gold.formula[cell]
+        upper = formula.upper()
+        labels = _ingredient_labels(
+            gold, formula, sheet, rownum,
+            col_to_num(split_coord(cell.split("!", 1)[1])[0]),
+        )
+        # Every value needs a positive signal. There is no default: a dividend
+        # row whose shape says nothing is left uncovered, because asserting a
+        # rule off the absence of a token is how this entry would become the
+        # next `projection_rule` over-disclosure.
+        cash_available = any(
+            (
+                "cash available" in l
+                or "available cash" in l
+                or "cash left" in l
+                or "available for distribution" in l
+                or "available for dividend" in l
+            )
+            for l in labels
+        )
+        # The floor is tested before the cap. 0677's `=MAX(MIN( H167:H168),0)` is
+        # both at once - the lesser of cash available and retained earnings, held
+        # at zero - and the two values are written as siblings, so one has to
+        # win. The floored residual wins because it is the reading the row's own
+        # report attributes and the one an agent gets wrong; a co-occurring cap
+        # is recorded as a known limit on the entry rather than silently chosen.
+        if cash_available and "MAX(" in upper and re.search(r",\s*0\s*\)", upper):
+            value = "residual_cash_floored"
+        elif "MIN(" in upper and any("retained" in l for l in labels):
+            value = "capped_at_retained_earnings"
+        elif cash_available:
+            value = "residual_cash_unfloored"
+        elif any(("payout" in l or "dividend per" in l) for l in labels) and "*" in formula:
+            value = "payout_ratio"
+        elif (
+            len(row) == 1
+            and refs_in(formula, sheet)
+            and not re.match(r"^=\s*SUM\(", formula.strip(), re.I)
+        ):
+            value = "first_period_only"
+        else:
+            continue
+        # Attach the payment cells, not a surviving unit stamp. 0638 D119 is
+        # `=BC` and remains as "EURm" in the delivered file; including it made
+        # Ship when think the distribution row had survived.
+        pay_cells = [c for c in row if dist_rank(c) >= 2] or [
+            c for c in row if dist_rank(c) >= 0
+        ]
+        out.append(record(
+            "distribution_policy", value, pay_cells, formula, values,
+            f"Row labelled {label!r} sizes its distribution by {value}.",
+            fields={"label": q(label)},
+        ))
+    return out
+
+
+def detect_liquidation_preference(gold: Book, scope: set[str]) -> list[dict]:
+    """How exit proceeds divide between preferred and common holders.
+
+    Ordered ahead of `stake_scaling`, which ships on `always` and would describe
+    one of these rows as an ownership-share multiplication.
+    """
+    values = [
+        "participating", "non_participating", "pro_rata_no_preference",
+        "capped_participation",
+    ]
+    out, seen_rows = [], set()
+    for k in sorted(scope):
+        label = gold.row_label(k)
+        lowered = label.lower()
+        if not any(t in lowered for t in EXIT_SPLIT_LABELS):
+            continue
+        # Exit or cap-table block only. Elsewhere these words are commentary.
+        sheet_l = k.split("!", 1)[0].lower()
+        if "cap table" not in sheet_l and "exit" not in lowered and "waterfall" not in lowered:
+            continue
+        resolved = _row_once(gold, k, seen_rows)
+        if not resolved:
+            continue
+        _sheet, _rownum, _col, row = resolved
+        # Not the leftmost formula on the row. A waterfall row commonly holds a
+        # plain pro-rata column beside the column that carries the preference -
+        # 0668 row 43 is `=C42/$C$24` in C and the solved preference in D - so
+        # classify on the most specific shape present, not on whichever comes
+        # first.
+        def rank(cell: str) -> int:
+            f = gold.formula[cell]
+            u = f.upper()
+            if "MIN(" in u:
+                return 3
+            if "MAX(" in u or re.search(r"\bIF\s*\(", u):
+                return 2
+            if solves_for_divisor(f):
+                return 1
+            return 0
+        cell = max(row, key=rank)
+        rnk = rank(cell)
+        # A product or a SUM labelled "Exit Equity Value" is not a split
+        # convention. 0644's Flags row 420 is that shape. 0668 ships because
+        # D43/D49 carry the solved preference (rank 1).
+        if rnk == 0 and "cap table" not in k.split("!", 1)[0].lower():
+            continue
+        if rnk == 0 and "/" not in gold.formula[cell]:
+            continue
+        formula = gold.formula[cell]
+        value = {
+            3: "capped_participation",
+            2: "non_participating",
+            1: "participating",
+            0: "pro_rata_no_preference",
+        }[rnk]
+        out.append(record(
+            "liquidation_preference", value, row, formula, values,
+            f"Row labelled {label!r} splits exit proceeds as {value}.",
+            fields={"label": q(label)},
+        ))
+    return out
+
+
+def solves_for_divisor(formula: str) -> bool:
+    """A preference solved for carries its own pro-rata divisor in the numerator.
+
+    0668's `=(C42-$C$21+$C$24*$C$21)/$C$24` is the observed shape: the share
+    count divides the whole expression and also multiplies inside it, which is
+    what solving for a participating preference leaves behind.
+    """
+    m = re.search(r"/\s*(\$?[A-Za-z]{1,3}\$?\d+)\s*\)?\s*$", formula.strip())
+    if not m:
+        return False
+    ref = m.group(1).replace("$", "")
+    head = formula[: m.start()].replace("$", "")
+    return bool(re.search(r"\b%s\b" % re.escape(ref), head))
 
 
 def detect_npv_timing(gold: Book, scope: set[str]) -> list[dict]:
@@ -1703,6 +1962,19 @@ def ingredient_phrase(gold: Book, evidence: str, cells: list[str], own_label: st
     return labels[0] if len(labels) == 1 else " and ".join(labels)
 
 
+def is_step_increment(body: str, prev: str) -> bool:
+    """Prior cell of this row, plus or minus exactly one further term.
+
+    `=+H59+$F$17` is the observed case. A SUM over members is not this shape.
+    """
+    text = re.sub(r"^\+", "", body.strip())
+    prev_re = r"\$?%s" % re.escape(prev)
+    other = r"(?:'[^']+'!)?\$?[A-Z]{1,3}\$?\d+"
+    return bool(re.fullmatch(
+        r"%s\s*[+\-]\s*%s" % (prev_re, other), text, re.I
+    ))
+
+
 def detect_projection_rule(gold: Book, delivered: Book, selected: set[str]) -> list[dict]:
     rows = defaultdict(list)
     for k in selected:
@@ -1724,6 +1996,8 @@ def detect_projection_rule(gold: Book, delivered: Book, selected: set[str]) -> l
                 kind = "hold_level"
             elif re.search(r"\*\s*\(\s*1\s*[+\-]", body):
                 kind = "hold_growth"
+            elif is_step_increment(body, prev):
+                kind = "step_increment"
             elif re.match(r"^AVERAGE\(", body.strip(), re.I):
                 kind = "average_window"
             elif re.search(r"[A-Z]{1,3}\$?\d+\s*\*\s*", body):
@@ -1745,18 +2019,15 @@ def detect_projection_rule(gold: Book, delivered: Book, selected: set[str]) -> l
             run.append(item)
         if run:
             runs.append(run)
-        # Coverage is measured against every cell on the row the agent has to
-        # build, not just the ones inside the graded closure. A period that is
-        # blank in the delivered file but outside the closure still gets built,
-        # and if it follows a different rule then "in each period" is false.
-        buildable = {
-            c for c in gold.row_cells(_sheet, _row)
-            if gold.formula.get(c) and not delivered.has(c)
-        }
-        covered = {k for r in runs for _, k, _, _ in r}
-        whole_row = buildable.issubset(covered)
+        # A 1-cell seed plus one long run (0644 Info!H59 is implied share,
+        # I59:M59 adds the increment) is not two bullets claiming the
+        # horizon. Decline only when two shippable runs would compete.
+        shippable = [r for r in runs if len(r) >= 3 and r[0][2] != "other"]
         for r in runs:
-            append_projection_run(out, gold, r, covers_row=whole_row and len(runs) == 1)
+            append_projection_run(
+                out, gold, r,
+                covers_row=len(shippable) == 1 and r in shippable,
+            )
     return out
 
 
@@ -1773,7 +2044,8 @@ def append_projection_run(out: list[dict], gold: Book, run: list[tuple], covers_
     evidence = gold.formula.get(cells[min(1, len(cells) - 1)], "")
     rec = record(
         "projection_rule", kind, cells, evidence,
-        ["hold_level", "hold_growth", "average_window", "ratio_to_driver"],
+        ["hold_level", "hold_growth", "step_increment", "average_window",
+         "ratio_to_driver"],
         f"Forecast row labelled {label!r}; applies only to this contiguous {kind} run.",
         # hold_level names no ingredient, and its sentence has no slot for one.
         # Passing an empty field would make the renderer discard the record while
@@ -1822,26 +2094,78 @@ def detect_stake_scaling(gold: Book, scope: set[str]) -> list[dict]:
     return out
 
 
+def _row_key(ref: str) -> tuple[str, int] | None:
+    sheet, coord = ref.split("!", 1)
+    p = split_coord(coord)
+    return (sheet, p[1]) if p else None
+
+
+def is_whole_value_read(formula: str, gold: Book, sheet: str, row: int) -> str | None:
+    """Single named source row, optionally sign-flipped or scaled by one factor."""
+    refs = refs_in(formula, sheet)
+    rows = []
+    for ref in refs:
+        rk = _row_key(ref)
+        if rk and rk not in rows:
+            rows.append(rk)
+    if not rows:
+        return None
+    # Same-row references are a projection, not a source read.
+    foreign = [(s, r) for s, r in rows if not (s == sheet and r == row)]
+    if not foreign or len(foreign) > 2:
+        return None
+    source_sheet, source_row = foreign[0]
+    sample = next(ref for ref in refs if _row_key(ref) == (source_sheet, source_row))
+    if not gold.row_label(sample):
+        return None
+    if len(foreign) == 2:
+        other = next(ref for ref in refs if _row_key(ref) == foreign[1])
+        if not gold.row_label(other):
+            return None
+        if not re.search(r"\*", formula):
+            return None
+    return sample
+
+
 def detect_source_selection(gold: Book, scope: set[str]) -> list[dict]:
-    out = []
+    out, seen_rows = [], set()
     for k in sorted(scope):
-        label = gold.row_label(k).lower()
-        if not any(t in label for t in ("initial investment", "purchase price", "entry", "consideration", "cv")):
-            continue
         formula = gold.formula.get(k)
         if not formula:
             continue
-        sheet = k.split("!", 1)[0]
-        ext = [r for r in refs_in(formula, sheet) if r.split("!", 1)[0] != sheet]
-        if not ext:
+        sheet, coord = k.split("!", 1)
+        p = split_coord(coord)
+        if not p or (sheet, p[1]) in seen_rows:
             continue
-        source = sorted(set(ext))[0]
+        label = gold.row_label(k)
+        if not label:
+            continue
+        source = is_whole_value_read(formula, gold, sheet, p[1])
+        if not source:
+            continue
+        source_sheet = source.split("!", 1)[0]
+        lowered = label.lower()
+        purchase = any(t in lowered for t in (
+            "initial investment", "purchase price", "entry", "consideration", "cv",
+        ))
+        rate_like = bool(re.search(
+            r"\brate\b|hold start|blended|wacc|source|cost of (debt|equity|capital)",
+            lowered,
+        ))
+        bare = bool(re.fullmatch(r"=\s*[+\-]?[A-Za-z0-9_ '$#!]+$", formula.strip()))
+        if source_sheet != sheet:
+            if not (purchase or rate_like):
+                continue
+        else:
+            if gold.row_label(source) == label or not bare:
+                continue
+        seen_rows.add((sheet, p[1]))
         source_label = gold.row_label(source)
         out.append(record(
             "source_selection", "source", [k], formula, ["source"],
-            f"Row labelled {gold.row_label(k)!r} reads from {pretty(source)}.",
+            f"Row labelled {label!r} reads from {pretty(source)}.",
             fields={
-                "label": q(gold.row_label(k)),
+                "label": q(label),
                 "ingredient": "the %s sheet, on the row labelled %s"
                               % (source.split("!", 1)[0], q(source_label))
                               if source_label else "the %s sheet" % source.split("!", 1)[0],
@@ -1932,11 +2256,64 @@ def detect_row_populated(gold: Book, delivered: Book, scope: set[str], targets: 
             if above and below:
                 out.append(record(
                     "row_populated", "unused", [], "no formula and no value anywhere on row",
-                    ["unused", "populated"],
+                    ["unused", "populated", "populated_but_unread"],
                     f"Row labelled {label!r} is empty in the original but sits inside the block that feeds a graded answer.",
                     row_ref=f"{quote_sheet(sheet)}!row {rownum}",
                     fields={"label": q(label)},
                 ))
+    out.extend(detect_populated_but_unread(gold))
+    return out
+
+
+ASSUMPTION_LABEL_RE = re.compile(
+    r"payout|ratio|assumption|yield|per annum|\bp\.a\.?\b|days\b|growth rate",
+    re.I,
+)
+
+
+def detect_populated_but_unread(gold: Book) -> list[dict]:
+    """A surviving assumption row that nothing in the golden reads."""
+    truncated: set[str] = set()
+    referenced: set[str] = set()
+    for k, formula in gold.formula.items():
+        sheet = k.split("!", 1)[0]
+        referenced.update(refs_in(formula, sheet, truncated=truncated))
+    referenced_rows = set()
+    for ref in referenced:
+        rk = _row_key(ref)
+        if rk:
+            referenced_rows.add(rk)
+    out, seen = [], set()
+    for k in list(gold.value) + list(gold.formula):
+        sheet, coord = k.split("!", 1)
+        p = split_coord(coord)
+        if not p or (sheet, p[1]) in seen:
+            continue
+        seen.add((sheet, p[1]))
+        if sheet in truncated:
+            continue
+        if (sheet, p[1]) in referenced_rows:
+            continue
+        label = gold.row_label(k)
+        if not label or len(label) < 4 or HEADER_RE.search(label) or label.isupper():
+            continue
+        if not ASSUMPTION_LABEL_RE.search(label):
+            continue
+        row_cells = gold.row_cells(sheet, p[1])
+        populated = any(
+            c in gold.formula or isinstance(gold.value.get(c), (int, float))
+            for c in row_cells
+        )
+        if not populated:
+            continue
+        out.append(record(
+            "row_populated", "populated_but_unread",
+            [c for c in row_cells if c in gold.formula or isinstance(gold.value.get(c), (int, float))],
+            "populated; no inbound reference",
+            ["unused", "populated", "populated_but_unread"],
+            f"Row labelled {label!r} is populated but unread.",
+            fields={"label": q(label)},
+        ))
     return out
 
 
@@ -1961,6 +2338,12 @@ def detect_aggregate_scope(gold: Book, delivered: Book, targets: list[str]) -> l
             continue
         sheet = k.split("!", 1)[0]
         spanned = refs_in("=" + m.group(1).strip(), sheet)
+        # Vertical only: a same-row horizontal SUM names one row and renders as
+        # "the total labelled X is the sum of the row labelled X".
+        member_rows = {split_coord(c.split("!", 1)[1])[1] for c in spanned
+                       if split_coord(c.split("!", 1)[1])}
+        if len(member_rows) < 2:
+            continue
         # The sentence names every member, or it would describe a different sum
         # than the one the workbook computes. The record's cells carry only the
         # members still to be built, so a visible member never rides along.
@@ -2161,7 +2544,21 @@ def ship_projection_rule(rec: dict, ctx: dict) -> bool:
     ingredients = _ingredients(evidence, sheet, row, col)
     if not ingredients:
         return False
+    if rec.get("value") == "step_increment" and increment_label_is_rate_like(
+        ctx, ingredients
+    ):
+        # Visibility of the increment is not visibility of add-vs-compound.
+        return True
     return not all(_available(ctx, rs, rc, rr, sheet, row) for rs, rc, rr in ingredients)
+
+
+def increment_label_is_rate_like(ctx: dict, ingredients: list) -> bool:
+    gold = ctx["gold"]
+    for rs, rc, rr in ingredients:
+        label = gold.row_label(key(rs, "%s%d" % (num_to_col(rc), rr))).lower()
+        if re.search(r"growth|p\.a\.|per annum|%", label):
+            return True
+    return False
 
 
 def ship_source_selection(rec: dict, ctx: dict) -> bool:
@@ -2179,6 +2576,47 @@ def ship_source_selection(rec: dict, ctx: dict) -> bool:
 def ship_not_a_target(rec: dict, ctx: dict) -> bool:
     """Ship only when the band is not itself graded."""
     return not any(c in ctx["targets"] for c in rec.get("cell_keys") or [])
+
+
+def _band_survives(rec: dict, ctx: dict) -> bool:
+    return any(ctx["delivered"].has(c) for c in rec.get("cell_keys") or [])
+
+
+def ship_distribution_policy(rec: dict, ctx: dict) -> bool:
+    """Ship only while the rule is still hidden.
+
+    A payout rate that survives on a labelled row and is applied to one visible
+    driver is ordinary reasoning, not a convention the agent cannot see.
+    """
+    if _band_survives(rec, ctx):
+        rec["declined_reason"] = "distribution row survives in the delivered file"
+        return False
+    if rec.get("value") == "payout_ratio":
+        ings = list(_ingredients(rec.get("evidence") or "", *_origin(rec)))
+        if len(ings) == 1 and ctx["delivered"].has(
+            key(ings[0][0], "%s%d" % (num_to_col(ings[0][1]), ings[0][2]))
+        ):
+            rec["declined_reason"] = "payout rate survives and applies to one visible driver"
+            return False
+    return True
+
+
+def ship_liquidation_preference(rec: dict, ctx: dict) -> bool:
+    """Ship only while the waterfall is blank and no preference multiple survives.
+
+    Deliberately not gated on the band being graded. This is a Section 1
+    convention: it names which of four defensible splits the author chose and
+    states no construction over inputs the agent still holds.
+    """
+    if _band_survives(rec, ctx):
+        rec["declined_reason"] = "waterfall row survives in the delivered file"
+        return False
+    for rs, rc, rr in _ingredients(rec.get("evidence") or "", *_origin(rec)):
+        cell = key(rs, "%s%d" % (num_to_col(rc), rr))
+        if "preference" in ctx["gold"].row_label(cell).lower() and ctx["delivered"].has(cell):
+            rec["declined_reason"] = "a surviving labelled row states the preference multiple"
+            return False
+    return True
 
 
 def ship_custom_method(rec: dict, ctx: dict) -> bool:
@@ -2220,6 +2658,8 @@ SHIP_WHEN = {
     "source_selection": ship_source_selection,
     "npv_timing": ship_not_a_target,
     "aggregate_scope": ship_not_a_target,
+    "distribution_policy": ship_distribution_policy,
+    "liquidation_preference": ship_liquidation_preference,
     **{entry_id: ship_custom_method for entry_id in METHOD_ENTRY_IDS},
 }
 
@@ -2246,6 +2686,43 @@ def apply_ship_when(records: list[dict], ctx: dict) -> list[dict]:
             rec.setdefault("declined_reason", "Ship when declined for this band")
             continue
         rec["disposition"] = "disclosed"
+    return records
+
+
+ENTRY_PRECEDENCE = (
+    list(METHOD_ROLE_PATTERNS)
+    + [
+        "discount_period", "inert_line", "terminal_value", "row_populated",
+        "npv_timing", "aggregate_scope", "projection_rule", "distribution_policy",
+        "liquidation_preference", "stake_scaling", "source_selection",
+    ]
+)
+
+
+def _entry_rank(rec: dict) -> int:
+    entry = rec.get("entry") or rec.get("family") or ""
+    try:
+        return ENTRY_PRECEDENCE.index(entry)
+    except ValueError:
+        return len(ENTRY_PRECEDENCE)
+
+
+def arbitrate_overlapping(records: list[dict]) -> list[dict]:
+    """First candidate that ships wins the shared cells; the rest fall through.
+
+    A withheld or declined record does not consume the band. Only a disclosed
+    record claims its cells.
+    """
+    winners = [r for r in records if r.get("disposition") == "disclosed"]
+    winners.sort(key=_entry_rank)
+    claimed: set[str] = set()
+    for rec in winners:
+        cells = set(rec.get("cell_keys") or [])
+        if cells & claimed:
+            rec["disposition"] = "suppressed"
+            rec["declined_reason"] = "earlier candidate already shipped"
+            continue
+        claimed |= cells
     return records
 
 
@@ -2419,6 +2896,10 @@ def detect_records(args) -> dict:
         detect_inert_line,
         detect_terminal_value,
         detect_npv_timing,
+        detect_distribution_policy,
+        # Ahead of stake_scaling: order is precedence, and stake_scaling ships
+        # on `always`, so it cannot be beaten by suppression.
+        detect_liquidation_preference,
         detect_stake_scaling,
         detect_source_selection,
     ):
@@ -2456,12 +2937,21 @@ def detect_records(args) -> dict:
 
     ctx = {"gold": gold, "delivered": delivered, "targets": target_set}
     unique = apply_ship_when(unique, ctx)
+    unique = arbitrate_overlapping(unique)
     unique = resolve_unused_conflicts(unique)
-    # A record naming a graded cell never ships, whatever its entry says.
+    # Section 2 only. A method on a graded target reconstructs the answer
+    # from kept inputs; the registry draws that line at "is the band graded"
+    # and does not extend it to Section 1. liquidation_preference on 0668
+    # D43/D49 is the standing case: the cells are graded and the convention
+    # still ships.
     for rec in unique:
-        if rec.get("leak_flag") and rec["disposition"] == "disclosed":
+        if (
+            rec.get("leak_flag")
+            and rec["disposition"] == "disclosed"
+            and rec.get("entry") in METHOD_ENTRY_IDS
+        ):
             rec["disposition"] = "suppressed"
-            rec["declined_reason"] = "record names a graded cell"
+            rec["declined_reason"] = "method band is itself graded"
 
     claimed = {c for rec in unique for c in rec.get("cell_keys", [])}
     by_disposition = Counter(r["disposition"] for r in unique)
@@ -2622,7 +3112,9 @@ def agent_records(records: list[dict]) -> list[dict]:
     """Only cited, disclosed records reach the agent."""
     out = []
     for rec in records:
-        if rec.get("leak_flag") or not rec.get("entry"):
+        if not rec.get("entry"):
+            continue
+        if rec.get("leak_flag") and rec.get("entry") in METHOD_ENTRY_IDS:
             continue
         if rec.get("disposition") != "disclosed":
             continue
@@ -2676,12 +3168,29 @@ def render_section(records: list[dict]) -> str:
         if not sentences:
             continue
         body = " ".join(dict.fromkeys(sentences))
-        # The same sentence repeated against a dozen cell ranges is noise that
-        # buries the disclosures that differ.
-        if body in seen_text:
-            continue
-        seen_text.add(body)
         cells = compact_cells(by_band[band][0].get("cells", []))
+        # A colliding sentence is re-anchored, never dropped. 0618 and 0632 both
+        # lost a disclosed record this way: same label, byte-identical body.
+        if body in seen_text:
+            sheet = ""
+            first = (by_band[band][0].get("cells") or [""])[0]
+            if isinstance(first, str) and "!" in first:
+                sheet = first.split("!", 1)[0].strip("`'\"")
+            candidates = []
+            if sheet:
+                candidates.append("On the %s sheet, %s%s" % (
+                    sheet, body[0].lower(), body[1:],
+                ))
+            cells_plain = cells.strip("`")
+            if cells_plain:
+                candidates.append("At %s, %s%s" % (
+                    cells_plain, body[0].lower(), body[1:],
+                ))
+            for cand in candidates:
+                if cand not in seen_text:
+                    body = cand
+                    break
+        seen_text.add(body)
         lines.append(f"- {cells}: {body}")
     return "\n".join(lines) + "\n"
 

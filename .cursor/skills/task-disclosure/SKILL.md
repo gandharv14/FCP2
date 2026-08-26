@@ -20,9 +20,11 @@ manifest's separate writer.
 3. **Rendering and audit.** The same deterministic registry templates, writer, leak audit, and
    verifier handle convention and custom-method records.
 
-The only model call is role arbitration on Filter 1 collisions. Custom prose stays a
-deterministic English rendering of the parsed formula AST, including every reference,
-literal, branch, and operation.
+The only model call inside the deterministic build is role arbitration on Filter 1
+collisions. Custom prose stays a deterministic English rendering of the parsed formula
+AST, including every reference, literal, branch, and operation. Literal English
+translation of a complete formula may be verbose, but that alone is not a blocking
+faithfulness defect.
 
 ## Workflow
 
@@ -124,7 +126,9 @@ The writer creates two task artifacts:
 
 `verify` is blocking for mechanical invariants:
 
-- Every selected cell is blank in the delivered workbook.
+- Every cell named by an agent-visible disclosure record is blank in the delivered
+  workbook. Reviewer-only, suppressed, standard, and unclassified records are not
+  agent-visible and must not participate in this check.
 - No selected band appears twice.
 - No agent-facing line contains a formula-shaped expression.
 - No numeric literal in the disclosure matches a graded target within tolerance.
@@ -132,8 +136,25 @@ The writer creates two task artifacts:
 - Every custom sentence covers every parsed reference and literal.
 - No custom and convention record claim the same cell.
 
-Layer-3 faithfulness review is intentionally separate: launch a fresh reviewer that did not
-write the disclosure and ask whether each bullet is true of the golden and safe for the agent.
+## Faithfulness review policy
+
+Layer-3 faithfulness review is intentionally separate: launch a fresh reviewer that did
+not write the disclosure and ask whether each bullet is true of the golden and safe for
+the agent.
+
+- Missing, reversed, or otherwise incorrect formula mechanics are blocking. This
+  includes omitted references or literals, wrong signs or operators, incomplete
+  aggregate ranges, and incorrect prior-period or copied-column scope.
+- A literal English translation of complete formula mechanics is not blocking merely
+  because it is formula-like.
+- Unnecessary but true mechanics are a non-blocking flag. Record them for cleanup; do
+  not fail an otherwise faithful task.
+- A wrong row label is repairable, not an immediate terminal failure. Resolve it by
+  walking left on the same row from the referenced cell, skipping formulas and cached
+  display text, numbers, blanks, units, error strings, and scenario markers until the
+  nearest semantic row name is found. Regenerate and re-review the disclosure after the
+  correction. It becomes blocking only if the corrected label cannot be established or
+  the regenerated disclosure remains false.
 
 ## Taxonomy
 

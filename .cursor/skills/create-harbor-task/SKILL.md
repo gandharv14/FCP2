@@ -437,16 +437,35 @@ replacing `"$STAGED/instruction.md"`.
 Require `"$NAT_RUN/validation.json"` to report `valid: true` and `applied: true`,
 and require `task.toml` to record model `gpt-5.6-sol-high`, endpoint
 `cursor-subagent`, the prompt version, and matching source/instruction hashes.
-This is the last prose mutation of the disclosure-bearing instruction. Do not
-continue on fallback or uncertainty. Step 15.5 may later rewrite headings and
-pointers when it replaces `## Workbook disclosure` with the Q&A file.
+This is the last prose mutation of the disclosure-bearing instruction unless the
+faithfulness review finds a repairable row-label defect. Do not continue on fallback
+or uncertainty. Step 15.5 may later rewrite headings and pointers when it replaces
+`## Workbook disclosure` with the Q&A file.
 
 Re-run `python3 "$DISCLOSURE" verify --task-dir "$STAGED"` against the final
 naturalized instruction. Then launch a fresh reviewer with the golden, delivered
 workbook, staged instruction, and `tests/disclosure.json`. It must check every
-sentence against the golden and fail on false, incomplete, ambiguous,
-answer-leaking, or formula-like wording. Save
-`"$RUN/disclosure-faithfulness.md"` and stop on a blocking finding.
+sentence against the golden.
+
+Apply this closed review policy:
+
+- Missing, reversed, or otherwise incorrect formula details are blocking, including
+  wrong signs/operators, omitted references or literals, incomplete ranges, and
+  incorrect period or copied-column scope.
+- False or answer-leaking wording is blocking.
+- Literal English translation of complete formula mechanics is not blocking merely
+  because it is formula-like.
+- Unnecessary but true mechanics are non-blocking findings; flag them in the report.
+- An incorrect row label is repairable. Navigate left on the same row from the
+  referenced cell, skipping formula/cached display text, numbers, blanks, units,
+  errors, and scenario markers to select the nearest semantic row name. Correct the
+  label resolver or generated record upstream, rerun `detect`, `context`, `write`,
+  and `verify`, then repeat naturalization from a fresh source snapshot and launch a
+  fresh reviewer. Do not hand-edit only the final instruction. A label becomes
+  blocking only when it cannot be resolved or remains wrong after regeneration.
+
+Save `"$RUN/disclosure-faithfulness.md"` with separate blocking findings and
+non-blocking flags. Stop only when a blocking finding remains after repair.
 
 ### 14. Run generalized HTTP oracle
 

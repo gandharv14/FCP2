@@ -260,7 +260,13 @@ class Book:
             # Own cell first: a label sitting in a short block (I9) is the name.
             # Then walk left. Never jump to the leftmost column on the row.
             for c in range(col, 0, -1):
-                v = self.value.get(key(sheet, "%s%d" % (num_to_col(c), row)))
+                candidate = key(sheet, "%s%d" % (num_to_col(c), row))
+                # A formula's cached text/error is a display result, not its row
+                # name. Start at the formula cell for positioning, but keep
+                # walking left until a literal semantic label is found.
+                if candidate in self.formula:
+                    continue
+                v = self.value.get(candidate)
                 if isinstance(v, (int, float)) or v is None:
                     continue
                 if not isinstance(v, str) or not v.strip() or v.startswith("="):
@@ -286,7 +292,8 @@ class Book:
 UNIT_TOKENS = {
     "aed", "usd", "eur", "gbp", "x", "%", "na", "n/a", "-", "bc",
     "000$", "$mm", "$bn", "$000s", "mm", "bn", "k", "m", "$", "yrs", "y",
-    "none", "nil", "null", "yes", "tbd", "n.m.", "nm",
+    "none", "nil", "null", "yes", "tbd", "n.m.", "nm", "n.a.", "year",
+    "years", "yr", "year(s)",
 }
 
 
@@ -307,9 +314,20 @@ def is_unit_stamp(text: str) -> bool:
         return True
     if re.fullmatch(r"p\s*&\s*l", lowered):
         return True
+    if re.fullmatch(r"#(?:div/0!|n/a|value!|ref!|name\?|num!|null!)", lowered):
+        return True
     if re.fullmatch(r"(usd|eur|gbp|aed)[kmbn]+", lowered):
         return True
     if re.fullmatch(r"(usd|eur|gbp|aed|\$)\s*['’]?(k|m|mm|bn|000s?)?", lowered):
+        return True
+    if re.fullmatch(
+        r"(?:usd|eur|gbp|aed|sar|[$€£])\s*(?:['’]?\s*0{3}s?|k|m|mm|bn)",
+        lowered,
+    ):
+        return True
+    if re.fullmatch(r"(?:usd|eur|gbp|aed|sar|[$€£])\s*/\s*[a-z]+", lowered):
+        return True
+    if re.fullmatch(r"(?:usd|eur|gbp|aed|sar|[$€£])\s*\d{4}[kmbn]*", lowered):
         return True
     return False
 
@@ -2261,7 +2279,7 @@ def detect_row_populated(gold: Book, delivered: Book, scope: set[str], targets: 
                     row_ref=f"{quote_sheet(sheet)}!row {rownum}",
                     fields={"label": q(label)},
                 ))
-    out.extend(detect_populated_but_unread(gold))
+    out.extend(detect_populated_but_unread(gold, delivered))
     return out
 
 
@@ -2271,7 +2289,7 @@ ASSUMPTION_LABEL_RE = re.compile(
 )
 
 
-def detect_populated_but_unread(gold: Book) -> list[dict]:
+def detect_populated_but_unread(gold: Book, delivered: Book) -> list[dict]:
     """A surviving assumption row that nothing in the golden reads."""
     truncated: set[str] = set()
     referenced: set[str] = set()
@@ -2300,6 +2318,13 @@ def detect_populated_but_unread(gold: Book) -> list[dict]:
         if not ASSUMPTION_LABEL_RE.search(label):
             continue
         row_cells = gold.row_cells(sheet, p[1])
+        surviving = [
+            c for c in row_cells
+            if c in delivered.formula
+            or isinstance(delivered.value.get(c), (int, float))
+        ]
+        if not surviving:
+            continue
         populated = any(
             c in gold.formula or isinstance(gold.value.get(c), (int, float))
             for c in row_cells
@@ -2308,7 +2333,7 @@ def detect_populated_but_unread(gold: Book) -> list[dict]:
             continue
         out.append(record(
             "row_populated", "populated_but_unread",
-            [c for c in row_cells if c in gold.formula or isinstance(gold.value.get(c), (int, float))],
+            surviving,
             "populated; no inbound reference",
             ["unused", "populated", "populated_but_unread"],
             f"Row labelled {label!r} is populated but unread.",
@@ -2318,13 +2343,8 @@ def detect_populated_but_unread(gold: Book) -> list[dict]:
 
 
 def detect_aggregate_scope(gold: Book, delivered: Book, targets: list[str]) -> list[dict]:
-    """Name the member rows of a total, never the total's own cell.
-
-    The old framing disclosed the graded cell's own SUM span, so every record it
-    produced was an answer leak and none of them ever shipped. Naming the members
-    is the useful half and does not touch the target.
-    """
-    out = []
+    """Name every member of equivalent vertical totals across target columns."""
+    grouped = defaultdict(list)
     for k in targets:
         formula = gold.formula.get(k)
         if not formula:
@@ -2344,34 +2364,46 @@ def detect_aggregate_scope(gold: Book, delivered: Book, targets: list[str]) -> l
                        if split_coord(c.split("!", 1)[1])}
         if len(member_rows) < 2:
             continue
-        # The sentence names every member, or it would describe a different sum
-        # than the one the workbook computes. The record's cells carry only the
-        # members still to be built, so a visible member never rides along.
         named = [gold.row_label(c) for c in spanned]
-        # Every spanned row must be nameable, or the member list the agent reads
-        # is not the set the workbook actually sums.
         if not all(named):
             continue
-        # A row the golden leaves empty in every column is not a member worth
-        # naming. Listing it tells the agent to build something that must stay
-        # blank, and these totals are often graded cells.
         if not all(row_has_data(gold, *c.split("!", 1)[0:1], split_coord(c.split("!", 1)[1])[1])
                    for c in spanned):
             continue
         labels = list(dict.fromkeys(named))
-        members = [c for c in spanned if gold.formula.get(c) and not delivered.has(c)]
-        if not members or not labels or len(labels) > 6:
+        members = [c for c in spanned if not delivered.has(c)]
+        if not members or not labels:
             continue
-        out.append(record(
-            "aggregate_scope", "member set", members, formula, ["member set"],
-            f"Total labelled {gold.row_label(k)!r} sums the rows labelled "
-            f"{', '.join(repr(l) for l in labels[:6])}.",
+        first = split_coord(spanned[0].split("!", 1)[1])
+        last = split_coord(spanned[-1].split("!", 1)[1])
+        target = split_coord(k.split("!", 1)[1])
+        if not first or not last or not target:
+            continue
+        group_key = (sheet, first[1], last[1], tuple(labels), gold.row_label(k))
+        grouped[group_key].append((col_to_num(target[0]), k, formula))
+
+    out = []
+    for (_sheet, first_row, last_row, labels, total_label), entries in sorted(grouped.items()):
+        entries.sort()
+        target_cells = [item[1] for item in entries]
+        if not target_cells or not total_label:
+            continue
+        rec = record(
+            "aggregate_scope", "member set", target_cells, entries[0][2], ["member set"],
+            f"Total labelled {total_label!r} aggregates the complete named member set.",
             fields={
-                "label": q(gold.row_label(k)),
+                "label": q(total_label),
                 "members": ("the row labelled " + q(labels[0])) if len(labels) == 1
-                           else "the rows labelled " + ", ".join(q(l) for l in labels),
+                           else "the rows labelled " + ", ".join(q(label) for label in labels),
             },
-        ))
+        )
+        rec["accepted_target_reference"] = True
+        rec["aggregate_member_rows"] = {
+            "first": first_row,
+            "last": last_row,
+            "labels": list(labels),
+        }
+        out.append(rec)
     return out
 
 
@@ -2501,6 +2533,11 @@ def ship_projection_rule(rec: dict, ctx: dict) -> bool:
     cells = rec.get("cell_keys") or []
     if not cells:
         return False
+    if rec.get("value") != "hold_level":
+        rec["declined_reason"] = (
+            "only a literal hold-level convention is safe for agent-facing disclosure"
+        )
+        return False
     sheet, coord = cells[0].split("!", 1)
     p = split_coord(coord)
     if not p:
@@ -2567,15 +2604,26 @@ def ship_source_selection(rec: dict, ctx: dict) -> bool:
     A source cell that survives in the delivered file is one read away from a
     value, so naming it hands that value over.
     """
-    for rs, rc, rr in _ingredients(rec.get("evidence") or "", *_origin(rec)):
-        if ctx["delivered"].has(key(rs, "%s%d" % (num_to_col(rc), rr))):
-            return False
-    return True
+    rec["declined_reason"] = (
+        "source relationship remains reviewer-only until sign and period "
+        "semantics are represented explicitly"
+    )
+    return False
 
 
 def ship_not_a_target(rec: dict, ctx: dict) -> bool:
     """Ship only when the band is not itself graded."""
     return not any(c in ctx["targets"] for c in rec.get("cell_keys") or [])
+
+
+def ship_aggregate_scope(rec: dict, ctx: dict) -> bool:
+    """Keep exact aggregate evidence reviewer-only when the total is graded."""
+    if any(c in ctx["targets"] for c in rec.get("cell_keys") or []):
+        rec["declined_reason"] = (
+            "complete aggregate scope would disclose a graded target's calculation"
+        )
+        return False
+    return bool(rec.get("aggregate_member_rows", {}).get("labels"))
 
 
 def _band_survives(rec: dict, ctx: dict) -> bool:
@@ -2657,7 +2705,7 @@ SHIP_WHEN = {
     "projection_rule": ship_projection_rule,
     "source_selection": ship_source_selection,
     "npv_timing": ship_not_a_target,
-    "aggregate_scope": ship_not_a_target,
+    "aggregate_scope": ship_aggregate_scope,
     "distribution_policy": ship_distribution_policy,
     "liquidation_preference": ship_liquidation_preference,
     **{entry_id: ship_custom_method for entry_id in METHOD_ENTRY_IDS},
@@ -3297,11 +3345,18 @@ def verify_task(task_dir: Path) -> dict:
         return {"task": task_dir.name, "passed": False, "faults": ["missing tests/disclosure.json"]}
     payload = json.loads(disclosure_path.read_text(encoding="utf-8"))
     delivered = Book(find_environment(task_dir))
-    selected = [c for r in payload.get("records", []) for c in r.get("cell_keys", [])]
-    nonblank = [pretty(c) for c in selected if delivered.has(c)]
-    if nonblank:
-        faults.append(f"{len(nonblank)} selected cells are non-blank in delivered workbook")
     shipped = payload.get("agent_records", [])
+    visible_cells = sorted({
+        cell
+        for record in shipped
+        for cell in record.get("cell_keys", [])
+    })
+    nonblank = [pretty(c) for c in visible_cells if delivered.has(c)]
+    if nonblank:
+        faults.append(
+            f"{len(nonblank)} agent-visible disclosure cells are non-blank "
+            "in delivered workbook"
+        )
     # One record per (band, entry). Two entries may legitimately describe one band;
     # the writer joins them into a single bullet.
     seen = Counter((r.get("band"), r.get("entry")) for r in payload.get("records", []))

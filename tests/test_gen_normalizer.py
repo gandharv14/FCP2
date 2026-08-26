@@ -203,6 +203,53 @@ class PlainEligibilityTests(unittest.TestCase):
             self.assertFalse(report["valid"])
             self.assertIn("eval/tasks.jsonl", report["unknown_files"])
 
+    def test_plain_environment_allows_dialogue_notes_after_apply(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp)
+            env = bundle / "environment"
+            env.mkdir()
+            (env / "0001-inputs.xlsx").write_bytes(b"x")
+            (env / "Dockerfile").write_text(
+                "FROM scratch\nCOPY additional-assumptions.md "
+                "/app/additional-assumptions.md\n",
+                encoding="utf-8",
+            )
+            (env / "additional-assumptions.md").write_text("notes\n", encoding="utf-8")
+            (bundle / "tests").mkdir()
+            (bundle / "tests" / "dialogue-applied.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            report = plain_eligibility.check_plain_environment(bundle, "0001")
+            self.assertTrue(report["valid"], report)
+
+    def test_plain_environment_rejects_stray_dialogue_notes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp)
+            env = bundle / "environment"
+            env.mkdir()
+            (env / "0001-inputs.xlsx").write_bytes(b"x")
+            (env / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (env / "additional-assumptions.md").write_text("notes\n", encoding="utf-8")
+            report = plain_eligibility.check_plain_environment(bundle, "0001")
+            self.assertFalse(report["valid"])
+            self.assertIn("additional-assumptions.md", report["unknown_files"])
+
+    def test_plain_environment_rejects_notes_without_dockerfile_copy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp)
+            env = bundle / "environment"
+            env.mkdir()
+            (env / "0001-inputs.xlsx").write_bytes(b"x")
+            (env / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (env / "additional-assumptions.md").write_text("notes\n", encoding="utf-8")
+            (bundle / "tests").mkdir()
+            (bundle / "tests" / "dialogue-applied.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            report = plain_eligibility.check_plain_environment(bundle, "0001")
+            self.assertFalse(report["valid"])
+            self.assertIn("additional-assumptions.md", report["unknown_files"])
+
 
 if __name__ == "__main__":
     unittest.main()

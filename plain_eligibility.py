@@ -15,6 +15,18 @@ EXTRACTION_CODES = frozenset({"unparsable_reference", "unknown_sheet"})
 SENTINEL = re.compile(r"no candidates were identified", re.I)
 MIN_DRAFT_ROWS = 3
 MIN_DRAFT_FRACTION = 0.02
+DIALOGUE_NOTES_NAME = "additional-assumptions.md"
+DIALOGUE_NOTES_COPY = f"COPY {DIALOGUE_NOTES_NAME} /app/{DIALOGUE_NOTES_NAME}"
+DIALOGUE_APPLIED_MARKER = "tests/dialogue-applied.json"
+
+
+def dialogue_notes_expected(bundle: Path) -> bool:
+    """True when apply left a marker and the main Dockerfile copies the notes."""
+    marker = bundle / DIALOGUE_APPLIED_MARKER
+    dockerfile = bundle / "environment" / "Dockerfile"
+    if not marker.is_file() or not dockerfile.is_file():
+        return False
+    return DIALOGUE_NOTES_COPY in dockerfile.read_text(encoding="utf-8")
 
 
 def _load(path: Path):
@@ -176,6 +188,8 @@ def check_plain_environment(bundle: Path, workbook_id: str) -> dict:
         return {"valid": False, "missing_files": ["environment/"], "unknown_files": [],
                 "symlinks": [], "workbooks": []}
     expected = {f"{workbook_id}-inputs.xlsx", "Dockerfile"}
+    if dialogue_notes_expected(bundle):
+        expected.add(DIALOGUE_NOTES_NAME)
     actual: set[str] = set()
     symlinks: list[str] = []
     for path in environment.rglob("*"):

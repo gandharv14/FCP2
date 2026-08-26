@@ -13,13 +13,11 @@ NOTES_NAME = "additional-assumptions.md"
 NOTES_COPY = f"COPY {NOTES_NAME} /app/{NOTES_NAME}"
 APPLIED_MARKER = "tests/dialogue-applied.json"
 DO_NOT_RERUN = (
-    "create-harbor-task",
     "disclose.py write",
     "disclose.py verify",
-    "plain_eligibility.check_plain_environment",
-    "xl_mcp_oracle.check_environment",
     "xl_harbor_prep.py",
     "xl_output_task.py",
+    "create-harbor-task steps 11-15",
 )
 DISCLOSURE_HEADING = "## Workbook disclosure"
 ASSUMPTIONS_HEADING = "## Additional assumptions"

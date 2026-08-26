@@ -1,6 +1,6 @@
 ---
 name: create-harbor-task
-description: Creates fail-closed Harbor workbook tasks with unified pre-run task disclosure. MCP-backed when the audit yields maskable variables; a plain (no-MCP) task only when every audit row is genuinely excluded. Use when asked to create or rebuild a Harbor task, package an .xlsx or workbook id, generate variable-source MCP inputs, or promote a tasks_outputs bundle.
+description: Creates fail-closed Harbor workbook tasks with unified pre-run task disclosure and, when agent_records exist, an additional-assumptions Q&A file. MCP-backed when the audit yields maskable variables; a plain (no-MCP) task only when every audit row is genuinely excluded. Use when asked to create or rebuild a Harbor task, package an .xlsx or workbook id, generate variable-source MCP inputs, or promote a tasks_outputs bundle.
 disable-model-invocation: true
 ---
 
@@ -41,6 +41,8 @@ MCP="$RUN/mcp"
 DISCLOSURE=.cursor/skills/task-disclosure/scripts/disclose.py
 DISCLOSURE_RUN="runs/disclosure/$WB-outputs"
 NAT_RUN="runs/$WB-instruction-naturalization"
+AA=.cursor/skills/additional-assumptions-dialogue/SKILL.md
+AA_RUN="runs/$WB-additional-assumptions"
 STAGE_ROOT=tasks_outputs_mcp
 STAGED="$STAGE_ROOT/$WB-outputs"
 TASK="tasks_outputs/$WB-outputs"
@@ -65,6 +67,10 @@ Expected artifacts:
 - `runs/$WB-variable-sources/oracle-report.json` (MCP mode only)
 - `runs/$WB-variable-sources/{plain_eligibility.json,first_normalization.json}`
   and, in plain mode, `tests/normalization_exclusions.json`
+- `runs/$WB-additional-assumptions/{claims.json,writer_pack.json}` and, when
+  `agent_records` is non-empty, `draft.md`, `review.json`, `apply.json`
+- `tasks_outputs_mcp/$WB-outputs/environment/additional-assumptions.md` and
+  `tests/dialogue-applied.json` when dialogue apply ran
 
 For multiple requested workbooks, complete all gates serially. Do not share a
 normalized spec, MCP bundle, mask list, or staged task between workbook ids.
@@ -431,7 +437,9 @@ replacing `"$STAGED/instruction.md"`.
 Require `"$NAT_RUN/validation.json"` to report `valid: true` and `applied: true`,
 and require `task.toml` to record model `gpt-5.6-sol-high`, endpoint
 `cursor-subagent`, the prompt version, and matching source/instruction hashes.
-This is the final content mutation; do not continue on fallback or uncertainty.
+This is the last prose mutation of the disclosure-bearing instruction. Do not
+continue on fallback or uncertainty. Step 15.5 may later rewrite headings and
+pointers when it replaces `## Workbook disclosure` with the Q&A file.
 
 Re-run `python3 "$DISCLOSURE" verify --task-dir "$STAGED"` against the final
 naturalized instruction. Then launch a fresh reviewer with the golden, delivered
@@ -514,6 +522,83 @@ print("exact-answer grader score: 1.0")
 PY
 ```
 
+### 15.5 Additional assumptions Q&A
+
+Load and follow `"$AA"`. Do not copy its writer, paraphrase, reviewer,
+`must_say`, spoken-formula, or apply/rollback logic into this skill. Run it
+against the staged bundle (`TASK="$STAGED"`), not the promoted path.
+
+```bash
+test -f "$AA"
+test -f "$STAGED/tests/disclosure.json"
+test -f "$STAGED/environment/Dockerfile"
+```
+
+If `$STAGED/tests/dialogue-applied.json` is already present, do not re-run
+steps 11–15 on this bundle. A full rebuild stages a fresh `$STAGED`, then
+this step runs again.
+
+```bash
+python3 .cursor/skills/additional-assumptions-dialogue/scripts/extract_claims.py \
+  --task-dir "$STAGED" --out "$AA_RUN"
+```
+
+If `"$AA_RUN/claims.json"` reports `"empty": true`, record
+`n/a (no agent_records)` and continue to promote. Do not launch writer or
+reviewer agents. Do not touch the Dockerfile.
+
+Otherwise follow that skill’s 2-round loop (`gpt-5.6-sol-high` writer,
+paraphrase-seniors, mechanical `check-draft`, independent reviewer) and apply
+to `$STAGED`. Docker-smoke the **main** image (`$STAGED/environment`, not
+`mcp-server`). `--skip-smoke` only if the user explicitly says the daemon is
+down; otherwise fail-closed. A skipped smoke is not a normal pass — report it
+as pending and do not promote unless the user accepted the skip.
+
+After a non-empty apply, re-run the matching closed-world check. Do **not**
+re-run `disclose.py write` / `verify`, naturalization, `xl_output_task.py`,
+or the live HTTP oracle.
+
+Plain mode:
+
+```bash
+python3 - "$STAGED" "$WB" <<'PY'
+import sys
+from pathlib import Path
+from plain_eligibility import check_plain_environment
+report = check_plain_environment(Path(sys.argv[1]), sys.argv[2])
+if report.get("valid") is not True:
+    raise SystemExit(report)
+print("plain environment hygiene PASS")
+PY
+```
+
+MCP mode:
+
+```bash
+python3 - "$STAGED" <<'PY'
+import sys
+from pathlib import Path
+from xl_mcp_oracle import check_environment
+bundle = Path(sys.argv[1])
+env = bundle / "environment"
+workbooks = sorted(
+    p for p in env.iterdir()
+    if p.is_file() and p.suffix.casefold() in {".xlsx", ".xlsm"}
+)
+if len(workbooks) != 1:
+    raise SystemExit("expected exactly one workbook in environment/")
+report = check_environment(bundle, workbooks[0])
+if report.get("valid") is not True:
+    raise SystemExit(report)
+print("MCP environment hygiene PASS")
+PY
+```
+
+Require `$STAGED/environment/additional-assumptions.md`, a Dockerfile
+`COPY additional-assumptions.md /app/additional-assumptions.md` line,
+`$STAGED/tests/dialogue-applied.json`, and no `## Workbook disclosure` left
+in `instruction.md`.
+
 ### 16. Promote only after every gate passes
 
 If a requested set contains multiple workbooks, wait until every staged bundle
@@ -567,6 +652,9 @@ Report, per workbook:
 - normalized spec, exclusions, profiles, and MCP paths; deterministic comparison
   and MCP validation/smoke summaries (`n/a (plain)` for MCP build/oracle)
 - staged path, oracle report and result (`n/a (plain)`), exact grader score,
+  additional-assumptions result (`n/a (no agent_records)`, applied, or
+  smoke pending), `$AA_RUN/{claims,review,apply}.json` when extract ran,
+  notes path and Dockerfile COPY when applied, main-image smoke result,
   final promoted path, previous-bundle backup path, and any retained diagnostics
 
 Completion requires every gate that applies to the chosen mode to pass.

@@ -321,6 +321,35 @@ class IsolationAndProfileTests(unittest.TestCase):
             self.assertFalse(leaked["valid"])
             self.assertIn("normalized.json", leaked["unknown_files"])
 
+    def test_dialogue_notes_allowed_after_apply(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workbook = self._environment(root)
+            (root / "environment" / "Dockerfile").write_text(
+                "COPY additional-assumptions.md /app/additional-assumptions.md\n",
+                encoding="utf-8",
+            )
+            (root / "environment" / "additional-assumptions.md").write_text(
+                "notes\n", encoding="utf-8"
+            )
+            (root / "tests").mkdir()
+            (root / "tests" / "dialogue-applied.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            report = check_environment(root, workbook)
+            self.assertTrue(report["valid"], report)
+
+    def test_stray_dialogue_notes_are_a_leak(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workbook = self._environment(root)
+            (root / "environment" / "additional-assumptions.md").write_text(
+                "notes\n", encoding="utf-8"
+            )
+            report = check_environment(root, workbook)
+            self.assertFalse(report["valid"])
+            self.assertIn("additional-assumptions.md", report["unknown_files"])
+
     def test_golden_eval_and_source_profile_snapshots_are_not_shippable(self):
         extras = (
             "golden.xlsx",

@@ -511,8 +511,85 @@ def make_band(gold: Book, sheet: str, row: int, pattern: str, run: list[tuple[in
 
 def select_payload(args) -> dict:
     task_dir = Path(args.task_dir).resolve()
-    gold = Book(find_golden(task_dir, args.golden))
-    delivered = Book(find_environment(task_dir))
+    golden_path = find_golden(task_dir, args.golden)
+    delivered_path = find_environment(task_dir)
+    generation = None
+    seg_root = getattr(args, "seg_root", None)
+    if seg_root:
+        from xl_seg.publication import (
+            INPUTS_POINTER_SCHEMA_VERSION,
+            resolve_for_consumer,
+        )
+
+        workbook = Path(golden_path).stem
+        expected_generation_id = getattr(
+            args, "expected_generation_id", None
+        )
+        packaged_manifest_path = (
+            task_dir / "tests" / "segmentation_generation_manifest.json"
+        )
+        if packaged_manifest_path.is_file():
+            packaged_manifest = json.loads(
+                packaged_manifest_path.read_text(encoding="utf-8")
+            )
+            packaged_generation_id = packaged_manifest.get("generation_id")
+            if (
+                expected_generation_id is not None
+                and packaged_generation_id != expected_generation_id
+            ):
+                raise SystemExit(
+                    "packaged and requested segmentation generation IDs disagree"
+                )
+            expected_generation_id = packaged_generation_id
+            inputs_generation_path = (
+                task_dir / "tests" / "inputs_generation.json"
+            )
+            if not inputs_generation_path.is_file():
+                raise SystemExit(
+                    "packaged task has no inputs generation binding"
+                )
+            inputs_generation = json.loads(
+                inputs_generation_path.read_text(encoding="utf-8")
+            )
+            delivered_sha256 = hashlib.sha256(
+                delivered_path.read_bytes()
+            ).hexdigest()
+            packaged_manifest_sha256 = hashlib.sha256(
+                packaged_manifest_path.read_bytes()
+            ).hexdigest()
+            if (
+                inputs_generation.get("schema_version")
+                != INPUTS_POINTER_SCHEMA_VERSION
+                or inputs_generation.get("generation_id")
+                != expected_generation_id
+                or inputs_generation.get("inputs_file") != delivered_path.name
+                or inputs_generation.get("inputs_sha256") != delivered_sha256
+                or inputs_generation.get("generation_manifest_sha256")
+                != packaged_manifest_sha256
+            ):
+                raise SystemExit(
+                    "packaged inputs generation binding is invalid"
+                )
+        generation_dir, manifest = resolve_for_consumer(
+            Path(seg_root) / workbook,
+            mode=getattr(args, "segmentation_mode", "strict"),
+            source_path=golden_path,
+            ast_dir=(
+                Path(args.ast_dir) / workbook
+                if getattr(args, "ast_dir", None) else None
+            ),
+            require_pass=True,
+            expected_generation_id=expected_generation_id,
+        )
+        generation = {
+            "generation_id": (
+                manifest.get("generation_id") if manifest is not None else None
+            ),
+            "directory": str(generation_dir),
+            "mode": getattr(args, "segmentation_mode", "strict"),
+        }
+    gold = Book(golden_path)
+    delivered = Book(delivered_path)
     targets_map, tolerance = load_key(task_dir)
     default_sheet = gold.sheets[0]
     targets = [parse_ref(t, default_sheet) for t in targets_map]
@@ -527,8 +604,8 @@ def select_payload(args) -> dict:
         "schema_version": "1.0",
         "task": task_dir.name,
         "task_dir": str(task_dir),
-        "golden": str(find_golden(task_dir, args.golden)),
-        "delivered": str(find_environment(task_dir)),
+        "golden": str(golden_path),
+        "delivered": str(delivered_path),
         "targets": list(targets_map),
         "target_keys": targets,
         "tolerance": tolerance,
@@ -543,6 +620,8 @@ def select_payload(args) -> dict:
         },
         "bands": bands,
     }
+    if generation is not None:
+        payload["segmentation_generation"] = generation
     return payload
 
 
@@ -3627,6 +3706,9 @@ def ensure_pipeline(task: Path, args):
     a.task_dir = str(task)
     a.golden = None
     a.ast_dir = args.ast_dir
+    a.seg_root = args.seg_root
+    a.segmentation_mode = args.segmentation_mode
+    a.expected_generation_id = getattr(args, "expected_generation_id", None)
     a.runs_root = args.runs_root
     a.out = None
     a.role_resolutions = getattr(args, "role_resolutions", None)
@@ -3679,6 +3761,13 @@ def main(argv=None):
         if name == "select":
             p.add_argument("--golden", default=None)
             p.add_argument("--ast-dir", default=None)
+            p.add_argument("--seg-root", default="seg_out")
+            p.add_argument(
+                "--segmentation-mode",
+                choices=("strict", "shadow", "legacy"),
+                default="strict",
+            )
+            p.add_argument("--expected-generation-id", default=None)
         if name == "detect":
             p.add_argument("--role-resolutions", default=None)
         if name == "write":
@@ -3690,7 +3779,14 @@ def main(argv=None):
     m = sub.add_parser("migrate")
     m.add_argument("--tasks-root", default=str(DEFAULT_TASKS_ROOT))
     m.add_argument("--out", required=True)
-    m.add_argument("--ast-dir", default=None)
+    m.add_argument("--ast-dir", default="ast_out")
+    m.add_argument("--seg-root", default="seg_out")
+    m.add_argument(
+        "--segmentation-mode",
+        choices=("strict", "shadow", "legacy"),
+        default="strict",
+    )
+    m.add_argument("--expected-generation-id", default=None)
     m.add_argument("--force", action="store_true")
     m.add_argument("--role-resolutions", default=None)
 

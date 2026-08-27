@@ -3256,6 +3256,7 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   python3 xl_ast_graph.py "4-10 100/0248.xlsx"
+  python3 xl_ast_graph.py "4-10 100/0248.xlsx" --production
   python3 xl_ast_graph.py "4-10 100/0248.xlsx" --focus "Calculations!T232" --depth 2
   python3 xl_ast_graph.py "4-10 100" --glob '*.xlsx' --no-graphml
 """)
@@ -3280,6 +3281,11 @@ def main(argv=None):
                         help="drop literal numbers and strings instead of giving them nodes")
     parser.add_argument("--no-values", action="store_true",
                         help="skip the cached-value pass (faster, but no labels)")
+    parser.add_argument("--production", action="store_true",
+                        help="Harbor pipeline output: write only nodes.csv and "
+                             "edges.csv (equivalent to --no-json --no-graphml "
+                             "--no-html). Default debug formats stay available "
+                             "when this flag is omitted.")
     parser.add_argument("--no-html", action="store_true")
     parser.add_argument("--no-json", action="store_true")
     parser.add_argument("--no-graphml", action="store_true")
@@ -3293,6 +3299,10 @@ def main(argv=None):
                              "many characters (default: %(default)s)")
     parser.add_argument("-q", "--quiet", action="store_true")
     args = parser.parse_args(argv)
+    if args.production:
+        args.no_json = True
+        args.no_graphml = True
+        args.no_html = True
 
     root = Path(args.path)
     if not root.exists():

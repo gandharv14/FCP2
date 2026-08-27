@@ -112,7 +112,7 @@ Do not read or print `.env`; the pipeline reads required credentials itself.
 ```bash
 python3 -m pip install -r requirements.txt
 test -f "$SOURCE/$WB.xlsx"
-python3 xl_ast_graph.py "$SOURCE/$WB.xlsx" -o "$AST_ROOT"
+python3 xl_ast_graph.py "$SOURCE/$WB.xlsx" -o "$AST_ROOT" --production
 test -f "$AST_ROOT/$WB/nodes.csv"
 test -f "$AST_ROOT/$WB/edges.csv"
 ```

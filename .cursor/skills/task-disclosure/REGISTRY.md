@@ -592,8 +592,8 @@ chose is not a construction over kept inputs.
   `average_balance` | `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
-  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
-    calculation, shown for {representative}: {steps}."
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this
+    {calculation_kind}, shown for {representative}: {steps}."
   - `bop_over_life` - "Depreciation on the row labelled {label} is the opening depreciable
     balance spread over the labelled useful life."
   - `bop_plus_capex_over_life` - "Depreciation on the row labelled {label} is the opening
@@ -622,8 +622,8 @@ chose is not a construction over kept inputs.
   `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
-  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
-    calculation, shown for {representative}: {steps}."
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this
+    {calculation_kind}, shown for {representative}: {steps}."
   - `opening_balance` - "Interest on the row labelled {label} is charged on the opening
     balance."
   - `average_balance` - "Interest on the row labelled {label} is charged on the average of the
@@ -656,8 +656,8 @@ chose is not a construction over kept inputs.
   `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
-  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
-    calculation, shown for {representative}: {steps}."
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this
+    {calculation_kind}, shown for {representative}: {steps}."
   - `pretax_profit` - "Tax on the row labelled {label} is charged on pre-tax profit at the
     labelled rate."
   - `taxable_income` - "Tax on the row labelled {label} is charged on taxable income at the
@@ -679,8 +679,8 @@ chose is not a construction over kept inputs.
   `capacity_utilisation` | `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
-  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
-    calculation, shown for {representative}: {steps}."
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this
+    {calculation_kind}, shown for {representative}: {steps}."
   - `prior_period_growth` - "Revenue on the row labelled {label} grows off the prior period at
     the labelled growth rate."
   - `price_times_volume` - "Revenue on the row labelled {label} is price multiplied by volume."
@@ -699,8 +699,8 @@ chose is not a construction over kept inputs.
   `component_sum` | `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
-  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
-    calculation, shown for {representative}: {steps}."
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this
+    {calculation_kind}, shown for {representative}: {steps}."
   - `prior_period_growth` - "The cost on the row labelled {label} grows off the prior period at
     the labelled growth rate."
   - `percent_of_revenue` - "The cost on the row labelled {label} is a labelled percentage of
@@ -722,8 +722,8 @@ chose is not a construction over kept inputs.
 - **Ship when.** Section default. A hardcoded 365 or 360 is ordinary arithmetic plumbing and
   is classified before the gate rather than treated as a custom method.
 - **Sentence.**
-  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
-    calculation, shown for {representative}: {steps}."
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this
+    {calculation_kind}, shown for {representative}: {steps}."
   - `percent_of_driver` - "The balance on the row labelled {label} is a labelled percentage of
     its driver."
   - `days_of_driver` - "The balance on the row labelled {label} is stated as a labelled number
@@ -743,8 +743,8 @@ chose is not a construction over kept inputs.
   `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
-  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
-    calculation, shown for {representative}: {steps}."
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this
+    {calculation_kind}, shown for {representative}: {steps}."
   - `percent_of_revenue` - "Capital spend on the row labelled {label} is a labelled percentage
     of revenue."
   - `prior_period_growth` - "Capital spend on the row labelled {label} grows off the prior
@@ -763,8 +763,8 @@ chose is not a construction over kept inputs.
   `cash_sweep` | `out_of_catalogue`
 - **Ship when.** Section default.
 - **Sentence.**
-  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
-    calculation, shown for {representative}: {steps}."
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this
+    {calculation_kind}, shown for {representative}: {steps}."
   - `required_funding` - "The draw on the row labelled {label} is whatever funding the period
     requires, floored at zero."
   - `fixed_amortisation` - "The repayment on the row labelled {label} is the opening principal
@@ -785,8 +785,8 @@ chose is not a construction over kept inputs.
   `exit_multiple` | `midyear_discount` | `out_of_catalogue`
 - **Ship when.** Section default, and declines when the band is itself a graded cell.
 - **Sentence.**
-  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
-    calculation, shown for {representative}: {steps}."
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this
+    {calculation_kind}, shown for {representative}: {steps}."
   - `periodic_discount` - "The row labelled {label} discounts each period's cash flow at the
     labelled discount rate over that period's count."
   - `npv_plus_t0` - "The row labelled {label} discounts the future cash flows and adds the
@@ -815,8 +815,8 @@ chose is not a construction over kept inputs.
 - **Ship when.** Section default, and declines when the band is itself a graded cell, which is
   the common case for a returns row.
 - **Sentence.**
-  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this copied-column
-    calculation, shown for {representative}: {steps}."
+  - `out_of_catalogue` - "For {band} on the row labelled {label}, use this
+    {calculation_kind}, shown for {representative}: {steps}."
   - `irr_on_series` - "The row labelled {label} takes the internal rate of return of the
     labelled investor cash-flow series."
   - `xirr_on_dated_series` - "The row labelled {label} takes the internal rate of return of the

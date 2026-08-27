@@ -320,6 +320,8 @@ def is_unit_stamp(text: str) -> bool:
         return True
     if re.fullmatch(r"(usd|eur|gbp|aed|\$)\s*['’]?(k|m|mm|bn|000s?)?", lowered):
         return True
+    if re.fullmatch(r"[$€£]\s+in\s+(?:k|m|mm|bn|000s?)", lowered):
+        return True
     if re.fullmatch(
         r"(?:usd|eur|gbp|aed|sar|[$€£])\s*(?:['’]?\s*0{3}s?|k|m|mm|bn)",
         lowered,
@@ -1280,8 +1282,47 @@ def confident_custom_reason(entry_id: str, profile: dict) -> str | None:
     return None
 
 
+def reference_lock_qualifier(raw: str) -> tuple[str, str]:
+    """Describe Excel absolute-reference locks without exposing formula syntax."""
+    match = REF_RE.search(raw)
+    if not match:
+        return "", ""
+    coordinates = [match.group("a")]
+    if match.group("b"):
+        coordinates.append(match.group("b"))
+    locks = []
+    for coordinate in coordinates:
+        parsed = re.fullmatch(r"(\$?)[A-Z]{1,3}(\$?)[0-9]{1,7}", coordinate)
+        locks.append((bool(parsed and parsed.group(1)), bool(parsed and parsed.group(2))))
+    if len(locks) == 1:
+        fixed_column, fixed_row = locks[0]
+        if fixed_column and fixed_row:
+            return "fixed ", ""
+        if fixed_column:
+            return "", " with its column fixed when copied"
+        if fixed_row:
+            return "", " with its row fixed when copied"
+        return "", ""
+    if locks and all(fixed_column and fixed_row for fixed_column, fixed_row in locks):
+        return "fixed ", ""
+    details = []
+    for coordinate, (fixed_column, fixed_row) in zip(coordinates, locks):
+        if not fixed_column and not fixed_row:
+            continue
+        clean = coordinate.replace("$", "")
+        if fixed_column and fixed_row:
+            scope = "row and column"
+        elif fixed_column:
+            scope = "column"
+        else:
+            scope = "row"
+        details.append(f"{clean}'s {scope}")
+    return "", (" with " + " and ".join(details) + " fixed when copied") if details else ""
+
+
 def describe_ref(gold: Book, raw: str, sheet: str, own_label: str) -> str:
     refs = refs_in("=" + raw, sheet)
+    lock_prefix, lock_suffix = reference_lock_qualifier(raw)
     if len(refs) == 1:
         value = gold.value.get(refs[0])
         if (
@@ -1289,20 +1330,23 @@ def describe_ref(gold: Book, raw: str, sheet: str, own_label: str) -> str:
             and isinstance(value, str)
             and value.strip()
         ):
-            return f"cell {pretty(refs[0])} containing {q(value.strip())}"
+            return f"{lock_prefix}cell {pretty(refs[0])}{lock_suffix} containing {q(value.strip())}"
+    ref_labels = [gold.row_label(ref) for ref in refs]
     labels = []
-    for ref in refs:
-        label = gold.row_label(ref)
+    for label in ref_labels:
         if label and label not in labels:
             labels.append(label)
     if refs:
         if len(refs) == 1 and ":" not in raw:
-            location = "cell " + pretty(refs[0])
+            location = lock_prefix + "cell " + pretty(refs[0]) + lock_suffix
         else:
             first_sheet, first_coord = pretty(refs[0]).rsplit("!", 1)
             _, last_coord = pretty(refs[-1]).rsplit("!", 1)
-            location = f"range {first_sheet}!{first_coord}:{last_coord}"
-        if labels:
+            location = (
+                f"{lock_prefix}range {first_sheet}!{first_coord}:{last_coord}"
+                f"{lock_suffix}"
+            )
+        if labels and all(ref_labels):
             named = [q(label) for label in labels]
             label_text = named[0] if len(named) == 1 else ", ".join(named[:-1]) + " and " + named[-1]
             noun = "row" if len(named) == 1 else "rows"
@@ -1414,9 +1458,51 @@ def custom_sentence_fields(profile: dict, gold: Book) -> dict:
         "label": q(profile.get("label", "")),
         "band": band,
         "representative": representative,
+        "calculation_kind": (
+            "calculation" if len(cells) == 1 else "copied-column calculation"
+        ),
         "steps": steps,
         "_coverage_complete": coverage_complete,
     }
+
+
+def expand_method_band(gold: Book, delivered: Book, band: dict) -> dict:
+    """Include the full contiguous blank copied-formula run on the target row."""
+    cells = list(band.get("cell_keys") or [])
+    if not cells:
+        return band
+    first = split_coord(cells[0].split("!", 1)[1])
+    if not first:
+        return band
+    sheet, row = band.get("sheet"), int(band.get("row") or first[1])
+    pattern = band.get("pattern") or r1c1ish(
+        gold.formula.get(cells[0], ""), row, col_to_num(first[0])
+    )
+    cols = [col_to_num(split_coord(c.split("!", 1)[1])[0]) for c in cells]
+    lo, hi = min(cols), max(cols)
+
+    def matches(col: int) -> bool:
+        candidate = key(sheet, f"{num_to_col(col)}{row}")
+        formula = gold.formula.get(candidate, "")
+        return bool(
+            formula
+            and not delivered.has(candidate)
+            and r1c1ish(formula, row, col) == pattern
+        )
+
+    while lo > 1 and matches(lo - 1):
+        lo -= 1
+    while matches(hi + 1):
+        hi += 1
+    if lo == min(cols) and hi == max(cols):
+        return band
+    return make_band(
+        gold,
+        sheet,
+        row,
+        pattern,
+        [(col, key(sheet, f"{num_to_col(col)}{row}")) for col in range(lo, hi + 1)],
+    )
 
 
 def detect_custom_methods(
@@ -1435,7 +1521,7 @@ def detect_custom_methods(
         for item in prepared:
             apply_role_resolution(item, payload)
     for item in prepared:
-        band = item["band"]
+        band = expand_method_band(gold, delivered, item["band"])
         label = item["label"]
         if item.get("blank_label"):
             assessments.append({

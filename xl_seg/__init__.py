@@ -9,6 +9,9 @@ __all__ = [
     "partition",
     "lineage",
     "evaluate",
+    "proof",
+    "diagnostics",
+    "publication",
     "adjudicate",
     "emit",
 ]

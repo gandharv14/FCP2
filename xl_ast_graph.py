@@ -25,6 +25,7 @@ import csv
 import datetime as _dt
 import json
 import re
+import shutil
 import sys
 import time
 import warnings
@@ -44,6 +45,8 @@ except ImportError:  # pragma: no cover
 
 EXCEL_MAX_COL = 16384
 EXCEL_MAX_ROW = 1048576
+AST_SCHEMA_VERSION = "xl-ast/v2"
+MAX_PARSE_ERROR_CHARS = 240
 
 NODE_KINDS = ["formula", "input", "label", "op", "const", "range", "name", "external"]
 
@@ -199,6 +202,14 @@ class SheetIndex:
             return None
         return lo_col, lo_row, hi_col, hi_row
 
+    def used_rows(self):
+        """Shared used-row frame for aligned whole-column references."""
+        if not self.cols:
+            return None
+        low = min(self.rows_by_col[col][0] for col in self.cols if self.rows_by_col[col])
+        high = max(self.rows_by_col[col][-1] for col in self.cols if self.rows_by_col[col])
+        return low, high
+
 
 # ---------------------------------------------------------------------------
 # formula -> AST
@@ -234,7 +245,10 @@ _FIXED_ROLES = {
     "XLOOKUP": ("value", "range", "range", "fallback"),
     "INDEX": ("range", "index", "index"),
     "MATCH": ("value", "range", "criteria"),
-    "OFFSET": ("range", "index", "index"),
+    # OFFSET's first argument contributes a coordinate only; its value is not
+    # consumed. Older graphs call this role "range", so evaluators must retain
+    # an arg-index fallback when loading legacy CSVs.
+    "OFFSET": ("address", "index", "index"),
     "ROUND": ("value", "index"),
     "ROUNDUP": ("value", "index"),
     "ROUNDDOWN": ("value", "index"),
@@ -589,6 +603,7 @@ class AstGraph:
         self.nodes = {}
         self.edges = []
         self._edge_seen = set()
+        self._truncated_ranges = set()
         self.cycles = []
         self.cyclic_nodes = set()
         self.warnings = []
@@ -630,7 +645,6 @@ class AstGraph:
                 if isinstance(value, ArrayFormula):
                     text = value.text
                     if isinstance(text, str) and text.startswith("="):
-                        formulas[(cell.row, cell.column)] = (text, True)
                         # A multi-cell array (CSE or spill) formula lives only
                         # on its master cell; the member cells it fills carry
                         # nothing but a cached value in the file, and would
@@ -638,17 +652,37 @@ class AstGraph:
                         # computed value handed to the rebuild as a given.
                         # Register every member as owning the same formula so
                         # it is a formula cell with real precedent edges.
-                        ref = str(getattr(value, "ref", "") or "")
-                        if ":" in ref:
-                            min_col, min_row, max_col, max_row = \
-                                range_boundaries(ref)
-                            for member_row in range(min_row, max_row + 1):
-                                for member_col in range(min_col, max_col + 1):
-                                    spot = (member_row, member_col)
-                                    if spot != (cell.row, cell.column):
-                                        formulas.setdefault(spot, (text, True))
+                        ref = str(getattr(value, "ref", "") or cell.coordinate)
+                        try:
+                            min_col, min_row, max_col, max_row = range_boundaries(
+                                ref.replace("$", "")
+                            )
+                        except Exception:
+                            min_col = max_col = cell.column
+                            min_row = max_row = cell.row
+                            ref = cell.coordinate
+                        anchor = self.cell_id(ws.title, cell.row, cell.column)
+                        for member_row in range(min_row, max_row + 1):
+                            for member_col in range(min_col, max_col + 1):
+                                spot = (member_row, member_col)
+                                idx.add(member_row, member_col)
+                                formulas.setdefault(spot, {
+                                    "text": text,
+                                    "array_formula": True,
+                                    "array_anchor": anchor,
+                                    "array_ref": ref,
+                                    "array_row": member_row - min_row,
+                                    "array_col": member_col - min_col,
+                                })
                 elif cell.data_type == "f" and isinstance(value, str) and value.startswith("="):
-                    formulas[(cell.row, cell.column)] = (value, False)
+                    formulas[(cell.row, cell.column)] = {
+                        "text": value,
+                        "array_formula": False,
+                        "array_anchor": "",
+                        "array_ref": "",
+                        "array_row": None,
+                        "array_col": None,
+                    }
             idx.finalise()
             self.index[ws.title] = idx
             self.formulas[ws.title] = formulas
@@ -695,8 +729,17 @@ class AstGraph:
             items = [(d.name, d) for d in wb.defined_names.definedName]
         for name, defn in items:
             value = getattr(defn, "value", None) or getattr(defn, "attr_text", None)
-            if value:
-                self.names_global[name.upper()] = value
+            if not value:
+                continue
+            local_id = getattr(defn, "localSheetId", None)
+            try:
+                local_sheet = self.sheet_names[int(local_id)] if local_id is not None else None
+            except (IndexError, TypeError, ValueError):
+                local_sheet = None
+            if local_sheet is None:
+                self.names_global[str(name).upper()] = value
+            else:
+                self.names_local[(local_sheet, str(name).upper())] = value
         for ws in wb.worksheets:
             local = getattr(ws, "defined_names", None)
             if not local:
@@ -708,7 +751,7 @@ class AstGraph:
             for name, defn in local_items:
                 value = getattr(defn, "value", None) or getattr(defn, "attr_text", None)
                 if value:
-                    self.names_local[(ws.title, name.upper())] = value
+                    self.names_local[(ws.title, str(name).upper())] = value
 
     # -- reference resolution -------------------------------------------
     def _split_ref(self, token):
@@ -753,18 +796,25 @@ class AstGraph:
         if external is not None:
             return [("ext", token)]
 
+        name_sheet = cur_sheet
+        if sheet_part is not None and ":" not in sheet_part and sheet_part in self.index:
+            name_sheet = sheet_part
+        key = body.upper()
+        defn = self.names_local.get((name_sheet, key))
+        if defn is None:
+            defn = self.names_global.get(key)
+        if defn is not None and depth < 6:
+            definition = str(defn).strip()
+            if definition.startswith("="):
+                definition = definition[1:].strip()
+            if "#REF" in definition.upper():
+                return [("name", body)]
+            out = []
+            for area in split_areas(definition):
+                out.extend(self.resolve(area, name_sheet, depth + 1))
+            return out or [("name", body)]
+
         if sheet_part is None:
-            key = body.upper()
-            defn = self.names_local.get((cur_sheet, key))
-            if defn is None:
-                defn = self.names_global.get(key)
-            if defn is not None and depth < 6:
-                if "#REF" in defn:
-                    return [("name", body)]
-                out = []
-                for area in split_areas(defn):
-                    out.extend(self.resolve(area, cur_sheet, depth + 1))
-                return out or [("name", body)]
             if not is_range_like(body):
                 return [("name", body)]
             sheets = [cur_sheet]
@@ -777,6 +827,7 @@ class AstGraph:
             else:
                 sheets = [sheet_part]
 
+        whole_columns = bool(_RE_COLS.match(body))
         try:
             min_col, min_row, max_col, max_row = range_boundaries(body.replace("$", ""))
         except Exception:
@@ -794,8 +845,46 @@ class AstGraph:
                 continue
             n = idx.count(min_col, min_row, max_col, max_row)
             if n == 0:
+                # An explicit scalar reference to a blank cell is still a real
+                # dependency. Excel supplies a blank value which operators may
+                # coerce to zero; dropping the address leaves formulas with no
+                # AST root and turns defined names pointing at blanks into
+                # spurious #NAME? values.
+                if min_col == max_col and min_row == max_row:
+                    out.append(("cell", sheet, min_row, min_col))
                 continue
-            if n > self.max_range_expand:
+            if whole_columns:
+                # Every whole-column argument on a sheet uses the same populated
+                # row frame. This preserves A:A/C:C positional alignment even
+                # when one column starts later or has interior blanks.
+                used_rows = idx.used_rows()
+                if used_rows is None:
+                    continue
+                lo_row, hi_row = used_rows
+                column_count = max_col - min_col + 1
+                row_budget = max(1, self.max_range_expand // column_count)
+                bounded_hi = min(hi_row, lo_row + row_budget - 1)
+                omitted_populated = (
+                    bounded_hi < hi_row
+                    and idx.count(min_col, bounded_hi + 1, max_col, hi_row) > 0
+                )
+                if bounded_hi < hi_row and len(self.warnings) < 25:
+                    self.warnings.append(
+                        "%s!%s bounded to shared rows %d:%d (used row %d)"
+                        % (sheet, body, lo_row, bounded_hi, hi_row)
+                    )
+                hi_row = bounded_hi
+                ref = "%s%d:%s%d" % (
+                    get_column_letter(min_col), lo_row,
+                    get_column_letter(max_col), hi_row,
+                )
+                if omitted_populated:
+                    self._truncated_ranges.add((sheet, ref))
+                out.append((
+                    "range", sheet, ref,
+                    column_count * (hi_row - lo_row + 1),
+                ))
+            elif n > self.max_range_expand:
                 # Clamp to the populated bounding box so a whole-column A:I
                 # does not become a range node a million rows tall.
                 box = idx.clip(min_col, min_row, max_col, max_row)
@@ -822,7 +911,12 @@ class AstGraph:
             "id": node_id, "kind": kind, "sheet": "", "row": None, "col": None,
             "coordinate": "", "owner": "", "op": "", "op_kind": "", "arity": "",
             "expr": "", "label": "", "formula": "", "value": None,
-            "array_formula": False,
+            "array_formula": False, "array_anchor": "", "array_ref": "",
+            "array_row": None, "array_col": None,
+            "ast_schema_version": AST_SCHEMA_VERSION,
+            "parse_status": "not_applicable", "parse_error": "",
+            "value_type": "",
+            "range_truncated": False,
         }
         self.nodes[node_id] = node
         return node
@@ -844,9 +938,15 @@ class AstGraph:
         node.update({
             "sheet": sheet, "row": row, "col": col,
             "coordinate": "%s%d" % (get_column_letter(col), row),
-            "formula": entry[0] if entry else "",
-            "array_formula": bool(entry[1]) if entry else False,
+            "formula": entry["text"] if entry else "",
+            "array_formula": bool(entry["array_formula"]) if entry else False,
+            "array_anchor": entry["array_anchor"] if entry else "",
+            "array_ref": entry["array_ref"] if entry else "",
+            "array_row": entry["array_row"] if entry else None,
+            "array_col": entry["array_col"] if entry else None,
             "value": jsonable(value),
+            "value_type": type(value).__name__ if value is not None else "blank",
+            "parse_status": "pending" if entry else "not_applicable",
             "label": self._label_for(sheet, row, col, value),
         })
         return node
@@ -914,21 +1014,29 @@ class AstGraph:
         for sheet in self.sheet_names:
             if self.sheet_filter and sheet not in self.sheet_filter:
                 continue
-            for (row, col), (formula, _) in self.formulas.get(sheet, {}).items():
+            for (row, col), entry in self.formulas.get(sheet, {}).items():
+                formula = entry["text"]
                 cell_id = self.cell_id(sheet, row, col)
+                cell_node = self._cell_node(sheet, row, col)
                 try:
                     ast = parse_formula(formula)
                 except FormulaError as exc:
+                    cell_node["parse_status"] = "error"
+                    cell_node["parse_error"] = str(exc)[:MAX_PARSE_ERROR_CHARS]
                     self.failed += 1
                     if len(self.warnings) < 25:
                         self.warnings.append("%s: could not parse %r (%s)"
                                              % (cell_id, formula[:60], exc))
                     continue
                 self.parsed += 1
-                self._cell_node(sheet, row, col)
+                cell_node["parse_status"] = "ok"
+                cell_node["parse_error"] = ""
                 ctx = {"cell": cell_id, "sheet": sheet, "n": 0,
                        "unresolved": 0, "broken": 0}
-                sources = self._emit(ast, ctx)
+                if entry["array_formula"] and ast.kind == "ref":
+                    sources = self._emit_ref(ast, ctx, preserve_range=True)
+                else:
+                    sources = self._emit(ast, ctx)
                 if ast.is_op:
                     role = "result"
                 elif ast.kind == "const":
@@ -1078,9 +1186,29 @@ class AstGraph:
                 ctx["unresolved"] += 1
         return [(node_id, "", "")]
 
-    def _emit_ref(self, node, ctx):
+    def _emit_ref(self, node, ctx, preserve_range=False):
         token = node.name
-        items = self.resolve(token, ctx["sheet"])
+        items = None
+        if preserve_range:
+            sheet_part, body, external = self._split_ref(token)
+            if external is None and _RE_RANGE.match(body):
+                sheet = sheet_part or ctx["sheet"]
+                if sheet in self.index:
+                    min_col, min_row, max_col, max_row = range_boundaries(
+                        body.replace("$", "")
+                    )
+                    ref = "%s%d:%s%d" % (
+                        get_column_letter(min_col), min_row,
+                        get_column_letter(max_col), max_row,
+                    )
+                    items = [(
+                        "range",
+                        sheet,
+                        ref,
+                        (max_col - min_col + 1) * (max_row - min_row + 1),
+                    )]
+        if items is None:
+            items = self.resolve(token, ctx["sheet"])
         multi = len(items) > 1 or (bool(items) and items[0][0] == "range")
         via = token if multi else ""
         out = []
@@ -1097,7 +1225,14 @@ class AstGraph:
                     src = self._blank_node(node_id, "range")
                     src.update({"sheet": sheet, "row": bounds[1], "col": bounds[0],
                                 "coordinate": ref, "value": n,
+                                "range_truncated": (sheet, ref) in self._truncated_ranges,
                                 "label": "%s (%d cells)" % (ref, n)})
+                    if preserve_range:
+                        # A top-level CSE range is an expression root shared by
+                        # projected members. Give the range a valid formula
+                        # owner (the array anchor encountered first) while each
+                        # member retains exactly one incoming root edge.
+                        src["owner"] = ctx["cell"]
             elif item[0] == "name":
                 node_id = "name:%s" % item[1]
                 src = self.nodes.get(node_id) or self._blank_node(node_id, "name")
@@ -1285,7 +1420,9 @@ class AstGraph:
 
 NODE_FIELDS = ["id", "kind", "sheet", "coordinate", "row", "col", "owner", "op",
                "op_kind", "arity", "expr", "label", "formula", "value",
-               "array_formula", "in_degree", "out_degree", "in_cycle"]
+               "array_formula", "array_anchor", "array_ref", "array_row",
+               "array_col", "ast_schema_version", "parse_status", "parse_error",
+               "value_type", "range_truncated", "in_degree", "out_degree", "in_cycle"]
 EDGE_FIELDS = ["source", "target", "role", "arg_index", "op", "cell", "ref",
                "via_range", "cross_sheet", "in_cycle"]
 
@@ -1313,8 +1450,12 @@ _GRAPHML_NODE_TYPES = {
     "kind": "string", "sheet": "string", "coordinate": "string", "row": "int",
     "col": "int", "owner": "string", "op": "string", "op_kind": "string",
     "arity": "int", "expr": "string", "label": "string", "formula": "string",
-    "value": "string", "array_formula": "boolean", "in_degree": "int",
-    "out_degree": "int", "in_cycle": "boolean",
+    "value": "string", "array_formula": "boolean", "array_anchor": "string",
+    "array_ref": "string", "array_row": "int", "array_col": "int",
+    "ast_schema_version": "string", "parse_status": "string",
+    "parse_error": "string", "value_type": "string",
+    "range_truncated": "boolean",
+    "in_degree": "int", "out_degree": "int", "in_cycle": "boolean",
 }
 _GRAPHML_EDGE_TYPES = {
     "role": "string", "arg_index": "int", "op": "string", "cell": "string",
@@ -3203,6 +3344,14 @@ def process(path, args):
 
     out_dir = Path(args.out) / path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "production", False):
+        # Production is a closed two-file contract even when this directory
+        # previously held debug output from a development run.
+        for old in out_dir.iterdir():
+            if old.is_dir() and not old.is_symlink():
+                shutil.rmtree(old)
+            else:
+                old.unlink()
 
     if not args.no_csv:
         write_csv(out_dir, nodes, edges)

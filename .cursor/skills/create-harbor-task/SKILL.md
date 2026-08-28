@@ -51,7 +51,8 @@ TASK="tasks_outputs/$WB-outputs"
 Expected artifacts:
 
 - `ast_out/$WB/{nodes.csv,edges.csv}`
-- `seg_out/$WB/{segments.json,curation.toml,lineage.json}`
+- `seg_out/$WB/curation.toml`, `current.json`, and the immutable current
+  `generations/<generation_id>/{generation-manifest.json,segments.json,bands.csv,output_candidates.csv,lineage.json,lineage/}`
 - `inputs_out/$WB-inputs.xlsx`: unredacted baseline inputs
 - `runs/disclosure/$WB-outputs/{bands,probe,records,context,verify}.json`
 - `runs/$WB-variable-sources/disclosure-faithfulness.md`
@@ -79,7 +80,10 @@ Stage all requested workbooks before promoting any of them.
 ## Non-negotiable gates
 
 - Stop on every failed, skipped, missing, ambiguous, or unreviewed gate.
-- Segmentation must report `passed: true`; `SKIPPED` is not acceptable.
+- Segmentation must resolve through the versioned current-generation pointer and
+  pass the strict generation gate; direct legacy files are not production input.
+- Legacy direct artifacts are an offline compatibility layout. Publication never
+  replaces existing direct files or directories; migrate them only while offline.
 - Preserve an existing `curation.toml`. Never pass `--recurate` unless the user
   explicitly asks to discard curation.
 - Do not silently change curated outputs because normalization, profiling,
@@ -130,6 +134,13 @@ test ! -f "$SEG_ROOT/$WB/curation.toml" || \
   shasum -a 256 "$SEG_ROOT/$WB/curation.toml"
 python3 xl_segment.py "$WB" --source "$SOURCE" \
   --ast-dir "$AST_ROOT" -o "$SEG_ROOT"
+python3 -m xl_seg.publication validate "$SEG_ROOT/$WB" \
+  --source "$SOURCE/$WB.xlsx" --ast-dir "$AST_ROOT/$WB" \
+  --validate-live-evidence --require-pass
+GENERATION_ID=$(python3 -m xl_seg.publication validate "$SEG_ROOT/$WB" \
+  --source "$SOURCE/$WB.xlsx" --ast-dir "$AST_ROOT/$WB" \
+  --validate-live-evidence --require-pass |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])')
 ```
 
 When no curation exists and the heuristic auto-includes nothing, the segmenter
@@ -147,20 +158,9 @@ Summarize every included output and the strongest exclusions from
 curation, re-run the same command. If an existing curation file changed without
 explicit approval, stop.
 
-Require the full verification proof:
-
-```bash
-python3 - "$SEG_ROOT/$WB/segments.json" <<'PY'
-import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-v = data.get("verification") or {}
-if v.get("skipped") or v.get("passed") is not True:
-    raise SystemExit("segmentation verification is not PASS: %r" % v)
-if v.get("seeded_inside_output_cone_count", 0) != 0:
-    raise SystemExit("segmentation seeded cells inside the output cone")
-print("segmentation PASS")
-PY
-```
+Only the full validator command above establishes PASS. Record its returned
+`generation_id`; reading `current.json` or checking its schema alone is never a
+verification result.
 
 Do not weaken the verifier, use `--no-verify`, or special-case the workbook.
 
@@ -168,8 +168,11 @@ Do not weaken the verifier, use `--no-verify`, or special-case the workbook.
 
 ```bash
 python3 xl_input_mask.py "$WB" --source "$SOURCE" \
-  --seg-dir "$SEG_ROOT" -o "$BASE_INPUT_ROOT"
+  --seg-dir "$SEG_ROOT" --ast-dir "$AST_ROOT" \
+  --segmentation-mode strict --expected-generation-id "$GENERATION_ID" \
+  -o "$BASE_INPUT_ROOT"
 test -f "$BASE_INPUT_ROOT/$WB-inputs.xlsx"
+test -f "$BASE_INPUT_ROOT/$WB-inputs.segmentation.json"
 shasum -a 256 "$BASE_INPUT_ROOT/$WB-inputs.xlsx"
 ```
 
@@ -346,7 +349,9 @@ and all failed build directories as diagnostics until completion.
 ```bash
 BASE_SHA=$(shasum -a 256 "$BASE_INPUT_ROOT/$WB-inputs.xlsx" | awk '{print $1}')
 python3 xl_input_mask.py "$WB" --source "$SOURCE" \
-  --seg-dir "$SEG_ROOT" -o "$MCP_INPUT_ROOT" \
+  --seg-dir "$SEG_ROOT" --ast-dir "$AST_ROOT" \
+  --segmentation-mode strict --expected-generation-id "$GENERATION_ID" \
+  -o "$MCP_INPUT_ROOT" \
   --mask-cells "$MCP/mask_cells.json"
 test "$(shasum -a 256 "$BASE_INPUT_ROOT/$WB-inputs.xlsx" | awk '{print $1}')" \
   = "$BASE_SHA"
@@ -365,6 +370,9 @@ test ! -e "$STAGED"
 python3 xl_output_task.py "$WB" \
   --source "$SOURCE" \
   --seg-root "$SEG_ROOT" \
+  --ast-dir "$AST_ROOT" \
+  --segmentation-mode strict \
+  --expected-generation-id "$GENERATION_ID" \
   --inputs-root "$MCP_INPUT_ROOT" \
   --variable-source-audit-inputs-root "$BASE_INPUT_ROOT" \
   --variable-source-audit-root runs \
@@ -397,7 +405,10 @@ test -f "$DISCLOSURE"
 python3 "$DISCLOSURE" select \
   --task-dir "$STAGED" \
   --golden "$SOURCE/$WB.xlsx" \
-  --ast-dir "$AST_ROOT"
+  --ast-dir "$AST_ROOT" \
+  --seg-root "$SEG_ROOT" \
+  --segmentation-mode strict \
+  --expected-generation-id "$GENERATION_ID"
 python3 "$DISCLOSURE" probe   --task-dir "$STAGED"
 python3 "$DISCLOSURE" roles   --task-dir "$STAGED"
 # Follow /task-disclosure: if ambiguous_roles.json has cases, launch one

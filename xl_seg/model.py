@@ -17,6 +17,17 @@ csv.field_size_limit(1 << 30)
 
 CELL_KINDS = ("formula", "input", "label")
 AST_KINDS = ("op", "const", "range")
+REQUIRED_AST_NODE_FIELDS = frozenset({
+    "ast_schema_version",
+    "parse_status",
+    "parse_error",
+    "value_type",
+    "range_truncated",
+    "array_anchor",
+    "array_ref",
+    "array_row",
+    "array_col",
+})
 
 A1_RE = re.compile(r"^([A-Za-z]{1,3})(\d{1,7})$")
 
@@ -95,6 +106,16 @@ class Node:
     formula: str
     value: str
     in_cycle: bool
+    array_formula: bool = False
+    array_anchor: str = ""
+    array_ref: str = ""
+    array_row: int | None = None
+    array_col: int | None = None
+    ast_schema_version: str = ""
+    parse_status: str = ""
+    parse_error: str = ""
+    value_type: str = ""
+    range_truncated: bool = False
 
     @property
     def is_cell(self) -> bool:
@@ -125,6 +146,9 @@ class Graph:
     edges: list[Edge]
     in_edges: dict[str, list[Edge]] = field(default_factory=dict)
     out_edges: dict[str, list[Edge]] = field(default_factory=dict)
+    capabilities: dict[str, bool] = field(default_factory=dict)
+    integrity_errors: list[dict] = field(default_factory=list)
+    ast_schema_version: str = ""
 
     def owner_of(self, node_id: str) -> str | None:
         """Resolve any node to the spreadsheet cell that owns it."""
@@ -153,10 +177,25 @@ def _int(text: str):
         return None
 
 
+def _text(row: dict, key: str, default: str = "") -> str:
+    value = row.get(key)
+    return default if value is None else value
+
+
+def _bool(row: dict, key: str, default: bool = False) -> bool:
+    value = row.get(key)
+    if value in (None, ""):
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def load(ast_dir: Path, wb: str) -> Graph:
     nodes: dict[str, Node] = {}
+    node_fields: set[str] = set()
     with open(ast_dir / "nodes.csv", newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
+        reader = csv.DictReader(fh)
+        node_fields = set(reader.fieldnames or ())
+        for row in reader:
             nodes[row["id"]] = Node(
                 id=row["id"],
                 kind=row["kind"],
@@ -172,12 +211,25 @@ def load(ast_dir: Path, wb: str) -> Graph:
                 label=row["label"],
                 formula=row["formula"],
                 value=row["value"],
-                in_cycle=row["in_cycle"] == "True",
+                in_cycle=_bool(row, "in_cycle"),
+                array_formula=_bool(row, "array_formula"),
+                array_anchor=_text(row, "array_anchor"),
+                array_ref=_text(row, "array_ref"),
+                array_row=_int(row.get("array_row")),
+                array_col=_int(row.get("array_col")),
+                ast_schema_version=_text(row, "ast_schema_version"),
+                parse_status=_text(row, "parse_status"),
+                parse_error=_text(row, "parse_error"),
+                value_type=_text(row, "value_type"),
+                range_truncated=_bool(row, "range_truncated"),
             )
 
     edges: list[Edge] = []
+    edge_fields: set[str] = set()
     with open(ast_dir / "edges.csv", newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
+        reader = csv.DictReader(fh)
+        edge_fields = set(reader.fieldnames or ())
+        for row in reader:
             edges.append(
                 Edge(
                     source=row["source"],
@@ -188,12 +240,77 @@ def load(ast_dir: Path, wb: str) -> Graph:
                     cell=row["cell"],
                     ref=row["ref"],
                     via_range=row["via_range"],
-                    cross_sheet=row["cross_sheet"] == "True",
+                    cross_sheet=_bool(row, "cross_sheet"),
                 )
             )
 
-    graph = Graph(wb=wb, nodes=nodes, edges=edges)
+    schema_versions = {
+        node.ast_schema_version for node in nodes.values()
+        if node.ast_schema_version
+    }
+    capabilities = {
+        "required_node_fields": REQUIRED_AST_NODE_FIELDS <= node_fields,
+        "schema_version_v2": schema_versions == {"xl-ast/v2"},
+        "edge_endpoints": {"source", "target"} <= edge_fields,
+        "formula_parse_status": "parse_status" in node_fields,
+        "array_member_coordinates": {
+            "array_anchor", "array_ref", "array_row", "array_col"
+        } <= node_fields,
+        "raw_value_type": "value_type" in node_fields,
+    }
+    integrity_errors: list[dict] = []
+    for edge_index, edge in enumerate(edges):
+        missing = [
+            endpoint for endpoint in (edge.source, edge.target)
+            if endpoint not in nodes
+        ]
+        if missing:
+            integrity_errors.append({
+                "code": "missing_edge_endpoint",
+                "edge_index": edge_index,
+                "missing": missing[:2],
+            })
+    for node in nodes.values():
+        if node.kind in AST_KINDS and (
+            not node.owner
+            or node.owner not in nodes
+            or nodes[node.owner].kind != "formula"
+        ):
+            integrity_errors.append({
+                "code": "invalid_ast_owner",
+                "node": node.id,
+                "owner": node.owner,
+            })
+        if node.kind == "formula" and node.parse_status == "error":
+            integrity_errors.append({
+                "code": "formula_parse_error",
+                "node": node.id,
+                "detail": node.parse_error[:240],
+            })
+
+    graph = Graph(
+        wb=wb,
+        nodes=nodes,
+        edges=edges,
+        capabilities=capabilities,
+        integrity_errors=integrity_errors,
+        ast_schema_version=(
+            next(iter(schema_versions)) if len(schema_versions) == 1 else ""
+        ),
+    )
     for edge in edges:
+        if edge.source not in nodes or edge.target not in nodes:
+            continue
         graph.in_edges.setdefault(edge.target, []).append(edge)
         graph.out_edges.setdefault(edge.source, []).append(edge)
+    for node in nodes.values():
+        if node.kind != "formula" or node.parse_status != "ok":
+            continue
+        roots = graph.in_edges.get(node.id, ())
+        if len(roots) != 1:
+            graph.integrity_errors.append({
+                "code": "invalid_formula_root_count",
+                "node": node.id,
+                "count": len(roots),
+            })
     return graph

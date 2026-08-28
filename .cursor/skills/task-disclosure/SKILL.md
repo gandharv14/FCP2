@@ -37,15 +37,31 @@ python3 $S bench --tasks-root ../08_12_34_samples_tasks_outputs_hinted
 python3 $S select --task-dir ../08_12_34_samples_tasks_outputs_hinted/0529-outputs
 python3 $S probe  --task-dir ../08_12_34_samples_tasks_outputs_hinted/0529-outputs
 python3 $S roles  --task-dir ../08_12_34_samples_tasks_outputs_hinted/0529-outputs
+python3 $S roles-validate --task-dir ../08_12_34_samples_tasks_outputs_hinted/0529-outputs  # only when the arbitration agent ran
 python3 $S detect --task-dir ../08_12_34_samples_tasks_outputs_hinted/0529-outputs
 python3 $S context --task-dir ../08_12_34_samples_tasks_outputs_hinted/0529-outputs
 python3 $S write --task-dir ../08_12_34_samples_tasks_outputs_hinted/0529-outputs --out ../tmp-0529-unified
+python3 $S faithcheck --task-dir ../tmp-0529-unified
 python3 $S verify --task-dir ../tmp-0529-unified
 ```
+
+`faithcheck` runs **after `write` and before `verify`**, and it is fail-closed: a
+nonzero exit means at least one written sentence could not be mechanically re-derived
+from the golden workbook, and the task must not proceed to verify, review, or staging.
+Do not hand-edit the instruction to clear a fault; fix the generator input (or report
+the defect) and regenerate through `detect`/`write`, then rerun `faithcheck`.
 
 If `roles` reports a non-zero case count, launch the arbitration agent below and write
 `runs/disclosure/<task>/role_resolutions.json` **before** `detect`. `detect` exits if
 collisions exist and that file is missing or incomplete. Zero collisions need no file.
+
+After the agent writes the file, run `roles-validate`. It salvages a lone JSON
+object from prose or concatenated output (with a warning), then strictly
+validates every row (known `case_id`, no duplicates, `chosen` among that
+case's candidates, no unknown keys) and stamps `"validated": true`. `detect`
+refuses any resolutions file that has not passed `roles-validate`. On
+validation errors, re-launch the arbitration agent exactly once, passing the
+printed errors verbatim; a second failure is a blocker.
 
 For a batch:
 
@@ -111,6 +127,7 @@ Each stage writes to `runs/disclosure/<task>/`:
 - `role_resolutions.json`
 - `records.json`
 - `context.json`
+- `faithcheck.json`
 - `verify.json`
 - `migration-summary.json`
 
@@ -121,6 +138,32 @@ The writer creates two task artifacts:
 
 - `tests/disclosure.json`: reviewer copy with evidence and audit details.
 - `instruction.md`: agent-facing text without formulas or answer values.
+
+## Deterministic faithfulness gate (`faithcheck`)
+
+`faithcheck` mechanically re-derives every claim the written disclosure makes and
+exits nonzero on any divergence. It writes `runs/disclosure/<task>/faithcheck.json`
+(a fault list with record ids, claim kind, expected vs found) and never writes into
+the task directory, so no golden value can reach an agent-visible artifact. Its four
+claim families mirror the observed blocker classes:
+
+- **Row labels.** Every stated target and operand label is re-resolved with the
+  leftward resolver; a mismatch is a fault (unit stamps such as `000A$` or `US$m`,
+  basis stamps such as `% of EBITDA`, period qualifiers such as `historical`, and
+  computed cached text are all rejected by the resolver).
+- **Copied scope.** The stated band must be the maximal same-mechanics golden span,
+  in the right geometry: a single-cell formula may not be phrased as a copied
+  calculation, a copied family may not be fragmented or truncated, and one record
+  may not span two copy families.
+- **Reference completeness.** Every reference, sign, and literal of the
+  representative golden formula must appear in the rendered mechanics, including the
+  lock behaviour of pinned references in copied bands and bare cross-sheet source
+  links that feed graded outputs.
+- **Graded-output closure.** No disclosed record may reach a graded answer, its
+  equality aliases (bare `=X` links, signed or not), or its same-row copied
+  equivalents. Such records must be suppressed, not disclosed.
+
+A faithcheck failure is blocking. There is no override flag by design.
 
 ## Verification
 

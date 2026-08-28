@@ -53,10 +53,15 @@ AA_RUN="runs/$WB-additional-assumptions"
 STAGE_ROOT=tasks_outputs_mcp
 STAGED="$STAGE_ROOT/$WB-outputs"
 TASK="tasks_outputs/$WB-outputs"
+# Golden source, .xlsx preferred, .xlsm accepted:
+GOLDEN=$(PYTHONPATH=synthetic-data-pipeline python3 -c \
+  "import sys; from xl_artifact_paths import resolve_workbook_artifact; \
+   print(resolve_workbook_artifact(sys.argv[1], sys.argv[2]))" "$SOURCE" "$WB")
 ```
 
 Expected artifacts:
 
+- `runs/preflight/$WB.json`: source-health verdict (must be `healthy`)
 - `release_out/$WB/current-release.json`, immutable
   `releases/<release_id>/release-manifest.json`, and immutable
   `task-generations/<task_generation_id>/generation-manifest.json`
@@ -279,6 +284,19 @@ verification result.
 
 Do not weaken the verifier, use `--no-verify`, or special-case the workbook.
 
+Then require a healthy source-health verdict before any model spend:
+
+```bash
+python3 xl_preflight.py "$WB" --source "$SOURCE" --seg-root "$SEG_ROOT" \
+  --out runs/preflight
+```
+
+A non-`healthy` classification (`frontier_unsafe`, `unsafe_circular`,
+`stale_cache_repairable`, `cached_mismatch`, `unverified`, `missing_source`)
+is a blocker: record `runs/preflight/$WB.json` as the quarantine verdict and
+stop. `stale_cache_repairable` means the golden must be recalculated and
+re-saved in Excel; do not work around any verdict inside the pipeline.
+
 ### 3. Build baseline inputs
 
 ```bash
@@ -432,6 +450,34 @@ workbooks. Write `"$RUN/maskability_report.json"` and fail unless:
 - a variable with an unmaskable or uncertain duplicate is fully excluded and
   its draft disposition is updated; partial masking is forbidden
 - duplicate refs across variables are intentional, compatible, and documented
+- the offline `leakscan` below reports zero unapproved value leaks
+
+Then run the oracle's duplicate/leak detector offline against the baseline
+inputs workbook. This is the same detector the step-14 HTTP oracle applies to
+the delivered workbook; any unapproved leak here is a blocker — fix the spec
+(mask, exclude, or justify) before building.
+
+```bash
+python3 xl_variable_mcp.py leakscan "$NORMALIZED" \
+  --workbook "$WB" --source "$SOURCE" \
+  --inputs "$BASE_INPUT_ROOT/$WB-inputs.xlsx" \
+  --report "$RUN/leakscan_report.json"
+```
+
+Pass `--allowlist "$RUN/oracle-allowlist.json"` only when a reviewed allowlist
+for legitimate unavoidable duplicates already exists; the command exits
+nonzero on any unapproved leak or allowlist fault.
+
+If the offline leakscan blocks with unapproved duplicate-value leaks, rerun it
+with `--emit-patch "$RUN/leak_patch.json"`. The patch proposes exactly one
+action per leak: `mask` (append the typed duplicate cell to that variable's
+`workbook.cells`), `extra_cell` (blank a formatted-text/percent/date rendering;
+the reason names the kind and source cell), or `exclude` (value not safely
+blankable; the draft_id chain is surfaced for dispositions). Review each
+proposal, apply the accepted ones by editing `normalize_$WB.py` (never
+`normalized.json` directly), rerun the normalizer, and re-scan until leakscan
+exits 0. Legitimate duplicates go in the reviewed allowlist instead —
+allowlisted leaks generate no proposals.
 
 Re-run the atomic normalizer and profile validator after any change. Do not use
 an allowlist to hide an unknown leak. If this step empties a spec that was
@@ -445,6 +491,7 @@ profiles, seed, and golden workbook. The build is network-free.
 ```bash
 A="$RUN/mcp-build-a"
 B="$RUN/mcp-build-b"
+python3 .cursor/skills/create-harbor-task/scripts/archive_run_dir.py "$A" "$B"
 test ! -e "$A" && test ! -e "$B"
 python3 xl_variable_mcp.py build "$NORMALIZED" "$A" \
   --workbook "$WB" --source "$SOURCE"
@@ -460,6 +507,7 @@ if report.get("valid") is not True:
     raise SystemExit(report)
 print(json.dumps(report, indent=2, sort_keys=True))
 PY
+python3 .cursor/skills/create-harbor-task/scripts/archive_run_dir.py "$MCP"
 test ! -e "$MCP"
 mv "$A" "$MCP"
 uv run --python 3.12 --with fastmcp --with openpyxl \
@@ -495,6 +543,7 @@ loss, and a non-empty mask. Never overwrite the baseline inputs workbook.
 MCP mode:
 
 ```bash
+python3 .cursor/skills/create-harbor-task/scripts/archive_run_dir.py "$STAGED"
 test ! -e "$STAGED"
 python3 xl_output_task.py "$WB" \
   --source "$SOURCE" \
@@ -545,13 +594,23 @@ python3 "$DISCLOSURE" select \
 python3 "$DISCLOSURE" probe   --task-dir "$STAGED"
 python3 "$DISCLOSURE" roles   --task-dir "$STAGED"
 # Follow /task-disclosure: if ambiguous_roles.json has cases, launch one
-# gpt-5.6-sol-high subagent to write role_resolutions.json before detect.
+# gpt-5.6-sol-high subagent to write role_resolutions.json, then validate it.
+# roles-validate stamps the file; detect refuses unvalidated files. On errors,
+# re-launch the agent once with the printed errors verbatim.
+test ! -f "$DISCLOSURE_RUN/role_resolutions.json" || \
+  python3 "$DISCLOSURE" roles-validate --task-dir "$STAGED"
 python3 "$DISCLOSURE" detect  --task-dir "$STAGED"
 python3 "$DISCLOSURE" context --task-dir "$STAGED"
 python3 "$DISCLOSURE" write   --task-dir "$STAGED"
+# Deterministic faithfulness gate: every written sentence is mechanically
+# re-derived from the golden (labels, copied scope, references, locks, alias
+# closure). Fail-closed; fix the generator and rerun detect/context/write —
+# never hand-edit the instruction.
+python3 "$DISCLOSURE" faithcheck --task-dir "$STAGED" --golden "$GOLDEN"
 python3 "$DISCLOSURE" verify  --task-dir "$STAGED"
 test -f "$DISCLOSURE_RUN/bands.json" &&
   test -f "$DISCLOSURE_RUN/records.json" &&
+  test -f "$DISCLOSURE_RUN/faithcheck.json" &&
   test -f "$DISCLOSURE_RUN/verify.json" &&
   test -f "$STAGED/tests/disclosure.json"
 python3 - "$STAGED" <<'PY'
@@ -570,6 +629,12 @@ Require verification without `--force` or `--no-fail`, no old hint/manifest
 sections, and no formulas/evidence in the agent-facing instruction.
 
 ### 13. Naturalize the complete staged instruction
+
+A rerun is first-class: archive any stale run directory instead of refusing.
+
+```bash
+python3 .cursor/skills/create-harbor-task/scripts/archive_run_dir.py "$NAT_RUN"
+```
 
 Load and follow
 `.cursor/skills/naturalize-finance-task-instruction/SKILL.md`. Initialize or
@@ -656,12 +721,26 @@ docker rm -f "$ORACLE_CONTAINER"
 trap - EXIT
 ```
 
+The oracle probes the sidecar for readiness (a trivial tool call, bounded
+timeout) before any semantic check. If the report's only failure is
+`mcp_not_ready`, capture the container logs and restart the container exactly
+once, then rerun the oracle:
+
+```bash
+docker logs "$ORACLE_CONTAINER" > "$RUN/oracle-container.log" 2>&1
+docker restart "$ORACLE_CONTAINER"
+```
+
+A second `mcp_not_ready`, or any failure after semantic checks began, is a
+blocker — never restart to retry a semantic failure.
+
 It must build and exercise the shipped sidecar over streamable HTTP, paginate
 like an agent, and prove every variable resolves to exact unsuperseded evidence,
 all chains are visible and acyclic, broad queries conflict, every intended cell
 is blank, no unapproved duplicate representation survives, profile excerpts
 are attributed and value-safe, and forbidden build/evaluation artifacts did not
-ship. Use an explicit reviewed allowlist only for legitimate unavoidable
+ship. The oracle re-checks the delivered workbook with the same duplicate/leak
+detector the step-8 `leakscan` ran offline (defense in depth). Use an explicit reviewed allowlist only for legitimate unavoidable
 duplicates; unknown, duplicate, and unused entries fail rather than becoming
 report-only warnings.
 
@@ -711,6 +790,7 @@ steps 11–15 on this bundle. A full rebuild stages a fresh `$STAGED`, then
 this step runs again.
 
 ```bash
+python3 .cursor/skills/create-harbor-task/scripts/archive_run_dir.py "$AA_RUN"
 python3 .cursor/skills/additional-assumptions-dialogue/scripts/extract_claims.py \
   --task-dir "$STAGED" --out "$AA_RUN"
 ```

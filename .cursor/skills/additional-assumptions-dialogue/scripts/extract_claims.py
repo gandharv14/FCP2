@@ -152,6 +152,38 @@ def build_claim(record: dict, index: int) -> dict:
     }
 
 
+DRAFT_FORMAT_RULES = (
+    "Every speaker turn starts at column 0 as **Title:** text — never number, "
+    "bullet, or indent turns.",
+    "Claim comments are literal, lowercase <!-- claim:RECORD_ID --> lines with "
+    "RECORD_ID copied character-for-character from the claim card (never "
+    "retitle, summarize, or capitalize them).",
+    "Place each claim comment immediately before that claim's first "
+    "conversational turn, one exchange per claim, in claim order.",
+    "Allowed titles only — juniors: Analyst, Associate; seniors: VP, Director, "
+    "Managing Director.",
+)
+
+
+def draft_skeleton(claims: list[dict], juniors: list[str], seniors: list[str]) -> str:
+    """Literal Markdown template the writer must follow, with real record ids."""
+    lines: list[str] = []
+    for index, claim in enumerate(claims):
+        junior = juniors[index % len(juniors)]
+        senior = seniors[index % len(seniors)]
+        lines.append("<!-- claim:%s -->" % claim["record_id"])
+        lines.append(
+            '**%s:** <junior question about the row labelled "%s">'
+            % (junior, claim.get("row_label") or "")
+        )
+        lines.append(
+            "**%s:** <senior answer covering every must_say atom for this claim>"
+            % senior
+        )
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def writer_claim(claim: dict) -> dict:
     keep = (
         "record_id",
@@ -189,6 +221,8 @@ def extract(task_dir: Path) -> dict:
             "senior_titles": seniors,
             "disclosure_body": body,
             "claims": [writer_claim(claim) for claim in claims],
+            "draft_format_rules": list(DRAFT_FORMAT_RULES),
+            "draft_skeleton": draft_skeleton(claims, juniors, seniors),
         },
     }
 

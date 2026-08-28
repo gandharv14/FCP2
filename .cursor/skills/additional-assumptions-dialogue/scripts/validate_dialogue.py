@@ -12,6 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from compose_draft import SLOT_LINE_RE, strip_slot_scaffold
 from aa_lib import (
     ALLOWED_TITLES,
     APPLIED_MARKER,
@@ -73,6 +74,25 @@ AST_DUMP_RE = re.compile(
     re.I,
 )
 COPIED_FORECAST_RE = re.compile(r"is copied across the forecast", re.I)
+# Whole-column (A:A, $V:$V, 'Op Loan 1'!$D:$D) and whole-row (3:3, Sheet!3:5)
+# references. Cell/range tokens with row digits (V12, J15:S15) are handled by
+# cell_refs_in; these regexes only match digit-less column pairs and bare
+# row-number pairs, optionally sheet-qualified.
+_SHEET_PREFIX = r"(?:(?:'[^']+'|[A-Za-z0-9_][A-Za-z0-9_ .&-]*)!)?"
+WHOLE_COL_RE = re.compile(
+    r"(?<![A-Za-z0-9$!:])" + _SHEET_PREFIX +
+    r"\$?[A-Z]{1,3}:\$?[A-Z]{1,3}(?![A-Za-z0-9:(])"
+)
+WHOLE_ROW_RE = re.compile(
+    r"(?<![A-Za-z0-9$!:.])" + _SHEET_PREFIX +
+    r"\$?\d{1,7}:\$?\d{1,7}(?![A-Za-z0-9:])"
+)
+
+
+def whole_axis_refs(text: str) -> list[str]:
+    hits = [match.group(0).strip() for match in WHOLE_COL_RE.finditer(text or "")]
+    hits.extend(match.group(0).strip() for match in WHOLE_ROW_RE.finditer(text or ""))
+    return hits
 
 
 def sheet_named_in(text: str, sheet: str) -> bool:
@@ -122,37 +142,163 @@ def expected_record_ids(claims_payload: dict) -> list[str]:
     return [claim["record_id"] for claim in (claims_payload.get("claims") or [])]
 
 
-def review_accuracy_passed(review: dict | None, claims_payload: dict) -> bool:
+MUST_SAY_VERDICTS = ("entailed", "missing", "contradicted")
+CLAIM_ENTRY_FRAGMENT = (
+    '{"record_id": "<record_id copied from claims.json>", '
+    '"must_say": "entailed|missing|contradicted"}'
+)
+ACCURACY_FRAGMENT = (
+    '"accuracy": {"verdict": "pass|fail", "claims": [%s, ...], '
+    '"extras": [], "cell_refs_in_senior_turns": []}' % CLAIM_ENTRY_FRAGMENT
+)
+NATURALNESS_FRAGMENT = '"naturalness": {"verdict": "pass|fail", "findings": []}'
+REVIEW_SCHEMA_TEMPLATE = (
+    "{\n"
+    '  "agent_model": "gpt-5.6-sol-high",\n'
+    '  "round": <1 or 2>,\n'
+    '  "accuracy": {\n'
+    '    "verdict": "pass" or "fail",\n'
+    '    "claims": [%s, ... one entry per claim, in claims.json order],\n'
+    '    "extras": [],\n'
+    '    "cell_refs_in_senior_turns": []\n'
+    "  },\n"
+    '  %s,\n'
+    '  "passed": true or false\n'
+    "}" % (CLAIM_ENTRY_FRAGMENT, NATURALNESS_FRAGMENT)
+)
+
+
+def review_accuracy_faults(review: dict | None, claims_payload: dict) -> list[str]:
+    """Diagnose the accuracy gate. Empty list == review_accuracy_passed.
+
+    Every fault names the offending/missing field and the schema fragment the
+    reviewer was expected to produce, so a malformed review is fixable from
+    the message alone. The conditions are exactly the historical gate: same
+    things fail, they just fail with a diagnosis.
+    """
     if not review:
-        return False
-    accuracy = review.get("accuracy") or {}
+        return [
+            "no review JSON was loaded; expected an object with top-level keys "
+            '"agent_model", "round", "accuracy", "naturalness", "passed"'
+        ]
+    faults: list[str] = []
+    accuracy = review.get("accuracy")
+    if not isinstance(accuracy, dict):
+        faults.append(
+            'review is missing the "accuracy" object (do not rename it or use '
+            "claim_coverage/ordered_claims); expected fragment: %s" % ACCURACY_FRAGMENT
+        )
+        accuracy = {}
     rows = accuracy.get("claims") or []
+    if not isinstance(rows, list):
+        faults.append(
+            'accuracy.claims is %r; expected an array of %s'
+            % (type(rows).__name__, CLAIM_ENTRY_FRAGMENT)
+        )
+        rows = []
+    elif "claims" not in accuracy and isinstance(review.get("accuracy"), dict):
+        faults.append(
+            'accuracy is missing the "claims" array; expected fragment: %s '
+            "(per-claim lists named must_say/ordered_claims are not read)"
+            % ACCURACY_FRAGMENT
+        )
     expected = expected_record_ids(claims_payload)
-    if not expected or len(rows) != len(expected):
-        return False
-    if [row.get("record_id") for row in rows] != expected:
-        return False
-    if any((row.get("must_say") != "entailed") for row in rows):
-        return False
+    if not expected:
+        faults.append("claims pack lists no claims; cannot cross-check review coverage")
+    elif len(rows) != len(expected):
+        faults.append(
+            "accuracy.claims has %d entries; expected exactly %d — one %s per "
+            "claim in claims.json order" % (len(rows), len(expected), CLAIM_ENTRY_FRAGMENT)
+        )
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            faults.append(
+                "accuracy.claims[%d] is %r; expected an object %s"
+                % (index, row, CLAIM_ENTRY_FRAGMENT)
+            )
+            continue
+        if index < len(expected) and row.get("record_id") != expected[index]:
+            faults.append(
+                "accuracy.claims[%d].record_id is %r; expected %r (claims.json order)"
+                % (index, row.get("record_id"), expected[index])
+            )
+        if "must_say" not in row:
+            faults.append(
+                'accuracy.claims[%d] (record_id %r) is missing the required '
+                '"must_say" field; expected fragment: %s'
+                % (index, row.get("record_id"), CLAIM_ENTRY_FRAGMENT)
+            )
+        elif row.get("must_say") != "entailed":
+            verdict = row.get("must_say")
+            if verdict in MUST_SAY_VERDICTS:
+                faults.append(
+                    "accuracy.claims[%d] (record_id %r) has must_say %r; every "
+                    'claim must be "entailed" for accuracy to pass'
+                    % (index, row.get("record_id"), verdict)
+                )
+            else:
+                faults.append(
+                    "accuracy.claims[%d] (record_id %r) has must_say %r; expected "
+                    'one of the strings "entailed"|"missing"|"contradicted" '
+                    "(booleans, lists, and objects are invalid)"
+                    % (index, row.get("record_id"), verdict)
+                )
     if accuracy.get("cell_refs_in_senior_turns"):
-        return False
-    return True
+        faults.append(
+            "accuracy.cell_refs_in_senior_turns is non-empty: %r; senior turns "
+            "must not contain cell refs"
+            % list(accuracy.get("cell_refs_in_senior_turns"))[:6]
+        )
+    return faults
+
+
+def review_accuracy_passed(review: dict | None, claims_payload: dict) -> bool:
+    return not review_accuracy_faults(review, claims_payload)
+
+
+def review_faults(review: dict | None, claims_payload: dict) -> list[str]:
+    """Diagnose the full round-1 gate. Empty list == review_passed."""
+    if not review:
+        return [
+            "no review JSON was loaded; expected: %s" % REVIEW_SCHEMA_TEMPLATE
+        ]
+    faults = review_accuracy_faults(review, claims_payload)
+    accuracy = review.get("accuracy") or {}
+    if isinstance(accuracy, dict):
+        if accuracy.get("verdict") != "pass":
+            faults.append(
+                'accuracy.verdict is %r; expected the string "pass" (fragment: '
+                '"verdict": "pass|fail")' % accuracy.get("verdict")
+            )
+        extras = accuracy.get("extras") or []
+        if extras:
+            faults.append(
+                "accuracy.extras is non-empty: %r; extras must be []" % extras[:4]
+            )
+    naturalness = review.get("naturalness")
+    if not isinstance(naturalness, dict):
+        faults.append(
+            'review is missing the "naturalness" object; expected fragment: %s'
+            % NATURALNESS_FRAGMENT
+        )
+    elif naturalness.get("verdict") != "pass":
+        faults.append(
+            'naturalness.verdict is %r; expected the string "pass" (fragment: %s)'
+            % (naturalness.get("verdict"), NATURALNESS_FRAGMENT)
+        )
+    if review.get("passed") is not True:
+        faults.append(
+            '"passed" is %r; expected the JSON boolean true (only when both '
+            "verdicts pass, every must_say is entailed, extras is empty, and "
+            "cell_refs_in_senior_turns is empty)" % review.get("passed")
+        )
+    return faults
 
 
 def review_passed(review: dict | None, claims_payload: dict | None = None) -> bool:
-    if not review:
-        return False
-    naturalness = review.get("naturalness") or {}
     if claims_payload is None:
         claims_payload = {}
-    extras = (review.get("accuracy") or {}).get("extras") or []
-    return (
-        review.get("passed") is True
-        and review_accuracy_passed(review, claims_payload)
-        and (review.get("accuracy") or {}).get("verdict") == "pass"
-        and not extras
-        and naturalness.get("verdict") == "pass"
-    )
+    return not review_faults(review, claims_payload)
 
 
 def map_turns_to_claims(turns: list[dict], claims: list[dict]) -> tuple[dict[str, list[dict]], list[str]]:
@@ -166,7 +312,11 @@ def map_turns_to_claims(turns: list[dict], claims: list[dict]) -> tuple[dict[str
         if record_id:
             seen_comment = True
             if record_id not in mapped:
-                faults.append(f"unknown claim comment: {record_id}")
+                faults.append(
+                    "unknown claim comment: %s; expected RECORD_ID copied exactly "
+                    "from claims.json, one of: %s"
+                    % (record_id, ", ".join(sorted(mapped)[:4]) or "(none)")
+                )
                 pending = None
                 continue
             mapped[record_id].append(turn)
@@ -175,7 +325,12 @@ def map_turns_to_claims(turns: list[dict], claims: list[dict]) -> tuple[dict[str
         if seen_comment and pending:
             mapped[pending].append(turn)
     if claims and not seen_comment:
-        faults.append("no claim comments; mapping is authoritative")
+        faults.append(
+            "no claim comments; mapping is authoritative — expected a literal "
+            "<!-- claim:RECORD_ID --> line (lowercase 'claim:', RECORD_ID copied "
+            "character-for-character from claims.json) immediately before each "
+            "claim's first turn"
+        )
     return mapped, faults
 
 
@@ -293,8 +448,14 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
     require_cast(claims_payload)
     turns = parse_turns(dialogue)
     if not turns:
-        faults.append("dialogue has no speaker turns")
-        accuracy_faults.append("dialogue has no speaker turns")
+        no_turns = (
+            "dialogue has no speaker turns; expected every turn to start at "
+            "column 0 as **Title:** text (for example **Analyst:** How should I "
+            "build this row?) — numbered, bulleted, or indented turns are not "
+            "parsed"
+        )
+        faults.append(no_turns)
+        accuracy_faults.append(no_turns)
         return {
             "passed": False,
             "faults": faults,
@@ -302,6 +463,7 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
             "cast_faults": cast_faults,
             "turns": 0,
             "senior_cell_refs": [],
+            "senior_axis_refs": [],
         }
 
     for turn in turns:
@@ -312,9 +474,51 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
         faults.extend(cast_faults)
 
     senior_text = "\n".join(turn["text"] for turn in turns if is_senior(turn["speaker"]))
-    leaks = cell_refs_in(senior_text)
+    # A visible row label may itself contain an A1-shaped product code
+    # (0261 IS: 'Atrial Fibrillation Best (Chest Belt) (B031)'). The label
+    # check requires the literal label in senior prose, so such tokens are
+    # label text, not cell addresses, and must not count as leaks.
+    label_tokens = {
+        token.strip()
+        for claim in claims
+        for token in cell_refs_in(claim.get("row_label") or "")
+    }
+    leaks = [
+        token for token in cell_refs_in(senior_text)
+        if token.strip() not in label_tokens
+    ]
     if leaks:
         faults.append("senior turns contain cell refs: %s" % ", ".join(leaks[:6]))
+    # The same label-text exemption applies to whole-axis tokens: a visible
+    # row label may itself be shaped like a column pair (0524 Multiples lists
+    # comparables by ticker rows 'UK:BBY', 'ES:ANA'). The label check requires
+    # those literal labels in senior prose, so they are label text, not
+    # whole-column references, and must not count as leaks.
+    axis_label_tokens = {
+        token.strip()
+        for claim in claims
+        for token in whole_axis_refs(claim.get("row_label") or "")
+    }
+    # must_say atoms are mandatory prose; a ticker-shaped label the card
+    # demands (the row labelled "UK:BBY") can never be a reportable leak.
+    axis_label_tokens.update(
+        token.strip()
+        for claim in claims
+        for atom in (claim.get("must_say") or [])
+        for token in whole_axis_refs(atom or "")
+    )
+    axis_leaks = [
+        token for token in whole_axis_refs(senior_text)
+        if token.strip() not in axis_label_tokens
+    ]
+    if axis_leaks:
+        accuracy_faults.append(
+            "senior turns contain whole-column/whole-row references: %s; "
+            "expected the tab name plus the visible row label (say: the row "
+            'labelled "..." on that tab) — a senior may never say A:A, $V:$V, '
+            "'Sheet'!D:D, or 3:3"
+            % ", ".join(list(dict.fromkeys(axis_leaks))[:6])
+        )
 
     mapped, map_faults = map_turns_to_claims(turns, claims)
     accuracy_faults.extend(map_faults)
@@ -325,7 +529,11 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
         ]
         blob = "\n".join(turn["text"] for turn in senior_turns)
         if not senior_turns:
-            accuracy_faults.append(f"{claim['record_id']}: no senior turn")
+            accuracy_faults.append(
+                f"{claim['record_id']}: no senior turn; expected at least one "
+                "**VP:** / **Director:** / **Managing Director:** turn between "
+                "this claim's <!-- claim:... --> comment and the next"
+            )
             continue
         juniors = [
             turn for turn in mapped.get(claim["record_id"], [])
@@ -393,7 +601,75 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
         "cast_faults": list(dict.fromkeys(cast_faults)),
         "turns": len(turns),
         "senior_cell_refs": leaks,
+        "senior_axis_refs": axis_leaks,
     }
+
+
+STRUCTURAL_FILL_RE = re.compile(
+    r"^(?:<!--|#{1,6}\s|\*\*[^*\n]{1,60}:\*\*|"
+    r"(?:Analyst|Associate|VP|Director|Managing Director)\s*:)"
+)
+
+
+def fill_faults(template: str, filled: str) -> list[str]:
+    """Byte-compare the writer-filled draft against the template outside slots.
+
+    Returns at most one fault: a precise error naming the first differing
+    line. Slots ({{SLOT:<id>}} lines) may be replaced by one or more
+    non-blank prose lines; every other line must match byte-for-byte.
+    """
+    t_lines = template.split("\n")
+    f_lines = filled.split("\n")
+    fi = 0
+    ti = 0
+    while ti < len(t_lines):
+        t_line = t_lines[ti]
+        slot = SLOT_LINE_RE.match(t_line)
+        if not slot:
+            if fi >= len(f_lines):
+                return [
+                    "structural drift: the draft ended before template line %d; "
+                    "expected %r" % (ti + 1, t_line)
+                ]
+            if f_lines[fi] != t_line:
+                return [
+                    "structural drift at draft line %d: expected %r (template "
+                    "line %d), found %r" % (fi + 1, t_line, ti + 1, f_lines[fi])
+                ]
+            fi += 1
+            ti += 1
+            continue
+        slot_id = slot.group(1)
+        boundary = t_lines[ti + 1] if ti + 1 < len(t_lines) else None
+        fill: list[tuple[int, str]] = []
+        while fi < len(f_lines) and (boundary is None or f_lines[fi] != boundary):
+            fill.append((fi, f_lines[fi]))
+            fi += 1
+        if not [line for _, line in fill if line.strip()]:
+            return [
+                "slot %s was deleted or left empty; replace the line "
+                "{{SLOT:%s}} (template line %d) with one or more prose lines"
+                % (slot_id, slot_id, ti + 1)
+            ]
+        for lineno, line in fill:
+            if "{{SLOT:" in line:
+                return [
+                    "draft line %d still contains the placeholder %r; replace "
+                    "the whole slot line with prose" % (lineno + 1, line)
+                ]
+            if STRUCTURAL_FILL_RE.match(line):
+                return [
+                    "draft line %d: slot %s fill adds a structural line %r; "
+                    "slots may only be replaced with prose (no new headings, "
+                    "speaker lines, or HTML comments)" % (lineno + 1, slot_id, line)
+                ]
+        ti += 1
+    if fi < len(f_lines) and any(line.strip() for line in f_lines[fi:]):
+        return [
+            "structural drift at draft line %d: content after the template "
+            "end: %r" % (fi + 1, f_lines[fi])
+        ]
+    return []
 
 
 def expected_pointer(task_dir: Path, claims_payload: dict) -> tuple[str, str]:
@@ -602,10 +878,19 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
           require_review_pass: bool, skip_smoke: bool) -> dict:
     if claims_payload.get("empty") or not claims_payload.get("claims"):
         raise DialogueError("empty agent_records: do not apply")
-    if require_review_pass and not review_passed(review, claims_payload):
-        raise DialogueError("review did not pass; not applying after round 1")
-    if not review_accuracy_passed(review, claims_payload):
-        raise DialogueError("reviewer accuracy did not pass; not applying")
+    if require_review_pass:
+        round_faults = review_faults(review, claims_payload)
+        if round_faults:
+            raise DialogueError(
+                "review did not pass; not applying after round 1: "
+                + "; ".join(round_faults[:6])
+            )
+    accuracy_gate_faults = review_accuracy_faults(review, claims_payload)
+    if accuracy_gate_faults:
+        raise DialogueError(
+            "reviewer accuracy did not pass; not applying: "
+            + "; ".join(accuracy_gate_faults[:6])
+        )
     if DOCKER_IMAGE_RE.search((task_dir / "task.toml").read_text(encoding="utf-8")):
         raise DialogueError("refuse apply: bare docker_image task")
 
@@ -697,6 +982,31 @@ def main(argv=None) -> int:
     check.add_argument("--claims", required=True, type=Path)
     check.add_argument("--report", default="")
 
+    fill_cmd = sub.add_parser(
+        "fill-check",
+        help="verify the writer kept the composed template byte-identical "
+             "outside the slots, then run the mechanical draft checks",
+    )
+    fill_cmd.add_argument("--task-dir", required=True, type=Path)
+    fill_cmd.add_argument("--template", required=True, type=Path)
+    fill_cmd.add_argument("--draft", required=True, type=Path)
+    fill_cmd.add_argument("--claims", required=True, type=Path)
+    fill_cmd.add_argument(
+        "--out", default="",
+        help="write the clean dialogue (slot comments stripped) here once "
+             "the structure holds",
+    )
+    fill_cmd.add_argument("--report", default="")
+
+    review_cmd = sub.add_parser(
+        "check-review",
+        help="validate the reviewer JSON against the required schema and round gate",
+    )
+    review_cmd.add_argument("--claims", required=True, type=Path)
+    review_cmd.add_argument("--review", required=True, type=Path)
+    review_cmd.add_argument("--round", type=int, default=1)
+    review_cmd.add_argument("--report", default="")
+
     apply_cmd = sub.add_parser("apply", help="write notes, patch Dockerfile, rewrite instruction")
     apply_cmd.add_argument("--task-dir", required=True, type=Path)
     apply_cmd.add_argument("--draft", required=True, type=Path)
@@ -721,8 +1031,71 @@ def main(argv=None) -> int:
             return 2
         print("smoke PASS: /app/%s" % NOTES_NAME)
         return 0
+    if args.cmd == "check-review":
+        claims_payload = load_claims(args.claims.resolve())
+        try:
+            review = load_review(args.review)
+        except json.JSONDecodeError as exc:
+            review = None
+            faults = [
+                "review file is not valid JSON (%s); expected: %s"
+                % (exc, REVIEW_SCHEMA_TEMPLATE)
+            ]
+        else:
+            if review is None:
+                faults = [
+                    "review file %s does not exist; the reviewer must write it "
+                    "before the round can be scored" % args.review
+                ]
+            elif args.round < 2:
+                faults = review_faults(review, claims_payload)
+            else:
+                faults = review_accuracy_faults(review, claims_payload)
+        report = {
+            "passed": not faults,
+            "round": args.round,
+            "faults": faults,
+            "schema": REVIEW_SCHEMA_TEMPLATE,
+        }
+        if args.report:
+            write_json(Path(args.report), report)
+        print("PASS" if not faults else "FAIL")
+        for fault in faults[:12]:
+            print("  -", fault)
+        return 0 if not faults else 2
+
     task_dir = args.task_dir.resolve()
     claims_payload = load_claims(args.claims.resolve())
+    if args.cmd == "fill-check":
+        template = args.template.read_text(encoding="utf-8")
+        filled = args.draft.read_text(encoding="utf-8")
+        structure_faults = fill_faults(template, filled)
+        report = {
+            "passed": False,
+            "structure_passed": not structure_faults,
+            "structure_faults": structure_faults,
+            "draft_report": None,
+            "out": args.out or None,
+        }
+        if structure_faults:
+            if args.report:
+                write_json(Path(args.report), report)
+            print("FAIL (structural drift)")
+            for fault in structure_faults:
+                print("  -", fault)
+            return 2
+        cleaned = strip_slot_scaffold(filled)
+        if args.out:
+            Path(args.out).write_text(cleaned, encoding="utf-8")
+        draft_report = check_draft(cleaned, claims_payload, task_dir)
+        report["passed"] = draft_report["passed"]
+        report["draft_report"] = draft_report
+        if args.report:
+            write_json(Path(args.report), report)
+        print("PASS" if draft_report["passed"] else "FAIL (check-draft)")
+        for fault in draft_report["faults"][:12]:
+            print("  -", fault)
+        return 0 if draft_report["passed"] else 3
     if args.cmd == "check-draft":
         report = check_draft(args.draft.read_text(encoding="utf-8"), claims_payload, task_dir)
         if args.report:

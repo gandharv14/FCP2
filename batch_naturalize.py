@@ -7,17 +7,24 @@ the exact `## Output` anchor to survive verbatim. So each rewrite is checked
 against the original and reverted unless it preserves:
 
   * the `## Output` anchor,
-  * every backtick-quoted cell reference,
-  * every numeric literal.
+  * every backtick-quoted cell reference, occurrence for occurrence,
+  * every numeric literal, occurrence for occurrence -- a rewrite may
+    neither drop a number from one of two constraints nor inject a new
+    number the original never stated,
+  * the `## Workbook disclosure` section byte-identical,
+
+and unless `disclose.py verify` still passes on the rewritten bundle.
 
 Only instruction.md is touched; workbooks, answer keys and tests are never read.
 """
 import json
 import re
+import subprocess
 import sys
 import shutil
 import time
 import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -86,13 +93,51 @@ def call_proxy(prompt, api_key, timeout=420, attempts=3):
 
 CELLREF = re.compile(r"`[^`\n]*![$A-Z]{1,3}\$?\d{1,6}(?::[$A-Z]{1,3}\$?\d{1,6})?`")
 NUMBER = re.compile(r"-?\d[\d,]*\.?\d*%?")
+DISCLOSURE_HEADING = "## Workbook disclosure"
+DISCLOSE_SCRIPT = Path(".cursor/skills/task-disclosure/scripts/disclose.py")
 
 
 def facts(text):
     return {
-        "refs": sorted(CELLREF.findall(text)),
-        "nums": sorted(NUMBER.findall(text)),
+        "refs": Counter(CELLREF.findall(text)),
+        "nums": Counter(NUMBER.findall(text)),
     }
+
+
+def count_diff(old, new):
+    """(dropped, added) occurrence deltas between two Counters."""
+    dropped = {k: c - new.get(k, 0) for k, c in old.items() if new.get(k, 0) < c}
+    added = {k: c - old.get(k, 0) for k, c in new.items() if old.get(k, 0) < c}
+    return dropped, added
+
+
+def section(text, heading):
+    """The section under `heading` up to the next `## ` heading, or None."""
+    lines = text.splitlines(keepends=True)
+    start = next((i for i, l in enumerate(lines) if l.strip() == heading), None)
+    if start is None:
+        return None
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("## "):
+            return "".join(lines[start:j])
+    return "".join(lines[start:])
+
+
+def verify_disclosure(wb):
+    """Re-run the disclosure verifier on the bundle; '' on pass, else reason."""
+    if not DISCLOSE_SCRIPT.exists():
+        return ""
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(DISCLOSE_SCRIPT), "verify",
+             "--task-dir", f"tasks_outputs_mcp/{wb}-outputs"],
+            capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return "disclosure verify timed out"
+    if proc.returncode != 0:
+        tail = (proc.stdout + proc.stderr).strip().splitlines()
+        return "disclosure verify failed: " + (tail[-1][:120] if tail else "?")
+    return ""
 
 
 def strip_fence(t):
@@ -128,14 +173,26 @@ def do_one(wb, api_key):
         return wb, "REVERT", "lost ## Output anchor"
 
     a, b = facts(original), facts(new)
-    missing_refs = [r for r in a["refs"] if r not in b["refs"]]
-    if missing_refs:
-        return wb, "REVERT", f"dropped {len(missing_refs)} cell refs"
-    missing_nums = [n for n in set(a["nums"]) if n not in set(b["nums"])]
-    if missing_nums:
-        return wb, "REVERT", f"dropped {len(missing_nums)} numbers"
+    dropped, added = count_diff(a["refs"], b["refs"])
+    if dropped:
+        return wb, "REVERT", f"dropped {sum(dropped.values())} cell ref occurrence(s)"
+    if added:
+        return wb, "REVERT", f"added {sum(added.values())} cell ref occurrence(s)"
+    dropped, added = count_diff(a["nums"], b["nums"])
+    if dropped:
+        return wb, "REVERT", f"dropped {sum(dropped.values())} number occurrence(s)"
+    if added:
+        return wb, "REVERT", f"added {sum(added.values())} number occurrence(s)"
+
+    disclosed = section(original, DISCLOSURE_HEADING)
+    if disclosed is not None and section(new, DISCLOSURE_HEADING) != disclosed:
+        return wb, "REVERT", "disclosure section not byte-identical"
 
     p.write_text(new, encoding="utf-8")
+    verdict = verify_disclosure(wb)
+    if verdict:
+        p.write_text(original, encoding="utf-8")
+        return wb, "REVERT", verdict
     return wb, "OK", f"{len(original.splitlines())}->{len(new.splitlines())} lines"
 
 

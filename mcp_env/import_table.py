@@ -24,7 +24,15 @@ def slug(text: str) -> str:
 
 
 def cells(line: str) -> list[str]:
-    return [part.strip() for part in line.strip().strip("|").split("|")]
+    """Split a Markdown table row on unescaped pipes only.
+
+    The audit writer escapes literal pipes inside cells as ``\\|``; splitting
+    on every pipe would shift all following columns and silently corrupt the
+    imported rows.
+    """
+    body = line.strip().strip("|")
+    return [part.strip().replace("\\|", "|")
+            for part in re.split(r"(?<!\\)\|", body)]
 
 
 def import_table(path: Path) -> dict[str, Any]:

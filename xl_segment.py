@@ -19,6 +19,7 @@ is provably sufficient.
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import json
 import random
@@ -684,6 +685,67 @@ def _not_run_verification(
     }
 
 
+def _divergence_roots(cg, result, bad_cells):
+    """Map each failing cell to its nearest divergence root.
+
+    A root is an ancestor that itself diverges from the workbook's cached
+    value while every one of its own sources agrees -- the first place the
+    recomputation went wrong, rather than the downstream symptom the grader
+    happened to sample. Walks the static edges plus the evaluator's
+    runtime-resolved edges so dynamic reads are traced too.
+    """
+    runtime_radj = result.runtime_radj or {}
+    state = {}
+
+    def divergent(cid):
+        cached = state.get(cid)
+        if cached is not None:
+            return cached
+        info = cg.info.get(cid)
+        if info is None or info.node.kind != "formula" or info.is_literal:
+            state[cid] = False
+            return False
+        verdict, _ = evaluate.compare(info.node.value, result.values.get(cid))
+        state[cid] = verdict in ("mismatch", "unresolved")
+        return state[cid]
+
+    source_cache = {}
+
+    def sources(cid):
+        cached = source_cache.get(cid)
+        if cached is None:
+            cached = set(cg.radj.get(cid, ()))
+            cached.update(runtime_radj.get(cid, ()))
+            source_cache[cid] = cached
+        return cached
+
+    roots = {}
+    for bad in bad_cells:
+        seen = {bad}
+        frontier = [bad]
+        root = None
+        budget = 100000
+        while frontier and root is None and budget > 0:
+            nxt = []
+            for cid in frontier:
+                budget -= 1
+                bad_parents = [p for p in sources(cid) if divergent(p)]
+                if not bad_parents:
+                    root = cid
+                    break
+                for parent in bad_parents:
+                    if parent not in seen:
+                        seen.add(parent)
+                        nxt.append(parent)
+            frontier = nxt
+        if root is None:
+            # Every divergent ancestor has a divergent parent: a cycle. Report
+            # the deterministic representative so repeated runs agree.
+            root = min(cid for cid in seen if divergent(cid))
+        roots[bad] = root
+    return roots
+
+
 def _verify(
     cg,
     result,
@@ -920,6 +982,28 @@ def _verify(
 
     out_tally, out_bad, output_eligible = grade(output_cells)
     mid_tally, mid_bad, middle_checked = grade(sample)
+    roots = _divergence_roots(cg, result, [r["cell"] for r in out_bad + mid_bad])
+    for record in out_bad + mid_bad:
+        root = roots.get(record["cell"])
+        if root and root != record["cell"]:
+            info = cg.info.get(root)
+            record["root"] = {
+                "cell": root,
+                "formula": info.node.formula if info else None,
+                "workbook": info.node.value if info else None,
+                "recomputed": str(result.values.get(root))[:40],
+            }
+    root_counts = collections.Counter(roots.values())
+    divergence_roots = []
+    for root, affected in root_counts.most_common(10):
+        info = cg.info.get(root)
+        divergence_roots.append({
+            "cell": root,
+            "affected_failures": affected,
+            "formula": info.node.formula if info else None,
+            "workbook": info.node.value if info else None,
+            "recomputed": str(result.values.get(root))[:40],
+        })
     # Some cells have to be seeded because nothing computes them: typed values,
     # labels, and formulas whose only references are empty. They should all sit
     # outside the output cone, so check rather than assume -- a leak would mean an
@@ -1154,6 +1238,7 @@ def _verify(
         "unresolved_total": len(result.unresolved),
         "unknown_functions": result.coverage["unknown_ops"],
         "failures": all_failures[: diagnostics.DEFAULT_SAMPLE_LIMIT],
+        "divergence_roots": divergence_roots,
         # Kept for existing callers until the planned consumer migration.
         "passed": legacy_passed,
         "counts": {
@@ -1311,6 +1396,12 @@ def _report(wb, payload, part, verify, traces, out_dir):
         for bad in verify["failures"][:3]:
             print(f"    {bad['verdict']}: {bad['cell']} {bad['formula'][:44]!r} "
                   f"workbook={bad['workbook'][:14]} got={bad['recomputed'][:14]}")
+        for root in verify.get("divergence_roots", [])[:5]:
+            formula = (root.get("formula") or "")[:44]
+            workbook = str(root.get("workbook"))[:14]
+            print(f"    root: {root['cell']} affects {root['affected_failures']} "
+                  f"failure(s) {formula!r} workbook={workbook} "
+                  f"got={root['recomputed'][:24]}")
     print(f"  lineage for {len(traces)} outputs -> {out_dir}/lineage/")
     for trace in traces[:5]:
         print(f"    {trace.label[:44] or trace.output:46s} "

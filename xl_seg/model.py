@@ -116,6 +116,10 @@ class Node:
     parse_error: str = ""
     value_type: str = ""
     range_truncated: bool = False
+    # A1 span of the multi-cell array formula this cell belongs to, empty for
+    # ordinary cells. Lets the evaluator hand each member its own positional
+    # element instead of the anchor's first value.
+    array_span: str = ""
 
     @property
     def is_cell(self) -> bool:
@@ -222,6 +226,7 @@ def load(ast_dir: Path, wb: str) -> Graph:
                 parse_error=_text(row, "parse_error"),
                 value_type=_text(row, "value_type"),
                 range_truncated=_bool(row, "range_truncated"),
+                array_span=_text(row, "array_span") or _text(row, "array_ref"),
             )
 
     edges: list[Edge] = []

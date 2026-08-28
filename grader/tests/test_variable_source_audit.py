@@ -7,10 +7,22 @@ from pathlib import Path
 
 import openpyxl
 
+from xl_task_build import read_env_key
 from xl_variable_source_audit import build_inventory, validate_table
 
 
 class VariableSourceAuditTests(unittest.TestCase):
+    def test_rl_key_takes_precedence_over_other_audit_keys(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env_file = Path(temp) / ".env"
+            env_file.write_text(
+                "lbx_api_key=stale-key\n"
+                "aligerr_org_key=org-key\n"
+                "rl_api_key=current-key\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(read_env_key(env_file), "current-key")
+
     def test_inventory_is_deterministic_and_skips_labels(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

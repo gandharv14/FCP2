@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 from xl_ast_graph import role_for
@@ -418,3 +421,49 @@ def test_lineage_cell_trace_consumes_stabilized_graph():
         output.id,
     ]
     assert trace["steps"][-1]["precedents"] == [selected.id]
+
+
+def test_lineage_cell_trace_is_stable_across_hash_seeds():
+    script = """\
+import json
+from types import SimpleNamespace
+from xl_seg import lineage
+
+inputs = [f"Sheet!A{i}" for i in range(1, 81)]
+output = "Sheet!Z1"
+adj = {cell: {output} for cell in inputs}
+radj = {output: set(inputs)}
+info = {
+    cell: SimpleNamespace(
+        node=SimpleNamespace(
+            label=cell, formula="", kind="input", value=cell
+        )
+    )
+    for cell in inputs
+}
+info[output] = SimpleNamespace(
+    node=SimpleNamespace(
+        label=output,
+        formula="=SUM(A1:A80)",
+        kind="formula",
+        value="3240",
+    )
+)
+cg = SimpleNamespace(adj=adj, radj=radj, info=info)
+trace = lineage.cell_trace(cg, {}, output, set(inputs), 1000)
+print(json.dumps([step["cell"] for step in trace["steps"]]))
+"""
+    traces = []
+    for seed in ("1", "2", "3"):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        traces.append(json.loads(result.stdout))
+
+    assert traces[0] == traces[1] == traces[2]
+    assert traces[0] == sorted(traces[0][:-1]) + ["Sheet!Z1"]

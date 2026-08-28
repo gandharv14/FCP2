@@ -1896,7 +1896,8 @@ def detect_distribution_policy(gold: Book, scope: set[str]) -> list[dict]:
     """
     values = [
         "residual_cash_floored", "residual_cash_unfloored", "payout_ratio",
-        "capped_at_retained_earnings", "first_period_only",
+        "capped_at_retained_earnings", "ownership_band_rate",
+        "first_period_only",
     ]
     out, seen_rows = [], set()
     for k in sorted(scope):
@@ -1982,10 +1983,16 @@ def detect_distribution_policy(gold: Book, scope: set[str]) -> list[dict]:
             value = "residual_cash_unfloored"
         elif any(("payout" in l or "dividend per" in l) for l in labels) and "*" in formula:
             value = "payout_ratio"
+        elif re.fullmatch(
+            r'=IF\([^,]+="<20%",0\.7,IF\([^,]+=">80%",1(?:\.0)?,0\.8\)\)',
+            re.sub(r"\s+|\$", "", formula.upper()),
+        ):
+            value = "ownership_band_rate"
         elif (
             len(row) == 1
             and refs_in(formula, sheet)
             and not re.match(r"^=\s*SUM\(", formula.strip(), re.I)
+            and not re.search(r"\b(IF|IFS|CHOOSE|LOOKUP|XLOOKUP)\s*\(", formula, re.I)
         ):
             value = "first_period_only"
         else:
@@ -1996,10 +2003,13 @@ def detect_distribution_policy(gold: Book, scope: set[str]) -> list[dict]:
         pay_cells = [c for c in row if dist_rank(c) >= 2] or [
             c for c in row if dist_rank(c) >= 0
         ]
+        fields = {"label": q(label)}
+        if value == "ownership_band_rate":
+            fields["ingredient"] = pretty(refs_in(formula, sheet)[0])
         out.append(record(
             "distribution_policy", value, pay_cells, formula, values,
             f"Row labelled {label!r} sizes its distribution by {value}.",
-            fields={"label": q(label)},
+            fields=fields,
         ))
     return out
 
@@ -2225,15 +2235,33 @@ def append_projection_run(out: list[dict], gold: Book, run: list[tuple], covers_
         return
     cells = [item[1] for item in run]
     evidence = gold.formula.get(cells[min(1, len(cells) - 1)], "")
+    sheet, coord = cells[0].split("!", 1)
+    first = split_coord(coord)
+    if kind == "hold_level" and first and run[0][0] >= 3:
+        row = first[1]
+        seed_coord = "%s%d" % (num_to_col(run[0][0] - 1), row)
+        prior_coord = "%s%d" % (num_to_col(run[0][0] - 2), row)
+        seed = key(sheet, seed_coord)
+        seed_formula = gold.formula.get(seed, "")
+        if re.fullmatch(
+            r"=\s*MAX\(\s*\$?%s\s*,\s*0\s*\)" % re.escape(prior_coord),
+            seed_formula,
+            re.I,
+        ):
+            kind = "first_period_zero_floor_then_hold"
+            cells.insert(0, seed)
+            evidence = seed_formula
     rec = record(
         "projection_rule", kind, cells, evidence,
         ["hold_level", "hold_growth", "step_increment", "average_window",
-         "ratio_to_driver"],
+         "ratio_to_driver", "first_period_zero_floor_then_hold"],
         f"Forecast row labelled {label!r}; applies only to this contiguous {kind} run.",
         # hold_level names no ingredient, and its sentence has no slot for one.
         # Passing an empty field would make the renderer discard the record while
         # the disposition still claimed it shipped.
-        fields=({"label": q(label)} if kind == "hold_level" else
+        fields=({"label": q(label)} if kind in (
+                    "hold_level", "first_period_zero_floor_then_hold",
+                ) else
                 {"label": q(label),
                  "ingredient": ingredient_phrase(gold, evidence, cells, own_label=label)}),
     )
@@ -2253,25 +2281,50 @@ def detect_stake_scaling(gold: Book, scope: set[str]) -> list[dict]:
         formula = gold.formula.get(k)
         if not formula:
             continue
-        hits = [r for r in refs_in(formula, k.split("!", 1)[0]) if r in pct_cells]
-        if not hits:
+        try:
+            if str(REPO_ROOT) not in sys.path:
+                sys.path.insert(0, str(REPO_ROOT))
+            from xl_ast_graph import parse_formula  # type: ignore
+
+            ast = parse_formula(formula)
+        except Exception:
+            continue
+        # This entry's sentence names both operands. Only claim a plain
+        # two-reference multiplication; complements, sums, or added unscaled
+        # terms require a different entry that can render their complete AST.
+        if (
+            ast.kind != "infix"
+            or ast.name != "*"
+            or len(ast.args) != 2
+            or any(arg.kind != "ref" for arg in ast.args)
+        ):
+            continue
+        references = refs_in(formula, k.split("!", 1)[0])
+        hits = [ref for ref in references if ref in pct_cells]
+        bases = [ref for ref in references if ref not in pct_cells]
+        if len(hits) != 1 or len(bases) != 1:
             continue
         sheet, coord = k.split("!", 1)
         p = split_coord(coord)
         if p:
-            byrow[(sheet, p[1])].append((col_to_num(p[0]), k, formula, hits))
+            byrow[(sheet, p[1])].append(
+                (col_to_num(p[0]), k, formula, hits[0], bases[0])
+            )
     out = []
     for (_sheet, _row), entries in sorted(byrow.items()):
         entries.sort()
-        _, first, formula, hits = entries[0]
+        _, first, formula, share, base = entries[0]
         out.append(record(
-            "stake_scaling", "applied", [k for _, k, _, _ in entries],
+            "stake_scaling", "applied", [k for _, k, _, _, _ in entries],
             formula, ["applied", "not_applied"],
-            f"Row labelled {gold.row_label(first)!r} multiplies by {pretty(hits[0])}, the ownership share.",
+            f"Row labelled {gold.row_label(first)!r} multiplies "
+            f"{pretty(base)} by {pretty(share)}, the ownership share.",
             fields={
                 "label": q(gold.row_label(first)),
-                "ingredient": "the row labelled %s" % q(gold.row_label(hits[0]))
-                              if gold.row_label(hits[0]) else pretty(hits[0]),
+                "base": "the row labelled %s" % q(gold.row_label(base))
+                        if gold.row_label(base) else pretty(base),
+                "ingredient": "the row labelled %s" % q(gold.row_label(share))
+                              if gold.row_label(share) else pretty(share),
             },
         ))
     return out
@@ -2698,7 +2751,9 @@ def ship_projection_rule(rec: dict, ctx: dict) -> bool:
     cells = rec.get("cell_keys") or []
     if not cells:
         return False
-    if rec.get("value") != "hold_level":
+    if rec.get("value") not in (
+        "hold_level", "first_period_zero_floor_then_hold",
+    ):
         rec["declined_reason"] = (
             "only a literal hold-level convention is safe for agent-facing disclosure"
         )
@@ -2728,6 +2783,8 @@ def ship_projection_rule(rec: dict, ctx: dict) -> bool:
     # horizon, and at most one of them can be right.
     if rec.get("covers_row") is False:
         return False
+    if rec.get("value") == "first_period_zero_floor_then_hold":
+        return True
     # A record whose ingredient could not be named renders nothing. Deciding that
     # here keeps the disposition honest instead of marking it disclosed and
     # dropping it silently at render time.
@@ -2789,6 +2846,16 @@ def ship_aggregate_scope(rec: dict, ctx: dict) -> bool:
         )
         return False
     return bool(rec.get("aggregate_member_rows", {}).get("labels"))
+
+
+def ship_row_populated(rec: dict, ctx: dict) -> bool:
+    """Do not claim that values are hidden when they remain agent-visible."""
+    if rec.get("value") == "populated_but_unread":
+        rec["declined_reason"] = (
+            "reviewer-only: cited values remain visible in the delivered workbook"
+        )
+        return False
+    return True
 
 
 def _band_survives(rec: dict, ctx: dict) -> bool:
@@ -2871,6 +2938,7 @@ SHIP_WHEN = {
     "source_selection": ship_source_selection,
     "npv_timing": ship_not_a_target,
     "aggregate_scope": ship_aggregate_scope,
+    "row_populated": ship_row_populated,
     "distribution_policy": ship_distribution_policy,
     "liquidation_preference": ship_liquidation_preference,
     **{entry_id: ship_custom_method for entry_id in METHOD_ENTRY_IDS},
@@ -3334,7 +3402,7 @@ def agent_records(records: list[dict]) -> list[dict]:
         if not render_sentence(rec):
             continue
         out.append({k: v for k, v in rec.items()
-                    if k not in ("evidence", "cell_keys", "divergence", "declined_reason")})
+                    if k not in ("evidence", "divergence", "declined_reason")})
     return out
 
 
@@ -3425,7 +3493,60 @@ def internal_tokens() -> list[str]:
     return sorted(tokens)
 
 
-def audit_text(section: str, task_dir: Path) -> list[str]:
+def same_number(a: float, b: float) -> bool:
+    return abs(a - b) <= 1e-12 * max(1.0, abs(a), abs(b))
+
+
+def trusted_formula_literal_counts(records: list[dict], task_dir: Path) -> Counter:
+    """Count independently sourced AST literals that may collide with targets.
+
+    A formula literal is not evidence that a target value was disclosed merely
+    because an unrelated graded result happens to have the same number. The
+    exemption is deliberately provenance-bound: only a complete custom-method
+    rendering on ungraded cells, with no graded references, receives a budget
+    for the numeric AST literals that actually occur in its rendered sentence.
+    Any additional occurrence of the same number remains a leak.
+    """
+    targets, _ = load_key(task_dir)
+    target_cells = {
+        parse_ref(ref, "")
+        for ref in targets
+        if "!" in ref
+    }
+    allowed: Counter = Counter()
+    for rec in records:
+        profile = rec.get("method_profile") or {}
+        cells = set(profile.get("cells") or rec.get("cell_keys") or [])
+        references = set(profile.get("references") or [])
+        if (
+            rec.get("source") != "custom_method_detector"
+            or rec.get("disposition") != "disclosed"
+            or rec.get("leak_flag")
+            or not rec.get("coverage_complete")
+            or not profile.get("complete")
+            or target_cells & (cells | references)
+        ):
+            continue
+        sentence = render_sentence(rec)
+        rendered_numbers = []
+        for raw in NUMBER_RE.findall(sentence):
+            try:
+                rendered_numbers.append(float(raw.replace(",", "")))
+            except ValueError:
+                continue
+        used = set()
+        for literal in profile.get("numbers") or []:
+            if isinstance(literal, bool) or not isinstance(literal, (int, float)):
+                continue
+            for i, rendered in enumerate(rendered_numbers):
+                if i not in used and same_number(rendered, float(literal)):
+                    used.add(i)
+                    allowed[rendered] += 1
+                    break
+    return allowed
+
+
+def audit_text(section: str, task_dir: Path, records: list[dict] | None = None) -> list[str]:
     faults = []
     formula_lines = [line for line in section.splitlines() if FORMULA_RE.search(line)]
     if formula_lines:
@@ -3434,11 +3555,13 @@ def audit_text(section: str, task_dir: Path) -> list[str]:
     if leaked:
         faults.append(f"internal taxonomy token(s) in agent text: {leaked[:5]}")
     targets = numeric_targets(task_dir)
+    allowed = trusted_formula_literal_counts(records or [], task_dir)
     for raw in NUMBER_RE.findall(section):
         try:
             val = float(raw.replace(",", ""))
         except ValueError:
             continue
+        matched_target = None
         for target in targets:
             # Zero/one are control literals in branches and collide with zero
             # checks or boolean targets by accident. Larger integers receive the
@@ -3447,8 +3570,20 @@ def audit_text(section: str, task_dir: Path) -> list[str]:
                 float(target).is_integer() and abs(target) <= 1
             ):
                 continue
-            if abs(val - target) <= 1e-12 * max(1.0, abs(target)):
-                faults.append(f"numeric literal {raw} matches target {target}")
+            if same_number(val, float(target)):
+                matched_target = target
+                break
+        if matched_target is None:
+            continue
+        permitted = next(
+            (number for number, count in allowed.items()
+             if count and same_number(val, number)),
+            None,
+        )
+        if permitted is not None:
+            allowed[permitted] -= 1
+            continue
+        faults.append(f"numeric literal {raw} matches target {matched_target}")
     return faults
 
 
@@ -3465,7 +3600,7 @@ def write_disclosure(args) -> dict:
     records_payload = read_stage(source_task, "records", Path(args.runs_root))
     safe = agent_records(records_payload.get("records", []))
     section = render_section(safe)
-    faults = audit_text(section, source_task)
+    faults = audit_text(section, source_task, safe)
     if faults and not args.force:
         raise SystemExit("refusing to write disclosure: " + "; ".join(faults[:5]))
     dst = Path(args.out).resolve() if args.out else source_task
@@ -3590,7 +3725,7 @@ def verify_task(task_dir: Path) -> dict:
                 )
         except Exception as exc:
             faults.append(f"custom structural verification failed: {exc}")
-    faults.extend(audit_text(section, task_dir))
+    faults.extend(audit_text(section, task_dir, shipped))
     return {"task": task_dir.name, "passed": not faults, "faults": faults}
 
 

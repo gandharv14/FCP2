@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 
-from .condense import strongly_connected, topo_order
+from .condense import strongly_connected
 from .frontier import primary_band
 from .partition import INPUT, MIDDLE, OUTPUT
 
@@ -126,7 +126,13 @@ def cell_trace(
                 cone.add(pred)
                 stack.append(pred)
 
-    groups = strongly_connected(cone, {n: {s for s in adj.get(n, ()) if s in cone} for n in cone})
+    # Canonicalize both Tarjan roots and successors.  The proof graphs store
+    # adjacency in sets, whose iteration order changes with PYTHONHASHSEED.
+    restricted_adj = {
+        node: tuple(sorted(succ for succ in adj.get(node, ()) if succ in cone))
+        for node in sorted(cone)
+    }
+    groups = strongly_connected(sorted(cone), restricted_adj)
     comp_of, members = {}, {}
     for group in groups:
         members[group[0]] = group
@@ -142,7 +148,11 @@ def cell_trace(
                 cadj.setdefault(a, set()).add(b)
                 cradj.setdefault(b, set()).add(a)
 
-    ordered = [c for comp in topo_order(members, cadj, cradj) for c in sorted(members[comp])]
+    ordered = [
+        cell
+        for comp in _restricted_topo(set(members), cadj, cradj)
+        for cell in sorted(members[comp])
+    ]
     truncated = max(0, len(ordered) - limit)
     if truncated:
         # Keep the inputs and the tail nearest the output; the middle is the bulk.

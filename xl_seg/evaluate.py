@@ -2923,7 +2923,7 @@ class Evaluator:
         def is_constant(value):
             return all(abs(coefficient) <= CONVERGENCE for coefficient in value[0])
 
-        def derive_spec(spec, seen):
+        def derive_spec(spec, seen, *, sum_blank_as_zero=False):
             kind, payload = spec
             if kind == "none":
                 return []
@@ -2941,7 +2941,18 @@ class Evaluator:
                     sources = (payload,)
             else:
                 return None
-            values = [derive(source, seen) for source in sources]
+            values = [
+                (
+                    constant(0.0)
+                    if sum_blank_as_zero
+                    and (
+                        source not in self.graph.nodes
+                        or self.values.get(source) in (None, "")
+                    )
+                    else derive(source, seen)
+                )
+                for source in sources
+            ]
             return None if any(value is None for value in values) else values
 
         def derive_condition(spec, seen):
@@ -3052,7 +3063,15 @@ class Evaluator:
                         )
                 return None
             grouped_args = [
-                derive_spec(spec, seen | {node_id}) for spec in specs
+                derive_spec(
+                    spec,
+                    seen | {node_id},
+                    # Blank cells have no AST node. Excel SUM treats blank
+                    # references as zero, so their absence is affine rather
+                    # than an unsupported dependency.
+                    sum_blank_as_zero=node.op == "SUM",
+                )
+                for spec in specs
             ]
             if any(arg is None for arg in grouped_args):
                 return reject(node_id, "unsupported_argument")

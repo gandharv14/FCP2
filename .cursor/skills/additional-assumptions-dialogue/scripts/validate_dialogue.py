@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 import re
@@ -178,6 +179,112 @@ def map_turns_to_claims(turns: list[dict], claims: list[dict]) -> tuple[dict[str
     return mapped, faults
 
 
+def licensed_formula_literals(claim: dict, task_dir: Path) -> Counter:
+    """Return target-safe AST constants licensed for this one claim."""
+    reviewer = claim.get("reviewer_only") or {}
+    if reviewer.get("source") != "custom_method_detector":
+        return Counter()
+    targets, _ = disclose.load_key(task_dir)
+    target_cells = {
+        disclose.parse_ref(ref, "")
+        for ref in targets
+        if "!" in ref
+    }
+    cells = {
+        disclose.parse_ref(ref, "")
+        for ref in reviewer.get("cells") or []
+        if "!" in ref
+    }
+    if cells & target_cells:
+        return Counter()
+    evidence = reviewer.get("evidence") or ""
+    sheet = claim.get("sheet") or ""
+    if set(disclose.refs_in(evidence, sheet)) & target_cells:
+        return Counter()
+    try:
+        if str(disclose.REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(disclose.REPO_ROOT))
+        from xl_ast_graph import parse_formula  # type: ignore
+
+        ast = parse_formula(evidence)
+    except Exception:
+        return Counter()
+    allowed: Counter = Counter()
+    for node in disclose.walk_ast(ast):
+        if node.kind != "const" or node.name != "number":
+            continue
+        try:
+            allowed[float(node.value)] += 1
+        except (TypeError, ValueError):
+            continue
+    return allowed
+
+
+def numeric_faults_with_budget(
+    text: str, task_dir: Path, allowed: Counter | None = None
+) -> list[str]:
+    """Audit target collisions while consuming only proven literal occurrences."""
+    budget = Counter(allowed or {})
+    faults = []
+    for fault in disclose.audit_text(text, task_dir):
+        match = re.fullmatch(r"numeric literal ([^ ]+) matches target .+", fault)
+        if not match:
+            continue
+        try:
+            value = float(match.group(1).replace(",", ""))
+        except ValueError:
+            faults.append(fault)
+            continue
+        permitted = next(
+            (
+                number
+                for number, count in budget.items()
+                if count and disclose.same_number(value, number)
+            ),
+            None,
+        )
+        if permitted is None:
+            faults.append(fault)
+        else:
+            budget[permitted] -= 1
+    return faults
+
+
+def audit_dialogue(
+    dialogue: str,
+    claims: list[dict],
+    turns: list[dict],
+    mapped: dict[str, list[dict]],
+    task_dir: Path,
+) -> list[str]:
+    """Audit prose globally, but numeric literals claim-by-claim."""
+    cleaned = strip_cell_refs(strip_claim_comments(dialogue))
+    faults = [
+        fault
+        for fault in disclose.audit_text(cleaned, task_dir)
+        if not fault.startswith("numeric literal ")
+    ]
+    assigned_senior_turns: set[int] = set()
+    for claim in claims:
+        senior_turns = [
+            turn
+            for turn in mapped.get(claim["record_id"], [])
+            if is_senior(turn["speaker"])
+        ]
+        assigned_senior_turns.update(id(turn) for turn in senior_turns)
+        text = "\n".join(turn["text"] for turn in senior_turns)
+        faults.extend(
+            numeric_faults_with_budget(
+                text, task_dir, licensed_formula_literals(claim, task_dir)
+            )
+        )
+    # Juniors, kickoff turns, and any unmapped senior prose receive no budget.
+    for turn in turns:
+        if id(turn) not in assigned_senior_turns:
+            faults.extend(numeric_faults_with_budget(turn["text"], task_dir))
+    return faults
+
+
 def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
     faults = []
     accuracy_faults = []
@@ -264,7 +371,7 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
             )
 
     faults.extend(accuracy_faults)
-    faults.extend(disclose.audit_text(strip_cell_refs(strip_claim_comments(dialogue)), task_dir))
+    faults.extend(audit_dialogue(dialogue, claims, turns, mapped, task_dir))
     if DISCLOSURE_HEADING.lower() in dialogue.lower():
         faults.append("dialogue uses the word disclosure")
     rebuild_hits = sorted({m.group(0) for m in REBUILD_FRAME_RE.finditer(dialogue)})

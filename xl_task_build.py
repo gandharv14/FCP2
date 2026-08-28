@@ -770,14 +770,37 @@ def read_env_key(env_file):
         path = Path(source)
         if not path.is_file():
             continue
+        values = {}
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            if key.strip().lower() == "lbx_api_key":
-                return value.strip().strip('"').strip("'")
-    return os.environ.get("LBX_API_KEY") or os.environ.get("lbx_api_key")
+            name = key.strip().lower()
+            if name in {
+                "lbx_api_key",
+                "alignerr_org_key",
+                "aligerr_org_key",
+                "rl_api_key",
+            }:
+                values[name] = value.strip().strip('"').strip("'")
+        if values:
+            return (
+                values.get("rl_api_key")
+                or values.get("alignerr_org_key")
+                or values.get("aligerr_org_key")
+                or values.get("lbx_api_key")
+            )
+    return (
+        os.environ.get("RL_API_KEY")
+        or os.environ.get("rl_api_key")
+        or os.environ.get("ALIGNERR_ORG_KEY")
+        or os.environ.get("alignerr_org_key")
+        or os.environ.get("ALIGERR_ORG_KEY")
+        or os.environ.get("aligerr_org_key")
+        or os.environ.get("LBX_API_KEY")
+        or os.environ.get("lbx_api_key")
+    )
 
 
 def call_naturalizer(base_url, api_key, model, project_id, messages):

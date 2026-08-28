@@ -55,7 +55,7 @@ def _ast(node_id, owner, kind, *, op="", arity="", value=""):
     )
 
 
-def _edge(source, target, index=0, role="arg"):
+def _edge(source, target, index=0, role="arg", via_range=""):
     return Edge(
         source=source,
         target=target,
@@ -64,7 +64,7 @@ def _edge(source, target, index=0, role="arg"):
         op="",
         cell=target.split("#", 1)[0],
         ref="",
-        via_range="",
+        via_range=via_range,
         cross_sheet=False,
     )
 
@@ -306,6 +306,81 @@ def test_contractive_multicell_affine_cycle_gets_bounded_certificate():
     assert certificate["dimension"] == 2
     assert certificate["contraction_bound"] == 0.3
     assert certificate["endpoint_error_bound"] is not None
+
+
+def test_sum_range_blank_is_zero_for_affine_cycle_certificate():
+    owner = _cell("Sheet!A1", "formula", 0, "=0.5*SUM(A1:B1)+1")
+    total = _ast("Sheet!A1#sum", owner.id, "op", op="SUM", arity=1)
+    factor = _ast("Sheet!A1#factor", owner.id, "const", value=0.5)
+    product = _ast("Sheet!A1#product", owner.id, "op", op="*", arity=2)
+    one = _ast("Sheet!A1#one", owner.id, "const", value=1)
+    add = _ast("Sheet!A1#add", owner.id, "op", op="+", arity=2)
+    graph, cg = _graph(
+        [owner, total, factor, product, one, add],
+        [
+            _edge(owner.id, total.id, via_range="A1:B1"),
+            _edge(factor.id, product.id, 0),
+            _edge(total.id, product.id, 1),
+            _edge(product.id, add.id, 0),
+            _edge(one.id, add.id, 1),
+            _edge(add.id, owner.id, role="result"),
+        ],
+    )
+
+    result = Evaluator(
+        graph,
+        cg,
+        strict_proof=True,
+        calculation=_calculation(count=100, delta=1e-9),
+        proof_outputs={owner.id},
+    ).run(set())
+
+    diagnostic = result.iterated[0]
+    assert result.missing_reads["Sheet!B1"] == {owner.id}
+    assert diagnostic["converged"] is True
+    assert diagnostic["certified"] is True
+    assert diagnostic["certification"]["kind"] == "scalar_affine"
+    assert diagnostic["certification"]["coefficient"] == 0.5
+    assert diagnostic["certification"]["fixed_point"] == 2.0
+
+
+def test_sum_range_formula_returning_blank_is_zero_for_cycle_certificate():
+    owner = _cell("Sheet!A1", "formula", 0, "=0.5*SUM(A1:B1)+1")
+    blank_formula = _cell("Sheet!B1", "formula", 0, "=C1")
+    blank_input = _cell("Sheet!C1", "input", "")
+    total = _ast("Sheet!A1#sum", owner.id, "op", op="SUM", arity=1)
+    factor = _ast("Sheet!A1#factor", owner.id, "const", value=0.5)
+    product = _ast("Sheet!A1#product", owner.id, "op", op="*", arity=2)
+    one = _ast("Sheet!A1#one", owner.id, "const", value=1)
+    add = _ast("Sheet!A1#add", owner.id, "op", op="+", arity=2)
+    graph, cg = _graph(
+        [owner, blank_formula, blank_input, total, factor, product, one, add],
+        [
+            _edge(blank_input.id, blank_formula.id, role="identity"),
+            _edge(owner.id, total.id, via_range="A1:B1"),
+            _edge(blank_formula.id, total.id, via_range="A1:B1"),
+            _edge(factor.id, product.id, 0),
+            _edge(total.id, product.id, 1),
+            _edge(product.id, add.id, 0),
+            _edge(one.id, add.id, 1),
+            _edge(add.id, owner.id, role="result"),
+        ],
+    )
+
+    result = Evaluator(
+        graph,
+        cg,
+        strict_proof=True,
+        calculation=_calculation(count=100, delta=1e-9),
+        proof_outputs={owner.id},
+    ).run({blank_input.id})
+
+    diagnostic = result.iterated[0]
+    assert result.values[blank_formula.id] is None
+    assert diagnostic["converged"] is True
+    assert diagnostic["certified"] is True
+    assert diagnostic["certification"]["coefficient"] == 0.5
+    assert diagnostic["certification"]["fixed_point"] == 2.0
 
 
 def test_cycle_topology_is_certified_after_post_iteration_stabilization():

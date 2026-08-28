@@ -173,7 +173,20 @@ def write_bands(out_dir: Path, bg, cd, part) -> None:
             ])
 
 
-def write_segments(out_dir: Path, wb, bg, cd, part, inputs, outputs, literals, verify) -> dict:
+def write_segments(
+    out_dir: Path,
+    wb,
+    bg,
+    cd,
+    part,
+    inputs,
+    outputs,
+    literals,
+    verify,
+    *,
+    proof=None,
+    selected_output_bands=None,
+) -> dict:
     def bands_of(comps):
         return sorted(b for c in comps for b in cd.comp_members[c])
 
@@ -188,6 +201,18 @@ def write_segments(out_dir: Path, wb, bg, cd, part, inputs, outputs, literals, v
                 "depth": cd.depth.get(comp, 0), "cells": band.cells,
             })
         return sorted(out, key=lambda d: (d["sheet"], d["band"]))
+
+    def describe_bands(band_ids):
+        out = []
+        for band_id in sorted(band_ids):
+            band = bg.bands[band_id]
+            comp = cd.comp_of[band_id]
+            out.append({
+                "band": band_id, "sheet": band.sheet, "label": band.label,
+                "width": band.width, "kind": band.kind, "vtype": band.vtype,
+                "depth": cd.depth.get(comp, 0), "cells": band.cells,
+            })
+        return out
 
     by_bucket = {name: [] for name in (INPUT, MIDDLE, OUTPUT, SCAFFOLD)}
     for comp, bucket in part.bucket.items():
@@ -204,7 +229,12 @@ def write_segments(out_dir: Path, wb, bg, cd, part, inputs, outputs, literals, v
         },
         "islands": {str(k): v for k, v in sorted(cd.island_sizes.items())[:10]},
         "inputs": describe(sorted(inputs)),
-        "outputs": describe(sorted(outputs)),
+        "outputs": (
+            describe_bands(selected_output_bands)
+            if selected_output_bands is not None
+            else describe(sorted(outputs))
+        ),
+        "output_components": sorted(outputs),
         "middle": bands_of(sorted(by_bucket[MIDDLE])),
         "scaffolding": {
             name: bands_of(sorted(c for c in by_bucket[SCAFFOLD] if part.subclass.get(c) == name))
@@ -215,6 +245,8 @@ def write_segments(out_dir: Path, wb, bg, cd, part, inputs, outputs, literals, v
         "verification": verify,
         "unfed_components": sorted(part.unfed),
     }
+    if proof is not None:
+        payload["proof"] = proof
     (out_dir / "segments.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
 
@@ -227,7 +259,7 @@ def _fmt(value):
     return "" if value is None else str(value)
 
 
-def write_lineage(out_dir: Path, wb: str, traces, values) -> None:
+def write_lineage(out_dir: Path, wb: str, traces, values, *, proof=None) -> None:
     lineage_dir = out_dir / "lineage"
     lineage_dir.mkdir(parents=True, exist_ok=True)
     for old in lineage_dir.glob("*.md"):
@@ -322,4 +354,6 @@ def write_lineage(out_dir: Path, wb: str, traces, values) -> None:
             for t in traces
         ],
     }
+    if proof is not None:
+        payload["proof"] = proof
     (out_dir / "lineage.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -83,6 +83,13 @@ except ImportError:  # pragma: no cover
     def human_size(n):
         return "%.1f KB" % (n / 1024.0)
 
+from xl_seg.proof import load_contract
+from xl_seg.publication import (
+    GenerationValidationError,
+    resolve_for_consumer,
+    write_inputs_sidecar,
+)
+
 
 # In sheet XML a static cell is a number unless it says otherwise; these are the
 # three ways it can say it holds text.
@@ -195,6 +202,27 @@ def input_cells(bands_path):
             if (band["sheet"], row, col) not in outputs
         )
     return frontier
+
+
+def stabilized_proof_inputs(seg_dir):
+    """Effective strict-proof cells, or ``None`` for legacy segmentation."""
+    proof = load_contract(seg_dir)
+    if proof is None:
+        return None
+    refs = proof.get("effective_inputs")
+    if not isinstance(refs, list):
+        return None
+    cells = defaultdict(set)
+    for ref in refs:
+        sheet, sep, coordinate = str(ref).rpartition("!")
+        if not sep:
+            continue
+        try:
+            row, col = coordinate_to_tuple(coordinate.replace("$", ""))
+        except ValueError:
+            continue
+        cells[sheet.strip("'")].add((row, col))
+    return cells
 
 
 def output_values(bands_path, book):
@@ -366,7 +394,11 @@ def frontier_proof(seg_dir):
     verdict = json.loads(path.read_text(encoding="utf-8")).get("verification", {})
     if verdict.get("skipped"):
         return "SKIPPED"
-    return "PASS" if verdict.get("passed") else "FAIL"
+    return "PASS" if (
+        verdict.get("status") == "pass"
+        and verdict.get("disposition") == "pass"
+        and verdict.get("blocking_reasons") == []
+    ) else "FAIL"
 
 
 # ---------------------------------------------------------------------------
@@ -766,11 +798,6 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
 # ---------------------------------------------------------------------------
 
 def process(wb_id, args):
-    bands = Path(args.seg_dir) / wb_id / "bands.csv"
-    if not bands.exists():
-        print("  %s: no bands.csv under %s" % (wb_id, bands.parent))
-        return False
-
     source = None
     for suffix in (".xlsx", ".xlsm"):
         candidate = Path(args.source) / (wb_id + suffix)
@@ -780,14 +807,45 @@ def process(wb_id, args):
     if source is None:
         print("  %s: no workbook in %s" % (wb_id, args.source))
         return False
+    segmentation_mode = getattr(args, "segmentation_mode", "legacy")
+    ast_root = Path(getattr(args, "ast_dir", "ast_out"))
+    try:
+        seg_dir, generation_manifest = resolve_for_consumer(
+            Path(args.seg_dir) / wb_id,
+            mode=segmentation_mode,
+            source_path=source,
+            ast_dir=ast_root / wb_id,
+            require_pass=True,
+            expected_generation_id=getattr(
+                args, "expected_generation_id", None
+            ),
+        )
+    except GenerationValidationError as exc:
+        print("  %s: segmentation gate failed: %s" % (wb_id, exc))
+        return False
+    bands = seg_dir / "bands.csv"
+    if not bands.exists():
+        print("  %s: no bands.csv under %s" % (wb_id, bands.parent))
+        return False
 
     warnings.simplefilter("ignore")
     book = openpyxl.load_workbook(source, data_only=True)
     keep, admitted = keep_cells(bands, args.keep, book)
     frontier = input_cells(bands)
+    proof_frontier = stabilized_proof_inputs(seg_dir)
+    if proof_frontier is not None:
+        # ``keep`` only controls which formula caches are frozen; typed cells
+        # survive independently. Replace declared formula-frontier admissions
+        # with the strict proof frontier so formula literals remain blank and
+        # must be rebuilt through their AST logic.
+        for sheet, spots in frontier.items():
+            keep[sheet].difference_update(spots)
+        for sheet, spots in proof_frontier.items():
+            keep[sheet].update(spots)
+        frontier = proof_frontier
     formula_coords = formula_coordinates(source)
 
-    proof = frontier_proof(Path(args.seg_dir) / wb_id)
+    proof = frontier_proof(seg_dir)
     outputs = output_values(bands, book)
     deny, denied_report, paste_suspects = pasted_answers(
         book, formula_coords, frontier, outputs)
@@ -827,7 +885,7 @@ def process(wb_id, args):
     write_masked(source, out_path, keep, deny, tally)
 
     outputs_at = output_cells(bands)
-    assumptions = embedded_assumptions(Path(args.seg_dir) / wb_id)
+    assumptions = embedded_assumptions(seg_dir)
     # The exact derivations of answer cells must not appear anywhere as text.
     forbidden_formulas = sorted({
         str(e.get("formula", "")) for e in assumptions
@@ -889,6 +947,12 @@ def process(wb_id, args):
         print("       period headers %d kept though not inputs%s"
               % (len(admitted), note))
     if not broken:
+        if generation_manifest is not None:
+            write_inputs_sidecar(
+                out_path,
+                seg_dir,
+                generation_manifest,
+            )
         print("       verified: no formulas, no derived numbers, typed cells intact")
         return True
     for name, hits in faults.items():
@@ -907,6 +971,23 @@ def main(argv=None):
                         help="workbook ids under --seg-dir")
     parser.add_argument("--seg-dir", default="seg_out",
                         help="where xl_segment.py wrote bands.csv")
+    parser.add_argument(
+        "--ast-dir",
+        default="ast_out",
+        help="AST root used to validate strict segmentation fingerprints",
+    )
+    parser.add_argument(
+        "--segmentation-mode",
+        choices=("strict", "shadow", "legacy"),
+        default="strict",
+        help="strict production gate (default), versioned shadow, or explicit "
+             "unversioned legacy downgrade",
+    )
+    parser.add_argument(
+        "--expected-generation-id",
+        default=None,
+        help="fail if current.json no longer names this generation",
+    )
     parser.add_argument("--source", default="4-10 100",
                         help="folder holding <wb>.xlsx")
     parser.add_argument("-o", "--out", default="inputs_out")

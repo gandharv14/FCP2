@@ -106,7 +106,7 @@ class FakeClient:
                 "id": "doc-2",
                 "source_id": "source-1",
                 "related_dataset_id": "dataset-1",
-                "content": "release rel-2 supersedes rel-1",
+                "content": "authoritative release rel-2",
             },
         }
 

@@ -22,6 +22,24 @@ fail() { echo "BUILDFAIL $WB gate=$1 :: $2"; exit 1; }
 
 (
 PLAIN=0
+# ---- gate 4: versioned segmentation generation --------------------------
+SEG_VALIDATION=$(python3 -m xl_seg.publication validate "seg_out/$WB" \
+  --source "$SOURCE/$WB.xlsx" --ast-dir "ast_out/$WB" \
+  --validate-live-evidence --require-pass 2>/dev/null) || exit 118
+GENERATION_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])' \
+  <<<"$SEG_VALIDATION") || exit 118
+python3 - "$WB" "$GENERATION_ID" <<'PY' >/dev/null 2>&1 || exit 119
+import sys
+from pathlib import Path
+from xl_seg.publication import validate_inputs_sidecar
+wb, generation_id = sys.argv[1:]
+validate_inputs_sidecar(
+    Path("inputs_out") / f"{wb}-inputs.xlsx",
+    expected_generation_id=generation_id,
+    generation_dir=Path("seg_out") / wb / "generations" / generation_id,
+)
+PY
+
 # ---- gate 5: import ------------------------------------------------------
 python3 xl_variable_mcp.py import "$RUN/$WB-inputs-variable-sources.md" \
   "$RUN/draft.json" >/dev/null 2>&1 || exit 91
@@ -90,6 +108,8 @@ uv run --python 3.12 --with fastmcp --with openpyxl \
 # ---- gate 10: mask MCP inputs separately -------------------------------
 BASE_SHA=$(shasum -a 256 "inputs_out/$WB-inputs.xlsx" | awk '{print $1}')
 python3 xl_input_mask.py "$WB" --source "$SOURCE" --seg-dir seg_out \
+  --ast-dir ast_out --segmentation-mode strict \
+  --expected-generation-id "$GENERATION_ID" \
   -o inputs_out_mcp --mask-cells "$RUN/mcp/mask_cells.json" >/dev/null 2>&1 || exit 101
 NOW=$(shasum -a 256 "inputs_out/$WB-inputs.xlsx" | awk '{print $1}')
 [ "$BASE_SHA" = "$NOW" ] || exit 102
@@ -100,12 +120,16 @@ fi
 rm -rf "$STAGED"
 if [ "$PLAIN" -eq 1 ]; then
   python3 xl_output_task.py "$WB" --source "$SOURCE" --seg-root seg_out \
+    --ast-dir ast_out --segmentation-mode strict \
+    --expected-generation-id "$GENERATION_ID" \
     --inputs-root inputs_out \
     --variable-source-audit-inputs-root inputs_out \
     --variable-source-audit-root runs \
     --variable-source-audit-model openai/gpt-5.6-sol \
     --no-naturalize -o tasks_outputs_mcp >/dev/null 2>&1 || exit 104
   for f in instruction.md task.toml tests/answer_key.json tests/outputs.json \
+           tests/segmentation_generation_manifest.json \
+           tests/inputs_generation.json \
            tests/test.sh tests/finance_grader tests/normalization_exclusions.json \
            "environment/$WB-inputs.xlsx" environment/Dockerfile; do
     [ -e "$STAGED/$f" ] || exit 105
@@ -137,12 +161,16 @@ raise SystemExit(0 if report.get("valid") else 1)
 PY
 else
   python3 xl_output_task.py "$WB" --source "$SOURCE" --seg-root seg_out \
+    --ast-dir ast_out --segmentation-mode strict \
+    --expected-generation-id "$GENERATION_ID" \
     --inputs-root inputs_out_mcp \
     --variable-source-audit-inputs-root inputs_out \
     --variable-source-audit-root runs \
     --variable-source-audit-model openai/gpt-5.6-sol \
     --mcp "$RUN/mcp" --no-naturalize -o tasks_outputs_mcp >/dev/null 2>&1 || exit 104
   for f in instruction.md task.toml tests/answer_key.json tests/masked_inputs.json \
+           tests/segmentation_generation_manifest.json \
+           tests/inputs_generation.json \
            "environment/$WB-inputs.xlsx"; do
     [ -e "$STAGED/$f" ] || exit 105
   done
@@ -150,7 +178,9 @@ fi
 
 # ---- gate 12: unified disclosure ---------------------------------------
 python3 "$D" select --task-dir "$STAGED" --golden "$SOURCE/$WB.xlsx" \
-  --ast-dir ast_out >/dev/null 2>&1 || exit 106
+  --ast-dir ast_out --seg-root seg_out --segmentation-mode strict \
+  --expected-generation-id "$GENERATION_ID" \
+  >/dev/null 2>&1 || exit 106
 python3 "$D" probe   --task-dir "$STAGED" >/dev/null 2>&1 || exit 106
 python3 "$D" roles   --task-dir "$STAGED" >/dev/null 2>&1 || exit 106
 # Collisions are fine as long as a complete Sol High resolution file covers them.
@@ -187,8 +217,7 @@ has = "## Workbook disclosure" in (task / "instruction.md").read_text(encoding="
 raise SystemExit(0 if has == bool(records.get("agent_records")) else 1)
 PY
 
-# AST is only needed through gate 12; reclaim it now (multi-GB per workbook).
-rm -rf "ast_out/$WB"
+# Retain AST evidence: strict live validation and safe reruns require it.
 
 # ---- gate 13 snapshot (naturalization applied separately) --------------
 rm -rf "$NAT_RUN"; mkdir -p "$NAT_RUN"
@@ -263,5 +292,7 @@ else:
   115) fail 6  "plain path reached with a non-empty spec" ;;
   116) fail 11 "MCP artifact leaked into a plain bundle" ;;
   117) fail 11 "plain environment hygiene failed" ;;
+  118) fail 4  "versioned segmentation generation gate failed" ;;
+  119) fail 4  "baseline inputs generation binding failed" ;;
   *)   fail ?  "unexpected rc=$RC" ;;
 esac

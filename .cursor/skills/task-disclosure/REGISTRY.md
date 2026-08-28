@@ -167,9 +167,10 @@ Records from this section ship a value. Their record metadata is `convention`.
 - **Id.** `row_populated`
 - **Question.** Is a labelled row used at all in the original?
 - **Alternatives.** `unused` | `populated` | `populated_but_unread`
-- **Ship when.** `always`, because the detector only emits a record once every condition below
-  already holds. `populated` is never emitted; it tells the agent nothing it cannot see.
-  `populated_but_unread` is emitted under its own conditions, listed after the `unused` set.
+- **Ship when.** `unused` ships once every condition below holds. `populated` is never emitted;
+  it tells the agent nothing it cannot see. `populated_but_unread` is retained reviewer-only:
+  its cited values survive in the delivered workbook, so putting it under a disclosure preamble
+  for choices the file no longer shows would be false and would violate the blank-cell invariant.
 - **Detection conditions for `unused`.** All of these, applied when the record is built:
   - The row is empty in the golden and shows nothing beyond its label in the delivered file.
     An emptied row and a never-populated row are otherwise indistinguishable, because the
@@ -296,7 +297,7 @@ Records from this section ship a value. Their record metadata is `convention`.
 - **Id.** `projection_rule`
 - **Question.** How is a forecast row carried forward?
 - **Alternatives.** `hold_level` | `hold_growth` | `step_increment` | `average_window` |
-  `ratio_to_driver`
+  `ratio_to_driver` | `first_period_zero_floor_then_hold`
 - **Ship when.** The ingredient the rule needs is **not** available to the agent. Specifically:
   - **declines** when every ingredient row is either visible in the delivered file or sits
     within fifteen rows on the same sheet. The agent can see the structure, so choosing the
@@ -355,6 +356,8 @@ Records from this section ship a value. Their record metadata is `convention`.
   - `average_window` - "The row labelled {label} is the average of {ingredient}."
   - `ratio_to_driver` - "The row labelled {label} is worked out in each period from
     {ingredient}."
+  - `first_period_zero_floor_then_hold` - "The row labelled {label} floors the first forecast
+    period at zero, then carries that amount forward unchanged over the remaining forecast."
 - **Detection.** Classify each cell on the row, then split the row into contiguous runs of one
   kind. A bare reference to the previous column is hold level; a `*(1+x)` factor is hold
   growth; a reference to the previous column plus or minus exactly one further term is a step
@@ -391,7 +394,7 @@ Records from this section ship a value. Their record metadata is `convention`.
 - **Id.** `distribution_policy`
 - **Question.** What sizes the distribution paid to holders in each period?
 - **Alternatives.** `residual_cash_floored` | `residual_cash_unfloored` | `payout_ratio` |
-  `capped_at_retained_earnings` | `first_period_only`
+  `capped_at_retained_earnings` | `ownership_band_rate` | `first_period_only`
 - **Ship when.** The distribution row is blank in the delivered file and no surviving labelled
   input states the policy. **Declines** when a payout rate survives on a labelled row and the
   distribution is that rate applied to a single visible driver, which is ordinary reasoning. No
@@ -406,12 +409,15 @@ Records from this section ship a value. Their record metadata is `convention`.
     earnings."
   - `capped_at_retained_earnings` - "The row labelled {label} distributes no more than the
     retained earnings available at the time."
+  - `ownership_band_rate` - "The row labelled {label} selects 70% when {ingredient} indicates
+    ownership below 20%, 100% when it indicates ownership above 80%, and 80% otherwise."
   - `first_period_only` - "The row labelled {label} pays in the first period only."
 - **Detection.** Rows whose label contains dividend, distribution, or shareholder payment. A
   `MAX` against zero over a cash-available term is the floored residual; the same term without
   the `MAX` is unfloored; a product against an earnings row is a payout ratio; a `MIN` against a
-  retained-earnings balance is the cap. **Every value needs a positive signal and there is no
-  default**: a dividend row whose shape matches none of the four is left uncovered. Asserting a
+  retained-earnings balance is the cap; the nested `<20%` / `>80%` branch is an ownership-band
+  rate selection. **Every value needs a positive signal and there is no default**: a dividend row
+  whose shape matches none of these is left uncovered. Asserting a
   rule from the absence of a token is how this entry would become the next `projection_rule`, whose
   own Note records it once produced 677 of 751 records.
 - **Known limit.** The values are written as siblings but the shapes are not exclusive. 0677's
@@ -500,16 +506,19 @@ Records from this section ship a value. Their record metadata is `convention`.
 - **Alternatives.** `applied` | `not_applied`
 - **Ship when.** `always`. Observed agents applied the share inconsistently across rows of the
   same page, and nothing in the delivered file says which lines carry it.
-- **Implemented scope.** Only `applied` is emitted; the detector recognises the multiplication,
-  not its absence, so `not_applied` is unreachable. Note also that a row may scale by the share
-  and then add an unscaled term, which the sentence does not capture.
+- **Implemented scope.** Only `applied` is emitted; the detector recognises a direct
+  multiplication of exactly two referenced cells, one of which is the ownership share.
+  Complements, sums, and formulas with an added unscaled term are left unclassified because this
+  entry cannot state their complete mechanics.
 - **Sentence.**
-  - `applied` - "The row labelled {label} is scaled by the buyer's ownership share in
+  - `applied` - "The row labelled {label} multiplies {base} by the buyer's ownership share in
     {ingredient}."
   - `not_applied` - "The row labelled {label} is stated in full, not scaled by the buyer's
     ownership share."
-- **Detection.** The formula references a cell whose row label matches equity investment,
-  ownership, stake, or percent acquired.
+- **Detection.** The formula is a direct multiplication of two references. One referenced cell's
+  row label matches equity investment, ownership, stake, or percent acquired; the other is named
+  as the base. A reference that is merely one addend in a total or is nested inside a complement
+  does not qualify.
 - **Seen in.** 0522, 0523, 0524, 0529, 0530.
 
 ## `source_selection`

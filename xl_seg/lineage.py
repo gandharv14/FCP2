@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 
-from .condense import strongly_connected, topo_order
+from .condense import strongly_connected
 from .frontier import primary_band
 from .partition import INPUT, MIDDLE, OUTPUT
 
@@ -56,19 +56,31 @@ def _restricted_topo(cone: set, adj: dict, radj: dict) -> list:
     return order
 
 
-def band_trace(bg, cd, part, comp: str) -> list:
+def band_trace(
+    bg,
+    cd,
+    part,
+    comp: str,
+    *,
+    comp_adj=None,
+    comp_radj=None,
+    proof_input_comps=None,
+) -> list:
     """Every component the output depends on, in dependency order."""
+    comp_adj = cd.comp_adj if comp_adj is None else comp_adj
+    comp_radj = cd.comp_radj if comp_radj is None else comp_radj
+    proof_input_comps = set() if proof_input_comps is None else proof_input_comps
     cone = {comp}
     stack = [comp]
     while stack:
         node = stack.pop()
-        for pred in cd.comp_radj.get(node, ()):
+        for pred in comp_radj.get(node, ()):
             if pred not in cone:
                 cone.add(pred)
                 stack.append(pred)
 
     steps = []
-    for i, node in enumerate(_restricted_topo(cone, cd.comp_adj, cd.comp_radj)):
+    for i, node in enumerate(_restricted_topo(cone, comp_adj, comp_radj)):
         band_id = primary_band(cd, bg, node)
         band = bg.bands[band_id]
         members = cd.comp_members[node]
@@ -76,13 +88,13 @@ def band_trace(bg, cd, part, comp: str) -> list:
             Step(
                 order=i,
                 node=band_id,
-                bucket=part.bucket.get(node, MIDDLE),
+                bucket=INPUT if node in proof_input_comps else part.bucket.get(node, MIDDLE),
                 sheet=band.sheet,
                 label=band.label,
                 formula=band.pattern or (band.kind if band.kind != "formula" else ""),
                 depth=cd.depth.get(node, 0),
                 inputs=sorted(
-                    primary_band(cd, bg, p) for p in cd.comp_radj.get(node, ()) if p in cone
+                    primary_band(cd, bg, p) for p in comp_radj.get(node, ()) if p in cone
                 ),
                 values=[f"{len(members)} band(s)"] if len(members) > 1 else [],
             )
@@ -90,20 +102,37 @@ def band_trace(bg, cd, part, comp: str) -> list:
     return steps
 
 
-def cell_trace(cg, values, cell_id: str, input_cells: set, limit: int) -> dict:
+def cell_trace(
+    cg,
+    values,
+    cell_id: str,
+    input_cells: set,
+    limit: int,
+    *,
+    adj=None,
+    radj=None,
+) -> dict:
     """Exact cell-by-cell derivation of one output value."""
+    adj = cg.adj if adj is None else adj
+    radj = cg.radj if radj is None else radj
     cone = {cell_id}
     stack = [cell_id]
     while stack:
         node = stack.pop()
         if node in input_cells and node != cell_id:
             continue
-        for pred in cg.radj.get(node, ()):
+        for pred in radj.get(node, ()):
             if pred not in cone:
                 cone.add(pred)
                 stack.append(pred)
 
-    groups = strongly_connected(cone, {n: {s for s in cg.adj.get(n, ()) if s in cone} for n in cone})
+    # Canonicalize both Tarjan roots and successors.  The proof graphs store
+    # adjacency in sets, whose iteration order changes with PYTHONHASHSEED.
+    restricted_adj = {
+        node: tuple(sorted(succ for succ in adj.get(node, ()) if succ in cone))
+        for node in sorted(cone)
+    }
+    groups = strongly_connected(sorted(cone), restricted_adj)
     comp_of, members = {}, {}
     for group in groups:
         members[group[0]] = group
@@ -111,7 +140,7 @@ def cell_trace(cg, values, cell_id: str, input_cells: set, limit: int) -> dict:
             comp_of[cell] = group[0]
     cadj, cradj = {}, {}
     for node in cone:
-        for succ in cg.adj.get(node, ()):
+        for succ in adj.get(node, ()):
             if succ not in cone:
                 continue
             a, b = comp_of[node], comp_of[succ]
@@ -119,7 +148,11 @@ def cell_trace(cg, values, cell_id: str, input_cells: set, limit: int) -> dict:
                 cadj.setdefault(a, set()).add(b)
                 cradj.setdefault(b, set()).add(a)
 
-    ordered = [c for comp in topo_order(members, cadj, cradj) for c in sorted(members[comp])]
+    ordered = [
+        cell
+        for comp in _restricted_topo(set(members), cadj, cradj)
+        for cell in sorted(members[comp])
+    ]
     truncated = max(0, len(ordered) - limit)
     if truncated:
         # Keep the inputs and the tail nearest the output; the middle is the bulk.
@@ -142,7 +175,7 @@ def cell_trace(cg, values, cell_id: str, input_cells: set, limit: int) -> dict:
                 "kind": info.node.kind,
                 "value": _plain(values.get(cid)),
                 "cached": info.node.value,
-                "precedents": sorted(p for p in cg.radj.get(cid, ()) if p in cone),
+                "precedents": sorted(p for p in radj.get(cid, ()) if p in cone),
             }
         )
     return {
@@ -161,15 +194,75 @@ def _plain(value):
     return str(value)
 
 
-def build(bg, cd, part, cg, values, outputs, input_cells, cell_limit: int) -> list:
+def _proof_graphs(bg, cd, proof_radj):
+    cell_radj = {
+        target: set(sources) for target, sources in proof_radj.items()
+    }
+    cell_adj = {}
+    comp_adj, comp_radj = {}, {}
+    for target, sources in cell_radj.items():
+        target_band = bg.of_cell.get(target)
+        target_comp = cd.comp_of.get(target_band)
+        for source in sources:
+            cell_adj.setdefault(source, set()).add(target)
+            source_band = bg.of_cell.get(source)
+            source_comp = cd.comp_of.get(source_band)
+            if source_comp is None or target_comp is None or source_comp == target_comp:
+                continue
+            comp_adj.setdefault(source_comp, set()).add(target_comp)
+            comp_radj.setdefault(target_comp, set()).add(source_comp)
+    return cell_adj, cell_radj, comp_adj, comp_radj
+
+
+def build(
+    bg,
+    cd,
+    part,
+    cg,
+    values,
+    outputs,
+    input_cells,
+    cell_limit: int,
+    *,
+    proof_radj=None,
+) -> list:
+    if proof_radj is None:
+        cell_adj, cell_radj = cg.adj, cg.radj
+        comp_adj, comp_radj = cd.comp_adj, cd.comp_radj
+    else:
+        cell_adj, cell_radj, comp_adj, comp_radj = _proof_graphs(
+            bg, cd, proof_radj
+        )
+    proof_input_comps = {
+        comp
+        for cell in input_cells
+        if (band := bg.of_cell.get(cell)) is not None
+        if (comp := cd.comp_of.get(band)) is not None
+    }
     traces = []
     for comp in outputs:
         band_id = primary_band(cd, bg, comp)
         band = bg.bands[band_id]
-        steps = band_trace(bg, cd, part, comp)
+        steps = band_trace(
+            bg,
+            cd,
+            part,
+            comp,
+            comp_adj=comp_adj,
+            comp_radj=comp_radj,
+            proof_input_comps=proof_input_comps,
+        )
         cells = {}
         for cid in band.cells:
-            cells[cid] = cell_trace(cg, values, cid, input_cells, cell_limit)
+            cells[cid] = cell_trace(
+                cg,
+                values,
+                cid,
+                input_cells,
+                cell_limit,
+                adj=cell_adj,
+                radj=cell_radj,
+            )
         traces.append(
             Trace(
                 output=band_id,

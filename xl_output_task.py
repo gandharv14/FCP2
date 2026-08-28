@@ -45,6 +45,13 @@ from xl_formula_hint_tasks import (
     load_formula_artifacts,
     render_section as render_custom_formula_section,
 )
+from xl_seg.proof import load_contract as load_proof_contract
+from xl_seg.publication import (
+    GenerationValidationError,
+    inputs_sidecar_path,
+    resolve_for_consumer,
+    validate_inputs_sidecar,
+)
 
 PIPELINE_VERSION = "1.0.0"
 TIMEOUT_BASE_SEC = 2400.0
@@ -335,9 +342,9 @@ def verify_mcp_mask(mcp_dir, artifact):
                ", ".join(populated[:8])))
 
 
-def collect(workbook, source_dir, seg_root, inputs_root):
+def collect(workbook, source_dir, seg_root, inputs_root, *, seg_dir=None):
     """(outputs, targets) - curated figures and their golden cell values."""
-    seg_dir = Path(seg_root) / workbook
+    seg_dir = Path(seg_dir) if seg_dir is not None else Path(seg_root) / workbook
     outputs = curated_outputs(seg_dir)
     if not outputs:
         raise SystemExit("%s: curation.toml includes no outputs" % workbook)
@@ -587,7 +594,10 @@ def load_plain_meta(workbook, audit_root="runs"):
 
 def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
          nat_meta, hints=None, hint_style="", mcp_dir=None, audit_meta=None,
-         formula_report=None, formula_hints=None, audit_root="runs"):
+         formula_report=None, formula_hints=None, audit_root="runs",
+         proof_contract=None, generation_manifest=None,
+         generation_manifest_path=None, inputs_generation=None,
+         inputs_generation_path=None):
     if out_dir.exists():
         shutil.rmtree(out_dir)
     (out_dir / "environment").mkdir(parents=True)
@@ -649,6 +659,41 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
         "pipeline_version": PIPELINE_VERSION,
         "created_at": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if proof_contract is not None:
+        proof_path = out_dir / "tests" / "segmentation_proof.json"
+        proof_path.write_text(
+            json.dumps(proof_contract, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        metadata.update({
+            "segmentation_proof": "tests/segmentation_proof.json",
+            "segmentation_proof_inputs":
+                len(proof_contract.get("effective_inputs") or []),
+            "segmentation_declared_inputs":
+                len(proof_contract.get("declared_static_inputs") or []),
+            "segmentation_runtime_edges": sum(
+                len(sources)
+                for sources in (proof_contract.get("runtime_radj") or {}).values()
+            ),
+            "segmentation_closure_stabilized": True,
+        })
+    if generation_manifest is not None:
+        generation_path = out_dir / "tests" / "segmentation_generation_manifest.json"
+        shutil.copy2(generation_manifest_path, generation_path)
+        metadata.update({
+            "segmentation_generation_manifest":
+                "tests/segmentation_generation_manifest.json",
+            "segmentation_generation_id": generation_manifest["generation_id"],
+            "segmentation_verification_schema":
+                generation_manifest["verification_schema_version"],
+        })
+    if inputs_generation is not None:
+        inputs_generation_out = out_dir / "tests" / "inputs_generation.json"
+        shutil.copy2(inputs_generation_path, inputs_generation_out)
+        metadata.update({
+            "inputs_generation": "tests/inputs_generation.json",
+            "inputs_generation_id": inputs_generation["generation_id"],
+        })
     if audit_meta is not None:
         metadata.update({
             "variable_source_audit": audit_meta["markdown"],
@@ -768,6 +813,23 @@ def main(argv=None):
     parser.add_argument("workbooks", nargs="+")
     parser.add_argument("--source", default="4-10 100")
     parser.add_argument("--seg-root", default="seg_out")
+    parser.add_argument(
+        "--ast-dir",
+        default="ast_out",
+        help="AST root used to validate strict segmentation fingerprints",
+    )
+    parser.add_argument(
+        "--segmentation-mode",
+        choices=("strict", "shadow", "legacy"),
+        default="strict",
+        help="strict production gate (default), versioned shadow, or explicit "
+             "unversioned legacy downgrade",
+    )
+    parser.add_argument(
+        "--expected-generation-id",
+        default=None,
+        help="fail if current.json no longer names this generation",
+    )
     parser.add_argument("--inputs-root", default="inputs_out")
     parser.add_argument("--taxonomy", default="taxonomy_out/workbooks.json")
     parser.add_argument("--env-file", default=".env")
@@ -862,8 +924,40 @@ def main(argv=None):
     out_root.mkdir(parents=True, exist_ok=True)
     for workbook in args.workbooks:
         family = families.get(workbook, "")
+        source_path = Path(args.source) / ("%s.xlsx" % workbook)
+        try:
+            seg_dir, generation_manifest = resolve_for_consumer(
+                Path(args.seg_root) / workbook,
+                mode=args.segmentation_mode,
+                source_path=source_path,
+                ast_dir=Path(args.ast_dir) / workbook,
+                require_pass=True,
+                expected_generation_id=args.expected_generation_id,
+            )
+        except GenerationValidationError as exc:
+            raise SystemExit(
+                "%s: segmentation generation gate failed: %s"
+                % (workbook, exc)
+            ) from exc
+        proof_contract = load_proof_contract(seg_dir)
+        artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
+        inputs_generation = None
+        inputs_generation_path = None
+        if generation_manifest is not None:
+            inputs_generation_path = inputs_sidecar_path(artifact)
+            try:
+                inputs_generation = validate_inputs_sidecar(
+                    artifact,
+                    expected_generation_id=generation_manifest["generation_id"],
+                    generation_dir=seg_dir,
+                )
+            except GenerationValidationError as exc:
+                raise SystemExit(
+                    "%s: inputs generation binding failed: %s"
+                    % (workbook, exc)
+                ) from exc
         outputs, targets = collect(workbook, args.source, args.seg_root,
-                                   args.inputs_root)
+                                   args.inputs_root, seg_dir=seg_dir)
         formula_report = None
         formula_hints = None
         if args.custom_formula_report:
@@ -879,7 +973,6 @@ def main(argv=None):
                 ],
                 context_path=Path(args.custom_formula_context),
             )
-        artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
         if mcp_dir is not None:
             verify_mcp_mask(mcp_dir, artifact)
         audit_meta = None
@@ -891,7 +984,7 @@ def main(argv=None):
             audit_meta = generate_audit(
                 workbook,
                 audit_artifact,
-                Path(args.seg_root) / workbook,
+                seg_dir,
                 Path(args.variable_source_audit_root)
                 / ("%s-variable-sources" % workbook),
                 config["api_key"],
@@ -904,7 +997,6 @@ def main(argv=None):
         hints = None
         hint_style = ""
         if args.hints:
-            seg_dir = Path(args.seg_root) / workbook
             hints = lineage_hints(outputs, load_lineage(seg_dir))
             hint_style = "lineage"
         elif args.semantic_hints:
@@ -938,7 +1030,15 @@ def main(argv=None):
              outputs, nat_meta, hints=hints, hint_style=hint_style,
              mcp_dir=mcp_dir, audit_meta=audit_meta,
              formula_report=formula_report, formula_hints=formula_hints,
-             audit_root=args.variable_source_audit_root)
+             audit_root=args.variable_source_audit_root,
+             proof_contract=proof_contract,
+             generation_manifest=generation_manifest,
+             generation_manifest_path=(
+                 seg_dir / "generation-manifest.json"
+                 if generation_manifest is not None else None
+             ),
+             inputs_generation=inputs_generation,
+             inputs_generation_path=inputs_generation_path)
         n_vars = mcp_variable_count(mcp_dir) if mcp_dir is not None else 0
         print("%s  %-16s %2d outputs, %3d cells%s, timeout %.0fs -> %s"
               % (workbook, family, len(outputs), len(targets),

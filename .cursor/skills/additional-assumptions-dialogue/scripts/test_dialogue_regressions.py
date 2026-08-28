@@ -14,6 +14,7 @@ from spoken_formula import speak_steps
 from validate_dialogue import (
     DialogueError,
     apply,
+    audit_dialogue,
     check_draft,
     map_turns_to_claims,
     review_accuracy_passed,
@@ -118,6 +119,63 @@ def test_review_coverage() -> None:
     _ok("review-empty-claims-fail", not review_accuracy_passed(empty, CLAIMS))
 
 
+def test_formula_literal_target_collision_is_claim_scoped(tmp_path: Path) -> None:
+    task = tmp_path / "0399-outputs"
+    (task / "tests").mkdir(parents=True)
+    (task / "tests" / "answer_key.json").write_text(
+        json.dumps({"targets": {"Timing!I32": 365.0}, "tolerance": {}}),
+        encoding="utf-8",
+    )
+    claim = {
+        "record_id": "method_revenue::FM::Growth rate, %::001",
+        "sheet": "FM",
+        "row_label": "Growth rate, %",
+        "reviewer_only": {
+            "source": "custom_method_detector",
+            "cells": ["FM!I117"],
+            "evidence": "=IF(I25=1,I118*I119*I120*365,0)",
+        },
+    }
+    claims = [claim]
+
+    good = (
+        "<!-- claim:method_revenue::FM::Growth rate, %::001 -->\n"
+        "**Analyst:** How should I build Growth rate, %?\n"
+        "**VP:** Multiply the operating drivers by 365 for Growth rate, %.\n"
+    )
+    good_turns = parse_turns(good)
+    good_mapped, _ = map_turns_to_claims(good_turns, claims)
+    _ok(
+        "formula-literal-collision-allowed",
+        not audit_dialogue(good, claims, good_turns, good_mapped, task),
+    )
+
+    leaked = good.replace("by 365 for", "by 365, and the target is 365 for")
+    leaked_turns = parse_turns(leaked)
+    leaked_mapped, _ = map_turns_to_claims(leaked_turns, claims)
+    faults = audit_dialogue(leaked, claims, leaked_turns, leaked_mapped, task)
+    _ok(
+        "extra-target-occurrence-fails",
+        faults == ["numeric literal 365 matches target 365.0"],
+        str(faults),
+    )
+
+    junior_leak = good.replace(
+        "How should I build Growth rate, %?",
+        "The target is 365. How should I build Growth rate, %?",
+    )
+    junior_turns = parse_turns(junior_leak)
+    junior_mapped, _ = map_turns_to_claims(junior_turns, claims)
+    faults = audit_dialogue(
+        junior_leak, claims, junior_turns, junior_mapped, task
+    )
+    _ok(
+        "junior-target-occurrence-fails",
+        faults == ["numeric literal 365 matches target 365.0"],
+        str(faults),
+    )
+
+
 def test_stale_pack() -> None:
     try:
         require_cast({"senior_title": "Senior banker", "claims": []})
@@ -127,8 +185,8 @@ def test_stale_pack() -> None:
         _ok("stale-pack", False, "did not raise")
 
 
-def test_apply_blocks_missing_must_say(tmp: Path) -> None:
-    task = tmp / "0042-outputs"
+def test_apply_blocks_missing_must_say(tmp_path: Path) -> None:
+    task = tmp_path / "0042-outputs"
     (task / "environment").mkdir(parents=True)
     (task / "tests").mkdir()
     (task / "instruction.md").write_text(
@@ -142,7 +200,7 @@ def test_apply_blocks_missing_must_say(tmp: Path) -> None:
         encoding="utf-8",
     )
     (task / "environment" / "0042-inputs.xlsx").write_bytes(b"PK\x03\x04fake")
-    draft = tmp / "draft.md"
+    draft = tmp_path / "draft.md"
     draft.write_text(
         "<!-- claim:projection_rule::Operations::Fee -->\n"
         "**Associate:** Fee?\n**VP:** On Operations I will get back to you.\n",
@@ -335,7 +393,9 @@ def main() -> int:
     test_sheet_only_when_unclear()
     test_paren_ast_draft_fails()
     with tempfile.TemporaryDirectory() as raw:
-        test_apply_blocks_missing_must_say(Path(raw))
+        tmp_path = Path(raw)
+        test_formula_literal_target_collision_is_claim_scoped(tmp_path)
+        test_apply_blocks_missing_must_say(tmp_path)
     print("all regressions passed")
     return 0
 

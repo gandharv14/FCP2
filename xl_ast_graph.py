@@ -630,23 +630,26 @@ class AstGraph:
                 if isinstance(value, ArrayFormula):
                     text = value.text
                     if isinstance(text, str) and text.startswith("="):
-                        formulas[(cell.row, cell.column)] = (text, True)
                         # A multi-cell array (CSE or spill) formula lives only
                         # on its master cell; the member cells it fills carry
                         # nothing but a cached value in the file, and would
                         # otherwise be classified as hand-typed inputs -- a
                         # computed value handed to the rebuild as a given.
                         # Register every member as owning the same formula so
-                        # it is a formula cell with real precedent edges.
+                        # it is a formula cell with real precedent edges, and
+                        # record the span so the evaluator can hand each
+                        # member its own positional element of the result.
                         ref = str(getattr(value, "ref", "") or "")
-                        if ":" in ref:
+                        span = ref if ":" in ref else ""
+                        formulas[(cell.row, cell.column)] = (text, True, span)
+                        if span:
                             min_col, min_row, max_col, max_row = \
                                 range_boundaries(ref)
                             for member_row in range(min_row, max_row + 1):
                                 for member_col in range(min_col, max_col + 1):
                                     spot = (member_row, member_col)
                                     if spot != (cell.row, cell.column):
-                                        formulas.setdefault(spot, (text, True))
+                                        formulas.setdefault(spot, (text, True, span))
                 elif cell.data_type == "f" and isinstance(value, str) and value.startswith("="):
                     formulas[(cell.row, cell.column)] = (value, False)
             idx.finalise()
@@ -796,12 +799,22 @@ class AstGraph:
             if n == 0:
                 continue
             if n > self.max_range_expand:
-                # Clamp to the populated bounding box so a whole-column A:I
-                # does not become a range node a million rows tall.
-                box = idx.clip(min_col, min_row, max_col, max_row)
-                lo_col, lo_row, hi_col, hi_row = box if box else (
-                    min_col, min_row, min(max_col, EXCEL_MAX_COL),
-                    min(max_row, EXCEL_MAX_ROW))
+                # Clamp to the sheet's populated bounding box so a
+                # whole-column A:I does not become a range node a million rows
+                # tall. Intersecting with the sheet box (not the range's own
+                # populated box) keeps same-sheet spans congruent, so paired
+                # arguments like SUMIF's criteria and sum ranges stay
+                # positionally aligned.
+                box = idx.clip(1, 1, EXCEL_MAX_COL, EXCEL_MAX_ROW)
+                if box:
+                    lo_col = max(min_col, box[0])
+                    lo_row = max(min_row, box[1])
+                    hi_col = min(max_col, box[2])
+                    hi_row = min(max_row, box[3])
+                else:
+                    lo_col, lo_row = min_col, min_row
+                    hi_col = min(max_col, EXCEL_MAX_COL)
+                    hi_row = min(max_row, EXCEL_MAX_ROW)
                 ref = "%s%d:%s%d" % (
                     get_column_letter(lo_col), lo_row,
                     get_column_letter(hi_col), hi_row,
@@ -822,7 +835,7 @@ class AstGraph:
             "id": node_id, "kind": kind, "sheet": "", "row": None, "col": None,
             "coordinate": "", "owner": "", "op": "", "op_kind": "", "arity": "",
             "expr": "", "label": "", "formula": "", "value": None,
-            "array_formula": False,
+            "array_formula": False, "array_span": "",
         }
         self.nodes[node_id] = node
         return node
@@ -846,6 +859,7 @@ class AstGraph:
             "coordinate": "%s%d" % (get_column_letter(col), row),
             "formula": entry[0] if entry else "",
             "array_formula": bool(entry[1]) if entry else False,
+            "array_span": entry[2] if entry and len(entry) > 2 else "",
             "value": jsonable(value),
             "label": self._label_for(sheet, row, col, value),
         })
@@ -914,7 +928,7 @@ class AstGraph:
         for sheet in self.sheet_names:
             if self.sheet_filter and sheet not in self.sheet_filter:
                 continue
-            for (row, col), (formula, _) in self.formulas.get(sheet, {}).items():
+            for (row, col), (formula, *_extra) in self.formulas.get(sheet, {}).items():
                 cell_id = self.cell_id(sheet, row, col)
                 try:
                     ast = parse_formula(formula)
@@ -993,6 +1007,12 @@ class AstGraph:
         """Render a cached value the way Excel's ``&`` would."""
         if isinstance(value, bool):
             return "TRUE" if value else "FALSE"
+        if isinstance(value, _dt.datetime):
+            # Excel concatenates a date as its serial number, e.g.
+            # INDIRECT(T2&":"&T3) building a "46023:46053" row span.
+            delta = value - _dt.datetime(1899, 12, 30)
+            serial = delta.days + delta.seconds / 86400.0
+            return str(int(serial)) if float(serial).is_integer() else str(serial)
         if isinstance(value, float) and value.is_integer():
             return str(int(value))
         return str(value)
@@ -1078,10 +1098,54 @@ class AstGraph:
                 ctx["unresolved"] += 1
         return [(node_id, "", "")]
 
+    _WHOLE_COL_RE = re.compile(r"^\$?[A-Za-z]{1,3}:\$?[A-Za-z]{1,3}$")
+    _WHOLE_ROW_RE = re.compile(r"^\$?\d{1,7}:\$?\d{1,7}$")
+
+    def _normalize_unbounded(self, token, cur_sheet):
+        """Clamp a whole-column/row span to the sheet's populated box.
+
+        Every unbounded span on a sheet clamps to the same window, keeping
+        paired ranges like ``SUMIF(D:D, key, J:J)`` row-aligned, and gives the
+        evaluator explicit bounds it can rebuild members from.
+        """
+        sheet_part, body, external = self._split_ref(token)
+        if external is not None:
+            return token
+        if sheet_part is not None and ":" in sheet_part:
+            return token
+        sheet = cur_sheet if sheet_part is None else sheet_part
+        idx = self.index.get(sheet)
+        if idx is None:
+            return token
+        stripped = body.replace("$", "")
+        if self._WHOLE_COL_RE.match(body):
+            box = idx.clip(1, 1, EXCEL_MAX_COL, EXCEL_MAX_ROW)
+            if not box:
+                return token
+            first, last = stripped.split(":")
+            new_body = "%s%d:%s%d" % (first, box[1], last, box[3])
+        elif self._WHOLE_ROW_RE.match(body):
+            box = idx.clip(1, 1, EXCEL_MAX_COL, EXCEL_MAX_ROW)
+            if not box:
+                return token
+            first, last = stripped.split(":")
+            new_body = "%s%s:%s%s" % (
+                get_column_letter(box[0]), first, get_column_letter(box[2]), last)
+        else:
+            return token
+        prefix, sep, _ = token.rpartition("!")
+        return prefix + sep + new_body if sep else new_body
+
     def _emit_ref(self, node, ctx):
-        token = node.name
+        token = self._normalize_unbounded(node.name, ctx["sheet"])
         items = self.resolve(token, ctx["sheet"])
-        multi = len(items) > 1 or (bool(items) and items[0][0] == "range")
+        # A span-like token must keep its via_range even when only one member
+        # cell is populated: the evaluator rebuilds the full span (empty
+        # members included) from this text, and losing it hands positional
+        # functions like INDEX/COUNTA a bare scalar instead of the range.
+        spanlike = ":" in token.rpartition("!")[2]
+        multi = (len(items) > 1 or (bool(items) and items[0][0] == "range")
+                 or (bool(items) and spanlike))
         via = token if multi else ""
         out = []
         for item in items:
@@ -1285,7 +1349,8 @@ class AstGraph:
 
 NODE_FIELDS = ["id", "kind", "sheet", "coordinate", "row", "col", "owner", "op",
                "op_kind", "arity", "expr", "label", "formula", "value",
-               "array_formula", "in_degree", "out_degree", "in_cycle"]
+               "array_formula", "array_span", "in_degree", "out_degree",
+               "in_cycle"]
 EDGE_FIELDS = ["source", "target", "role", "arg_index", "op", "cell", "ref",
                "via_range", "cross_sheet", "in_cycle"]
 
@@ -1313,8 +1378,8 @@ _GRAPHML_NODE_TYPES = {
     "kind": "string", "sheet": "string", "coordinate": "string", "row": "int",
     "col": "int", "owner": "string", "op": "string", "op_kind": "string",
     "arity": "int", "expr": "string", "label": "string", "formula": "string",
-    "value": "string", "array_formula": "boolean", "in_degree": "int",
-    "out_degree": "int", "in_cycle": "boolean",
+    "value": "string", "array_formula": "boolean", "array_span": "string",
+    "in_degree": "int", "out_degree": "int", "in_cycle": "boolean",
 }
 _GRAPHML_EDGE_TYPES = {
     "role": "string", "arg_index": "int", "op": "string", "cell": "string",

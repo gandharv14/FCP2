@@ -95,6 +95,10 @@ class Node:
     formula: str
     value: str
     in_cycle: bool
+    # A1 span of the multi-cell array formula this cell belongs to, empty for
+    # ordinary cells. Lets the evaluator hand each member its own positional
+    # element instead of the anchor's first value.
+    array_span: str = ""
 
     @property
     def is_cell(self) -> bool:
@@ -173,6 +177,7 @@ def load(ast_dir: Path, wb: str) -> Graph:
                 formula=row["formula"],
                 value=row["value"],
                 in_cycle=row["in_cycle"] == "True",
+                array_span=row.get("array_span") or "",
             )
 
     edges: list[Edge] = []

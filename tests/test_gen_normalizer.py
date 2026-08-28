@@ -234,6 +234,40 @@ class PlainEligibilityTests(unittest.TestCase):
             self.assertFalse(report["valid"])
             self.assertIn("additional-assumptions.md", report["unknown_files"])
 
+    def test_plain_environment_accepts_xlsm_inputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp)
+            env = bundle / "environment"
+            env.mkdir()
+            (env / "0624-inputs.xlsm").write_bytes(b"m")
+            (env / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            report = plain_eligibility.check_plain_environment(bundle, "0624")
+            self.assertTrue(report["valid"], report)
+            self.assertEqual(report["workbooks"], ["0624-inputs.xlsm"])
+
+    def test_plain_environment_rejects_both_workbook_suffixes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp)
+            env = bundle / "environment"
+            env.mkdir()
+            (env / "0001-inputs.xlsx").write_bytes(b"x")
+            (env / "0001-inputs.xlsm").write_bytes(b"m")
+            (env / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            report = plain_eligibility.check_plain_environment(bundle, "0001")
+            self.assertFalse(report["valid"])
+            self.assertIn("exactly one workbook at environment root",
+                          report["missing_files"])
+
+    def test_plain_environment_missing_workbook_error_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp)
+            env = bundle / "environment"
+            env.mkdir()
+            (env / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            report = plain_eligibility.check_plain_environment(bundle, "0001")
+            self.assertFalse(report["valid"])
+            self.assertIn("0001-inputs.xlsx", report["missing_files"])
+
     def test_plain_environment_rejects_notes_without_dockerfile_copy(self):
         with tempfile.TemporaryDirectory() as temp:
             bundle = Path(temp)

@@ -159,6 +159,14 @@ def cells_from_band_ref(ref: str) -> set[str]:
     return {key(sheet, coord)}
 
 
+# A formula that is exactly one cell reference. BARE_LINK is unsigned (a plain
+# link or `=+X`); BARE_ALIAS also admits a leading minus, because a negated
+# alias still carries the source's construction up to sign.
+_BARE_REF_BODY = r"(?:(?:'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_. &-]*)!)?\$?[A-Z]{1,3}\$?[0-9]{1,7}"
+BARE_LINK_RE = re.compile(r"^=\s*\+?\s*%s\s*$" % _BARE_REF_BODY)
+BARE_ALIAS_RE = re.compile(r"^=\s*[+\-]?\s*%s\s*$" % _BARE_REF_BODY)
+
+
 # --------------------------------------------------------------------------- workbook
 
 
@@ -191,7 +199,24 @@ class Book:
             wbv.close()
         self._labels: dict[str, str] = {}
         self._label_cols: dict[str, set] = {}
+        self._stamp_cols: dict[str, set] = {}
         self._marker_cache: dict[str, dict] = {}
+        self._max_cols: dict[str, int] = {}
+
+    def max_col(self, sheet: str) -> int:
+        """Rightmost used column on a sheet, so row scans never truncate scope."""
+        if sheet in self._max_cols:
+            return self._max_cols[sheet]
+        hi = 1
+        for k in list(self.value) + list(self.formula):
+            s, coord = k.split("!", 1)
+            if s != sheet:
+                continue
+            p = split_coord(coord)
+            if p:
+                hi = max(hi, col_to_num(p[0]))
+        self._max_cols[sheet] = hi
+        return hi
 
     def label_columns(self, sheet: str) -> set:
         """Columns that name rows, found from how the sheet is actually laid out.
@@ -223,6 +248,64 @@ class Book:
         self._label_cols[sheet] = cols
         return cols
 
+    def stamp_columns(self, sheet: str) -> set:
+        """Columns that carry units or bases rather than row names.
+
+        0661's Assumptions column F holds "#", "date", "k€", "% of EBITDA",
+        "years" - and, on two rows, the bare word "EBITDA", which is the basis
+        of the "Acquisition multiple" assumption beside it, not a row name.
+        No token list can reject "EBITDA" outright (it is a real row label
+        elsewhere), but a column that is overwhelmingly stamps does not name
+        rows even where one cell holds a real word.
+        """
+        if sheet in self._stamp_cols:
+            return self._stamp_cols[sheet]
+        stamps = Counter()
+        other = Counter()
+        for k, v in self.value.items():
+            s, coord = k.split("!", 1)
+            if s != sheet or k in self.formula:
+                continue
+            if not isinstance(v, str) or not v.strip():
+                continue
+            p = split_coord(coord)
+            if not p:
+                continue
+            col = col_to_num(p[0])
+            if is_unit_stamp(v) or is_soft_label(v):
+                stamps[col] += 1
+            else:
+                other[col] += 1
+        cols = {
+            c for c, n in stamps.items()
+            if n >= 5 and other.get(c, 0) <= max(1, n // 4)
+        }
+        self._stamp_cols[sheet] = cols
+        return cols
+
+    def linked_literal_text(self, k: str, hops: int = 4) -> str | None:
+        """Text a bare single-reference link chain ultimately displays.
+
+        A linked label - 0350's `Summary!G14 = Assumptions!B51` showing
+        "Exit Year", 0666's `Calc_M!B386` linking "Initial Equity investment"
+        - is a real row name and is accepted. Computed text (concatenations,
+        lookups, scenario CHOOSEs) is not, because its cached display can
+        describe a state rather than the row (0528's scenario side tables).
+        """
+        cur = k
+        for _ in range(hops):
+            formula = self.formula.get(cur)
+            if formula is None:
+                v = self.value.get(cur)
+                return v if isinstance(v, str) and v.strip() else None
+            if not BARE_LINK_RE.match(formula.strip()):
+                return None
+            refs = refs_in(formula, cur.split("!", 1)[0])
+            if len(refs) != 1:
+                return None
+            cur = refs[0]
+        return None
+
     def is_row_name(self, sheet: str, col: int, text: str) -> bool:
         """A row name identifies one row; a scenario marker repeats down a column.
 
@@ -231,7 +314,7 @@ class Book:
         blocks. Naming a row "Base" identifies nothing.
         """
         return not bool(re.fullmatch(
-            r"(?:base(?: case| plus)?|downside|lender|pancake|optimistic|pessimistic)",
+            r"(?:base(?: case| plus| stressed)?|downside|lender|pancake|optimistic|pessimistic)",
             text.strip(),
             re.I,
         ))
@@ -255,35 +338,71 @@ class Book:
         sheet, coord = k.split("!", 1)
         p = split_coord(coord)
         label = ""
+        fallback = ""
         if p:
             col, row = col_to_num(p[0]), p[1]
             # Own cell first: a label sitting in a short block (I9) is the name.
             # Then walk left. Never jump to the leftmost column on the row.
             for c in range(col, 0, -1):
                 candidate = key(sheet, "%s%d" % (num_to_col(c), row))
-                # A formula's cached text/error is a display result, not its row
-                # name. Start at the formula cell for positioning, but keep
-                # walking left until a literal semantic label is found.
-                if candidate in self.formula:
-                    continue
                 v = self.value.get(candidate)
+                # A formula's cached numeric, error or blank display is a
+                # result, not a row name: keep walking. But a formula whose
+                # cached display is semantic TEXT is a linked label - 0350's
+                # `Summary!G14 = Assumptions!B51` shows "Exit Year", 0666's
+                # `Calc_M!B386` links "Initial Equity investment" - and
+                # skipping it lands on a different block's label ("Zip Code").
+                # Cached text still runs the same unit/error/marker filters,
+                # so an IFERROR's "n.a." or a scenario toggle's "Base" is
+                # rejected exactly like literal text would be.
+                if candidate in self.formula and not isinstance(v, str):
+                    continue
+                # Cached display text is only trusted when it is a genuine
+                # linked label: a bare reference chain ending on literal text.
+                # Computed cached text is skipped like a formula result
+                # (0528's scenario side tables, 0605's review standard).
+                if candidate in self.formula and isinstance(v, str):
+                    if self.linked_literal_text(candidate) is None:
+                        continue
                 if isinstance(v, (int, float)) or v is None:
                     continue
                 if not isinstance(v, str) or not v.strip() or v.startswith("="):
                     continue
                 text = v.strip()
+                # Calendar words are usually the unit column beside the real
+                # name (0256 Summary!I6 "Year" beside "Uses & sources of
+                # funds"; 0233 Model!G211 "date" beside "First Availability
+                # Date") and are skipped. But on a row that carries nothing
+                # else - 0233 Model!292's year header row names itself "Year"
+                # in D292 - they are the nearest semantic name, so remember
+                # the first one as a fallback rather than returning blank.
+                if is_soft_label(text):
+                    if not fallback:
+                        fallback = text
+                    continue
                 if is_unit_stamp(text):
                     continue
                 if re.fullmatch(r"scenario\s+\d+", text, re.I):
+                    continue
+                # A column that is overwhelmingly units and bases does not
+                # name rows even where one cell holds a real word (0661's
+                # F column stamps "EBITDA" beside "Acquisition multiple").
+                if c in self.stamp_columns(sheet):
                     continue
                 if not self.is_row_name(sheet, c, text):
                     continue
                 label = text
                 break
+        label = label or fallback
         self._labels[k] = label
         return label
 
-    def row_cells(self, sheet: str, rownum: int, lo: int = 1, hi: int = 80) -> list[str]:
+    def row_cells(self, sheet: str, rownum: int, lo: int = 1, hi: int | None = None) -> list[str]:
+        # hi defaults to the sheet's real width. The old fixed cap of 80
+        # columns silently truncated row scans at column CB, which is how
+        # 0353's monthly waterfall rows lost their CC:DW periods.
+        if hi is None:
+            hi = self.max_col(sheet)
         return [key(sheet, "%s%d" % (num_to_col(c), rownum)) for c in range(lo, hi + 1)]
 
 
@@ -295,6 +414,12 @@ UNIT_TOKENS = {
     "none", "nil", "null", "yes", "tbd", "n.m.", "nm", "n.a.", "year",
     "years", "yr", "year(s)",
 }
+
+
+def is_soft_label(text: str) -> bool:
+    """Calendar/type stamps: skipped while walking, usable as a last resort."""
+    raw = text.strip()
+    return len(raw) >= 4 and bool(re.fullmatch(r"(?:years?|year\(s\)|dates?)", raw, re.I))
 
 
 def is_unit_stamp(text: str) -> bool:
@@ -312,11 +437,36 @@ def is_unit_stamp(text: str) -> bool:
         return True
     if re.fullmatch(r"days?", lowered):
         return True
+    # Type/period stamps sitting between the label and the data. 0233's
+    # Model!G211 holds "date" beside "First Availability Date".
+    if re.fullmatch(r"dates?", lowered):
+        return True
+    # Physical energy/power units: 0233's Control!E20 holds "TWh" beside
+    # "ElecLink flows".
+    if re.fullmatch(r"[kmgt]?w(?:h|hrs?)?", lowered):
+        return True
+    # Scale stamps written as words or quantities: "in '000" (0233 Model!E292),
+    # "'000", "000s".
+    if re.fullmatch(r"(?:in\s*)?['’]?0{3}s?", lowered):
+        return True
+    # A currency code followed by a scale word: 0518's "AED million".
+    if re.fullmatch(
+        r"(?:usd|eur|gbp|aed|sar|zar|chf|jpy|cny|inr|cad|aud)"
+        r"\s+(?:thousand|million|billion|trillion|bn|mn|mm|k|m)s?",
+        lowered,
+    ):
+        return True
+    # A country-prefixed currency symbol: 0646's `=BC` named range displays
+    # "US$" beside the "Dividends" label.
+    if re.fullmatch(r"[a-z]{0,3}\s*[$€£¥]", lowered):
+        return True
     if re.fullmatch(r"p\s*&\s*l", lowered):
         return True
     if re.fullmatch(r"#(?:div/0!|n/a|value!|ref!|name\?|num!|null!)", lowered):
         return True
-    if re.fullmatch(r"(usd|eur|gbp|aed)[kmbn]+", lowered):
+    # Currency-code scale stamps: 0620's Calc/FS/DCF grids hold "ZARm" in the
+    # unit column beside every row name.
+    if re.fullmatch(r"(usd|eur|gbp|aed|sar|zar)[kmbn]+", lowered):
         return True
     if re.fullmatch(r"(usd|eur|gbp|aed|\$)\s*['’]?(k|m|mm|bn|000s?)?", lowered):
         return True
@@ -325,9 +475,49 @@ def is_unit_stamp(text: str) -> bool:
         lowered,
     ):
         return True
-    if re.fullmatch(r"(?:usd|eur|gbp|aed|sar|[$€£])\s*/\s*[a-z]+", lowered):
+    # Currency-per-unit stamps may carry multi-word denominators: 0600's
+    # InputT!D5 holds "USD/Metric T".
+    if re.fullmatch(r"(?:usd|eur|gbp|aed|sar|[$€£])\s*/\s*[a-z0-9 .%-]+", lowered):
         return True
     if re.fullmatch(r"(?:usd|eur|gbp|aed|sar|[$€£])\s*\d{4}[kmbn]*", lowered):
+        return True
+    # Currency-then-zeros scale stamps with an optional trailing apostrophe:
+    # 0635's Inputs!D56 holds "$000'" in the unit column beside the
+    # "Land lease" label.
+    if re.fullmatch(r"(?:usd|eur|gbp|aed|sar|[$€£])\s*['’]?0{3}s?['’]?", lowered):
+        return True
+    # Scale-prefixed currency stamps: 0598's Calculation!D265 holds "000A$"
+    # beside the "Equity invested" label.
+    if re.fullmatch(r"['’]?0{3}s?\s*[a-z]{0,3}\s*[$€£¥]", lowered):
+        return True
+    # A currency symbol with a trailing scale letter: 0622/0660's "US$m".
+    if re.fullmatch(r"[a-z]{0,3}\s*[$€£¥]\s*(?:k|m|mm|mn|bn|b)", lowered):
+        return True
+    # Period-type qualifiers between the name and the data: 0669's
+    # Calculations!C61 holds "historical" beside "Total Cost of Sales".
+    if re.fullmatch(
+        r"(?:historic(?:al)?|actuals?|forecasts?|projections?|projected|"
+        r"budget(?:ed)?|estimated?|estimates)",
+        lowered,
+    ):
+        return True
+    # Basis stamps: 0661's Assumptions!F42 holds "% of EBITDA" as the basis
+    # of the assumption beside it. "% net revenue" (0233's real row name)
+    # carries no "of" and is kept.
+    if re.fullmatch(r"%\s*of\s+[a-z0-9 .&/'’-]+", lowered):
+        return True
+    # Per-period quantity stamps and bare hour units: 0599's staffing block
+    # stamps "hours / week" in the unit column beside every role name.
+    if re.fullmatch(
+        r"(?:hours?|hrs?|days?|weeks?|months?|shifts?|fte)\s*/\s*[a-z0-9 .-]+",
+        lowered,
+    ):
+        return True
+    if re.fullmatch(r"hours?|hrs?", lowered):
+        return True
+    # Template placeholders are not semantic names: 0599's dormant "Empty"
+    # input slots.
+    if re.fullmatch(r"empty", lowered):
         return True
     return False
 
@@ -351,8 +541,11 @@ def task_id(task_dir: Path) -> str:
 
 def find_environment(task_dir: Path) -> Path:
     env = task_dir / "environment"
-    for path in sorted(env.glob("*.xlsx")):
-        return path
+    # Same resolution contract as xl_artifact_paths.resolve_workbook_artifact:
+    # .xlsx preferred, .xlsm accepted (workbooks 0635/0654 ship .xlsm inputs).
+    for pattern in ("*.xlsx", "*.xlsm"):
+        for path in sorted(env.glob(pattern)):
+            return path
     raise FileNotFoundError(f"no delivered workbook under {env}")
 
 
@@ -365,9 +558,10 @@ def find_golden(task_dir: Path, explicit: str | None = None) -> Path:
         if not base.exists():
             continue
         for sub in sorted(base.iterdir()):
-            cand = sub / f"{tid}.xlsx"
-            if cand.exists():
-                return cand.resolve()
+            for suffix in (".xlsx", ".xlsm"):
+                cand = sub / f"{tid}{suffix}"
+                if cand.exists():
+                    return cand.resolve()
     raise FileNotFoundError(f"golden workbook not found for {tid}; pass --golden")
 
 
@@ -457,7 +651,380 @@ def r1c1ish(formula: str, row: int, col: int) -> str:
     return REF_RE.sub(repl, formula or "")
 
 
-def group_bands(gold: Book, cells: list[str]) -> list[dict]:
+# ------------------------------------------------------------- copied scope
+#
+# The faithfulness reviewers judge a disclosed band against the *maximal
+# same-mechanics span in the golden workbook*, including periods the selection
+# never reached because the delivered file kept cached text or errors there, or
+# because the graded closure did not pull them in. These helpers decide whether
+# two golden cells carry the same copied mechanics and extend a band's stated
+# scope to that maximal span. Selection semantics (which cells are blank and
+# feed a graded answer) are untouched: only the stated scope widens.
+
+
+def _mech_tokens(formula: str):
+    """Split a formula into a normalized non-ref skeleton and its ref tokens."""
+    body = STRING_RE.sub('""', formula)
+    parts, refs, last = [], [], 0
+    for m in REF_RE.finditer(body):
+        if m.group("a").upper() in NOT_A_REF:
+            continue
+        parts.append(body[last : m.start()])
+        refs.append(m)
+        last = m.end()
+    parts.append(body[last:])
+    return re.sub(r"\s+", "", "".join(parts)).upper(), refs
+
+
+def _mech_coord_match(ra: str, rb: str, dcol: int, drow: int) -> bool:
+    pa = re.match(r"(\$?)([A-Z]{1,3})(\$?)(\d+)", ra.upper())
+    pb = re.match(r"(\$?)([A-Z]{1,3})(\$?)(\d+)", rb.upper())
+    if not pa or not pb:
+        return False
+    ca, rowa = col_to_num(pa.group(2)), int(pa.group(4))
+    cb, rowb = col_to_num(pb.group(2)), int(pb.group(4))
+    # A pinned anchor: both formulas read the same absolute cell even though
+    # the author never typed the $ (0533's `D19=D18*B19`, `E19=E18*B19`).
+    if ca == cb and rowa == rowb:
+        return True
+    # A dragged copy: matching $ flags, relative parts shifted by the offset.
+    if pa.group(1) != pb.group(1) or pa.group(3) != pb.group(3):
+        return False
+    col_ok = (ca == cb) if pa.group(1) else (ca + dcol == cb)
+    row_ok = (rowa == rowb) if pa.group(3) else (rowa + drow == rowb)
+    return col_ok and row_ok
+
+
+def _mech_ref_match(ma, mb, sheet: str, dcol: int, drow: int) -> bool:
+    sa = unquote_sheet(ma.group("sheet")) if ma.group("sheet") else sheet
+    sb = unquote_sheet(mb.group("sheet")) if mb.group("sheet") else sheet
+    if sa != sb:
+        return False
+    for part in ("a", "b"):
+        ra, rb = ma.group(part), mb.group(part)
+        if (ra is None) != (rb is None):
+            return False
+        if ra is not None and not _mech_coord_match(ra, rb, dcol, drow):
+            return False
+    return True
+
+
+def copy_equivalent(gold: Book, a: str, b: str) -> bool:
+    """True when b's golden formula is a's copied to b's position.
+
+    Each reference must either shift with the copy (a dragged relative ref) or
+    stay pinned to the same absolute cell (a fixed anchor, with or without $).
+    """
+    fa, fb = gold.formula.get(a), gold.formula.get(b)
+    if not fa or not fb:
+        return False
+    sheet_a, ca = a.split("!", 1)
+    sheet_b, cb = b.split("!", 1)
+    if sheet_a != sheet_b:
+        return False
+    pa, pb = split_coord(ca), split_coord(cb)
+    if not pa or not pb:
+        return False
+    dcol, drow = col_to_num(pb[0]) - col_to_num(pa[0]), pb[1] - pa[1]
+    ska, refsa = _mech_tokens(fa)
+    skb, refsb = _mech_tokens(fb)
+    if ska != skb or len(refsa) != len(refsb):
+        return False
+    return all(
+        _mech_ref_match(x, y, sheet_a, dcol, drow) for x, y in zip(refsa, refsb)
+    )
+
+
+def bare_row_copy(gold: Book, k: str) -> bool:
+    """A bare same-row reference to an earlier column: one hold-flat step.
+
+    The first cell of a hold-flat run may skip a spacer column (0233's
+    `DCF!AG31 = AE31` before `AH31 = AG31`), so strict copy-equivalence would
+    exclude the seed cell the reviewers count as part of the run.
+    """
+    formula = gold.formula.get(k)
+    if not formula:
+        return False
+    m = re.fullmatch(r"=\s*\+?\s*(\$?[A-Z]{1,3}\$?\d{1,7})\s*", formula)
+    if not m:
+        return False
+    p = split_coord(k.split("!", 1)[1])
+    rp = split_coord(m.group(1))
+    return bool(p and rp and rp[1] == p[1] and col_to_num(rp[0]) < col_to_num(p[0]))
+
+
+def copy_compatible(gold: Book, a: str, b: str) -> bool:
+    return copy_equivalent(gold, a, b) or (
+        bare_row_copy(gold, a) and bare_row_copy(gold, b)
+    )
+
+
+def _copy_lock_split(gold: Book, cells: list[str]):
+    """Classify the representative formula's references as pinned or advancing.
+
+    Compares the band's first two golden formulas token by token. A pinned
+    reference reads the same absolute cell in every copy; an advancing one
+    shifts with its position. Duplicate rendered addresses are disambiguated
+    by occurrence, because 0658's `LBO!N84` reads N83 twice - once pinned,
+    once advancing - and the representative alone cannot tell them apart.
+    """
+    if len(cells) < 2:
+        return [], []
+    a, b = cells[0], cells[1]
+    fa, fb = gold.formula.get(a), gold.formula.get(b)
+    if not fa or not fb:
+        return [], []
+    ska, refsa = _mech_tokens(fa)
+    skb, refsb = _mech_tokens(fb)
+    if ska != skb or len(refsa) != len(refsb):
+        return [], []
+    sheet = a.split("!", 1)[0]
+
+    def shown(m) -> str:
+        s = unquote_sheet(m.group("sheet")) if m.group("sheet") else sheet
+        coord = m.group("a").replace("$", "")
+        if m.group("b"):
+            coord += ":" + m.group("b").replace("$", "")
+        return "%s!%s" % (quote_sheet(s), coord)
+
+    counts = Counter(shown(m) for m in refsa)
+    seen: Counter = Counter()
+    pinned, moving = [], []
+    for x, y in zip(refsa, refsb):
+        addr = shown(x)
+        seen[addr] += 1
+        desc = addr if counts[addr] == 1 else "occurrence %d of %s" % (seen[addr], addr)
+        if shown(y) == addr:
+            pinned.append(desc)
+            continue
+        # A range can pin one endpoint while the other advances with the
+        # copy (0351's SUM($F$101:F101)). Name the fixed endpoint, or the
+        # note's "every other reference shifts" clause would be false.
+        if x.group("b") and y.group("b"):
+            ax, bx = x.group("a").replace("$", ""), x.group("b").replace("$", "")
+            ay, by = y.group("a").replace("$", ""), y.group("b").replace("$", "")
+            if ax == ay and bx != by:
+                pinned.append("the start %s of %s" % (ax, desc))
+                continue
+            if bx == by and ax != ay:
+                pinned.append("the end %s of %s" % (bx, desc))
+                continue
+        moving.append(desc)
+    return pinned, moving
+
+
+def copy_lock_note(gold: Book, cells: list[str]) -> str:
+    """A clause naming the references the copy pattern pins, when it pins any.
+
+    0658's three blocked records each kept some references fixed
+    (`LBO!$C$34:$C$37`, the first `$N83`, `$C$9`) while others advanced with
+    the column, and the sentences gave only the representative addresses.
+    Emitted only for a mixed pattern: an all-advancing or all-pinned copy
+    needs no note.
+    """
+    pinned, moving = _copy_lock_split(gold, cells)
+    # Endpoint-pinned ranges ("the start I250 of $I250:I250") are partially
+    # moving: their other endpoint advances with the copy (0451's
+    # SUM($I250:I250) -> SUM($I250:P250)). They must never trigger the
+    # identical-calculation wording, which is only true when every reference
+    # is a fully pinned plain address.
+    all_plain = all(not d.startswith("the ") for d in pinned)
+    if pinned and not moving and all_plain:
+        # All references pinned: every copy holds the identical formula
+        # (0441's =+IF($J238<=$F241,$E241/$F241,0) across J241:N241). Say so,
+        # or a reader applying default copy translation shifts them all.
+        return (
+            ". As this formula is copied across the band, every reference "
+            "stays fixed on exactly the cited cells, so each copy holds the "
+            "identical calculation"
+        )
+    if not pinned:
+        return ""
+    listed = pinned[0] if len(pinned) == 1 else ", ".join(pinned[:-1]) + " and " + pinned[-1]
+    plural = len(pinned) > 1
+    # Endpoint descriptions ("the start F101 of ...") carry their own noun;
+    # only plain addresses take the "the reference(s)" prefix.
+    if all(not d.startswith("the ") for d in pinned):
+        subject = "the reference%s %s" % ("s" if plural else "", listed)
+    else:
+        subject = listed
+    return (
+        ". As this formula is copied across the band, %s stay%s fixed "
+        "while every other reference shifts with its position"
+        % (subject, "" if plural else "s")
+    )
+
+
+def full_copied_scope(
+    gold: Book, cells: list[str], targets: set | None = None, cap: int = 600
+) -> list[str]:
+    """Extend a contiguous same-row run to the maximal same-mechanics span.
+
+    Walks outward over golden cells regardless of the delivered file's state,
+    because a period kept as cached text or an error still belongs to the
+    copied scope the sentence must state. Stops at a graded target so a wider
+    stated scope can never claim a graded cell's construction.
+    """
+    if not cells:
+        return cells
+    sheet, coord = cells[0].split("!", 1)
+    p0 = split_coord(coord)
+    if not p0:
+        return list(cells)
+    row = p0[1]
+    cols = sorted(
+        col_to_num(split_coord(c.split("!", 1)[1])[0])
+        for c in cells
+        if split_coord(c.split("!", 1)[1])
+    )
+    if not cols:
+        return list(cells)
+    lo, hi = cols[0], cols[-1]
+    targets = targets or set()
+
+    def walk(start: int, step: int, edge_col: int) -> int:
+        edge = key(sheet, "%s%d" % (num_to_col(edge_col), row))
+        c, out, steps = start, edge_col, 0
+        limit = gold.max_col(sheet)
+        while 1 <= c <= limit and steps < cap:
+            cand = key(sheet, "%s%d" % (num_to_col(c), row))
+            if cand in targets or cand not in gold.formula:
+                break
+            if not copy_compatible(gold, edge, cand):
+                break
+            out, edge = c, cand
+            c += step
+            steps += 1
+        return out
+
+    out_lo = walk(lo - 1, -1, lo)
+    out_hi = walk(hi + 1, 1, hi)
+    return [key(sheet, "%s%d" % (num_to_col(c), row)) for c in range(out_lo, out_hi + 1)]
+
+
+def full_copied_scope_vertical(
+    gold: Book, cells: list[str], targets: set | None = None, cap: int = 600
+) -> list[str]:
+    """Vertical analog of full_copied_scope for copied-DOWN families.
+
+    0528's `Inputs!U144:U146` is one contiguous copied-down run (`=U137*5`,
+    `=U138*5`, `=U139*5`), but row-oriented banding fragments it into three
+    one-cell records that each falsely claim their own scope. The stated
+    scope of a same-column run must be its maximal same-mechanics span.
+    """
+    if not cells:
+        return cells
+    sheet, coord = cells[0].split("!", 1)
+    p0 = split_coord(coord)
+    if not p0:
+        return list(cells)
+    colnum = col_to_num(p0[0])
+    rows = sorted(
+        split_coord(c.split("!", 1)[1])[1]
+        for c in cells
+        if split_coord(c.split("!", 1)[1])
+    )
+    if not rows:
+        return list(cells)
+    lo, hi = rows[0], rows[-1]
+    targets = targets or set()
+
+    def walk(start: int, step: int, edge_row: int) -> int:
+        edge = key(sheet, "%s%d" % (num_to_col(colnum), edge_row))
+        r, out, steps = start, edge_row, 0
+        while r >= 1 and steps < cap:
+            cand = key(sheet, "%s%d" % (num_to_col(colnum), r))
+            if cand in targets or cand not in gold.formula:
+                break
+            if not copy_equivalent(gold, edge, cand):
+                break
+            out, edge = r, cand
+            r += step
+            steps += 1
+        return out
+
+    out_lo = walk(lo - 1, -1, lo)
+    out_hi = walk(hi + 1, 1, hi)
+    return [key(sheet, "%s%d" % (num_to_col(colnum), r)) for r in range(out_lo, out_hi + 1)]
+
+
+# ---------------------------------------------------------- graded closure
+
+
+def bare_alias_ref(gold: Book, k: str) -> str | None:
+    """The single cell a bare (optionally signed) reference formula reads."""
+    formula = gold.formula.get(k)
+    if not formula or len(formula) > 80 or not BARE_ALIAS_RE.match(formula.strip()):
+        return None
+    refs = refs_in(formula, k.split("!", 1)[0])
+    return refs[0] if len(refs) == 1 else None
+
+
+def graded_closure(gold: Book, targets) -> set[str]:
+    """Cells whose construction is equivalent to a graded answer's.
+
+    Two expansions, iterated to a fixpoint:
+
+    - equality aliases: a bare-reference formula `=X` (optionally signed)
+      makes the two cells the same figure, in either direction. 0441:
+      `Model!O1 = +O24`, so disclosing O24's IRR calculation disclosed the
+      graded O1; the same holds for a graded cell that is a bare reference
+      into a band.
+    - copied-method equivalents on the same row: a golden formula that is a
+      closure cell's formula copied to another column carries the same
+      method. 0672: `DCF!G58` is graded `DCF!C58` copied; 0620: `DCF!C37`
+      leaked the mechanics of requested `DCF!E37`.
+
+    Any disclosed record whose band, references, or rendered mechanics reach
+    this set describes a graded answer and must be suppressed (0353's
+    Summary!D50 leak is the direct case).
+    """
+    closure = set(targets)
+    links = []
+    for k, formula in gold.formula.items():
+        ref = bare_alias_ref(gold, k)
+        if ref:
+            links.append((k, ref))
+    expanded: set[str] = set()
+    for _ in range(16):
+        changed = False
+        for a, b in links:
+            if (a in closure) != (b in closure):
+                closure.update((a, b))
+                changed = True
+        for c in sorted(closure - expanded):
+            expanded.add(c)
+            if c not in gold.formula:
+                continue
+            sheet, coord = c.split("!", 1)
+            p = split_coord(coord)
+            if not p:
+                continue
+            for other in gold.row_cells(sheet, p[1]):
+                if (
+                    other != c
+                    and other not in closure
+                    and other in gold.formula
+                    and copy_compatible(gold, c, other)
+                ):
+                    closure.add(other)
+                    changed = True
+        if not changed:
+            break
+    return closure
+
+
+def group_bands(gold: Book, cells: list[str], targets: set | None = None) -> list[dict]:
+    """Band selected cells by row, splitting on any mechanics change.
+
+    Grouping tests copied-mechanics equivalence rather than exact normalized
+    patterns, so a pinned-anchor copy (`D19=D18*B19`, `E19=E18*B19`) and a
+    hold-flat seed stay in one band. Each band's *stated* scope is then
+    extended to the maximal same-mechanics span in the golden workbook, and
+    bands whose stated scopes meet are merged, so one row never emits two
+    records claiming the same copied range.
+    """
+    targets = targets or set()
     rows: dict[tuple, list[tuple[int, str]]] = defaultdict(list)
     for k in cells:
         sheet, coord = k.split("!", 1)
@@ -465,42 +1032,155 @@ def group_bands(gold: Book, cells: list[str]) -> list[dict]:
         if not p:
             continue
         col, row = p
-        formula = gold.formula.get(k, "")
-        pattern = r1c1ish(formula, row, col_to_num(col))
-        rows[(sheet, row, pattern)].append((col_to_num(col), k))
+        rows[(sheet, row)].append((col_to_num(col), k))
 
     bands_out = []
-    for (sheet, row, pattern), entries in sorted(rows.items()):
+    for (sheet, row), entries in sorted(rows.items()):
         entries.sort()
+        runs: list[list[tuple[int, str]]] = []
         run: list[tuple[int, str]] = []
         for item in entries:
-            if run and item[0] != run[-1][0] + 1:
-                bands_out.append(make_band(gold, sheet, row, pattern, run))
+            if run and not (
+                item[0] == run[-1][0] + 1
+                and copy_compatible(gold, run[-1][1], item[1])
+            ):
+                runs.append(run)
                 run = []
             run.append(item)
         if run:
-            bands_out.append(make_band(gold, sheet, row, pattern, run))
-    return bands_out
+            runs.append(run)
+        extended = [
+            (r, full_copied_scope(gold, [k for _, k in r], targets)) for r in runs
+        ]
+        merged: list[tuple[list, list]] = []
+        for r, full in extended:
+            if merged:
+                prev_run, prev_full = merged[-1]
+                prev_hi = col_to_num(split_coord(prev_full[-1].split("!", 1)[1])[0])
+                cur_lo = col_to_num(split_coord(full[0].split("!", 1)[1])[0])
+                # Merge only when the extended scopes actually overlap, which
+                # proves the walk crossed the gap on compatible mechanics.
+                # Runs that merely touch are different copy families sitting
+                # side by side (0233's Model!J224:R224 against S224:BT224,
+                # which pin different rate cells).
+                if cur_lo <= prev_hi:
+                    span = full_copied_scope(
+                        gold, [k for _, k in prev_run + r], targets
+                    )
+                    merged[-1] = (prev_run + r, span)
+                    continue
+            merged.append((r, full))
+        for r, full in merged:
+            bands_out.append(make_band(gold, sheet, row, r, full))
+    return merge_vertical_singletons(gold, bands_out, targets)
 
 
-def make_band(gold: Book, sheet: str, row: int, pattern: str, run: list[tuple[int, str]]) -> dict:
+def make_vertical_band(gold: Book, sheet: str, colnum: int, run_keys: list[str],
+                       full: list[str] | None = None) -> dict:
+    stated = full or run_keys
+    rows = [split_coord(k.split("!", 1)[1])[1] for k in stated]
+    col = num_to_col(colnum)
+    ref = (
+        f"{quote_sheet(sheet)}!{col}{rows[0]}"
+        if rows[0] == rows[-1]
+        else f"{quote_sheet(sheet)}!{col}{rows[0]}:{col}{rows[-1]}"
+    )
+    formulas = list(dict.fromkeys(gold.formula.get(k, "") for k in run_keys))
+    first_row = split_coord(run_keys[0].split("!", 1)[1])[1]
+    return {
+        "band": ref,
+        "sheet": sheet,
+        "row": first_row,
+        "col_lo": colnum,
+        "col_hi": colnum,
+        "orientation": "vertical",
+        "cells": [pretty(k) for k in stated],
+        "cell_keys": run_keys,
+        "stated_cell_keys": stated,
+        "label": gold.row_label(stated[0]) if stated else "",
+        "pattern": r1c1ish(gold.formula.get(run_keys[0], ""), first_row, colnum),
+        "formula_samples": formulas[:3],
+        "values": [jsonable(gold.value.get(k)) for k in run_keys[:5]],
+    }
+
+
+def merge_vertical_singletons(gold: Book, bands: list[dict],
+                              targets: set | None = None) -> list[dict]:
+    """Rejoin copied-DOWN families that row banding left as one-cell bands.
+
+    0528's `Inputs!U144:U146` was selected cell by cell, and each cell sits
+    on its own row, so row banding emitted three singleton bands whose
+    records each falsely claimed a self-contained scope. Contiguous
+    same-column singletons in one copy family become a single vertical band,
+    and a lone singleton's stated scope extends to its vertical span the
+    same way horizontal bands extend theirs.
+    """
+    targets = targets or set()
+    out, singles = [], []
+    for band in bands:
+        stated = band.get("stated_cell_keys") or band.get("cell_keys") or []
+        if len(band.get("cell_keys") or []) == 1 and len(stated) == 1:
+            singles.append(band)
+        else:
+            out.append(band)
+    by_col: dict[tuple, list] = defaultdict(list)
+    for band in singles:
+        k = band["cell_keys"][0]
+        sheet, coord = k.split("!", 1)
+        p = split_coord(coord)
+        if not p:
+            out.append(band)
+            continue
+        by_col[(sheet, col_to_num(p[0]))].append((p[1], k, band))
+    for (sheet, colnum), entries in sorted(by_col.items()):
+        entries.sort()
+        runs: list[list] = []
+        run: list = []
+        for item in entries:
+            if run and not (
+                item[0] == run[-1][0] + 1
+                and copy_equivalent(gold, run[-1][1], item[1])
+            ):
+                runs.append(run)
+                run = []
+            run.append(item)
+        if run:
+            runs.append(run)
+        for r in runs:
+            keys = [k for _, k, _ in r]
+            full = full_copied_scope_vertical(gold, keys, targets)
+            if len(r) == 1 and len(full) <= 1:
+                out.append(r[0][2])
+            else:
+                out.append(make_vertical_band(gold, sheet, colnum, keys, full))
+    return out
+
+
+def make_band(gold: Book, sheet: str, row: int, run: list[tuple[int, str]],
+              full: list[str] | None = None) -> dict:
     cells = [k for _, k in run]
-    first_col, last_col = run[0][0], run[-1][0]
+    stated = full or cells
+    first_col = col_to_num(split_coord(stated[0].split("!", 1)[1])[0])
+    last_col = col_to_num(split_coord(stated[-1].split("!", 1)[1])[0])
     ref = (
         f"{quote_sheet(sheet)}!{num_to_col(first_col)}{row}"
         if first_col == last_col
         else f"{quote_sheet(sheet)}!{num_to_col(first_col)}{row}:{num_to_col(last_col)}{row}"
     )
     formulas = list(dict.fromkeys(gold.formula.get(k, "") for k in cells))
+    pattern = r1c1ish(gold.formula.get(cells[0], ""), row, run[0][0]) if cells else ""
     return {
         "band": ref,
         "sheet": sheet,
         "row": row,
         "col_lo": first_col,
         "col_hi": last_col,
-        "cells": [pretty(k) for k in cells],
+        # The stated scope: the full copied-mechanics span the sentences and
+        # reviewer records must quote. Selection semantics live in cell_keys.
+        "cells": [pretty(k) for k in stated],
         "cell_keys": cells,
-        "label": gold.row_label(cells[0]) if cells else "",
+        "stated_cell_keys": stated,
+        "label": gold.row_label(stated[0]) if stated else "",
         "pattern": pattern,
         "formula_samples": formulas[:3],
         "values": [jsonable(gold.value.get(k)) for k in cells[:5]],
@@ -520,7 +1200,10 @@ def select_payload(args) -> dict:
     closure = ast if ast is not None else regex
     selected = blanked_formula_cells(gold, delivered, closure)
 
-    bands = group_bands(gold, selected)
+    # Stated scopes stop at the graded closure, not just the raw targets, so
+    # a widened span can never claim a graded alias's construction (0620,
+    # 0672).
+    bands = group_bands(gold, selected, graded_closure(gold, set(targets)))
     payload = {
         "schema_version": "1.0",
         "task": task_dir.name,
@@ -797,6 +1480,13 @@ def load_role_resolutions(path: Path) -> dict | None:
     if not path.exists():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("validated") is not True:
+        raise SystemExit(
+            f"{path} has not passed roles-validate; run\n"
+            f"  python3 disclose.py roles-validate --task-dir <task>\n"
+            "first. Malformed or unvalidated arbitration files blocked "
+            "workbooks 0350/0468/0522/0527/0534; detect refuses them now."
+        )
     by_id = {}
     for row in payload.get("resolutions") or []:
         case_id = row.get("case_id")
@@ -804,6 +1494,126 @@ def load_role_resolutions(path: Path) -> dict | None:
             by_id[case_id] = row
     payload["by_id"] = by_id
     return payload
+
+
+# --------------------------------------------------------------------- roles-validate
+
+
+ROLE_RESOLUTION_ROW_KEYS = {"case_id", "label", "chosen", "reason", "confidence"}
+# Older arbitration prompts said "chosen_role"; normalize rather than reject.
+LEGACY_ROLE_KEY = "chosen_role"
+
+
+def validate_role_resolutions(
+    path: Path, cases: list[dict]
+) -> tuple[dict | None, list[str], list[str]]:
+    """(normalized payload or None, errors, warnings) for an arbitration file.
+
+    Models are asked to write exactly one JSON object, but the observed
+    failure modes are prose wrappers and concatenated objects ("Extra data at
+    line 2 column 1"). Extraction is tolerant -- the first balanced object is
+    salvaged and the discard reported as a warning -- while the schema itself
+    is strict: every row must name a known case_id at most once and choose one
+    of that case's candidate roles. Any schema fault is an error carrying the
+    exact detail the retry prompt needs.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, [f"cannot read {path}: {exc}"], []
+
+    payload = None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as first_error:
+        stripped = text.lstrip()
+        start = stripped.find("{")
+        if start < 0:
+            return None, [f"no JSON object found: {first_error}"], []
+        try:
+            payload, end = json.JSONDecoder().raw_decode(stripped[start:])
+        except json.JSONDecodeError:
+            return None, [f"invalid JSON: {first_error}"], []
+        prefix = stripped[:start].strip()
+        trailing = stripped[start + end:].strip()
+        warnings.append(
+            "the file was not exactly one JSON object "
+            f"(parser: {first_error}); salvaged the first object and "
+            f"discarded {len(prefix)} prefix and {len(trailing)} trailing "
+            "character(s). The arbitration agent must output one JSON object "
+            "and nothing else."
+        )
+
+    if not isinstance(payload, dict):
+        return None, errors + [
+            "top level must be a JSON object with a 'resolutions' list"], warnings
+    rows = payload.get("resolutions")
+    if not isinstance(rows, list):
+        return None, errors + ["'resolutions' must be a list"], warnings
+
+    known = {case["case_id"]: case for case in cases}
+    seen: set[str] = set()
+    clean_rows: list[dict] = []
+    for index, row in enumerate(rows):
+        where = f"resolutions[{index}]"
+        if not isinstance(row, dict):
+            errors.append(f"{where}: must be an object")
+            continue
+        if LEGACY_ROLE_KEY in row and "chosen" not in row:
+            row = dict(row)
+            row["chosen"] = row.pop(LEGACY_ROLE_KEY)
+            warnings.append(
+                f"{where}: legacy key '{LEGACY_ROLE_KEY}' normalized to 'chosen'")
+        unknown = sorted(set(row) - ROLE_RESOLUTION_ROW_KEYS)
+        if unknown:
+            errors.append(
+                f"{where}: unknown key(s) {unknown}; allowed keys: "
+                f"{sorted(ROLE_RESOLUTION_ROW_KEYS)}")
+            continue
+        case_id = row.get("case_id")
+        if not isinstance(case_id, str) or not case_id.strip():
+            errors.append(f"{where}: 'case_id' must be a non-empty string")
+            continue
+        if case_id in seen:
+            errors.append(f"{where}: duplicate case_id {case_id!r}")
+            continue
+        seen.add(case_id)
+        if known and case_id not in known:
+            errors.append(
+                f"{where}: case_id {case_id!r} is not one of the "
+                f"{len(known)} case(s) in ambiguous_roles.json")
+            continue
+        chosen = row.get("chosen")
+        if chosen is not None:
+            # null means the agent abstained; candidates fall through in
+            # registry order, exactly the pre-existing detect behavior.
+            if not isinstance(chosen, str) or not chosen.strip():
+                errors.append(
+                    f"{where}: 'chosen' must be a candidate id or null")
+                continue
+            candidates = (known.get(case_id) or {}).get("roles") or []
+            if known and chosen not in candidates:
+                errors.append(
+                    f"{where}: chosen {chosen!r} is not a candidate role for "
+                    f"{case_id!r}; candidates: {candidates}")
+                continue
+        clean_rows.append(
+            {key: row[key] for key in ROLE_RESOLUTION_ROW_KEYS if key in row})
+
+    if errors:
+        return None, errors, warnings
+    normalized = {
+        "schema_version": "1.0",
+        "validated": True,
+        "resolutions": clean_rows,
+    }
+    # Keep the arbitration provenance stamp: build_one.sh's gate-12 checker
+    # requires it, and normalizing it away used to deadlock the gate.
+    if isinstance(payload.get("agent_model"), str):
+        normalized["agent_model"] = payload["agent_model"]
+    return normalized, [], warnings
 
 
 def require_role_resolutions(cases: list[dict], path: Path) -> dict:
@@ -1057,6 +1867,11 @@ def catalog_signature(entry_id: str, profile: dict) -> str | None:
             return None
         if profile_has_label(profile, r"\bnol\b", r"loss") and "MAX" in funcs:
             return "taxable_income_after_losses"
+        # A clamp without a labelled loss balance is not any catalogued
+        # variant: describing `MAX(EBT,0)*rate` as plain pretax_profit would
+        # suppress the zero floor the agent cannot see (0256 CalcA!H56).
+        if funcs & {"MAX", "MIN"}:
+            return None
         if profile_has_label(profile, r"taxable income"):
             return "taxable_income"
         if profile_has_label(profile, r"\bebt\b", r"pre.?tax", r"profit before tax"):
@@ -1395,11 +2210,18 @@ def describe_ast(node, gold: Book, sheet: str, own_label: str) -> str:
     return " then ".join(args)
 
 
-def custom_sentence_fields(profile: dict, gold: Book) -> dict:
+def custom_sentence_fields(profile: dict, gold: Book, lock_cells: list | None = None) -> dict:
     cells = profile.get("cells") or []
     sheet = cells[0].split("!", 1)[0] if cells else ""
     ast = profile.get("ast")
     steps = describe_ast(ast, gold, sheet, profile.get("label", "")) if ast is not None else ""
+    if steps:
+        # A copy pattern pinning some references while others advance must
+        # say so, or the representative addresses misstate the band (0658).
+        # Use the stated copied span when it is wider than the profile's
+        # anchor cells, mirroring faithcheck's lock-cell selection (0248).
+        span = lock_cells if lock_cells and len(lock_cells) > 1 else cells
+        steps += copy_lock_note(gold, span)
     reference_renderings = [
         describe_ref(gold, raw, sheet, profile.get("label", ""))
         for raw in profile.get("raw_references", [])
@@ -1514,7 +2336,8 @@ def try_custom_role(gold: Book, band: dict, label: str, base: dict, entry_id: st
             **base, "entry": entry_id, "status": "unclassified",
             "reason": "no_catalogue_match_but_no_positive_custom_signal",
         }
-    fields = custom_sentence_fields(profile, gold)
+    fields = custom_sentence_fields(
+        profile, gold, lock_cells=band.get("stated_cell_keys"))
     coverage_complete = bool(fields.pop("_coverage_complete", False))
     rec = record(
         entry_id,
@@ -1524,6 +2347,7 @@ def try_custom_role(gold: Book, band: dict, label: str, base: dict, entry_id: st
         registry().get(entry_id, {}).get("alternatives", []),
         f"Out-of-catalogue {entry_id} method on row {label!r}.",
         fields=fields,
+        stated_cells=band.get("stated_cell_keys"),
     )
     rec.update({
         "source": "custom_method_detector",
@@ -1657,8 +2481,16 @@ def detect_inert_line(gold: Book, scope: set[str]) -> list[dict]:
             continue
         if not all(abs(v) < 1e-9 for v in nums):
             continue
+        # Claim only cells whose cached value is numeric zero. A guard row can
+        # carry label-mirror formula cells caching text (0635's
+        # Caclulation!B69 = B$18 -> "Post PPA flag"); the always_zero sentence
+        # must be true of every claimed cell, matching the registry Detection
+        # test ("every cached value is zero").
+        zero_cells = [
+            c for c in row if isinstance(gold.value.get(c), (int, float))
+        ]
         out.append(record(
-            "inert_line", "always_zero", row, gold.formula[row[0]],
+            "inert_line", "always_zero", zero_cells, gold.formula[zero_cells[0]],
             ["always_zero", "charged_once", "charged_every_period"],
             f"Row labelled {label!r} evaluates to zero in all periods.",
             fields={"label": q(label)},
@@ -1722,17 +2554,103 @@ def _ingredient_labels(gold: Book, formula: str, sheet: str, row: int, col: int)
     ]
 
 
-def detect_distribution_policy(gold: Book, scope: set[str]) -> list[dict]:
+DIST_CASH_TOKENS = (
+    "cash available", "available cash", "cash left",
+    "available for distribution", "available for dividend",
+)
+
+
+def _dist_cash_label(text: str) -> bool:
+    return any(t in text for t in DIST_CASH_TOKENS)
+
+
+def _parse_formula_ast(formula: str):
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from xl_ast_graph import parse_formula  # type: ignore
+
+        return parse_formula(formula)
+    except Exception:
+        return None
+
+
+def _max_floor_operand(node):
+    """The X of MAX(X, 0) or MAX(0, X); None for any other shape."""
+    if node is None or getattr(node, "kind", None) != "func":
+        return None
+    if node.name.upper() != "MAX" or len(node.args) != 2:
+        return None
+
+    def is_zero(n):
+        try:
+            return n.kind == "const" and n.name == "number" and abs(float(n.shape)) < 1e-12
+        except (TypeError, ValueError):
+            return False
+
+    a, b = node.args
+    if is_zero(b):
+        return a
+    if is_zero(a):
+        return b
+    return None
+
+
+def _single_ref_cell(node, sheet: str) -> str | None:
+    """The one cell a bare (possibly sign-prefixed) reference node points at."""
+    if node is None:
+        return None
+    if getattr(node, "kind", None) == "prefix" and node.name == "+" and len(node.args) == 1:
+        node = node.args[0]
+    if getattr(node, "kind", None) != "ref":
+        return None
+    refs = refs_in("=" + node.name, sheet)
+    return refs[0] if len(refs) == 1 else None
+
+
+def _floor_note(gold: Book, formula: str, sheet: str) -> str:
+    """A truthful floor clause when the row reads a MAX(...,0)-floored source.
+
+    0256's `H29 = H28` and 0350's `= G157 * C66` both distribute a source that
+    is already held at zero; saying nothing about the floor left the registry
+    sentence free to claim negatives were possible. The clause names only the
+    floor, never the source's full construction.
+    """
+    for ref in refs_in(formula, sheet):
+        src = gold.formula.get(ref)
+        if not src:
+            continue
+        if _max_floor_operand(_parse_formula_ast(src)) is None:
+            continue
+        label = gold.row_label(ref)
+        if label and _dist_cash_label(label.lower()):
+            return (
+                "; the row labelled %s floors its own calculation at zero" % q(label)
+            )
+    return ""
+
+
+def detect_distribution_policy(gold: Book, scope: set[str],
+                               targets: set | None = None) -> list[dict]:
     """Which rule sizes a dividend or distribution row.
 
     A residual and a payout ratio are both ordinary practice and the delivered
     file keeps neither formula, so the choice is invisible. Worse, a surviving
     payout-ratio row on another sheet actively points at the wrong one.
+
+    Only two shapes may still use a named-value sentence, because only there is
+    the fixed wording provably complete: an exact `MAX(cash, 0)` residual and
+    an exact two-reference payout product. Every other distribution shape - a
+    `MIN` entitlement cap, a pass-through copy of a floored row, a share
+    multiplier over floored cash, a lesser-of-two-rows clamp - is rendered
+    mechanically from its parsed formula so no cap, floor or reference is
+    dropped (0256, 0350, 0352, 0353, 0646).
     """
     values = [
         "residual_cash_floored", "residual_cash_unfloored", "payout_ratio",
-        "capped_at_retained_earnings", "first_period_only",
+        "capped_at_retained_earnings", "first_period_only", "formula_mechanics",
     ]
+    targets = targets or set()
     out, seen_rows = [], set()
     for k in sorted(scope):
         label = gold.row_label(k)
@@ -1793,49 +2711,80 @@ def detect_distribution_policy(gold: Book, scope: set[str]) -> list[dict]:
         # row whose shape says nothing is left uncovered, because asserting a
         # rule off the absence of a token is how this entry would become the
         # next `projection_rule` over-disclosure.
-        cash_available = any(
-            (
-                "cash available" in l
-                or "available cash" in l
-                or "cash left" in l
-                or "available for distribution" in l
-                or "available for dividend" in l
-            )
-            for l in labels
-        )
-        # The floor is tested before the cap. 0677's `=MAX(MIN( H167:H168),0)` is
-        # both at once - the lesser of cash available and retained earnings, held
-        # at zero - and the two values are written as siblings, so one has to
-        # win. The floored residual wins because it is the reading the row's own
-        # report attributes and the one an agent gets wrong; a co-occurring cap
-        # is recorded as a known limit on the entry rather than silently chosen.
-        if cash_available and "MAX(" in upper and re.search(r",\s*0\s*\)", upper):
+        cash_available = any(_dist_cash_label(l) for l in labels)
+        payout_labelled = any(("payout" in l or "dividend per" in l) for l in labels)
+        ast = _parse_formula_ast(formula)
+        # The record claims the maximal contiguous same-mechanics span around
+        # the classified cell, so a surviving unit stamp (`=BC` in 0638's D119)
+        # never joins the band and the stated scope never truncates at an
+        # arbitrary column.
+        run = full_copied_scope(gold, [cell], targets)
+        value, fields, mechanics_refs = None, {"label": q(label)}, []
+        # Exact plain floored residual: MAX of a single cash-available
+        # reference against zero. Anything else - MIN caps, pass-through
+        # copies, share multipliers, lesser-of clamps - is not fully
+        # described by any fixed sentence and must be rendered.
+        floor_ref = _single_ref_cell(_max_floor_operand(ast), sheet)
+        if floor_ref and _dist_cash_label(gold.row_label(floor_ref).lower()):
             value = "residual_cash_floored"
-        elif "MIN(" in upper and any("retained" in l for l in labels):
-            value = "capped_at_retained_earnings"
-        elif cash_available:
-            value = "residual_cash_unfloored"
-        elif any(("payout" in l or "dividend per" in l) for l in labels) and "*" in formula:
-            value = "payout_ratio"
-        elif (
+        if value is None and (
+            ast is not None
+            and getattr(ast, "kind", None) == "infix"
+            and ast.name == "*"
+            and len(ast.args) == 2
+        ):
+            # Exact payout product: two bare references, one on a payout row.
+            factor_cells = [_single_ref_cell(arg, sheet) for arg in ast.args]
+            if all(factor_cells) and any(
+                ("payout" in gold.row_label(fc).lower()
+                 or "dividend per" in gold.row_label(fc).lower())
+                for fc in factor_cells
+            ):
+                value = "payout_ratio"
+        if value is None and ast is not None and (
+            cash_available or payout_labelled or "MIN(" in upper
+        ):
+            steps = describe_ast(ast, gold, sheet, label)
+            if _single_ref_cell(ast, sheet):
+                ref_cell = _single_ref_cell(ast, sheet)
+                own_p = split_coord(cell.split("!", 1)[1])
+                ref_p = split_coord(ref_cell.split("!", 1)[1])
+                same_col = bool(
+                    own_p and ref_p and own_p[0] == ref_p[0]
+                    and ref_cell.split("!", 1)[0] == sheet
+                )
+                lead = (
+                    "copy the same-column value from"
+                    if same_col
+                    else "take the value from"
+                )
+                steps = "%s %s" % (lead, steps)
+            steps += _floor_note(gold, formula, sheet)
+            steps += copy_lock_note(gold, run)
+            value = "formula_mechanics"
+            fields = {
+                "label": q(label),
+                "band": compact_cells([pretty(c) for c in run]).strip("`"),
+                "representative": pretty(cell),
+                "steps": steps,
+            }
+            mechanics_refs = refs_in(formula, sheet)
+        if value is None and (
             len(row) == 1
             and refs_in(formula, sheet)
             and not re.match(r"^=\s*SUM\(", formula.strip(), re.I)
         ):
             value = "first_period_only"
-        else:
+        if value is None:
             continue
-        # Attach the payment cells, not a surviving unit stamp. 0638 D119 is
-        # `=BC` and remains as "EURm" in the delivered file; including it made
-        # Ship when think the distribution row had survived.
-        pay_cells = [c for c in row if dist_rank(c) >= 2] or [
-            c for c in row if dist_rank(c) >= 0
-        ]
-        out.append(record(
-            "distribution_policy", value, pay_cells, formula, values,
+        rec = record(
+            "distribution_policy", value, run, formula, values,
             f"Row labelled {label!r} sizes its distribution by {value}.",
-            fields={"label": q(label)},
-        ))
+            fields=fields,
+        )
+        if mechanics_refs:
+            rec["mechanics_references"] = mechanics_refs
+        out.append(rec)
     return out
 
 
@@ -1993,7 +2942,8 @@ def is_step_increment(body: str, prev: str) -> bool:
     ))
 
 
-def detect_projection_rule(gold: Book, delivered: Book, selected: set[str]) -> list[dict]:
+def detect_projection_rule(gold: Book, delivered: Book, selected: set[str],
+                           targets: set | None = None) -> list[dict]:
     rows = defaultdict(list)
     for k in selected:
         sheet, coord = k.split("!", 1)
@@ -2045,11 +2995,13 @@ def detect_projection_rule(gold: Book, delivered: Book, selected: set[str]) -> l
             append_projection_run(
                 out, gold, r,
                 covers_row=len(shippable) == 1 and r in shippable,
+                targets=targets,
             )
     return out
 
 
-def append_projection_run(out: list[dict], gold: Book, run: list[tuple], covers_row: bool = True):
+def append_projection_run(out: list[dict], gold: Book, run: list[tuple],
+                          covers_row: bool = True, targets: set | None = None):
     if len(run) < 3:
         return
     kind = run[0][2]
@@ -2060,6 +3012,10 @@ def append_projection_run(out: list[dict], gold: Book, run: list[tuple], covers_
         return
     cells = [item[1] for item in run]
     evidence = gold.formula.get(cells[min(1, len(cells) - 1)], "")
+    # State the maximal golden same-mechanics span, not just the selected run.
+    # A hold-flat run's seed (`AG31=AE31` ahead of `AH31=AG31`) and periods the
+    # delivered file kept as cached text both belong to the copied scope.
+    stated = full_copied_scope(gold, cells, targets)
     rec = record(
         "projection_rule", kind, cells, evidence,
         ["hold_level", "hold_growth", "step_increment", "average_window",
@@ -2071,24 +3027,53 @@ def append_projection_run(out: list[dict], gold: Book, run: list[tuple], covers_
         fields=({"label": q(label)} if kind == "hold_level" else
                 {"label": q(label),
                  "ingredient": ingredient_phrase(gold, evidence, cells, own_label=label)}),
+        stated_cells=stated,
     )
     rec["covers_row"] = covers_row
     out.append(rec)
+
+
+def _multiplies_ref(formula: str, ref: str) -> bool:
+    """The reference actually participates in a multiplication.
+
+    0666's `Calc_M!C386` is exactly `=Assumptions!C$162` - a direct read of an
+    equity-investment amount with no operator at all - and the old detector
+    still described it as an ownership-share multiplication.
+    """
+    sheet, coord = ref.split("!", 1)
+    p = split_coord(coord)
+    if not p:
+        return False
+    coord_re = r"\$?%s\$?%d(?![0-9])" % (p[0], p[1])
+    sheet_re = r"(?:'%s'|%s)!" % (re.escape(sheet.replace("'", "''")), re.escape(sheet))
+    ref_re = r"(?:%s)?%s" % (sheet_re, coord_re)
+    return bool(
+        re.search(r"%s\s*\*" % ref_re, formula)
+        or re.search(r"\*\s*%s" % ref_re, formula)
+    )
 
 
 def detect_stake_scaling(gold: Book, scope: set[str]) -> list[dict]:
     pct_cells = set()
     for k, v in gold.value.items():
         label = gold.row_label(k)
-        if label and re.search(r"equity investment|ownership|stake|% acquired", label, re.I):
-            if isinstance(v, (int, float)):
-                pct_cells.add(k)
+        if not label or not re.search(r"equity investment|ownership|stake|% acquired", label, re.I):
+            continue
+        # An ownership share is a fraction. An "Initial Equity investment"
+        # AMOUNT matches the label pattern too (0666), and describing a read
+        # of that amount as share scaling states mechanics the formula does
+        # not have.
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v <= 1:
+            pct_cells.add(k)
     byrow = defaultdict(list)
     for k in sorted(scope):
         formula = gold.formula.get(k)
         if not formula:
             continue
-        hits = [r for r in refs_in(formula, k.split("!", 1)[0]) if r in pct_cells]
+        hits = [
+            r for r in refs_in(formula, k.split("!", 1)[0])
+            if r in pct_cells and _multiplies_ref(formula, r)
+        ]
         if not hits:
             continue
         sheet, coord = k.split("!", 1)
@@ -2099,6 +3084,16 @@ def detect_stake_scaling(gold: Book, scope: set[str]) -> list[dict]:
     for (_sheet, _row), entries in sorted(byrow.items()):
         entries.sort()
         _, first, formula, hits = entries[0]
+        if not gold.row_label(first):
+            continue
+        # The fixed sentence has no slot for a sign flip or a subtraction.
+        # 0523's `'NPV & IRR'!B11 = -Multiples!D26*B4` shipped as a bare
+        # ownership-share claim and was blocked for omitting the source and
+        # its leading negation; a partial claim is false by omission, so a
+        # formula carrying any minus declines here. Silence is safer.
+        body = re.sub(r"'(?:[^']|'')+'!", "S!", STRING_RE.sub('""', formula))
+        if "-" in body:
+            continue
         out.append(record(
             "stake_scaling", "applied", [k for _, k, _, _ in entries],
             formula, ["applied", "not_applied"],
@@ -2146,20 +3141,27 @@ def is_whole_value_read(formula: str, gold: Book, sheet: str, row: int) -> str |
 
 
 def detect_source_selection(gold: Book, scope: set[str]) -> list[dict]:
-    out, seen_rows = [], set()
+    # Dedup by (sheet, row, source): a row whose columns each read a
+    # *different* source cell (e.g. period columns linking to consecutive
+    # blocks of another sheet) carries one material link per column, and the
+    # faithcheck source_link rule demands a record for each. Same-source
+    # repeats on a row still collapse to one record.
+    out, seen_links = [], set()
     for k in sorted(scope):
         formula = gold.formula.get(k)
         if not formula:
             continue
         sheet, coord = k.split("!", 1)
         p = split_coord(coord)
-        if not p or (sheet, p[1]) in seen_rows:
+        if not p:
             continue
         label = gold.row_label(k)
         if not label:
             continue
         source = is_whole_value_read(formula, gold, sheet, p[1])
         if not source:
+            continue
+        if (sheet, p[1], source) in seen_links:
             continue
         source_sheet = source.split("!", 1)[0]
         lowered = label.lower()
@@ -2171,24 +3173,32 @@ def detect_source_selection(gold: Book, scope: set[str]) -> list[dict]:
             lowered,
         ))
         bare = bool(re.fullmatch(r"=\s*[+\-]?[A-Za-z0-9_ '$#!]+$", formula.strip()))
+        # An unsigned bare single-cell read is exactly representable in the
+        # entry's sentence, so the cross-sheet gate admits it even without a
+        # purchase or rate label (0648's `'IRR-NPV Calculations'!DS6 =
+        # Workings!D87`, the omitted terminal exit-value link).
+        bare_unsigned = bool(BARE_LINK_RE.match(formula.strip()))
         if source_sheet != sheet:
-            if not (purchase or rate_like):
+            if not (purchase or rate_like or bare_unsigned):
                 continue
         else:
             if gold.row_label(source) == label or not bare:
                 continue
-        seen_rows.add((sheet, p[1]))
+        seen_links.add((sheet, p[1], source))
         source_label = gold.row_label(source)
-        out.append(record(
+        rec = record(
             "source_selection", "source", [k], formula, ["source"],
             f"Row labelled {label!r} reads from {pretty(source)}.",
             fields={
                 "label": q(label),
-                "ingredient": "the %s sheet, on the row labelled %s"
-                              % (source.split("!", 1)[0], q(source_label))
-                              if source_label else "the %s sheet" % source.split("!", 1)[0],
+                # Name the exact cell as well as the row, so the link chain
+                # is reproducible without the formula (0648's repair shape).
+                "ingredient": describe_ref(gold, pretty(source), sheet, label),
             },
-        ))
+        )
+        rec["source_cell"] = source
+        rec["bare_unsigned_link"] = bare_unsigned
+        out.append(rec)
     return out
 
 
@@ -2247,9 +3257,13 @@ def detect_row_populated(gold: Book, delivered: Book, scope: set[str], targets: 
                 is_text = isinstance(v, str) and k not in gold.formula
                 if is_text and not label:
                     label, label_col = v.strip(), cnum
-                elif label_col is not None and cnum > label_col:
-                    if k in gold.formula or isinstance(v, (int, float)):
-                        data.append(k)
+                elif k in gold.formula or isinstance(v, (int, float)):
+                    # Golden data anywhere on the row disproves "unused",
+                    # including formulas left of the first literal text.
+                    # 0605's Dashboard row 14 holds `D14 = Calc!B$140` before
+                    # its "Operating metrics" heading in K14, and the old
+                    # position gate declared the whole row empty.
+                    data.append(k)
             if data or not label or len(label) < 4 or HEADER_RE.search(label) or label.isupper():
                 continue
             # The row must look empty in the file the agent actually receives. Its
@@ -2599,16 +3613,44 @@ def increment_label_is_rate_like(ctx: dict, ingredients: list) -> bool:
 
 
 def ship_source_selection(rec: dict, ctx: dict) -> bool:
-    """Ship the wiring only when the source still has to be built.
+    """Ship the wiring only in the exactly-representable case.
 
-    A source cell that survives in the delivered file is one read away from a
-    value, so naming it hands that value over.
+    0648 blocked because the model's sole terminal exit-value link
+    (`'IRR-NPV Calculations'!DS6 = Workings!D87`) was omitted entirely. The
+    old blanket decline ("until sign and period semantics are represented
+    explicitly") is now met narrowly: a bare, unsigned, single-cell read from
+    another sheet has no sign or scale to misstate, and the sentence names
+    the exact source cell. Everything else stays reviewer-only:
+
+    - a sign-flipped or scaled read has semantics the sentence cannot carry;
+    - a same-sheet mirror is ordinary spreadsheet reasoning;
+    - a source in the graded-output closure would name answer material;
+    - a source that survives in the delivered file is one read away from a
+      value, so naming it hands that value over.
     """
-    rec["declined_reason"] = (
-        "source relationship remains reviewer-only until sign and period "
-        "semantics are represented explicitly"
-    )
-    return False
+    cells = rec.get("cell_keys") or []
+    src = rec.get("source_cell")
+    if not rec.get("bare_unsigned_link") or not src or len(cells) != 1:
+        rec["declined_reason"] = (
+            "only a bare unsigned single-cell read renders sign and scale "
+            "exactly; this shape stays reviewer-only"
+        )
+        return False
+    if src.split("!", 1)[0] == cells[0].split("!", 1)[0]:
+        rec["declined_reason"] = "same-sheet mirror is ordinary spreadsheet reasoning"
+        return False
+    if any(c in ctx["targets"] for c in cells) or src in ctx["targets"]:
+        rec["declined_reason"] = "source link reaches the graded-output closure"
+        return False
+    if ctx["delivered"].has(src):
+        rec["declined_reason"] = (
+            "source survives in the delivered file; naming it hands the value over"
+        )
+        return False
+    if not (rec.get("fields") or {}).get("ingredient"):
+        rec["declined_reason"] = "source could not be named cleanly"
+        return False
+    return True
 
 
 def ship_not_a_target(rec: dict, ctx: dict) -> bool:
@@ -2639,6 +3681,15 @@ def ship_distribution_policy(rec: dict, ctx: dict) -> bool:
     if _band_survives(rec, ctx):
         rec["declined_reason"] = "distribution row survives in the delivered file"
         return False
+    if rec.get("value") == "formula_mechanics":
+        # Unlike the named-value sentences, the mechanics sentence states a
+        # construction, so it follows the Section 2 graded-target policy.
+        if any(c in ctx["targets"] for c in rec.get("cell_keys") or []):
+            rec["declined_reason"] = "distribution mechanics band is itself graded"
+            return False
+        if set(rec.get("mechanics_references") or []) & ctx["targets"]:
+            rec["declined_reason"] = "distribution mechanics would name a graded target"
+            return False
     if rec.get("value") == "payout_ratio":
         ings = list(_ingredients(rec.get("evidence") or "", *_origin(rec)))
         if len(ings) == 1 and ctx["delivered"].has(
@@ -2800,10 +3851,15 @@ def resolve_unused_conflicts(records: list[dict]) -> list[dict]:
     return records
 
 
-def record(family, value, cells, evidence, alternatives, note, row_ref=None, fields=None):
+def record(family, value, cells, evidence, alternatives, note, row_ref=None, fields=None,
+           stated_cells=None):
+    # stated_cells widens what the record *says* to the full copied-mechanics
+    # span; cells remain what the record claims for arbitration, leak checks
+    # and blankness verification.
+    shown = stated_cells or cells
     return {
-        "band": compact_cells([pretty(c) for c in cells]) if cells else row_ref,
-        "cells": [pretty(c) for c in cells] if cells else ([row_ref] if row_ref else []),
+        "band": compact_cells([pretty(c) for c in shown]) if shown else row_ref,
+        "cells": [pretty(c) for c in shown] if shown else ([row_ref] if row_ref else []),
         "cell_keys": cells,
         "label": note,
         "role": family,
@@ -2853,6 +3909,53 @@ def detect_defects(gold: Book, targets: list[str], scope: set[str]) -> list[dict
 
 def overlap_claimed(record_cells: list[str], claimed: set[str]) -> bool:
     return any(c in claimed for c in record_cells)
+
+
+def record_reach(rec: dict) -> set[str]:
+    """Every cell a record claims, states, or names in its mechanics."""
+    reach = set(rec.get("cell_keys") or [])
+    for c in rec.get("cells") or []:
+        if isinstance(c, str) and "!" in c and "!row " not in c:
+            sheet, coord = c.rsplit("!", 1)
+            if split_coord(coord):
+                reach.add(key(sheet, coord))
+    reach.update(rec.get("mechanics_references") or [])
+    reach.update((rec.get("method_profile") or {}).get("references") or [])
+    if rec.get("source_cell"):
+        reach.add(rec["source_cell"])
+    return reach
+
+
+def suppress_closure_reach(records: list[dict], closure: set[str]) -> list[dict]:
+    """Suppress any disclosed record that reaches the graded-output closure.
+
+    The old gate suppressed only Section 2 methods whose own band was
+    literally graded, which let through:
+
+    - 0353: a zero-value claim over `Summary!B50:O50`, whose band contains
+      requested `Summary!D50`, shipped from a Section 1 entry;
+    - 0441: `Model!O24`'s method, where graded `Model!O1` is `=+O24`;
+    - 0620/0672: mechanics for the same-row copied equivalent of a graded
+      cell.
+
+    `liquidation_preference` keeps its registry standing exception (0668: it
+    names which of four defensible splits the author chose, not a
+    construction), and `aggregate_scope` records marked
+    `accepted_target_reference` name visible labels, never the target.
+    """
+    for rec in records:
+        if rec.get("disposition") != "disclosed":
+            continue
+        if rec.get("entry") == "liquidation_preference" or rec.get("accepted_target_reference"):
+            continue
+        hit = record_reach(rec) & closure
+        if hit:
+            rec["disposition"] = "suppressed"
+            rec["declined_reason"] = (
+                "record reaches the graded-output closure at "
+                + ", ".join(pretty(h) for h in sorted(hit)[:3])
+            )
+    return records
 
 
 def import_legacy_method_records(task_dir: Path, delivered: Book, claimed_keys: set[str]) -> list[dict]:
@@ -2923,6 +4026,10 @@ def detect_records(args) -> dict:
     scope = selected_keys(selection)
     targets = selection["target_keys"]
     target_set = set(targets)
+    # Everything downstream that guards against describing a graded answer
+    # guards against its aliases and copied equivalents too (0353, 0441,
+    # 0620, 0672).
+    closure = graded_closure(gold, target_set)
 
     # Custom methods get first claim. Standard, ambiguous and uncertain
     # assessments remain reviewer-visible but do not claim the band, so the
@@ -2944,15 +4051,19 @@ def detect_records(args) -> dict:
         detect_inert_line,
         detect_terminal_value,
         detect_npv_timing,
-        detect_distribution_policy,
-        # Ahead of stake_scaling: order is precedence, and stake_scaling ships
-        # on `always`, so it cannot be beaten by suppression.
-        detect_liquidation_preference,
-        detect_stake_scaling,
-        detect_source_selection,
     ):
         convention_records.extend(fn(gold, convention_scope))
-    convention_records.extend(detect_projection_rule(gold, delivered, convention_scope))
+    convention_records.extend(
+        detect_distribution_policy(gold, convention_scope, closure)
+    )
+    # Ahead of stake_scaling: order is precedence, and stake_scaling ships
+    # on `always`, so it cannot be beaten by suppression.
+    convention_records.extend(detect_liquidation_preference(gold, convention_scope))
+    convention_records.extend(detect_stake_scaling(gold, convention_scope))
+    convention_records.extend(detect_source_selection(gold, convention_scope))
+    convention_records.extend(
+        detect_projection_rule(gold, delivered, convention_scope, closure)
+    )
     convention_records.extend(detect_row_populated(
         gold, delivered, convention_scope, targets
     ))
@@ -2977,29 +4088,26 @@ def detect_records(args) -> dict:
     defects = detect_defects(gold, targets, scope)
 
     for rec in unique:
-        rec["leak_flag"] = any(c in target_set for c in rec.get("cell_keys", []))
+        rec["leak_flag"] = any(c in closure for c in rec.get("cell_keys", []))
 
     drift = check_registry_drift({r["family"] for r in unique})
     if drift:
         raise SystemExit("registry drift:\n  " + "\n  ".join(drift))
 
-    ctx = {"gold": gold, "delivered": delivered, "targets": target_set}
+    ctx = {
+        "gold": gold,
+        "delivered": delivered,
+        "targets": closure,
+        "raw_targets": target_set,
+    }
     unique = apply_ship_when(unique, ctx)
     unique = arbitrate_overlapping(unique)
     unique = resolve_unused_conflicts(unique)
-    # Section 2 only. A method on a graded target reconstructs the answer
-    # from kept inputs; the registry draws that line at "is the band graded"
-    # and does not extend it to Section 1. liquidation_preference on 0668
-    # D43/D49 is the standing case: the cells are graded and the convention
-    # still ships.
-    for rec in unique:
-        if (
-            rec.get("leak_flag")
-            and rec["disposition"] == "disclosed"
-            and rec.get("entry") in METHOD_ENTRY_IDS
-        ):
-            rec["disposition"] = "suppressed"
-            rec["declined_reason"] = "method band is itself graded"
+    # Graded-output closure gate, replacing the old Section-2-only rule that
+    # let 0353's zero-value claim over a graded band and 0441/0620/0672's
+    # alias/copied-method leaks ship. liquidation_preference keeps its 0668
+    # exception inside suppress_closure_reach.
+    unique = suppress_closure_reach(unique, closure)
 
     claimed = {c for rec in unique for c in rec.get("cell_keys", [])}
     by_disposition = Counter(r["disposition"] for r in unique)
@@ -3020,6 +4128,7 @@ def detect_records(args) -> dict:
             "selected_cells": len(scope),
             "claimed_selected_cells": len(scope & claimed),
             "unexplained_cells": len(scope - claimed),
+            "graded_closure_cells": len(closure),
             "leak_flags": sum(1 for r in unique if r.get("leak_flag")),
             "method_assessments": dict(Counter(
                 a.get("status", "unknown") for a in method_assessments
@@ -3152,8 +4261,33 @@ def compact_cells(cells: list[str]) -> str:
     if len({p[0] for p in parsed}) == 1 and len({p[1] for p in parsed}) == 1:
         parsed.sort(key=lambda x: x[2])
         return f"`{parsed[0][0]}!{parsed[0][3]}:{parsed[-1][3]}`"
+    # A copied-down family collapses the same way a row band does.
+    if len({p[0] for p in parsed}) == 1 and len({p[2] for p in parsed}) == 1:
+        parsed.sort(key=lambda x: x[1])
+        return f"`{parsed[0][0]}!{parsed[0][3]}:{parsed[-1][3]}`"
     shown = ", ".join(f"`{c}`" for c in cells[:4])
     return shown + (f" and {len(cells) - 4} more" if len(cells) > 4 else "")
+
+
+def stated_orientation(rec: dict) -> str:
+    """How a record's stated cells lie: single, row, column, or mixed."""
+    parsed = []
+    for c in rec.get("cells") or []:
+        if not isinstance(c, str) or "!" not in c or "!row " in c:
+            continue
+        sheet, coord = c.rsplit("!", 1)
+        p = split_coord(coord)
+        if p:
+            parsed.append((sheet, p[1], col_to_num(p[0])))
+    if not parsed:
+        return "none"
+    if len(parsed) == 1:
+        return "single"
+    if len({p[0] for p in parsed}) == 1 and len({p[1] for p in parsed}) == 1:
+        return "row"
+    if len({p[0] for p in parsed}) == 1 and len({p[2] for p in parsed}) == 1:
+        return "column"
+    return "mixed"
 
 
 def agent_records(records: list[dict]) -> list[dict]:
@@ -3186,14 +4320,34 @@ def render_sentence(rec: dict) -> str:
         return ""
     fields = rec.get("fields") or {}
     # An empty field means the detector could not name the thing cleanly. Render
-    # nothing rather than a sentence with a hole in it.
-    if any(not str(v).strip() for v in fields.values()):
+    # nothing rather than a sentence with a hole in it. A quoted empty label
+    # ('""') is the same hole wearing quotes: 0666 shipped a sentence claiming
+    # its target sat on a row labelled "".
+    if any(not str(v).strip() or str(v).strip() in ('""', "''") for v in fields.values()):
         return ""
     try:
         text = template.format(**fields)
     except (KeyError, IndexError):
         return ""
-    return text if "{" not in text else ""
+    if "{" in text:
+        return ""
+    # The registry method template says "copied-column calculation". For a
+    # single-cell stated scope that claim is false (0248, 0462, 0518, 0537,
+    # 0605), and for a copied-DOWN family the direction is wrong. Rewrite the
+    # scope wording deterministically from the stated cells' geometry; the
+    # registry keeps authority over everything else in the sentence.
+    if "copied-column calculation" in text:
+        orientation = stated_orientation(rec)
+        if orientation == "single":
+            text = text.replace("copied-column calculation", "single-cell calculation")
+            representative = str(fields.get("representative") or "")
+            if representative:
+                text = text.replace(", shown for %s:" % representative, ":")
+        elif orientation == "column":
+            text = text.replace(
+                "copied-column calculation", "calculation copied down the rows"
+            )
+    return text
 
 
 def render_section(records: list[dict]) -> str:
@@ -3260,7 +4414,15 @@ def internal_tokens() -> list[str]:
     return sorted(tokens)
 
 
-def audit_text(section: str, task_dir: Path) -> list[str]:
+def significant_digits(raw: str) -> int:
+    """Digits a rendered numeric literal carries, leading zeros excluded."""
+    mantissa = re.split(r"[eE]", raw)[0]
+    digits = re.sub(r"[^0-9]", "", mantissa).lstrip("0")
+    return len(digits)
+
+
+def audit_text(section: str, task_dir: Path, records: list[dict] | None = None,
+               closure: set[str] | None = None) -> list[str]:
     faults = []
     formula_lines = [line for line in section.splitlines() if FORMULA_RE.search(line)]
     if formula_lines:
@@ -3269,20 +4431,47 @@ def audit_text(section: str, task_dir: Path) -> list[str]:
     if leaked:
         faults.append(f"internal taxonomy token(s) in agent text: {leaked[:5]}")
     targets = numeric_targets(task_dir)
+    # Numeric-collision policy (0469). Two tiers:
+    #
+    # (a) Provenance. A literal rendered from a record that reaches the
+    #     graded-output closure is answer material however it is spelled, so
+    #     any target match refuses with no specificity floor. Records that
+    #     reach the closure are already suppressed upstream; this is the
+    #     fail-closed net for one that slips through.
+    # (b) Pure value coincidence. Refuse only high-specificity matches: the
+    #     literal must carry at least four significant digits. A small round
+    #     integer such as the divisor 6 colliding with a graded 6.0 is a
+    #     spurious collision (0469's refusal), not a leak - low-specificity
+    #     constants are ordinary formula plumbing, and tier (a) has already
+    #     proven the record they came from does not reach the closure.
+    #     Zero and +/-1 targets stay exempt as control literals.
+    closure_literals: set[float] = set()
+    if records and closure:
+        for rec in records:
+            if record_reach(rec) & set(closure):
+                for number in (rec.get("method_profile") or {}).get("numbers") or []:
+                    try:
+                        closure_literals.add(float(number))
+                    except (TypeError, ValueError):
+                        continue
     for raw in NUMBER_RE.findall(section):
         try:
             val = float(raw.replace(",", ""))
         except ValueError:
             continue
         for target in targets:
-            # Zero/one are control literals in branches and collide with zero
-            # checks or boolean targets by accident. Larger integers receive the
-            # normal answer-collision audit.
             if abs(float(target)) <= 1e-12 or (
                 float(target).is_integer() and abs(target) <= 1
             ):
                 continue
-            if abs(val - target) <= 1e-12 * max(1.0, abs(target)):
+            if abs(val - target) > 1e-12 * max(1.0, abs(target)):
+                continue
+            if any(abs(val - lit) <= 1e-12 * max(1.0, abs(lit)) for lit in closure_literals):
+                faults.append(
+                    f"numeric literal {raw} matches target {target} and its "
+                    "provenance record reaches the graded-output closure"
+                )
+            elif significant_digits(raw) >= 4:
                 faults.append(f"numeric literal {raw} matches target {target}")
     return faults
 
@@ -3300,7 +4489,19 @@ def write_disclosure(args) -> dict:
     records_payload = read_stage(source_task, "records", Path(args.runs_root))
     safe = agent_records(records_payload.get("records", []))
     section = render_section(safe)
-    faults = audit_text(section, source_task)
+    closure = None
+    try:
+        selection = read_stage(source_task, "bands", Path(args.runs_root))
+        closure = graded_closure(
+            Book(Path(selection["golden"])), set(selection["target_keys"])
+        )
+    except Exception:
+        closure = None
+    disclosed = [
+        r for r in records_payload.get("records", [])
+        if r.get("disposition") == "disclosed"
+    ]
+    faults = audit_text(section, source_task, records=disclosed, closure=closure)
     if faults and not args.force:
         raise SystemExit("refusing to write disclosure: " + "; ".join(faults[:5]))
     dst = Path(args.out).resolve() if args.out else source_task
@@ -3336,6 +4537,341 @@ def strip_agent_sections(text: str) -> str:
 def cmd_write(args):
     result = write_disclosure(args)
     print(f"{result['task']}: wrote {result['written_records']} disclosure record(s) -> {result['out']}")
+
+
+# --------------------------------------------------------------------------- faithcheck
+#
+# Runs after `write` and before `verify`. Every claim a written record makes
+# is mechanically re-derived from the golden workbook and the staged
+# artifacts; any divergence is a fault and the command exits nonzero. Pure
+# read-and-check: it writes only runs/disclosure/<task>/faithcheck.json,
+# which is never staged for the agent, and it never copies golden cached
+# values anywhere.
+
+FAITHCHECK_SCOPE_ENTRIES = METHOD_ENTRY_IDS | {"projection_rule", "distribution_policy"}
+
+
+def _fault(faults: list, rec, kind: str, claim: str, expected: str = "", found: str = ""):
+    faults.append({
+        "record": rec.get("band") if isinstance(rec, dict) else rec,
+        "entry": rec.get("entry") if isinstance(rec, dict) else None,
+        "kind": kind,
+        "claim": claim,
+        "expected": expected,
+        "found": found,
+    })
+
+
+def _unquote_label(text) -> str:
+    text = str(text or "").strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text[1:-1]
+    return text
+
+
+def _stated_keys(rec: dict) -> list[str]:
+    out = []
+    for c in rec.get("cells") or []:
+        if isinstance(c, str) and "!" in c and "!row " not in c:
+            sheet, coord = c.rsplit("!", 1)
+            if split_coord(coord):
+                out.append(key(sheet, coord))
+    return out
+
+
+def _claimed_rows(rec: dict) -> set[tuple]:
+    rows = set()
+    for c in rec.get("cell_keys") or []:
+        rk = _row_key(c)
+        if rk:
+            rows.add(rk)
+    for c in rec.get("cells") or []:
+        m = re.match(r"^`?(.+)!row (\d+)`?$", str(c))
+        if m:
+            rows.add((unquote_sheet(m.group(1)), int(m.group(2))))
+    return rows
+
+
+def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
+                    golden: str | None = None) -> dict:
+    """Mechanically re-derive every claim in the written disclosure.
+
+    Four claim families, mirroring the observed blocker classes:
+
+    a. row labels (0598, 0605, 0622, 0660, 0661, 0669): every stated target
+       and operand label is re-resolved with the leftward resolver;
+    b. copied scope (0248, 0462, 0518, 0528, 0537, 0595, 0605, 0622): the
+       stated band must be the maximal same-mechanics golden span, phrased
+       for its true geometry;
+    c. reference completeness (0523, 0648, 0658): every reference, sign, and
+       literal of the representative golden formula must appear in the
+       rendered mechanics, including pinned-reference lock behaviour and
+       undisclosed bare cross-sheet source links;
+    d. graded-output closure (0353, 0441, 0620, 0672): no disclosed record
+       may reach a graded answer, its equality aliases, or its same-row
+       copied equivalents.
+    """
+    disclosure_path = task_dir / "tests" / "disclosure.json"
+    if not disclosure_path.exists():
+        raise SystemExit(f"faithcheck needs {disclosure_path}; run write first")
+    payload = json.loads(disclosure_path.read_text(encoding="utf-8"))
+    gold = Book(find_golden(task_dir, golden))
+    delivered = Book(find_environment(task_dir))
+    targets_map, _ = load_key(task_dir)
+    default_sheet = gold.sheets[0]
+    targets = {parse_ref(t, default_sheet) for t in targets_map}
+    closure = graded_closure(gold, targets)
+
+    disclosed = [
+        rec for rec in payload.get("records", [])
+        if rec.get("disposition") == "disclosed"
+        and rec.get("entry")
+        and render_sentence(rec)
+    ]
+
+    faults: list[dict] = []
+
+    truncated: set[str] = set()
+    referenced_rows: set[tuple] = set()
+    if any(rec.get("entry") == "row_populated" for rec in disclosed):
+        for k, formula in gold.formula.items():
+            for ref in refs_in(formula, k.split("!", 1)[0], truncated=truncated):
+                rk = _row_key(ref)
+                if rk:
+                    referenced_rows.add(rk)
+
+    for rec in disclosed:
+        sentence = render_sentence(rec)
+        entry = rec.get("entry")
+        fields = rec.get("fields") or {}
+        cells = list(rec.get("cell_keys") or [])
+        stated = _stated_keys(rec)
+        anchor_cells = stated or cells
+
+        # ------------------------------------------------ (a) target label
+        claimed_label = _unquote_label(fields.get("label"))
+        if claimed_label and anchor_cells:
+            expected_label = gold.row_label(anchor_cells[0])
+            if expected_label != claimed_label:
+                _fault(
+                    faults, rec, "row_label",
+                    "stated row label must equal the leftward-resolver label",
+                    expected=expected_label, found=claimed_label,
+                )
+
+        # ------------------- (a)/(c) operand labels, references, literals
+        steps = str(fields.get("steps") or "")
+        if steps and cells:
+            profile = formula_profile(gold, {
+                "band": rec.get("band"),
+                "cell_keys": cells,
+                "label": gold.row_label(cells[0]),
+                "pattern": "",
+            })
+            if not profile.get("complete"):
+                _fault(
+                    faults, rec, "reference",
+                    "representative golden formula could not be re-parsed for the coverage proof",
+                    expected="parseable formula", found=str(profile.get("error")),
+                )
+            else:
+                sheet0 = cells[0].split("!", 1)[0]
+                for raw in profile.get("raw_references") or []:
+                    rendered = describe_ref(gold, raw, sheet0, profile.get("label", ""))
+                    if rendered not in steps:
+                        _fault(
+                            faults, rec, "reference",
+                            "every golden reference must appear in the rendered "
+                            "mechanics with its re-derived label",
+                            expected=rendered,
+                            found="absent or differently labelled in the record's steps",
+                        )
+                for literal in profile.get("literal_renderings") or []:
+                    if literal not in steps:
+                        _fault(
+                            faults, rec, "reference",
+                            "every golden literal must appear in the rendered mechanics",
+                            expected=literal, found="absent from the record's steps",
+                        )
+                lock_cells = anchor_cells if len(anchor_cells) > 1 else cells
+                pinned, moving = _copy_lock_split(gold, lock_cells)
+                if pinned and moving and "fixed" not in steps:
+                    _fault(
+                        faults, rec, "lock",
+                        "a copy pattern pinning some references must state the lock behaviour",
+                        expected="a clause naming the pinned reference(s): " + ", ".join(pinned),
+                        found="no lock clause in the rendered mechanics",
+                    )
+
+        # ----------------------- (c) partial-claim entries: sign coverage
+        if entry == "stake_scaling" and cells:
+            formula = gold.formula.get(cells[0]) or ""
+            body = re.sub(r"'(?:[^']|'')+'!", "S!", STRING_RE.sub('""', formula))
+            if "-" in body:
+                _fault(
+                    faults, rec, "reference",
+                    "ownership-share sentence omits a negation or subtraction "
+                    "present in the golden formula",
+                    expected="rendered mechanics carrying the sign",
+                    found="fixed stake_scaling sentence with no sign slot",
+                )
+
+        # -------------------------------------------------- (b) scope
+        if entry in FAITHCHECK_SCOPE_ENTRIES and anchor_cells:
+            span_h = full_copied_scope(gold, [anchor_cells[0]], closure)
+            span_v = full_copied_scope_vertical(gold, [anchor_cells[0]], closure)
+            span = span_h if len(span_h) >= len(span_v) else span_v
+            stated_multi = len(anchor_cells) > 1
+            if "copied-column calculation" in sentence and not stated_multi and len(span) <= 1:
+                _fault(
+                    faults, rec, "scope",
+                    "single-cell formula phrased as a copied-column calculation",
+                    expected="single-cell phrasing",
+                    found="copied-column claim over %s" % rec.get("band"),
+                )
+            if "single-cell calculation" in sentence and len(span) > 1:
+                _fault(
+                    faults, rec, "scope",
+                    "copied family phrased as a single-cell calculation",
+                    expected=compact_cells([pretty(c) for c in span]),
+                    found=str(rec.get("band")),
+                )
+            if stated_multi:
+                rows = {split_coord(c.split("!", 1)[1])[1] for c in anchor_cells}
+                colsn = {col_to_num(split_coord(c.split("!", 1)[1])[0]) for c in anchor_cells}
+                if len(rows) == 1:
+                    expected_span = full_copied_scope(gold, anchor_cells, closure)
+                elif len(colsn) == 1:
+                    expected_span = full_copied_scope_vertical(gold, anchor_cells, closure)
+                else:
+                    expected_span = anchor_cells
+                if set(expected_span) - set(anchor_cells):
+                    _fault(
+                        faults, rec, "scope",
+                        "stated scope is narrower than the golden same-mechanics span",
+                        expected=compact_cells([pretty(c) for c in expected_span]),
+                        found=str(rec.get("band")),
+                    )
+                for a, b in zip(anchor_cells, anchor_cells[1:]):
+                    if not copy_compatible(gold, a, b):
+                        _fault(
+                            faults, rec, "scope",
+                            "stated band mixes different mechanics",
+                            expected="one copy family per record",
+                            found="%s against %s" % (pretty(a), pretty(b)),
+                        )
+                        break
+            elif len(span) > 1:
+                _fault(
+                    faults, rec, "scope",
+                    "stated scope is a fragment of a copied family",
+                    expected=compact_cells([pretty(c) for c in span]),
+                    found=str(rec.get("band")),
+                )
+
+        # ------------------------------ (b) row_populated truth re-checks
+        if entry == "row_populated":
+            for rk in sorted(_claimed_rows(rec)):
+                sheet, rownum = rk
+                if rec.get("value") == "populated_but_unread":
+                    if sheet in truncated:
+                        _fault(
+                            faults, rec, "reference",
+                            "unread claim is unverifiable: the reference scan "
+                            "truncated an oversized range on this sheet",
+                            expected="verifiable absence of inbound references",
+                            found="oversized ranges skipped",
+                        )
+                    elif rk in referenced_rows:
+                        _fault(
+                            faults, rec, "reference",
+                            "row claimed unread is read by a golden formula",
+                            expected="no inbound reference anywhere in the golden",
+                            found="a golden formula references the row",
+                        )
+                if rec.get("value") == "unused":
+                    if any(
+                        k in gold.formula or isinstance(gold.value.get(k), (int, float))
+                        for k in gold.row_cells(sheet, rownum)
+                    ):
+                        _fault(
+                            faults, rec, "scope",
+                            "row claimed unused carries golden data",
+                            expected="an empty golden row",
+                            found="formulas or values on the row",
+                        )
+
+        # ------------------------------------------------ (d) closure
+        if entry != "liquidation_preference" and not rec.get("accepted_target_reference"):
+            hit = sorted(record_reach(rec) & closure)
+            if hit:
+                _fault(
+                    faults, rec, "closure",
+                    "record reaches the graded-output closure and must be "
+                    "suppressed, not disclosed",
+                    expected="suppressed",
+                    found="disclosed; reaches " + ", ".join(pretty(h) for h in hit[:4]),
+                )
+
+    # -------------------- (c) undisclosed bare cross-sheet source links
+    selection = None
+    try:
+        selection = read_stage(task_dir, "bands", runs_root)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        selection = None
+    if selection is not None:
+        covered = {c for r in disclosed for c in (r.get("cell_keys") or [])}
+        for band in selection.get("bands", []):
+            keys = band.get("cell_keys") or []
+            if len(keys) != 1:
+                continue
+            k = keys[0]
+            formula = (gold.formula.get(k) or "").strip()
+            if not formula or not BARE_LINK_RE.match(formula):
+                continue
+            src = bare_alias_ref(gold, k)
+            if not src or src.split("!", 1)[0] == k.split("!", 1)[0]:
+                continue
+            if k in closure or src in closure:
+                continue
+            if k in covered:
+                continue
+            if delivered.has(k) or delivered.has(src):
+                continue
+            if not gold.row_label(k) or not gold.row_label(src):
+                continue
+            _fault(
+                faults, pretty(k), "source_link",
+                "material bare cross-sheet source link is not disclosed",
+                expected="a source_selection record naming %s and its source %s"
+                         % (pretty(k), pretty(src)),
+                found="no disclosed record covers this cell",
+            )
+
+    return {
+        "schema_version": "1.0",
+        "task": task_dir.name,
+        "golden": str(find_golden(task_dir, golden)),
+        "checked_records": len(disclosed),
+        "graded_closure_cells": len(closure),
+        "faults": faults,
+        "passed": not faults,
+    }
+
+
+def cmd_faithcheck(args):
+    task_dir = Path(args.task_dir).resolve()
+    result = faithcheck_task(task_dir, Path(args.runs_root), getattr(args, "golden", None))
+    out = Path(args.out) if args.out else run_dir(task_dir, Path(args.runs_root)) / "faithcheck.json"
+    write_json(out, result)
+    print(
+        f"{result['task']}: faithcheck {'PASS' if result['passed'] else 'FAIL'} "
+        f"({result['checked_records']} record(s), {len(result['faults'])} fault(s))"
+    )
+    for fault in result["faults"][:10]:
+        print(f"  - [{fault['kind']}] {fault['record']}: {fault['claim']}")
+    if result["faults"]:
+        raise SystemExit(2)
 
 
 def verify_task(task_dir: Path) -> dict:
@@ -3406,9 +4942,14 @@ def verify_task(task_dir: Path) -> dict:
     if missing_render:
         faults.append(f"{len(missing_render)} custom record(s) did not render: {missing_render[:5]}")
 
+    gold_book = None
+    try:
+        gold_book = Book(find_golden(task_dir))
+    except Exception:
+        gold_book = None
     if custom:
         try:
-            gold = Book(find_golden(task_dir))
+            gold = gold_book if gold_book is not None else Book(find_golden(task_dir))
             structural = []
             for rec in custom:
                 profile = formula_profile(gold, {
@@ -3425,7 +4966,21 @@ def verify_task(task_dir: Path) -> dict:
                 )
         except Exception as exc:
             faults.append(f"custom structural verification failed: {exc}")
-    faults.extend(audit_text(section, task_dir))
+    closure = None
+    if gold_book is not None:
+        try:
+            targets_map, _ = load_key(task_dir)
+            default_sheet = gold_book.sheets[0]
+            closure = graded_closure(
+                gold_book, {parse_ref(t, default_sheet) for t in targets_map}
+            )
+        except Exception:
+            closure = None
+    disclosed_records = [
+        r for r in payload.get("records", [])
+        if r.get("disposition") == "disclosed"
+    ]
+    faults.extend(audit_text(section, task_dir, records=disclosed_records, closure=closure))
     return {"task": task_dir.name, "passed": not faults, "faults": faults}
 
 
@@ -3574,6 +5129,39 @@ def cmd_migrate(args):
     write_json(Path(args.runs_root) / "migration-summary.json", payload)
 
 
+def cmd_roles_validate(args):
+    task_dir = Path(args.task_dir).resolve()
+    runs_root = Path(args.runs_root)
+    path = Path(args.file) if args.file else default_role_resolutions_path(
+        task_dir, runs_root)
+    if not path.exists():
+        raise SystemExit(f"no arbitration file to validate at {path}")
+    cases_path = run_dir(task_dir, runs_root) / "ambiguous_roles.json"
+    cases = []
+    if cases_path.exists():
+        cases = json.loads(cases_path.read_text(encoding="utf-8")).get("cases") or []
+    normalized, errors, warnings = validate_role_resolutions(path, cases)
+    for warning in warnings:
+        print(f"{task_dir.name}: WARNING {warning}")
+    if errors:
+        for error in errors:
+            print(f"{task_dir.name}: ERROR {error}")
+        raise SystemExit(
+            f"{task_dir.name}: role_resolutions.json failed validation with "
+            f"{len(errors)} error(s); re-launch the arbitration agent once "
+            "with the exact errors above")
+    unresolved = [
+        case["case_id"] for case in cases
+        if case["case_id"] not in {row["case_id"] for row in normalized["resolutions"]}
+    ]
+    if unresolved:
+        print(f"{task_dir.name}: note: {len(unresolved)} case(s) left "
+              f"unresolved (candidates fall through in registry order)")
+    write_json(path, normalized)
+    print(f"{task_dir.name}: roles-validate PASS "
+          f"({len(normalized['resolutions'])} resolution(s)) -> {path}")
+
+
 # --------------------------------------------------------------------------- cli
 
 
@@ -3586,13 +5174,17 @@ def main(argv=None):
     b.add_argument("--tasks-root", default=str(DEFAULT_TASKS_ROOT))
     b.add_argument("--out", default=None)
 
-    for name in ("select", "probe", "roles", "detect", "context", "write", "verify"):
+    for name in ("select", "probe", "roles", "roles-validate", "detect",
+                 "context", "write", "faithcheck", "verify"):
         p = sub.add_parser(name)
         p.add_argument("--task-dir", required=True)
         p.add_argument("--out", default=None)
-        if name == "select":
+        if name in ("select", "faithcheck"):
             p.add_argument("--golden", default=None)
+        if name == "select":
             p.add_argument("--ast-dir", default=None)
+        if name == "roles-validate":
+            p.add_argument("--file", default=None)
         if name == "detect":
             p.add_argument("--role-resolutions", default=None)
         if name == "write":
@@ -3614,9 +5206,11 @@ def main(argv=None):
         "select": cmd_select,
         "probe": cmd_probe,
         "roles": cmd_roles,
+        "roles-validate": cmd_roles_validate,
         "detect": cmd_detect,
         "context": cmd_context,
         "write": cmd_write,
+        "faithcheck": cmd_faithcheck,
         "verify": cmd_verify,
         "migrate": cmd_migrate,
     }[args.command](args)

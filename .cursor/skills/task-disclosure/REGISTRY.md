@@ -391,12 +391,15 @@ Records from this section ship a value. Their record metadata is `convention`.
 - **Id.** `distribution_policy`
 - **Question.** What sizes the distribution paid to holders in each period?
 - **Alternatives.** `residual_cash_floored` | `residual_cash_unfloored` | `payout_ratio` |
-  `capped_at_retained_earnings` | `first_period_only`
+  `capped_at_retained_earnings` | `first_period_only` | `formula_mechanics`
 - **Ship when.** The distribution row is blank in the delivered file and no surviving labelled
   input states the policy. **Declines** when a payout rate survives on a labelled row and the
   distribution is that rate applied to a single visible driver, which is ordinary reasoning. No
   unread-row test belongs here; whether a surviving rate row is actually read is
   `row_populated`'s Question, and duplicating it would put two bullets on one decision.
+  `formula_mechanics` additionally follows the Section 2 graded-target policy: it states a
+  construction, so it **declines** when the band is graded or when it would name a graded
+  target.
 - **Sentence.**
   - `residual_cash_floored` - "The row labelled {label} distributes whatever cash the period
     leaves over, and never falls below zero."
@@ -407,20 +410,26 @@ Records from this section ship a value. Their record metadata is `convention`.
   - `capped_at_retained_earnings` - "The row labelled {label} distributes no more than the
     retained earnings available at the time."
   - `first_period_only` - "The row labelled {label} pays in the first period only."
-- **Detection.** Rows whose label contains dividend, distribution, or shareholder payment. A
-  `MAX` against zero over a cash-available term is the floored residual; the same term without
-  the `MAX` is unfloored; a product against an earnings row is a payout ratio; a `MIN` against a
-  retained-earnings balance is the cap. **Every value needs a positive signal and there is no
-  default**: a dividend row whose shape matches none of the four is left uncovered. Asserting a
-  rule from the absence of a token is how this entry would become the next `projection_rule`, whose
-  own Note records it once produced 677 of 751 records.
-- **Known limit.** The values are written as siblings but the shapes are not exclusive. 0677's
-  `=MAX(MIN( H167:H168),0)` is a floored residual **and** a cap at retained earnings at once - the
-  lesser of cash available and retained earnings, held at zero - and only one value can be
-  reported. The floor wins, because it is the reading the task's own report attributes to the cause
-  and the one the observed agents got wrong. A row where the cap is the load-bearing half would be
-  described incompletely, and expressing both would need the cap to become a modifier rather than
-  an alternative.
+  - `formula_mechanics` - "For {band} on the row labelled {label}, size the distribution
+    exactly as follows, shown for {representative}: {steps}."
+- **Detection.** Rows whose label contains dividend, distribution, or shareholder payment. Only
+  two shapes may use a fixed named-value sentence, because only there is that wording provably
+  complete: an exact `MAX` of a single cash-available reference against zero is the floored
+  residual, and an exact two-reference product against a payout row is the payout ratio. Every
+  other distribution shape - a `MIN` entitlement cap (0352, 0353), a pass-through copy of a
+  floored source row (0256), a share multiplier over floored cash (0350), a lesser-of-two-rows
+  clamp under a zero floor (0646) - is rendered mechanically from the parsed formula, so no cap,
+  floor, multiplier or reference is dropped. Where the row reads a source that is itself held at
+  a `MAX(...,0)` floor, the rendered sentence states that floor. **Every value still needs a
+  positive signal and there is no default**: a dividend row whose shape matches nothing here is
+  left uncovered. `residual_cash_unfloored` and `capped_at_retained_earnings` are retained for
+  vocabulary but are no longer emitted by detection: the unfloored claim proved unprovable from
+  the shape alone (0256 and 0350 both floored their cash upstream of the distribution row), and
+  the retained-earnings cap sentence omits the cash side of the `MIN` (the 0646 defect).
+- **Superseded limit.** An earlier version reported one sibling value for mixed shapes and let
+  the floor win on 0677's `=MAX(MIN( H167:H168),0)`. Independent review (0646) blocked exactly
+  that omission - the lesser-of cap was dropped - so mixed shapes now render both halves through
+  `formula_mechanics` instead of choosing one.
 - **Seen in.** 0638 - `CalcA!H119:AC119`, where one bullet is the only single disclosure measured
   to move anything on that task, at 12 of 24 graded cells rising to 18. 0677 -
   `'Financial Model'!H169:L169`, labelled "Dividends to be distributed", where the golden is
@@ -504,7 +513,7 @@ Records from this section ship a value. Their record metadata is `convention`.
   not its absence, so `not_applied` is unreachable. Note also that a row may scale by the share
   and then add an unscaled term, which the sentence does not capture.
 - **Sentence.**
-  - `applied` - "The row labelled {label} is scaled by the buyer's ownership share in
+  - `applied` - "The row labelled {label} is scaled by the ownership share in
     {ingredient}."
   - `not_applied` - "The row labelled {label} is stated in full, not scaled by the buyer's
     ownership share."

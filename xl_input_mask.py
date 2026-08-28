@@ -56,8 +56,12 @@ try:
     import openpyxl
     from openpyxl.utils import get_column_letter
     from openpyxl.utils.cell import coordinate_to_tuple
+    from openpyxl.worksheet.formula import ArrayFormula
 except ImportError:  # pragma: no cover
     sys.exit("openpyxl is required:  python3 -m pip install openpyxl")
+
+# Zip parts that can carry <f> formula elements.
+FORMULA_PART_PREFIXES = ("xl/worksheets/", "xl/macrosheets/", "xl/dialogsheets/")
 
 try:
     from xl_level_split import (
@@ -159,7 +163,13 @@ def keep_cells(bands_path, mode, book=None):
             continue
         if band["bucket"] == "input":
             keep[sheet].update(span)
-        elif mode != "inputs" and band["vtype"] in ("text", "unit"):
+        elif (mode != "inputs" and band["kind"] != "formula"
+              and band["vtype"] in ("text", "unit")):
+            # Typed text/unit cells survive on their own (mask_sheet never
+            # blanks typed cells); admitting a *formula* band here would
+            # freeze its cached display -- e.g. IFERROR fallback strings like
+            # "-" -- which is derived content and pre-discloses the branch a
+            # blanked calculation takes (0261 Soft Inc survivors).
             keep[sheet].update(span)
         elif mode == "headers" and band["vtype"] == "axis":
             axis[sheet].update(span)
@@ -679,13 +689,22 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
     faults = {"formula": [], "leaked": [], "lost": [], "changed": []}
 
     # No chart part may still carry cached series values: re-scrubbing the
-    # written file must be a no-op.
+    # written file must be a no-op. And a strict zero-formula census: no sheet
+    # part of the written file may retain any <f> element at all -- ordinary,
+    # shared, array, or dataTable -- regardless of how openpyxl would present
+    # the cell.
     with zipfile.ZipFile(out_path) as zf:
         for name in zf.namelist():
             if is_chart_part(name):
                 _, hits = scrub_chart_caches(name, zf.read(name))
                 if hits:
                     faults["leaked"].append("%s (chart value cache)" % name)
+            elif name.startswith(FORMULA_PART_PREFIXES) and name.endswith(".xml"):
+                match = FORMULA_RE.search(zf.read(name))
+                if match:
+                    faults["formula"].append(
+                        "%s (<f> element survived: %s)"
+                        % (name, match.group(0)[:80].decode("utf-8", "replace")))
 
     forbidden_formulas = [f for f in forbidden_formulas if str(f).strip()]
 
@@ -702,9 +721,20 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
                 spot = (cell.row, cell.column)
                 where = "%s!%s%d" % (ws.title, get_column_letter(cell.column),
                                      cell.row)
+                if isinstance(value, ArrayFormula):
+                    faults["formula"].append("%s (array formula)" % where)
+                    continue
                 if isinstance(value, str):
-                    if value.startswith("="):
+                    if cell.data_type == "f":
                         faults["formula"].append(where)
+                    elif value.startswith("=") and spot in derived:
+                        # A frozen formula result that still reads like a
+                        # formula is indistinguishable from a leak; refuse it.
+                        # Typed text that merely looks like a formula (e.g. a
+                        # literal "=" label on a dashboard) is original golden
+                        # content the mask must preserve, not a survivor.
+                        faults["formula"].append(
+                            "%s (formula-like derived text)" % where)
                     elif any(f in value for f in forbidden_formulas):
                         faults["formula"].append("%s (output cell formula text)"
                                                  % where)
@@ -908,7 +938,7 @@ def main(argv=None):
     parser.add_argument("--seg-dir", default="seg_out",
                         help="where xl_segment.py wrote bands.csv")
     parser.add_argument("--source", default="4-10 100",
-                        help="folder holding <wb>.xlsx")
+                        help="folder holding <wb>.xlsx or <wb>.xlsm")
     parser.add_argument("-o", "--out", default="inputs_out")
     parser.add_argument("--keep", choices=KEEP_MODES, default="headers",
                         help="how much non-input content survives")

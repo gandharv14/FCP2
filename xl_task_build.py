@@ -161,8 +161,10 @@ class Spec:
         """Cells whose own formula or any ancestor's formula is volatile."""
         own = set()
         for sheet, cells in self.graph.formulas.items():
-            for coord, (formula, _) in cells.items():
-                if VOLATILE_RE.search(formula):
+            # plain formulas are (text, False); array formulas carry a third
+            # span element, so unpack positionally instead of destructuring
+            for coord, entry in cells.items():
+                if VOLATILE_RE.search(entry[0]):
                     own.add((sheet,) + coord)
         if not own:
             return set()
@@ -456,6 +458,14 @@ def _ratio_pairs(spec, library):
                                    spec.is_target(sheet, dr, col)]
                         if not any(blanked):
                             continue
+                        # every participating cell must be recomputable
+                        # (a gradable target) or still visible in the
+                        # snapshot; a blanked-but-excluded cell (volatile,
+                        # cyclic, unparsed) would bake an unreproducible
+                        # cached value into the answer key
+                        if not all(t or spec.visible(sheet, r, col)
+                                   for t, r in zip(blanked, (nr, dr))):
+                            continue
                         combos.append((name, entry, sheet, col, nr, nv, dr, dv))
     return combos
 
@@ -689,8 +699,14 @@ def build_trace_driver(spec, tpl, rng):
         for r in rows:
             part_value = values.get((r, col))
             part_label = spec.row_label(sheet, r, col)
-            if is_number(part_value) and part_label:
-                parts.append((r, part_label, part_value))
+            if not (is_number(part_value) and part_label):
+                continue
+            # component cells must be recomputable targets or visible in
+            # the snapshot, otherwise the delta baked into the answer key
+            # rests on a value the agent can neither see nor rebuild
+            if not (spec.visible(sheet, r, col) or spec.is_target(sheet, r, col)):
+                continue
+            parts.append((r, part_label, part_value))
         if len(parts) < 3:
             continue
         metric = spec.row_label(sheet, row, col)
@@ -708,6 +724,9 @@ def build_trace_driver(spec, tpl, rng):
         for r, part_label, part_value in parts:
             v_a = values.get((r, col_a))
             if not is_number(v_a):
+                break
+            if not (spec.visible(sheet, r, col_a)
+                    or spec.is_target(sheet, r, col_a)):
                 break
             earlier.append((r, part_label, part_value, v_a))
         if len(earlier) != len(parts):

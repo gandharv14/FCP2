@@ -91,8 +91,22 @@ def evaluate(run: Path) -> dict:
     draft = _load(run / "draft.json")
     exclusions_path = run / "exclusions.json"
     exclusions = json.loads(exclusions_path.read_text(encoding="utf-8")) if exclusions_path.is_file() else {}
-    workbook = str(report.get("workbook") or draft.get("asset") or run.parent.name)
-    workbook = re.sub(r"-variable-sources$", "", run.name)
+    # Metadata is the primary source of the workbook id; the directory name
+    # is only a fallback. (An unconditional overwrite here used to discard
+    # the metadata id and silently weaken the draft-row floor for
+    # unconventionally named runs.)
+    workbook = str(report.get("workbook") or "").strip()
+    if not workbook:
+        # draft.json carries "<id>-inputs.xlsx — ..." rather than a bare id
+        asset = re.match(r"\s*(.+?)-inputs\.xlsx", str(draft.get("asset") or ""))
+        workbook = asset.group(1) if asset else ""
+    dir_id = re.sub(r"-variable-sources$", "", run.name) \
+        if run.name.endswith("-variable-sources") else ""
+    if workbook and dir_id and workbook != dir_id:
+        return {"eligible": False, "mode": "fail",
+                "reason": "workbook id mismatch: metadata says %r but the "
+                          "run directory is %r" % (workbook, run.name)}
+    workbook = workbook or dir_id or run.name
     variables = spec.get("variables") if isinstance(spec.get("variables"), list) else None
     if variables is None:
         return {"eligible": False, "mode": "fail", "reason": "normalized.json has no variables list"}
@@ -187,7 +201,10 @@ def check_plain_environment(bundle: Path, workbook_id: str) -> dict:
     if not environment.is_dir():
         return {"valid": False, "missing_files": ["environment/"], "unknown_files": [],
                 "symlinks": [], "workbooks": []}
-    expected = {f"{workbook_id}-inputs.xlsx", "Dockerfile"}
+    # The masker names the artifact after the golden source's suffix, so the
+    # single required workbook may be either <id>-inputs.xlsx or .xlsm.
+    artifact_names = {f"{workbook_id}-inputs.xlsx", f"{workbook_id}-inputs.xlsm"}
+    expected = {"Dockerfile"}
     if dialogue_notes_expected(bundle):
         expected.add(DIALOGUE_NOTES_NAME)
     actual: set[str] = set()
@@ -202,8 +219,11 @@ def check_plain_environment(bundle: Path, workbook_id: str) -> dict:
         relative for relative in actual
         if Path(relative).suffix.casefold() in {".xlsx", ".xlsm"}
     )
-    missing = sorted(expected - actual)
-    unknown = sorted(actual - expected)
+    missing_set = expected - actual
+    if not (actual & artifact_names):
+        missing_set = missing_set | {f"{workbook_id}-inputs.xlsx"}
+    missing = sorted(missing_set)
+    unknown = sorted(actual - expected - artifact_names)
     if len(workbooks) != 1:
         missing.append("exactly one workbook at environment root")
     return {

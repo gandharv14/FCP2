@@ -28,6 +28,8 @@ from pathlib import Path
 import openpyxl
 from openpyxl.utils import column_index_from_string as ci, get_column_letter as gl
 
+from xl_artifact_paths import resolve_workbook_artifact
+
 # Locate !A1 / !A1:B2, then take the sheet name immediately before the bang.
 # Excel sheet names are at most 31 characters and cannot contain \ / ? * [ ] : !
 CELL = r"\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?"
@@ -72,8 +74,9 @@ CAUSE_PROSE = {
 
 
 def _source_root(wb):
-    from pathlib import Path as _P
-    return "4-10 100" if _P(f"4-10 100/{wb}.xlsx").exists() else "batch-src"
+    if resolve_workbook_artifact("4-10 100", wb).exists():
+        return "4-10 100"
+    return "batch-src"
 
 
 def extract_refs(text, sheets=None):
@@ -182,9 +185,12 @@ def analyse(wb):
     run = Path(f"runs/{wb}-variable-sources")
     draft = json.loads((run / "draft.json").read_text(encoding="utf-8"))
     SR = _source_root(wb)
-    G = openpyxl.load_workbook(f"{SR}/{wb}.xlsx", data_only=False)
-    GV = openpyxl.load_workbook(f"{SR}/{wb}.xlsx", data_only=True)
-    BI = openpyxl.load_workbook(f"inputs_out/{wb}-inputs.xlsx", data_only=False)
+    golden = resolve_workbook_artifact(SR, wb)
+    G = openpyxl.load_workbook(golden, data_only=False)
+    GV = openpyxl.load_workbook(golden, data_only=True)
+    BI = openpyxl.load_workbook(
+        resolve_workbook_artifact("inputs_out", wb, "%s-inputs"),
+        data_only=False)
     sheets = {s.strip().upper(): s for s in G.sheetnames}
 
     def vkey(v):
@@ -320,7 +326,7 @@ def emit(wb, draft, rows):
             r["codes"] = list(r.get("codes") or []) + ["forced_exclusion"]
             r["reason"] = CAUSE_PROSE["forced_exclusion"]
             continue
-        for sh, c, raw_val in r["cells"]:
+        for idx, (sh, c, raw_val) in enumerate(r["cells"]):
             val, is_date = coerce(raw_val)
             vid = f"{base}-{slug(sh)}-{c.lower()}" if multi else base
             n = 2
@@ -345,7 +351,10 @@ def emit(wb, draft, rows):
                     % ((name[0].lower() + name[1:]) if name else "this assumption")
                 ),
                 "cells": [f"{sh}!{c}"],
-                "extra_cells": r["extra"] if not multi else [],
+                # the row's duplicate-covering cells ride on the first atomic
+                # variable (downstream deduplicates refs); dropping them for
+                # multi-cell rows would leave known duplicates unmasked
+                "extra_cells": r["extra"] if idx == 0 else [],
             })
         inc_map[r["row"]["draft_id"]] = ids
         for e in r["extra"]:

@@ -33,6 +33,7 @@ try:
 except ImportError:  # pragma: no cover
     import tomllib as tomli
 
+from xl_artifact_paths import resolve_workbook_artifact
 from xl_task_build import (Instance, PROD_ENDPOINT, naturalize, read_env_key,
                            toml_table)
 from xl_harbor_prep import DOCKERFILE
@@ -236,6 +237,23 @@ def longest_band_path(trace):
     return list(reversed(path))
 
 
+LIT_BAND_VALUE_RE = re.compile(r"#lit=[^\s`]+")
+HARDCODED_LABEL_RE = re.compile(r"\[hardcoded [^\]]+\]")
+
+
+def scrub_literal_values(text):
+    """Hide hardcoded-constant values riding in band ids and labels.
+
+    Literal-source bands carry the constant's value in both their id
+    (``Sheet!M416#lit=1255``) and label (``... [hardcoded 1255]``). Hints
+    embed those strings in the agent-visible instruction *after* every leak
+    check has already run, so the value must never survive into hint text --
+    in --mcp tasks it may literally be a masked research variable.
+    """
+    text = LIT_BAND_VALUE_RE.sub("#lit", text)
+    return HARDCODED_LABEL_RE.sub("[hardcoded assumption]", text)
+
+
 def lineage_hints(outputs, lineage):
     """Compact, answer-free hints grounded in each output's lineage trace."""
     hints = []
@@ -253,14 +271,17 @@ def lineage_hints(outputs, lineage):
         )
         route = " → ".join(
             "`%s` (%s)" % (
-                step["node"],
-                display_name(step.get("label") or step["node"], step["sheet"]),
+                scrub_literal_values(step["node"]),
+                scrub_literal_values(
+                    display_name(step.get("label") or step["node"],
+                                 step["sheet"])),
             )
             for step in route_steps
         )
         target = path[-1] if path else {}
         direct_nodes = target.get("inputs") or []
-        direct = ["`%s`" % node for node in direct_nodes[:5]]
+        direct = ["`%s`" % scrub_literal_values(node)
+                  for node in direct_nodes[:5]]
         if len(direct_nodes) > 5:
             direct.append(
                 "%d other direct bands" % (len(direct_nodes) - 5)
@@ -287,6 +308,44 @@ def lineage_hints(outputs, lineage):
             ),
         })
     return hints
+
+
+NUMBER_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def verify_hints_hold_no_masked_values(hints, mcp_dir):
+    """Packaging-time guard: hint text must never carry a masked value.
+
+    The naturalizer's leak scan only covers the scenario paragraph, so this
+    mirrors xl_input_mask's assumptions redaction for the hint bullets that
+    are injected into the instruction afterwards. Fails closed.
+    """
+    rows = json.loads(
+        (mcp_dir / "masked_inputs.json").read_text(encoding="utf-8"))
+    deny_numbers, deny_texts = [], set()
+    for row in rows:
+        value = row.get("cell_value")
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, (int, float)):
+            deny_numbers.append(float(value))
+        else:
+            text = str(value).strip()
+            if text:
+                deny_texts.add(text)
+    joined = "\n".join(hint["text"] for hint in hints)
+    leaks = set()
+    for token in NUMBER_TOKEN_RE.findall(joined):
+        v = float(token)
+        if any(abs(v - abs(t)) <= 1e-9 * max(1.0, abs(t))
+               for t in deny_numbers):
+            leaks.add(token)
+    leaks.update(text for text in deny_texts if text in joined)
+    if leaks:
+        raise SystemExit(
+            "lineage hints would leak masked research value(s) %s into the "
+            "instruction; hint text must stay answer-free"
+            % ", ".join(sorted(leaks)[:5]))
 
 
 def hint_section(hints):
@@ -342,10 +401,11 @@ def collect(workbook, source_dir, seg_root, inputs_root):
     if not outputs:
         raise SystemExit("%s: curation.toml includes no outputs" % workbook)
 
-    gold = openpyxl.load_workbook(Path(source_dir) / ("%s.xlsx" % workbook),
-                                  data_only=True)
+    gold = openpyxl.load_workbook(
+        resolve_workbook_artifact(source_dir, workbook), data_only=True)
     masked = openpyxl.load_workbook(
-        Path(inputs_root) / ("%s-inputs.xlsx" % workbook), data_only=True)
+        resolve_workbook_artifact(inputs_root, workbook, "%s-inputs"),
+        data_only=True)
 
     resolved, targets = [], {}
     for entry in outputs:
@@ -363,12 +423,25 @@ def collect(workbook, source_dir, seg_root, inputs_root):
             ref = "%s!%s" % (quote_sheet(sheet), coord)
             targets[ref] = value
             refs.append(ref)
-        if refs:
-            raw = entry.get("name") or entry["label"]
-            resolved.append({"name": display_name(raw, entry["sheet"]),
-                             "raw_label": raw,
-                             "sheet": entry["sheet"], "band": entry["band"],
-                             "score": entry.get("score"), "refs": refs})
+        if not refs:
+            # a curated headline figure quietly vanishing would shrink the
+            # instruction, target table and answer key self-consistently, so
+            # nothing downstream could notice -- fail loudly instead
+            raise SystemExit(
+                "%s: curated output %r (%s) resolved to no gradable cells: "
+                "every cell's gold value is missing, text or an error value; "
+                "re-save the golden workbook with cached values or fix "
+                "curation.toml"
+                % (workbook, entry.get("name") or entry["label"],
+                   entry["band"]))
+        raw = entry.get("name") or entry["label"]
+        resolved.append({"name": display_name(raw, entry["sheet"]),
+                         "raw_label": raw,
+                         "sheet": entry["sheet"], "band": entry["band"],
+                         "score": entry.get("score"), "refs": refs})
+    if not resolved:
+        raise SystemExit("%s: no curated output produced any answer cells"
+                         % workbook)
     return resolved, targets
 
 
@@ -587,7 +660,8 @@ def load_plain_meta(workbook, audit_root="runs"):
 
 def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
          nat_meta, hints=None, hint_style="", mcp_dir=None, audit_meta=None,
-         formula_report=None, formula_hints=None, audit_root="runs"):
+         formula_report=None, formula_hints=None, audit_root="runs",
+         source_name=None):
     if out_dir.exists():
         shutil.rmtree(out_dir)
     (out_dir / "environment").mkdir(parents=True)
@@ -622,7 +696,7 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
         template = "outputs"
     metadata = {
         "workbook": workbook,
-        "source_file": "%s.xlsx" % workbook,
+        "source_file": source_name or ("%s.xlsx" % workbook),
         "artifact": artifact.name,
         "template": template,
         "financebench_question_type": "metrics-generated",
@@ -879,15 +953,14 @@ def main(argv=None):
                 ],
                 context_path=Path(args.custom_formula_context),
             )
-        artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
+        artifact = resolve_workbook_artifact(
+            args.inputs_root, workbook, "%s-inputs")
         if mcp_dir is not None:
             verify_mcp_mask(mcp_dir, artifact)
         audit_meta = None
         if not args.no_variable_source_audit:
-            audit_artifact = (
-                Path(args.variable_source_audit_inputs_root)
-                / ("%s-inputs.xlsx" % workbook)
-            )
+            audit_artifact = resolve_workbook_artifact(
+                args.variable_source_audit_inputs_root, workbook, "%s-inputs")
             audit_meta = generate_audit(
                 workbook,
                 audit_artifact,
@@ -907,6 +980,8 @@ def main(argv=None):
             seg_dir = Path(args.seg_root) / workbook
             hints = lineage_hints(outputs, load_lineage(seg_dir))
             hint_style = "lineage"
+            if mcp_dir is not None:
+                verify_hints_hold_no_masked_values(hints, mcp_dir)
         elif args.semantic_hints:
             hints = semantic_hints(family)
             hint_style = "semantic"
@@ -938,7 +1013,8 @@ def main(argv=None):
              outputs, nat_meta, hints=hints, hint_style=hint_style,
              mcp_dir=mcp_dir, audit_meta=audit_meta,
              formula_report=formula_report, formula_hints=formula_hints,
-             audit_root=args.variable_source_audit_root)
+             audit_root=args.variable_source_audit_root,
+             source_name=resolve_workbook_artifact(args.source, workbook).name)
         n_vars = mcp_variable_count(mcp_dir) if mcp_dir is not None else 0
         print("%s  %-16s %2d outputs, %3d cells%s, timeout %.0fs -> %s"
               % (workbook, family, len(outputs), len(targets),

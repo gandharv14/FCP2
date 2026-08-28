@@ -12,7 +12,7 @@ from collections import Counter
 from pathlib import Path
 
 
-PROMPT_VERSION = "finance-instruction-naturalizer-v1"
+PROMPT_VERSION = "finance-instruction-naturalizer-v3"
 MODEL = "gpt-5.6-sol-high"
 
 HEADING_RE = re.compile(r"(?m)^(#{1,6}\s+.+)$")
@@ -29,6 +29,27 @@ FENCE_RE = re.compile(r"(?ms)^```[^\n]*\n.*?^```\s*$")
 TABLE_RE = re.compile(r"(?m)(?:^\|.*\|\s*\n?){2,}")
 LIST_RE = re.compile(r"(?m)^(?:[-*+]|\d+\.)\s+.+$")
 
+# The exact-count token checks validate() enforces, in evaluation order.
+# freeze_protected_spans.py derives its frozen token spans from this same
+# table (labels and compiled patterns), so the freezer and the validator can
+# never disagree about what counts as a number, cell reference, URL, or
+# inline-code span.
+EXACT_TOKEN_CHECKS = (
+    ("fenced code blocks", FENCE_RE),
+    ("Markdown tables", TABLE_RE),
+    ("list items", LIST_RE),
+    ("inline-code spans", INLINE_CODE_RE),
+    ("URLs", URL_RE),
+    ("cell references", CELL_RE),
+    ("numbers", NUMBER_RE),
+)
+
+# The subset of EXACT_TOKEN_CHECKS whose tokens the freezer wraps in immutable
+# [[Fnn]] markers inside the two rewriteable regions. Structural checks
+# (fences, tables, lists) live almost entirely in protected sections, which
+# are already enforced byte-for-byte.
+FROZEN_TOKEN_LABELS = ("inline-code spans", "URLs", "cell references", "numbers")
+
 SOURCE_CATEGORIES = (
     "market rates",
     "tax rates",
@@ -36,6 +57,25 @@ SOURCE_CATEGORIES = (
     "contractual terms",
     "opening balances",
 )
+
+SEMANTIC_ANCHORS = (
+    ("rebuild", ("rebuild",)),
+    ("working directory", ("working directory",)),
+    ("blank", ("blank", "cleared")),
+    ("no formulas", ("no formulas",)),
+    ("derived", ("derived",)),
+    ("install", ("install",)),
+    ("packages", ("packages",)),
+    ("research data service", ("research data service",)),
+)
+REMOVED_TERMS = ("removed", "stripped out")
+REMOVED_ACCEPTED = ("removed", "stripped out", "cleared", "blanked")
+INPUT_AVAILABILITY_ACCEPTED = ("present", "remain", "retained")
+REGION_LABELS = {
+    "preamble": "opening prose (text before the first heading)",
+    "input": "## Input section",
+    "mutable": "opening prose or ## Input section",
+}
 
 
 class RewriteValidationError(ValueError):
@@ -74,10 +114,148 @@ def mutable_text(text: str) -> str:
     return preamble + input_section(sections)
 
 
-def require(condition: bool, message: str, checks: list[str]) -> None:
+def require(
+    condition: bool,
+    message: str,
+    checks: list[str],
+    expected: str | None = None,
+    found: str | None = None,
+) -> None:
+    """Record a passing check by name, or fail with a self-explanatory message.
+
+    Failure messages always lead with the check name, then state what was
+    expected and what was actually found, so a blocked run's validation.json
+    is diagnosable without re-deriving the check.
+    """
     if not condition:
-        raise RewriteValidationError(message)
+        detail = "check failed: %s" % message
+        if expected is not None:
+            detail += " | expected: %s" % expected
+        if found is not None:
+            detail += " | found: %s" % found
+        raise RewriteValidationError(detail)
     checks.append(message)
+
+
+def first_diff(source_body: str, candidate_body: str) -> str:
+    source_lines = source_body.splitlines()
+    candidate_lines = candidate_body.splitlines()
+    for index, (old, new) in enumerate(zip(source_lines, candidate_lines)):
+        if old != new:
+            return "line %d differs | source: %r | candidate: %r" % (
+                index + 1,
+                old[:160],
+                new[:160],
+            )
+    return "line counts differ: source has %d lines, candidate has %d" % (
+        len(source_lines),
+        len(candidate_lines),
+    )
+
+
+def model_type_phrase(source_preamble: str) -> str | None:
+    matches = re.findall(
+        r"(?=\b(?:an?|the)\s+([A-Za-z][^.\n]{0,120}?\bmodel)\b)",
+        source_preamble,
+        re.IGNORECASE,
+    )
+    return min(matches, key=len) if matches else None
+
+
+def named_outputs_phrase(source_preamble: str) -> str | None:
+    match = re.search(
+        r"(?:including|such as)\s+(.+?)(?=\.\s+(?:The full list|Every required)|$)",
+        source_preamble,
+        re.IGNORECASE | re.DOTALL,
+    )
+    return " ".join(match.group(1).split()) if match else None
+
+
+def protected_anchor_specs(source: str) -> list[dict]:
+    """The exact anchor list validate() enforces on the rewriteable regions.
+
+    Each spec carries the check name, the source phrase that triggered it,
+    the accepted candidate phrases (all lowercase), the region the candidate
+    is searched in, and whether the comparison is whitespace-normalized.
+    freeze_protected_spans.py uses this same list, so anything frozen before
+    the rewrite is exactly what the validator later demands.
+    """
+    preamble, sections = split_sections(source)
+    input_body = input_section(sections)
+    mutable_lower = (preamble + input_body).lower()
+    input_lower = input_body.lower()
+    specs: list[dict] = []
+
+    phrase = model_type_phrase(preamble)
+    if phrase:
+        specs.append({
+            "check": "financial model type preserved: %s" % phrase,
+            "phrase": phrase,
+            "accepted": (phrase.lower(),),
+            "region": "preamble",
+            "normalize_ws": False,
+        })
+    phrase = named_outputs_phrase(preamble)
+    if phrase:
+        specs.append({
+            "check": "named example outputs preserved",
+            "phrase": phrase,
+            "accepted": (phrase.lower(),),
+            "region": "preamble",
+            "normalize_ws": True,
+        })
+    for category in SOURCE_CATEGORIES:
+        if category in mutable_lower:
+            specs.append({
+                "check": "source category preserved: %s" % category,
+                "phrase": category,
+                "accepted": (category,),
+                "region": "mutable",
+                "normalize_ws": False,
+            })
+    for anchor, accepted in SEMANTIC_ANCHORS:
+        if anchor in mutable_lower:
+            specs.append({
+                "check": "semantic anchor preserved: %s" % anchor,
+                "phrase": anchor,
+                "accepted": accepted,
+                "region": "mutable",
+                "normalize_ws": False,
+            })
+    if "only" in input_lower:
+        specs.append({
+            "check": "Input exclusivity preserved",
+            "phrase": "only",
+            "accepted": ("only",),
+            "region": "input",
+            "normalize_ws": False,
+        })
+    if "may " in input_lower:
+        specs.append({
+            "check": "Input permission modality preserved",
+            "phrase": "may ",
+            "accepted": ("may ",),
+            "region": "input",
+            "normalize_ws": False,
+        })
+    if "present" in input_lower:
+        specs.append({
+            "check": "Input availability preserved",
+            "phrase": "present",
+            "accepted": INPUT_AVAILABILITY_ACCEPTED,
+            "region": "input",
+            "normalize_ws": False,
+        })
+    removed = next((term for term in REMOVED_TERMS if term in mutable_lower), None)
+    if removed:
+        specs.append({
+            "check": "removed-content scope preserved",
+            "phrase": removed,
+            "accepted": REMOVED_ACCEPTED,
+            "region": "mutable",
+            "normalize_ws": False,
+        })
+    return specs
 
 
 def validate(source: str, candidate: str, answer_key: dict | None = None) -> dict:
@@ -91,6 +269,8 @@ def validate(source: str, candidate: str, answer_key: dict | None = None) -> dic
         candidate_headings == source_headings,
         "headings and section order preserved",
         checks,
+        expected="the source headings in order: %r" % source_headings,
+        found="%r" % candidate_headings,
     )
 
     for (heading, source_body), (_, candidate_body) in zip(
@@ -102,104 +282,57 @@ def validate(source: str, candidate: str, answer_key: dict | None = None) -> dic
             candidate_body == source_body,
             "protected section preserved byte-for-byte: %s" % heading,
             checks,
+            expected="a byte-identical copy of the source section",
+            found=(
+                None
+                if candidate_body == source_body
+                else first_diff(source_body, candidate_body)
+            ),
         )
 
-    for label, pattern in (
-        ("fenced code blocks", FENCE_RE),
-        ("Markdown tables", TABLE_RE),
-        ("list items", LIST_RE),
-        ("inline-code spans", INLINE_CODE_RE),
-        ("URLs", URL_RE),
-        ("cell references", CELL_RE),
-        ("numbers", NUMBER_RE),
-    ):
+    for label, pattern in EXACT_TOKEN_CHECKS:
+        source_counts = counter(pattern, source)
+        candidate_counts = counter(pattern, candidate)
+        found = None
+        if candidate_counts != source_counts:
+            missing = dict((source_counts - candidate_counts).most_common(8))
+            added = dict((candidate_counts - source_counts).most_common(8))
+            found = "missing from candidate: %r; new in candidate: %r" % (
+                missing,
+                added,
+            )
         require(
-            counter(pattern, candidate) == counter(pattern, source),
+            candidate_counts == source_counts,
             "%s preserved exactly" % label,
             checks,
+            expected="the same %s tokens with the same counts as the source" % label,
+            found=found,
         )
 
-    source_mutable = mutable_text(source)
-    candidate_mutable = mutable_text(candidate)
-    source_input = input_section(source_sections).lower()
     candidate_input = input_section(candidate_sections).lower()
-    source_mutable_lower = source_mutable.lower()
-    candidate_mutable_lower = candidate_mutable.lower()
-
-    model_matches = re.findall(
-        r"(?=\b(?:an?|the)\s+([A-Za-z][^.\n]{0,120}?\bmodel)\b)",
-        source_preamble,
-        re.IGNORECASE,
-    )
-    if model_matches:
-        model_phrase = min(model_matches, key=len)
+    candidate_mutable_lower = mutable_text(candidate).lower()
+    candidate_regions = {
+        "preamble": candidate_preamble.lower(),
+        "input": candidate_input,
+        "mutable": candidate_mutable_lower,
+    }
+    for spec in protected_anchor_specs(source):
+        haystack = candidate_regions[spec["region"]]
+        if spec["normalize_ws"]:
+            haystack = " ".join(haystack.split())
+        accepted = spec["accepted"]
         require(
-            model_phrase.lower() in candidate_preamble.lower(),
-            "financial model type preserved: %s" % model_phrase,
+            any(term in haystack for term in accepted),
+            spec["check"],
             checks,
-        )
-
-    named_outputs = re.search(
-        r"(?:including|such as)\s+(.+?)(?=\.\s+(?:The full list|Every required)|$)",
-        source_preamble,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if named_outputs:
-        phrase = " ".join(named_outputs.group(1).split())
-        require(
-            phrase.lower() in " ".join(candidate_preamble.split()).lower(),
-            "named example outputs preserved",
-            checks,
-        )
-
-    for category in SOURCE_CATEGORIES:
-        if category in source_mutable_lower:
-            require(
-                category in candidate_mutable_lower,
-                "source category preserved: %s" % category,
-                checks,
-            )
-
-    semantic_anchors = (
-        ("rebuild", ("rebuild",)),
-        ("working directory", ("working directory",)),
-        ("blank", ("blank", "cleared")),
-        ("no formulas", ("no formulas",)),
-        ("derived", ("derived",)),
-        ("install", ("install",)),
-        ("packages", ("packages",)),
-        ("research data service", ("research data service",)),
-    )
-    for source_anchor, accepted in semantic_anchors:
-        if source_anchor in source_mutable_lower:
-            require(
-                any(term in candidate_mutable_lower for term in accepted),
-                "semantic anchor preserved: %s" % source_anchor,
-                checks,
-            )
-
-    if "only" in source_input:
-        require("only" in candidate_input, "Input exclusivity preserved", checks)
-    if "may " in source_input:
-        require(
-            "may " in candidate_input,
-            "Input permission modality preserved",
-            checks,
-        )
-    if "present" in source_input:
-        require(
-            any(term in candidate_input for term in ("present", "remain", "retained")),
-            "Input availability preserved",
-            checks,
-        )
-    if any(term in source_mutable_lower for term in ("removed", "stripped out")):
-        require(
-            any(
-                term in candidate_mutable_lower
-                for term in ("removed", "stripped out", "cleared", "blanked")
+            expected="one of %r (case-insensitive%s) somewhere in the candidate %s"
+            % (
+                list(accepted),
+                ", whitespace-normalized" if spec["normalize_ws"] else "",
+                REGION_LABELS[spec["region"]],
             ),
-            "removed-content scope preserved",
-            checks,
+            found="none of those phrases occur there (source anchor was %r)"
+            % spec["phrase"],
         )
 
     if answer_key:
@@ -212,18 +345,31 @@ def validate(source: str, candidate: str, answer_key: dict | None = None) -> dic
                 variants.add(str(int(value)))
             for variant in variants:
                 pattern = re.compile(r"(?<![\d.])%s(?![\d.])" % re.escape(variant))
+                source_hits = len(pattern.findall(source))
+                candidate_hits = len(pattern.findall(candidate))
                 require(
-                    len(pattern.findall(candidate)) <= len(pattern.findall(source)),
+                    candidate_hits <= source_hits,
                     "no new answer-value occurrence: %s" % variant,
                     checks,
+                    expected="at most %d occurrence(s), matching the source"
+                    % source_hits,
+                    found="%d occurrence(s) in the candidate" % candidate_hits,
                 )
 
     require(
         "{{" not in candidate and "}}" not in candidate,
         "no unresolved template placeholders",
         checks,
+        expected="no '{{' or '}}' anywhere in the candidate",
+        found="unresolved '{{'/'}}' placeholder text",
     )
-    require(candidate.endswith("\n"), "candidate has final newline", checks)
+    require(
+        candidate.endswith("\n"),
+        "candidate has final newline",
+        checks,
+        expected="candidate text ending with a newline",
+        found="candidate ends with %r" % candidate[-8:],
+    )
 
     return {
         "valid": True,

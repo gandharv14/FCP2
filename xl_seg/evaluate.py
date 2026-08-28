@@ -11,6 +11,7 @@ and is reported rather than silently coerced to zero.
 
 from __future__ import annotations
 
+import heapq
 import math
 import re
 from calendar import monthrange
@@ -19,7 +20,7 @@ from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta
 
 from .condense import strongly_connected, topo_order
-from .model import Graph, a1, range_members, split_ref
+from .model import A1_RE, Graph, a1, col_number, range_members, split_ref
 from .project import CellGraph
 
 
@@ -154,7 +155,12 @@ def _matches(value, criteria) -> bool:
     text = str(criteria)
     op, operand = CRITERIA_RE.match(text).groups()
     try:
-        target = float(operand)
+        stripped = operand.strip()
+        if stripped.endswith("%"):
+            # Excel parses criteria like ">0%" numerically.
+            target = float(stripped[:-1]) / 100.0
+        else:
+            target = float(operand)
         left = num(value, math.nan)
     except ValueError:
         target = operand.strip().lower()
@@ -268,7 +274,11 @@ def _solve_rate(exponents, values, guess=0.1, scan=True):
 
 
 def _irr(values, guess=0.1):
-    if not values:
+    # Excel documents that IRR needs at least one positive and one negative
+    # flow. Without a sign change the NPV curve never crosses zero -- and on an
+    # all-zero series it is identically zero, which the grid scan would happily
+    # "solve" at whatever point sits nearest the guess.
+    if not values or not any(v > 0 for v in values) or not any(v < 0 for v in values):
         return ExcelError("#NUM!")
     return _solve_rate(list(range(len(values))), values, guess)
 
@@ -276,12 +286,90 @@ def _irr(values, guess=0.1):
 def _xirr(values, dates, guess=0.1):
     if len(values) != len(dates) or not values:
         return ExcelError("#NUM!")
+    if not any(v > 0 for v in values) or not any(v < 0 for v in values):
+        return ExcelError("#NUM!")
     start = dates[0]
     return _solve_rate([(d - start) / 365.0 for d in dates], values, guess)
 
 
 def _div(a, b):
     return ExcelError("#DIV/0!") if b == 0 else a / b
+
+
+def _ddb_amount(cost, salvage, life, period, factor):
+    """Double-declining depreciation for one whole ``period`` (1-based).
+
+    Mirrors the reference implementation Excel-compatible engines share
+    (LibreOffice ``ScGetDDB``): book value declines geometrically at
+    ``factor/life`` capped at 100%, and the period's charge never takes the
+    book value below salvage or itself goes negative.
+    """
+    rate = factor / life
+    if rate >= 1.0:
+        rate = 1.0
+        old = cost if period == 1 else 0.0
+    else:
+        old = cost * (1.0 - rate) ** (period - 1.0)
+    new = cost * (1.0 - rate) ** period
+    return max(old - (salvage if new < salvage else new), 0.0)
+
+
+def _inter_vdb(cost, salvage, life, life1, period, factor):
+    """VDB core with straight-line switching (LibreOffice ``ScInterVDB``)."""
+    vdb = 0.0
+    loop_end = int(math.ceil(period - 1e-12))
+    remaining = cost - salvage
+    switched = False
+    linear = 0.0
+    for i in range(1, loop_end + 1):
+        if not switched:
+            ddb = _ddb_amount(cost, salvage, life, float(i), factor)
+            denominator = life1 - float(i - 1)
+            linear = remaining / denominator if denominator != 0 else math.inf
+            if linear > ddb:
+                term = linear
+                switched = True
+            else:
+                term = ddb
+                remaining -= ddb
+        else:
+            term = linear
+        if i == loop_end:
+            term *= period + 1.0 - loop_end
+        vdb += term
+    return vdb
+
+
+def _vdb_value(cost, salvage, life, start, end, factor, no_switch):
+    if (start < 0.0 or end < start or end > life or cost < 0.0
+            or salvage > cost or factor <= 0.0 or life <= 0.0):
+        return ExcelError("#NUM!")
+    int_start = math.floor(start + 1e-12)
+    int_end = math.ceil(end - 1e-12)
+    if no_switch:
+        vdb = 0.0
+        for i in range(int(int_start) + 1, int(int_end) + 1):
+            term = _ddb_amount(cost, salvage, life, float(i), factor)
+            if i == int_start + 1:
+                term *= min(end, int_start + 1.0) - start
+            elif i == int_end:
+                term *= end + 1.0 - int_end
+            vdb += term
+        return vdb
+    life1 = life
+    fractional = abs(start - int_start) > 1e-12 or abs(end - int_end) > 1e-12
+    if fractional and factor > 1 and start >= life / 2.0 - 1e-12:
+        # Excel's documented quirk: fractional spans starting in the second
+        # half of the asset's life re-anchor at midlife.
+        part = start - life / 2.0
+        start = life / 2.0
+        end -= part
+        life1 += 1.0
+    # Depreciation accumulated before `start` always comes off the cost first;
+    # the requested span then runs on the reduced book value over the
+    # remaining life.
+    cost -= _inter_vdb(cost, salvage, life, life1, start, factor)
+    return _inter_vdb(cost, salvage, life, life - start, end - start, factor)
 
 
 def _fv_value(rate, nper, pmt, pv, ptype):
@@ -439,17 +527,83 @@ def snap(result: float, *operands: float) -> float:
     Excel zeroes a sum whose magnitude is negligible against its operands, so
     ``=SUM(a,-a)`` is exactly 0 and any ``IF(x>0)`` downstream takes the false
     branch. Plain IEEE arithmetic leaves a ~1e-15 residue and flips the branch.
+    The threshold stays within a few ulps: workbook 0654 caches a genuine
+    -1.04e-5 residue against 2.8e8 operands (3.8e-14 relative), which Excel
+    demonstrably does not zero.
     """
     scale = max((abs(x) for x in operands), default=0.0)
-    return 0.0 if scale and abs(result) < scale * 1e-13 else result
+    return 0.0 if scale and abs(result) < scale * 1e-15 else result
+
+
+def _broadcast(operation, left, right):
+    """Element-wise binary application in array context (legacy CSE rules).
+
+    Scalars replicate across the other operand's shape; paired ranges align
+    positionally, and members beyond the shorter operand read #N/A as Excel's
+    array evaluation does.
+    """
+    ranges = [operand for operand in (left, right) if isinstance(operand, RangeValues)]
+    shape = ranges[0]
+    length = max(len(operand) for operand in ranges)
+
+    def element(operand, index):
+        if isinstance(operand, RangeValues):
+            return operand[index] if index < len(operand) else ExcelError("#N/A")
+        return operand
+
+    values = []
+    for index in range(length):
+        a, b = element(left, index), element(right, index)
+        if is_bad(a):
+            values.append(a)
+        elif is_bad(b):
+            values.append(b)
+        else:
+            values.append(operation(a, b))
+    rows, cols = shape.rows, shape.cols
+    if rows * cols != length:
+        rows, cols = 1, length
+    return RangeValues(values, rows, cols)
+
+
+def _numeric(value):
+    """Excel arithmetic coercion: text must parse as a number, else #VALUE!."""
+    if isinstance(value, str):
+        parsed = num(value, math.nan)
+        if math.isnan(parsed):
+            return ExcelError("#VALUE!")
+        return parsed
+    return num(value)
+
+
+def _arith(operation):
+    def apply(a, b):
+        x = _numeric(a)
+        if isinstance(x, ExcelError):
+            return x
+        y = _numeric(b)
+        if isinstance(y, ExcelError):
+            return y
+        return operation(x, y)
+    return apply
+
+
+def _negate(a):
+    x = _numeric(a)
+    return x if isinstance(x, ExcelError) else -x
+
+
+def _percent(a):
+    x = _numeric(a)
+    return x if isinstance(x, ExcelError) else x / 100.0
 
 
 BINARY = {
-    "+": lambda a, b: snap(num(a) + num(b), num(a), num(b)),
-    "-": lambda a, b: snap(num(a) - num(b), num(a), num(b)),
-    "*": lambda a, b: num(a) * num(b),
-    "/": lambda a, b: _div(num(a), num(b)),
-    "^": lambda a, b: _power(num(a), num(b)),
+    "+": _arith(lambda x, y: snap(x + y, x, y)),
+    "-": _arith(lambda x, y: snap(x - y, x, y)),
+    "*": _arith(lambda x, y: x * y),
+    "/": _arith(_div),
+    "^": _arith(lambda x, y: _power(x, y)),
     "&": lambda a, b: f"{_text(a)}{_text(b)}",
     "=": lambda a, b: _equal(a, b),
     "<>": lambda a, b: not _equal(a, b),
@@ -459,9 +613,11 @@ BINARY = {
     "<=": lambda a, b: num(a) <= num(b),
 }
 UNARY = {
-    "u-": lambda a: -num(a),
-    "u+": lambda a: num(a),
-    "%": lambda a: num(a) / 100.0,
+    "u-": _negate,
+    # Excel's unary plus is a no-op that preserves its operand, including
+    # text: =+IFERROR(x, "n.a.") must surface "n.a.", not 0.
+    "u+": lambda a: a if a is not None else 0.0,
+    "%": _percent,
 }
 
 
@@ -631,8 +787,12 @@ class Evaluator:
             return self._indirect(node)
         if op == "ROW":
             return self._row(node)
+        if op == "COLUMN":
+            return self._column(node)
         if op == "COUNTA":
             return self._counta(node)
+        if op == "isect":
+            return self._reference_join(node)
         if op == "IFERROR":
             if not self._arg_specs(node):
                 return Unresolved("iferror-arity")
@@ -707,7 +867,12 @@ class Evaluator:
             values = list(flatten(args))
             return RangeValues(values, 1, len(values))
         if node.op_kind in ("infix",) and op in BINARY:
-            return BINARY[op](args[0], args[1]) if len(args) > 1 else Unresolved("arity")
+            if len(args) < 2:
+                return Unresolved("arity")
+            left, right = args[0], args[1]
+            if isinstance(left, RangeValues) or isinstance(right, RangeValues):
+                return _broadcast(BINARY[op], left, right)
+            return BINARY[op](left, right)
         if node.op_kind in ("prefix", "postfix") and op in UNARY:
             if not args:
                 return Unresolved("arity")
@@ -851,6 +1016,11 @@ class Evaluator:
         row = int(num(args[1])) if len(args) > 1 else 1
         if not isinstance(source, RangeValues):
             return pool[row - 1] if 1 <= row <= len(pool) else ExcelError("#REF!")
+        explicit_col = len(args) > 2 and args[2] is not None
+        if not explicit_col and source.rows == 1 and row >= 1:
+            # Excel treats a lone index into a single-row vector as the
+            # position along the row, not a row number.
+            return pool[row - 1] if row <= len(pool) else ExcelError("#REF!")
         col = int(num(args[2])) if len(args) > 2 and args[2] is not None else 1
         if row == 0 and col == 0:
             return source
@@ -937,6 +1107,14 @@ class Evaluator:
         return _power(future / present, 1.0 / periods) - 1.0
 
     _fn__xlfn_rri = _fn_rri
+
+    def _fn_vdb(self, args):
+        if len(args) < 5:
+            return ExcelError("#VALUE!")
+        cost, salvage, life, start, end = (num(a) for a in args[:5])
+        factor = num(args[5]) if len(args) > 5 and args[5] is not None else 2.0
+        no_switch = truthy(args[6]) if len(args) > 6 and args[6] is not None else False
+        return _vdb_value(cost, salvage, life, start, end, factor, no_switch)
 
     def _fn_sumproduct(self, args):
         arrays = [list(flatten([arg])) for arg in args]
@@ -1499,6 +1677,12 @@ class Evaluator:
         return float(serial)
 
     def _fn_weekday(self, args):
+        if isinstance(args[0], RangeValues):
+            # Array context, e.g. SUMPRODUCT(--(WEEKDAY(ROW(...), 2) < 6)).
+            source = args[0]
+            values = [self._fn_weekday([value] + list(args[1:]))
+                      for value in source]
+            return RangeValues(values, source.rows, source.cols)
         monday0 = (EPOCH + timedelta(days=int(num(args[0])))).weekday()
         mode = int(num(args[1], 1.0)) if len(args) > 1 and args[1] is not None else 1
         if mode == 1:
@@ -1727,15 +1911,175 @@ class Evaluator:
             return args[declared]
         return ExcelError("#REF!")
 
+    _REF_ARG_RE = re.compile(
+        r"^\s*[A-Za-z_.]+\(\s*"
+        r"(?:(?:'[^']+'|[A-Za-z0-9_ .&-]+)!)?\$?([A-Za-z]{1,3})\$?(\d{1,7})")
+
+    def _reference_axis(self, node, axis):
+        """Coordinates a ROW()/COLUMN() argument covers, or None.
+
+        Handles plain references, spans, and statically resolved INDIRECT
+        targets; multi-member references return the sorted distinct axis
+        values (Excel's array form).
+        """
+        specs = self._arg_specs(node)
+        if not specs:
+            return None
+        spec = specs[0]
+        if spec[0] == "span":
+            coordinates = [_split(member) for member in spec[1]]
+            return sorted({c[axis] for c in coordinates if c is not None})
+        if spec[0] == "scalar":
+            source = self.graph.nodes.get(spec[1])
+            if source is None:
+                return None
+            if source.is_cell:
+                value = source.row if axis == 1 else source.col
+                return [value] if value is not None else None
+            if source.op == "INDIRECT":
+                declared = int(source.arity) if str(source.arity).isdigit() else 1
+                inner = self._arg_specs(source)
+                if len(inner) > declared:
+                    target = inner[declared]
+                    if target[0] == "span":
+                        coordinates = [_split(member) for member in target[1]]
+                        return sorted({c[axis] for c in coordinates if c is not None})
+                    if target[0] == "scalar":
+                        cell = self.graph.nodes.get(target[1])
+                        if cell is not None and cell.is_cell:
+                            value = cell.row if axis == 1 else cell.col
+                            return [value] if value is not None else None
+                # No statically resolved target: the reference text may still
+                # be computable, e.g. ROW(INDIRECT(T2&":"&T3)) where the dates
+                # concatenate into a "46023:46053" whole-row span.
+                if inner:
+                    text = self._arg_value(inner[0])
+                    if isinstance(text, str) and axis == 1:
+                        match = re.match(
+                            r"^\s*(\d{1,7})(?:\.0+)?\s*:\s*(\d{1,7})(?:\.0+)?\s*$",
+                            text,
+                        )
+                        if match:
+                            low, high = int(match.group(1)), int(match.group(2))
+                            if low <= high and high - low < 10000:
+                                return list(range(low, high + 1))
+        return None
+
     def _row(self, node):
-        """Excel ROW, using the referenced range or the formula owner's row."""
-        incoming = sorted(self.graph.in_edges.get(node.id, ()), key=lambda edge: edge.arg_index)
-        if incoming:
-            source = self.graph.nodes.get(incoming[0].source)
-            if source is not None and source.row is not None:
-                return float(source.row)
+        """Excel ROW: scalar for a cell, array for a range, owner row bare."""
+        values = self._reference_axis(node, 1)
+        if values:
+            if len(values) == 1:
+                return float(values[0])
+            return RangeValues([float(v) for v in values], len(values), 1)
+        # An argument pointing at an empty cell has no edge; the literal
+        # reference is still in the expression text.
+        if str(node.arity) not in ("", "0"):
+            match = self._REF_ARG_RE.match(node.expr or "")
+            if match:
+                return float(int(match.group(2)))
         owner = self.graph.nodes.get(node.owner)
         return float(owner.row) if owner is not None and owner.row is not None else ExcelError("#REF!")
+
+    def _column(self, node):
+        """Excel COLUMN: scalar for a cell, array for a range, owner column bare."""
+        values = self._reference_axis(node, 2)
+        if values:
+            if len(values) == 1:
+                return float(values[0])
+            return RangeValues([float(v) for v in values], 1, len(values))
+        if str(node.arity) not in ("", "0"):
+            match = self._REF_ARG_RE.match(node.expr or "")
+            if match:
+                return float(col_number(match.group(1)))
+        owner = self.graph.nodes.get(node.owner)
+        return float(owner.col) if owner is not None and owner.col is not None else ExcelError("#REF!")
+
+    def _reference_join(self, node):
+        """Reference-form colon, e.g. ``SUM(INDEX(...):INDEX(...))``.
+
+        The parser renders a colon between computed references as nested
+        ``isect`` nodes. When every leaf operand is an INDEX over a real span,
+        resolve each INDEX to its member cell and read the rectangle between
+        them. Anything else stays unresolved, as before.
+        """
+        leaves = []
+
+        def collect(nid):
+            source = self.graph.nodes.get(nid)
+            if source is not None and source.op == "isect":
+                for edge in sorted(self.graph.in_edges.get(nid, ()),
+                                   key=lambda e: e.arg_index):
+                    collect(edge.source)
+            else:
+                leaves.append(nid)
+
+        collect(node.id)
+        corner_cells = []
+        real_leaves = 0
+        for leaf in leaves:
+            source = self.graph.nodes.get(leaf)
+            if source is not None and source.kind == "name" and \
+                    source.label in ("", ":"):
+                # Placeholder produced by the parser for the colon itself.
+                continue
+            real_leaves += 1
+            if source is None or source.op != "INDEX":
+                return Unresolved("unsupported:isect")
+            members = self._index_reference(source)
+            if not isinstance(members, list):
+                return members if is_bad(members) else Unresolved("unsupported:isect")
+            corner_cells.extend(members)
+        if real_leaves != 2 or not corner_cells:
+            return Unresolved("unsupported:isect")
+        splits = [_split(corner) for corner in corner_cells]
+        if any(s is None for s in splits) or len({s[0] for s in splits}) != 1:
+            return Unresolved("unsupported:isect")
+        sheet = splits[0][0]
+        row_lo, row_hi = min(s[1] for s in splits), max(s[1] for s in splits)
+        col_lo, col_hi = min(s[2] for s in splits), max(s[2] for s in splits)
+        members = [
+            a1(sheet, row, col)
+            for row in range(row_lo, row_hi + 1)
+            for col in range(col_lo, col_hi + 1)
+        ]
+        values = [self._read(cid) for cid in members]
+        return RangeValues(values, row_hi - row_lo + 1, col_hi - col_lo + 1)
+
+    def _index_reference(self, node):
+        """Member cell ids an INDEX call refers to, for reference-form use.
+
+        Returns a one-element list for an ordinary lookup, the whole member
+        list for Excel's documented ``INDEX(range, 0)`` whole-range form, or
+        an error/Unresolved marker.
+        """
+        specs = self._arg_specs(node)
+        if not specs or specs[0][0] != "span":
+            return Unresolved("unsupported:isect")
+        members = specs[0][1]
+        coordinates = [_split(cid) for cid in members]
+        rows = len({row for _, row, _ in coordinates})
+        cols = len({col for _, _, col in coordinates})
+        first = self._arg(node, 1) if len(specs) > 1 else 1.0
+        if is_bad(first):
+            return first
+        position = int(num(first))
+        if position == 0:
+            return list(members)
+        second = self._arg(node, 2) if len(specs) > 2 else None
+        if second is not None:
+            if is_bad(second):
+                return second
+            row_index, col_index = position, int(num(second))
+        elif rows == 1:
+            row_index, col_index = 1, position
+        else:
+            row_index, col_index = position, 1
+        index = (row_index - 1) * cols + col_index - 1
+        if not (1 <= row_index <= rows and 1 <= col_index <= cols
+                and 0 <= index < len(members)):
+            return ExcelError("#REF!")
+        return [members[index]]
 
     def _counta(self, node):
         """Count nonblank values, recovering a range omitted by older AST graphs."""
@@ -1754,7 +2098,9 @@ class Evaluator:
         bad = next((value for value in values if isinstance(value, Unresolved)), None)
         if bad is not None:
             return bad
-        return float(sum(value is not None and value != "" for value in values))
+        # Excel's COUNTA counts every non-empty cell, including formulas that
+        # display as "" -- only genuinely empty cells (None here) are skipped.
+        return float(sum(value is not None for value in values))
 
     def _offset(self, node):
         """Resolve a dynamic reference, including optional range dimensions."""
@@ -1805,7 +2151,15 @@ class Evaluator:
         if is_bad(height) or is_bad(width):
             return height if is_bad(height) else width
         height, width = int(num(height, 1.0)), int(num(width, 1.0))
-        if height < 1 or width < 1 or target_row < 1 or target_col < 1:
+        if height == 0 or width == 0:
+            return ExcelError("#REF!")
+        # Excel allows negative height/width: the range anchors at the target
+        # cell and extends upward/leftward, e.g. SUM(OFFSET(AF85,0,0,1,-3)).
+        if height < 0:
+            target_row, height = target_row + height + 1, -height
+        if width < 0:
+            target_col, width = target_col + width + 1, -width
+        if target_row < 1 or target_col < 1:
             return ExcelError("#REF!")
         return [
             a1(base_sheet, row, col)
@@ -1923,7 +2277,6 @@ class Evaluator:
             graph_passes = graph_pass + 1
             before_pass = dict(self.values)
             cycle_candidates = []
-            disabled_cycle_candidates = []
             current_cycles = dict(indeterminate_diagnostics)
             active_adj, active_radj = self._active_graph(cells)
             signature = frozenset(
@@ -1950,10 +2303,11 @@ class Evaluator:
 
             for comp in topo_order(members, comp_adj, comp_radj):
                 group = members[comp]
-                pending = sorted(
-                    cell for cell in group
+                ordered = self._cycle_order(group, active_adj)
+                pending = [
+                    cell for cell in ordered
                     if cell not in seeded and cell not in indeterminate
-                )
+                ]
                 if not pending:
                     continue
                 cyclic = len(group) > 1 or any(
@@ -1962,29 +2316,23 @@ class Evaluator:
                 if not cyclic:
                     self.values[pending[0]] = self._eval_cell(pending[0])
                     continue
+                # A workbook whose calculation settings disable iteration but
+                # whose cached values are a converged circular solution can
+                # only have been saved by a session that did iterate (Excel
+                # writes zeros otherwise). Recompute the cycle either way and
+                # let verification's cached-value comparison be the judge; the
+                # diagnostic reason records the setting mismatch.
+                diagnostic = self._iterate_group(
+                    pending, iteration_limit, iteration_delta
+                )
+                diagnostic["unique"] = True
+                diagnostic.update({
+                    "size": len(group), "seed": comp,
+                    "graph_pass": graph_pass + 1,
+                })
                 if not iterate:
-                    # A zero-valued selector can temporarily expose an otherwise
-                    # inactive self-reference. Give the active graph a single
-                    # lazy sweep to settle before declaring a real cycle.
-                    diagnostic = self._iterate_group(pending, 1, iteration_delta)
-                    diagnostic.update({
-                        "size": len(group), "seed": comp,
-                        "reason": "iteration-disabled-provisional",
-                        "graph_pass": graph_pass + 1,
-                    })
-                    disabled_cycle_candidates.append(
-                        (tuple(sorted(group)), pending, diagnostic)
-                    )
-                else:
-                    diagnostic = self._iterate_group(
-                        pending, iteration_limit, iteration_delta
-                    )
-                    diagnostic["unique"] = True
-                    diagnostic.update({
-                        "size": len(group), "seed": comp,
-                        "graph_pass": graph_pass + 1,
-                    })
-                    cycle_candidates.append((tuple(sorted(group)), pending, diagnostic))
+                    diagnostic["reason"] = "iteration-disabled-recomputed"
+                cycle_candidates.append((tuple(sorted(group)), pending, diagnostic))
                 current_cycles[tuple(sorted(group))] = diagnostic
 
             max_change = max(
@@ -1994,19 +2342,6 @@ class Evaluator:
             latest_cycles = current_cycles
             if signature == last_signature and max_change <= iteration_delta:
                 found_indeterminate = False
-                for group_key, pending, diagnostic in disabled_cycle_candidates:
-                    diagnostic.update({
-                        "iterations": 0,
-                        "converged": False,
-                        "max_change": None,
-                        "reason": "iteration-disabled",
-                    })
-                    latest_cycles[group_key] = diagnostic
-                    indeterminate_diagnostics[group_key] = diagnostic
-                    indeterminate.update(pending)
-                    for cell in pending:
-                        self.values[cell] = Unresolved("circular-reference")
-                    found_indeterminate = True
                 for group_key, pending, diagnostic in cycle_candidates:
                     alternative = self._alternate_fixed_point(
                         pending, diagnostic, iteration_limit, iteration_delta
@@ -2080,6 +2415,48 @@ class Evaluator:
         )
 
     @staticmethod
+    def _cycle_order(group, adjacency):
+        """Dependency-ordered sweep for a (possibly cyclic) group.
+
+        Excel updates a circular block in calculation-chain order, so a
+        division sees its in-cycle denominator's fresh value within the same
+        sweep. An alphabetical sweep can evaluate the division first, produce
+        a transient #DIV/0!, and let the error stick across iterations.
+        Kahn's algorithm over the intra-group edges, breaking ties and true
+        cycles deterministically by name.
+        """
+        members = set(group)
+        incoming = {cell: 0 for cell in group}
+        forward = {cell: [] for cell in group}
+        for source in group:
+            for target in adjacency.get(source, ()):
+                if target in members and target != source:
+                    forward[source].append(target)
+                    incoming[target] += 1
+        ready = [cell for cell, degree in incoming.items() if degree == 0]
+        heapq.heapify(ready)
+        remaining = {cell for cell, degree in incoming.items() if degree > 0}
+        order = []
+        while ready or remaining:
+            if not ready:
+                # A genuine cycle: break it at the lexicographically smallest
+                # member so repeated runs sweep identically.
+                cut = min(remaining)
+                remaining.discard(cut)
+                incoming[cut] = 0
+                heapq.heappush(ready, cut)
+                continue
+            cell = heapq.heappop(ready)
+            order.append(cell)
+            for target in forward[cell]:
+                if target in remaining:
+                    incoming[target] -= 1
+                    if incoming[target] <= 0:
+                        remaining.discard(target)
+                        heapq.heappush(ready, target)
+        return order
+
+    @staticmethod
     def _value_change(before, after):
         if isinstance(before, (int, float)) and isinstance(after, (int, float)):
             if math.isfinite(float(before)) and math.isfinite(float(after)):
@@ -2088,6 +2465,8 @@ class Evaluator:
 
     def _iterate_group(self, pending, iteration_limit, iteration_delta):
         max_change = math.inf
+        refine_delta = min(iteration_delta, 1e-11)
+        converged_step = None
         for step in range(iteration_limit):
             max_change = 0.0
             for cell in pending:
@@ -2095,10 +2474,19 @@ class Evaluator:
                 after = self._eval_cell(cell)
                 self.values[cell] = after
                 max_change = max(max_change, self._value_change(before, after))
-            if max_change <= iteration_delta:
+            if max_change <= iteration_delta and converged_step is None:
+                converged_step = step
+            # Excel stops at the workbook's delta, but every subsequent
+            # recalculation of a saved file iterates again from the converged
+            # state, so cached values sit essentially at the fixed point.
+            # Keep polishing (bounded) until the change is negligible, not
+            # merely below the workbook threshold.
+            if max_change <= refine_delta:
+                break
+            if converged_step is not None and step - converged_step >= 200:
                 break
         return {
-            "iterations": step + 1,
+            "iterations": (converged_step if converged_step is not None else step) + 1,
             "converged": max_change <= iteration_delta,
             "max_change": None if math.isinf(max_change) else max_change,
             "errors": sum(isinstance(self.values[cell], ExcelError) for cell in pending),
@@ -2193,14 +2581,45 @@ class Evaluator:
         root = self.graph.root_of(cid)
         if root is not None:
             value = self._eval_node(root)
-            # Dynamic-array formulas store the anchor's first element in the
-            # owning cell; spill cells are represented separately in the grid.
+            # Dynamic-array anchors store the first element in the owning
+            # cell; members of a multi-cell CSE span each take their own
+            # positional element of the shared result.
             if isinstance(value, RangeValues):
-                return value[0] if value else None
+                return self._array_element(info.node, value)
             return value
         if info.empty_ref:
             return 0.0
         return Unresolved("no-ast-root")
+
+    def _array_element(self, node, value):
+        """Pick this cell's element from a multi-cell array-formula result.
+
+        Excel's CSE semantics: the member at offset (dr, dc) inside the
+        entered span reads result[dr][dc], with single-row/single-column
+        results broadcast across the span and out-of-range members #N/A.
+        Cells without a recorded span keep the anchor's first element.
+        """
+        if not value:
+            return None
+        span = getattr(node, "array_span", "")
+        if not span or node.row is None or node.col is None:
+            return value[0]
+        start = span.split(":", 1)[0].replace("$", "")
+        matched = A1_RE.match(start)
+        if not matched:
+            return value[0]
+        offset_row = node.row - int(matched.group(2))
+        offset_col = node.col - col_number(matched.group(1))
+        row = offset_row if value.rows > 1 else 0
+        col = offset_col if value.cols > 1 else 0
+        if row < 0 or col < 0 or row >= value.rows or col >= value.cols:
+            return ExcelError("#N/A")
+        index = row * value.cols + col
+        if index >= len(value):
+            return ExcelError("#N/A")
+        element = value[index]
+        # An empty source cell inside an array result renders as 0 in Excel.
+        return 0.0 if element is None else element
 
 
 def workbook_oracle(path):

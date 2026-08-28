@@ -9,6 +9,7 @@ LiteLLM proxy the variable-source audit uses.
 Only the ambiguous_roles.json cases are read: no workbooks, formulas, values or
 graded cells, so arbitration cannot see the answers.
 """
+import importlib.util
 import json
 import sys
 import urllib.request
@@ -16,6 +17,19 @@ import urllib.error
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+DISCLOSE_PATH = Path(".cursor/skills/task-disclosure/scripts/disclose.py")
+
+
+def load_disclose():
+    """Import disclose.py so output is validated with the gate's own code."""
+    spec = importlib.util.spec_from_file_location("disclose", DISCLOSE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+DISCLOSE = load_disclose()
 
 PROXY_URL = "https://litellm.labelbox.com/chat/completions"
 PROXY_MODEL = "openai/gpt-5.6-sol"
@@ -107,20 +121,47 @@ def parse(text):
     return json.loads(t[start:end + 1])
 
 
+def write_validated(dst, cases, resolutions, agent_model):
+    """Validate with the disclosure gate's own validator, then write.
+
+    ``detect`` refuses any resolutions file that has not passed
+    roles-validate, and build_one.sh's gate-12 checker needs the
+    ``agent_model`` stamp -- write a file that satisfies both.
+    """
+    dst.write_text(json.dumps(
+        {"agent_model": agent_model, "resolutions": resolutions},
+        indent=2) + "\n", encoding="utf-8")
+    normalized, errors, _ = DISCLOSE.validate_role_resolutions(dst, cases)
+    if normalized is None:
+        dst.unlink()  # never leave an unvalidatable file poisoning the cache
+        raise RuntimeError("arbitration output failed roles-validate: "
+                           + "; ".join(errors[:3]))
+    normalized["agent_model"] = agent_model
+    dst.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
+    return normalized
+
+
 def do_one(wb, api_key):
     src = Path(f"runs/disclosure/{wb}-outputs/ambiguous_roles.json")
     dst = Path(f"runs/disclosure/{wb}-outputs/role_resolutions.json")
-    if dst.exists():
-        return wb, "CACHED", 0, 0
-    if not src.exists():
-        return wb, "NOCASES", 0, 0
-    payload = json.loads(src.read_text(encoding="utf-8"))
+    payload = json.loads(src.read_text(encoding="utf-8")) if src.exists() else {}
     cases = payload.get("cases", [])
+    if dst.exists():
+        existing = json.loads(dst.read_text(encoding="utf-8"))
+        if existing.get("validated") is True:
+            return wb, "CACHED", 0, 0
+        # Legacy pre-validation file: upgrade it in place so detect stops
+        # refusing it, instead of caching the deadlock forever.
+        normalized = write_validated(
+            dst, cases, existing.get("resolutions") or [],
+            existing.get("agent_model") or "gpt-5.6-sol-high")
+        nulls = sum(1 for r in normalized["resolutions"] if r["chosen"] is None)
+        return wb, "REVALIDATED", len(normalized["resolutions"]), nulls
     if not cases:
         return wb, "NOCASES", 0, 0
 
     by_id = {c.get("case_id"): c for c in cases}
-    resolutions = []
+    resolved = {}
     # Keep request bodies modest so the proxy does not truncate the reply.
     CHUNK = 25
     for i in range(0, len(cases), CHUNK):
@@ -130,7 +171,9 @@ def do_one(wb, api_key):
         got = parse(text).get("resolutions", [])
         for r in got:
             cid = r.get("case_id")
-            if cid not in by_id:
+            # Drop unknown ids and duplicates (ids echoed across chunks);
+            # roles-validate rejects any duplicate case_id outright.
+            if cid not in by_id or cid in resolved:
                 continue
             chosen = r.get("chosen")
             if isinstance(chosen, str) and chosen.lower() in ("null", "none", ""):
@@ -138,24 +181,22 @@ def do_one(wb, api_key):
             # Never accept a role that was not offered for this case.
             if chosen is not None and chosen not in (by_id[cid].get("roles") or []):
                 chosen = None
-            resolutions.append({
+            resolved[cid] = {
                 "case_id": cid,
                 "label": by_id[cid].get("label"),
                 "chosen": chosen,
                 "reason": (r.get("reason") or "")[:200],
-            })
+            }
 
-    seen = {r["case_id"] for r in resolutions}
+    resolutions = list(resolved.values())
     for cid, c in by_id.items():
-        if cid not in seen:  # abstain rather than leave a case uncovered
+        if cid not in resolved:  # abstain rather than leave a case uncovered
             resolutions.append({
                 "case_id": cid, "label": c.get("label"), "chosen": None,
                 "reason": "no arbitration returned; abstained",
             })
 
-    dst.write_text(json.dumps(
-        {"agent_model": "gpt-5.6-sol-high", "resolutions": resolutions},
-        indent=2) + "\n", encoding="utf-8")
+    write_validated(dst, cases, resolutions, "gpt-5.6-sol-high")
     nulls = sum(1 for r in resolutions if r["chosen"] is None)
     return wb, "OK", len(resolutions), nulls
 

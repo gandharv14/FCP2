@@ -203,8 +203,18 @@ def test_production_csv_matches_default_and_skips_debug_artifacts(small_model, t
         json.dumps({"targets": {"Summary!B3": 110}, "tolerance": {}}, indent=2),
         encoding="utf-8",
     )
-    default_select = _select(task_dir, small_model, default_root)
-    production_select = _select(task_dir, small_model, production_root)
+    default_select = _select(
+        task_dir,
+        small_model,
+        default_root,
+        seg_root=default_seg,
+    )
+    production_select = _select(
+        task_dir,
+        small_model,
+        production_root,
+        seg_root=production_seg,
+    )
     shutil.copy2(
         generation / "generation-manifest.json",
         tests / "segmentation_generation_manifest.json",

@@ -17,31 +17,40 @@ Accept a staged Harbor task directory. Set:
 STAGED=tasks_outputs_mcp/0256-outputs
 WB=0256
 NAT_RUN="runs/$WB-instruction-naturalization"
-SOURCE="$NAT_RUN/source.md"
-CANDIDATE="$NAT_RUN/candidate.md"
+SOURCE="$NAT_RUN/source.snapshot.md"
 REPORT="$NAT_RUN/validation.json"
+RECOVERY=.cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py
 ```
 
 Never edit a promoted task. The staged `instruction.md` must already contain
 the research section, target table, custom-formula hints, modelling conventions,
 and output contract that will ship.
 
-Create the source snapshot without overwriting an earlier review:
+Initialize or resume the code-owned state. This never overwrites a different
+source snapshot:
 
 ```bash
-test ! -e "$NAT_RUN"
-mkdir -p "$NAT_RUN"
-cp "$STAGED/instruction.md" "$SOURCE"
+python3 "$RECOVERY" init "$STAGED/instruction.md" \
+  --state-dir "$NAT_RUN" \
+  --instruction "$STAGED/instruction.md" \
+  --task-toml "$STAGED/task.toml" \
+  --answer-key "$STAGED/tests/answer_key.json"
 ```
 
 ## Rewrite
 
-Launch exactly one `generalPurpose` subagent with model `gpt-5.6-sol-high`.
-Give it the source path and candidate path. Require it to read the complete
-source, apply the prompt below, and write only the full candidate Markdown to
-`$CANDIDATE`. It must not edit the staged bundle.
+Use at most two total attempts. Each attempt launches a fresh `generalPurpose`
+subagent with model `gpt-5.6-sol-high`. Give it the immutable source and two
+attempt paths:
 
-Use this prompt verbatim:
+```bash
+PREAMBLE="$NAT_RUN/attempt-01/preamble_body.md"
+INPUT_BODY="$NAT_RUN/attempt-01/input_body.md"
+```
+
+For attempt two, use `attempt-02`. The model must write only those two editable
+bodies. It must not reproduce headings, protected sections, or edit the staged
+bundle. Use this prompt:
 
 ```text
 You are a senior finance professional editing a spreadsheet-reconstruction task
@@ -56,20 +65,17 @@ HARD RULES
    "do not", or an equivalent requirement.
 2. Do not add modelling advice, formulas, assumptions, interpretations, facts,
    hints, or answer values.
-3. Preserve every Markdown heading and its order.
-4. Reproduce every section other than the opening prose and `## Input`
-   byte-for-byte. This includes the research service, target table, hints,
-   conventions, and output contract.
-5. Within the opening prose and `## Input`, reproduce verbatim every inline-code
+3. Return exactly two files: the opening body and the body beneath `## Input`.
+   Do not include either heading or any other section.
+4. Within those bodies, reproduce verbatim every inline-code
    span, filename, path, URL, service or tool name, sheet name, cell reference,
    range, output label, period, unit, count, threshold, formula, and number.
-6. Keep all source categories and finance terminology, including lists such as
+5. Keep all source categories and finance terminology, including lists such as
    market rates, tax rates, macro assumptions, contractual terms, and opening
    balances.
-7. Preserve whether content is present, blank, removed, available only through
+6. Preserve whether content is present, blank, removed, available only through
    a service, verified absent, optional, required, or prohibited.
-8. Do not remove repetition when it independently communicates a requirement.
-9. Output the complete rewritten Markdown and nothing else. End with one newline.
+7. Do not remove repetition when it independently communicates a requirement.
 
 Prefer concise sentences and terminology used by investment banking, private
 equity, valuation, FP&A, or project-finance practitioners when appropriate.
@@ -82,37 +88,46 @@ infer workbook facts. Its only input is the completed instruction.
 
 ## Validate and apply
 
-Run the deterministic validator:
+Submit the two bodies. Code reconstructs the full document from untouched source
+bytes, preserving the BOM, newline style, headings, and protected sections:
 
 ```bash
-python3 .cursor/skills/naturalize-finance-task-instruction/scripts/validate_instruction_rewrite.py \
-  "$SOURCE" "$CANDIDATE" \
-  --answer-key "$STAGED/tests/answer_key.json" \
-  --report "$REPORT"
+python3 "$RECOVERY" submit "$NAT_RUN" \
+  --preamble "$PREAMBLE" --input "$INPUT_BODY"
 ```
 
-Then read the complete source, candidate, and report. Perform a clause-by-clause
-semantic review of the two rewriteable regions. Reject any omitted, weakened,
-or added claim even when the deterministic validator passed.
-
-Only after both reviews pass, atomically apply the candidate and update the
-task's naturalizer metadata:
+Read the attempt candidate and validation report. Perform clause-by-clause
+semantic review of the two editable regions. If attempt one passed mechanically
+but failed semantic review, record the rejection:
 
 ```bash
-python3 .cursor/skills/naturalize-finance-task-instruction/scripts/validate_instruction_rewrite.py \
-  "$SOURCE" "$CANDIDATE" \
-  --answer-key "$STAGED/tests/answer_key.json" \
-  --report "$REPORT" \
-  --apply-to "$STAGED/instruction.md" \
-  --task-toml "$STAGED/task.toml" \
-  --attempts 1
+python3 "$RECOVERY" reject "$NAT_RUN" \
+  --reason-code semantic_mismatch \
+  --message "<specific omitted, weakened, or added claim>"
+```
+
+Then launch one fresh attempt using the original source and the recorded reason
+codes. A mechanically rejected attempt is retried only when `state.json` reports
+`retry_ready`. Never edit or feed the failed candidate into attempt two. Stop
+after attempt two fails.
+
+Only after deterministic and semantic review pass, bind that approval to the
+selected candidate and apply it:
+
+```bash
+python3 "$RECOVERY" accept "$NAT_RUN" \
+  --reviewer "main-agent" \
+  --message "Clause-by-clause semantic review passed"
+python3 "$RECOVERY" apply "$NAT_RUN"
+python3 "$RECOVERY" verify-applied "$NAT_RUN"
 ```
 
 Require `valid: true`, `applied: true`, model `gpt-5.6-sol-high`, matching
-source/candidate hashes, protected-section checks, exact-token checks, semantic
-anchor checks, and no new answer-value occurrence.
+source/candidate hashes, protected-byte checks, exact-token checks, semantic
+anchor checks, and no new answer-value occurrence. `instruction.md` and
+`task.toml` are one journaled transaction; an interrupted apply must roll back
+or reconcile before continuing.
 
-If generation, deterministic validation, or semantic review fails, stop.
-Retain `source.md`, `candidate.md`, and `validation.json` as diagnostics and
-leave the staged instruction unchanged. Do not fall back to an earlier
-scenario-only naturalizer and do not promote an unreviewed rewrite.
+Retain the immutable source, both attempt directories, state, reports, and apply
+journal. Do not fall back to an earlier naturalizer and do not promote an
+unreviewed rewrite.

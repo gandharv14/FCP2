@@ -12,7 +12,9 @@ and is reported rather than silently coerced to zero.
 from __future__ import annotations
 
 import math
+import os
 import re
+import stat
 import zipfile
 from calendar import monthrange
 from collections import defaultdict
@@ -673,6 +675,27 @@ class CalculationMetadata:
     iterate_count_origin: str = "unknown"
     iterate_delta_origin: str = "unknown"
     raw_calc_pr: dict = dataclass_field(default_factory=dict)
+    calc_mode: str | None = None
+    full_calc_on_load: bool | None = None
+    force_full_calc: bool | None = None
+    calc_mode_origin: str = "unknown"
+    full_calc_on_load_origin: str = "unknown"
+    force_full_calc_origin: str = "unknown"
+
+    @property
+    def calcMode(self):
+        """OOXML spelling retained for metadata consumers."""
+        return self.calc_mode
+
+    @property
+    def fullCalcOnLoad(self):
+        """OOXML spelling retained for metadata consumers."""
+        return self.full_calc_on_load
+
+    @property
+    def forceFullCalc(self):
+        """OOXML spelling retained for metadata consumers."""
+        return self.force_full_calc
 
 
 class Evaluator:
@@ -4014,13 +4037,30 @@ def _xml_bool(value):
 def workbook_calculation_metadata(path) -> CalculationMetadata:
     """Read only OOXML calculation settings, never worksheet cached values."""
     path = Path(path)
-    if not path.is_file():
+    try:
+        metadata = path.lstat()
+    except OSError:
         return CalculationMetadata(
             available=False, source=str(path), reason="file_not_found"
         )
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        return CalculationMetadata(
+            available=False, source=str(path), reason="source_not_regular_file"
+        )
     try:
-        with zipfile.ZipFile(path) as archive:
-            root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OSError("source_not_regular_file")
+            with os.fdopen(descriptor, "rb") as handle:
+                descriptor = -1
+                with zipfile.ZipFile(handle) as archive:
+                    root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
     except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
         return CalculationMetadata(
             available=False,
@@ -4037,6 +4077,9 @@ def workbook_calculation_metadata(path) -> CalculationMetadata:
             iterate_origin="default",
             iterate_count_origin="default",
             iterate_delta_origin="default",
+            calc_mode_origin="default",
+            full_calc_on_load_origin="default",
+            force_full_calc_origin="default",
             raw_calc_pr={},
         )
     count_raw = calc.attrib.get("iterateCount")
@@ -4067,11 +4110,24 @@ def workbook_calculation_metadata(path) -> CalculationMetadata:
     raw = {str(key): str(value) for key, value in sorted(calc.attrib.items())}
     iterate_raw = calc.attrib.get("iterate")
     parsed_iterate = _xml_bool(iterate_raw)
+    calc_mode_raw = calc.attrib.get("calcMode")
+    parsed_calc_mode = (
+        calc_mode_raw
+        if calc_mode_raw in {"auto", "autoNoTable", "manual"}
+        else None
+    )
+    full_calc_raw = calc.attrib.get("fullCalcOnLoad")
+    parsed_full_calc = _xml_bool(full_calc_raw)
+    force_full_raw = calc.attrib.get("forceFullCalc")
+    parsed_force_full = _xml_bool(force_full_raw)
     return CalculationMetadata(
         available=True,
         iterate=parsed_iterate if iterate_raw is not None else False,
         iterate_count=count,
         iterate_delta=delta,
+        calc_mode=parsed_calc_mode,
+        full_calc_on_load=parsed_full_calc,
+        force_full_calc=parsed_force_full,
         source=str(path),
         iterate_origin=(
             "unknown"
@@ -4092,6 +4148,27 @@ def workbook_calculation_metadata(path) -> CalculationMetadata:
             if not delta_valid
             else "explicit"
             if delta_raw is not None
+            else "default"
+        ),
+        calc_mode_origin=(
+            "unknown"
+            if calc_mode_raw is not None and parsed_calc_mode is None
+            else "explicit"
+            if calc_mode_raw is not None
+            else "default"
+        ),
+        full_calc_on_load_origin=(
+            "unknown"
+            if full_calc_raw is not None and parsed_full_calc is None
+            else "explicit"
+            if full_calc_raw is not None
+            else "default"
+        ),
+        force_full_calc_origin=(
+            "unknown"
+            if force_full_raw is not None and parsed_force_full is None
+            else "explicit"
+            if force_full_raw is not None
             else "default"
         ),
         raw_calc_pr=raw,

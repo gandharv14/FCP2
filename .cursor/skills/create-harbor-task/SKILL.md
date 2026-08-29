@@ -24,8 +24,14 @@ pipeline repository root and set:
 
 ```bash
 WB=0256
-SOURCE="4-10 100"
-AST_ROOT=ast_out
+RAW_SOURCE_FILE="4-10 100/$WB.xlsx"
+SOURCE_RUN="source_out/$WB"
+SOURCE_HEALTH="runs/$WB-source-health.json"
+RECALC_RUN="runs/$WB-source-recalc"
+TRUSTED_RUNNER_PUBLIC_KEY="/etc/harbor/excel-runner-public.pem"
+EXCEL_ENGINE_VERSION="<exact-approved-Microsoft-Excel-version>"
+# SOURCE, SOURCE_FILE, SOURCE_GENERATION_ID, and AST_ROOT are resolved after
+# immutable source preparation and strict activation.
 SEG_ROOT=seg_out
 BASE_INPUT_ROOT=inputs_out
 MCP_INPUT_ROOT=inputs_out_mcp
@@ -50,14 +56,15 @@ TASK="tasks_outputs/$WB-outputs"
 
 Expected artifacts:
 
-- `ast_out/$WB/{nodes.csv,edges.csv}`
+- `source_out/$WB/current.json` and immutable
+  `generations/<generation_id>/{source/$WB.xlsx,ast/$WB/{nodes.csv,edges.csv},ast-provenance.json,generation-manifest.json}`
 - `seg_out/$WB/curation.toml`, `current.json`, and the immutable current
   `generations/<generation_id>/{generation-manifest.json,segments.json,bands.csv,output_candidates.csv,lineage.json,lineage/}`
 - `inputs_out/$WB-inputs.xlsx`: unredacted baseline inputs
 - `runs/disclosure/$WB-outputs/{bands,probe,records,context,verify}.json`
 - `runs/$WB-variable-sources/disclosure-faithfulness.md`
 - `tasks_outputs_mcp/$WB-outputs/tests/disclosure.json`
-- `runs/$WB-instruction-naturalization/{source.md,candidate.md,validation.json}`
+- `runs/$WB-instruction-naturalization/{source.snapshot.md,state.json,spans.json,attempt-01/,attempt-02/,validation.json}`
 - `runs/$WB-variable-sources/$WB-inputs-variable-sources.{md,inventory.json,metadata.json}`
 - `draft.json`, `normalize_$WB.py`, `normalized.json`, `exclusions.json`,
   `normalization_report.json`, `source_profiles.json`, and profile captures
@@ -80,6 +87,8 @@ Stage all requested workbooks before promoting any of them.
 ## Non-negotiable gates
 
 - Stop on every failed, skipped, missing, ambiguous, or unreviewed gate.
+- Every production golden-workbook read must use the activated immutable source
+  generation. Missing source/AST provenance or a hash mismatch is a blocker.
 - Segmentation must resolve through the versioned current-generation pointer and
   pass the strict generation gate; direct legacy files are not production input.
 - Legacy direct artifacts are an offline compatibility layout. Publication never
@@ -112,17 +121,95 @@ Stage all requested workbooks before promoting any of them.
 ### 1. Preflight and AST
 
 Do not read or print `.env`; the pipeline reads required credentials itself.
+Only `.xlsx` is eligible for the authoritative-source path.
 
 ```bash
 python3 -m pip install -r requirements.txt
-test -f "$SOURCE/$WB.xlsx"
-python3 xl_ast_graph.py "$SOURCE/$WB.xlsx" -o "$AST_ROOT" --production
+test -f "$RAW_SOURCE_FILE"
+python3 xl_source_health.py observe "$RAW_SOURCE_FILE" -o "$SOURCE_HEALTH"
+```
+
+Read `"$SOURCE_HEALTH"`. Stop on `unsupported` or `insufficient_evidence`.
+External links/connections, macros, OLE, volatile formulas, data tables, and
+unknown iteration semantics are not automatic-recalculation candidates.
+
+For `recalc_candidate`, create a bound request:
+
+```bash
+mkdir -p "$RECALC_RUN"
+python3 xl_source_recalc.py request "$RAW_SOURCE_FILE" \
+  "$RECALC_RUN/recalculated/$WB.xlsx" \
+  --allowed-root "$RECALC_RUN/recalculated" \
+  --trusted-runner-public-key "$TRUSTED_RUNNER_PUBLIC_KEY" \
+  --permitted-engine-version "$EXCEL_ENGINE_VERSION" \
+  -o "$RECALC_RUN/request.json"
+```
+
+On a Linux/VM host, stop after writing the request. Resume only after a macOS
+runner returns the exact hash-bound workbook and `result.json`. On the dedicated
+macOS Excel runner, require an `excel-isolation-attestation/v1` file confirming
+the dedicated session, disabled network/macros/add-ins/link updates, and
+suppressed prompts. The attestation and sandbox runner must be root-owned,
+non-writable by the invoking user, stored under protected root-owned parent
+directories, and hash-bound to each other. The attestation must also bind
+`$TRUSTED_RUNNER_PUBLIC_KEY`. The runner must sign an
+`excel-runner-receipt/v1` payload that includes the request, source, output,
+engine/version, isolation, calculation-complete, and completion-time claims:
+
+```bash
+python3 xl_source_recalc.py execute "$RECALC_RUN/request.json" \
+  --source "$RAW_SOURCE_FILE" \
+  --allowed-root "$RECALC_RUN/recalculated" \
+  --isolation-attestation /etc/harbor/excel-isolation-attestation.json \
+  --sandbox-runner /usr/local/sbin/harbor-excel-sandbox \
+  -o "$RECALC_RUN/result.json"
+python3 xl_source_health.py observe \
+  "$RECALC_RUN/recalculated/$WB.xlsx" \
+  -o "$RECALC_RUN/source-health-after.json"
+EFFECTIVE_CANDIDATE="$RECALC_RUN/recalculated/$WB.xlsx"
+EFFECTIVE_HEALTH="$RECALC_RUN/source-health-after.json"
+```
+
+For `pass`, use the original as `EFFECTIVE_CANDIDATE` and
+`"$SOURCE_HEALTH"` as `EFFECTIVE_HEALTH`. Build a fresh production AST and
+publish an inactive immutable source generation:
+
+```bash
+if [ "$EFFECTIVE_CANDIDATE" = "$RAW_SOURCE_FILE" ]; then
+  PREPARED=$(python3 xl_source_recalc.py prepare "$EFFECTIVE_CANDIDATE" \
+    --workbook "$WB" --publication-root "$SOURCE_RUN" \
+    --health "$EFFECTIVE_HEALTH")
+else
+  PREPARED=$(python3 xl_source_recalc.py prepare "$EFFECTIVE_CANDIDATE" \
+    --workbook "$WB" --publication-root "$SOURCE_RUN" \
+    --health "$EFFECTIVE_HEALTH" \
+    --request "$RECALC_RUN/request.json" \
+    --result "$RECALC_RUN/result.json" \
+    --original-source "$RAW_SOURCE_FILE" \
+    --trusted-runner-public-key "$TRUSTED_RUNNER_PUBLIC_KEY")
+fi
+SOURCE_GENERATION_ID=$(python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["generation_id"])' \
+  <<<"$PREPARED")
+SOURCE=$(python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["source_root"])' \
+  <<<"$PREPARED")
+SOURCE_FILE=$(python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["source_path"])' \
+  <<<"$PREPARED")
+SOURCE_SHA256=$(python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["source_sha256"])' \
+  <<<"$PREPARED")
+AST_ROOT=$(python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["ast_root"])' \
+  <<<"$PREPARED")
+test -f "$SOURCE_FILE"
 test -f "$AST_ROOT/$WB/nodes.csv"
 test -f "$AST_ROOT/$WB/edges.csv"
 ```
 
-Reuse a complete AST only when it belongs to the same golden workbook and the
-user did not request a rebuild.
+Do not reuse an AST across source hashes, policy/engine versions, builder-code
+hashes, or builder arguments. Missing or mismatched AST provenance is a blocker.
 
 ### 2. Segment, preserve curation, require PASS
 
@@ -157,6 +244,21 @@ Summarize every included output and the strongest exclusions from
 `curation.toml`. Require user confirmation before continuing. If the user edits
 curation, re-run the same command. If an existing curation file changed without
 explicit approval, stop.
+
+After confirmation, activate the immutable source only through the strict
+segmentation proof that was just produced:
+
+```bash
+python3 -m xl_source_publication activate \
+  "$SOURCE_RUN" "$SOURCE_GENERATION_ID" \
+  --segmentation-dir "$SEG_ROOT/$WB" \
+  --expected-segmentation-generation-id "$GENERATION_ID"
+RESOLVED=$(python3 -m xl_source_publication resolve \
+  "$SOURCE_RUN" --expected-generation-id "$SOURCE_GENERATION_ID")
+test "$(python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["source_path"])' \
+  <<<"$RESOLVED")" = "$SOURCE_FILE"
+```
 
 Only the full validator command above establishes PASS. Record its returned
 `generation_id`; reading `current.json` or checking its schema alone is never a
@@ -224,6 +326,8 @@ the complete set, then use `os.replace` for each final JSON. Never hand-edit a
 final JSON in place. Re-running it from the same inputs must be byte-identical.
 
 ```bash
+python3 gen_normalizer.py "$WB" \
+  --source-file "$SOURCE_FILE" --source-sha256 "$SOURCE_SHA256"
 python3 "$RUN/normalize_$WB.py"
 python3 - "$DRAFT" "$NORMALIZED" "$DISPOSITIONS" <<'PY'
 import json, sys
@@ -439,15 +543,24 @@ sections, and no formulas/evidence in the agent-facing instruction.
 ### 13. Naturalize the complete staged instruction
 
 Load and follow
-`.cursor/skills/naturalize-finance-task-instruction/SKILL.md`. Launch exactly
-one `generalPurpose` subagent with model `gpt-5.6-sol-high`, preserve every
-protected section—including `## Workbook disclosure`—byte-for-byte, and require
-deterministic plus clause-by-clause semantic validation before atomically
-replacing `"$STAGED/instruction.md"`.
+`.cursor/skills/naturalize-finance-task-instruction/SKILL.md`. Initialize or
+resume its code-owned recovery state. Launch at most two fresh `generalPurpose`
+subagents with model `gpt-5.6-sol-high`; each receives the same immutable source
+and writes only `preamble_body` and `input_body` for its attempt. Code must
+reconstruct the full instruction from untouched source bytes.
 
 Require `"$NAT_RUN/validation.json"` to report `valid: true` and `applied: true`,
 and require `task.toml` to record model `gpt-5.6-sol-high`, endpoint
 `cursor-subagent`, the prompt version, and matching source/instruction hashes.
+Every rejected attempt must have reason codes. A semantic rejection must be
+recorded with the recovery CLI before attempt two. The apply journal must be
+committed or safely rolled back; mixed `instruction.md`/`task.toml` state is a
+blocker.
+
+```bash
+python3 .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py \
+  verify-applied "$NAT_RUN"
+```
 This is the last prose mutation of the disclosure-bearing instruction unless the
 faithfulness review finds a repairable row-label defect. Do not continue on fallback
 or uncertainty. Step 15.5 may later rewrite headings and pointers when it replaces
@@ -635,6 +748,15 @@ If a requested set contains multiple workbooks, wait until every staged bundle
 passes before promoting the set. Promotion uses same-filesystem renames and
 rollback; do not delete or overwrite the current bundle in place.
 
+After any additional-assumptions apply, verify that the live instruction still
+matches the naturalizer metadata hash:
+
+```bash
+python3 .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py \
+  verify-metadata --instruction "$STAGED/instruction.md" \
+  --task-toml "$STAGED/task.toml"
+```
+
 ```bash
 python3 - "$STAGED" "$TASK" <<'PY'
 import os, sys, time
@@ -664,6 +786,8 @@ Do not run Harbor rollouts unless the user separately asks.
 Report, per workbook:
 
 - workbook id, golden path, AST path, segmentation `PASS`, and curation hash
+- source-health route/reasons, recalc request/result when applicable, immutable
+  source generation ID, engine/version, source hash, and AST provenance verdict
 - curated output names/bands and confirmation that curation was preserved
 - disclosure run path; custom/convention disclosed, suppressed, standard, and
   unclassified counts; mechanical verdict; fresh faithfulness-review path and

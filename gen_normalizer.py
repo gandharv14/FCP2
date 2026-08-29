@@ -17,7 +17,9 @@ The emitted script writes ``normalized.json``, ``exclusions.json`` and
 
 from __future__ import annotations
 
+import argparse
 import collections
+import hashlib
 import json
 import os
 import pprint
@@ -71,9 +73,12 @@ CAUSE_PROSE = {
 }
 
 
-def _source_root(wb):
-    from pathlib import Path as _P
-    return "4-10 100" if _P(f"4-10 100/{wb}.xlsx").exists() else "batch-src"
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def extract_refs(text, sheets=None):
@@ -178,12 +183,20 @@ def atomic_json(path, payload):
     os.replace(tmp, path)
 
 
-def analyse(wb):
+def analyse(wb, source_file, expected_source_sha256):
     run = Path(f"runs/{wb}-variable-sources")
     draft = json.loads((run / "draft.json").read_text(encoding="utf-8"))
-    SR = _source_root(wb)
-    G = openpyxl.load_workbook(f"{SR}/{wb}.xlsx", data_only=False)
-    GV = openpyxl.load_workbook(f"{SR}/{wb}.xlsx", data_only=True)
+    source = Path(source_file)
+    if source.name != f"{wb}.xlsx" or not source.is_file() or source.is_symlink():
+        raise SystemExit("normalizer requires the activated <workbook>.xlsx source")
+    actual_sha256 = _sha256(source)
+    if actual_sha256 != expected_source_sha256:
+        raise SystemExit(
+            "normalizer source hash mismatch: expected %s, got %s"
+            % (expected_source_sha256, actual_sha256)
+        )
+    G = openpyxl.load_workbook(source, data_only=False)
+    GV = openpyxl.load_workbook(source, data_only=True)
     BI = openpyxl.load_workbook(f"inputs_out/{wb}-inputs.xlsx", data_only=False)
     sheets = {s.strip().upper(): s for s in G.sheetnames}
 
@@ -563,6 +576,14 @@ if __name__ == "__main__":
 
 
 if __name__ == "__main__":
-    wb = sys.argv[1]
-    draft, rows = analyse(wb)
-    emit(wb, draft, rows)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("workbook")
+    parser.add_argument("--source-file", required=True)
+    parser.add_argument("--source-sha256", required=True)
+    args = parser.parse_args()
+    draft, rows = analyse(
+        args.workbook,
+        args.source_file,
+        args.source_sha256,
+    )
+    emit(args.workbook, draft, rows)

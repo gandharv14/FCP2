@@ -260,8 +260,19 @@ def stabilize_runtime_proof(
 def segment(wb: str, args) -> dict:
     started = time.time()
     ast_dir = Path(args.ast_dir) / wb
+    source = Path(args.source) / f"{wb}.xlsx"
     if not (ast_dir / "nodes.csv").exists():
         raise SystemExit(f"no graph at {ast_dir}")
+    try:
+        from xl_source_publication import validate_bound_ast_if_required
+
+        validate_bound_ast_if_required(
+            source,
+            ast_dir,
+            require=not getattr(args, "allow_legacy_ast", True),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"source/AST provenance gate failed: {exc}") from exc
     out_dir = Path(args.out) / wb
     out_dir.mkdir(parents=True, exist_ok=True)
     curation_path = out_dir / "curation.toml"
@@ -347,7 +358,6 @@ def segment(wb: str, args) -> dict:
             f"{wb}: curated output identity does not match selected output cells"
         )
 
-    source = Path(args.source) / f"{wb}.xlsx"
     verify = _not_run_verification(
         source,
         ast_dir,
@@ -1166,6 +1176,11 @@ def main(argv=None):
     parser.add_argument("workbooks", nargs="+", help="workbook ids under --ast-dir")
     parser.add_argument("--ast-dir", default="ast_out")
     parser.add_argument("--source", default="4-10 100", help="folder holding <wb>.xlsx")
+    parser.add_argument(
+        "--allow-legacy-ast",
+        action="store_true",
+        help="offline compatibility only: allow AST CSVs without provenance",
+    )
     parser.add_argument("-o", "--out", default="seg_out")
     parser.add_argument("--threshold", type=float, default=6.0,
                         help="auto-include outputs scoring at least this")

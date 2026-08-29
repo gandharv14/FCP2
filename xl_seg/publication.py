@@ -501,6 +501,14 @@ def _verify_live_evidence(
     ast_dir,
     curation_path,
 ) -> None:
+    try:
+        from xl_source_publication import validate_bound_ast_if_required
+
+        validate_bound_ast_if_required(source_path, ast_dir)
+    except ValueError as exc:
+        raise GenerationValidationError(
+            f"effective source/AST provenance failed: {exc}"
+        ) from exc
     ordered = manifest["curated_output_cells"]["ordered"]
     current, missing = evidence_fingerprints(
         source_path,

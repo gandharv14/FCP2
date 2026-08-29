@@ -511,6 +511,21 @@ def make_band(gold: Book, sheet: str, row: int, pattern: str, run: list[tuple[in
 
 def select_payload(args) -> dict:
     task_dir = Path(args.task_dir).resolve()
+    segmentation_mode = getattr(args, "segmentation_mode", "strict")
+    if segmentation_mode == "strict":
+        missing = [
+            name
+            for name, value in (
+                ("--golden", getattr(args, "golden", None)),
+                ("--ast-dir", getattr(args, "ast_dir", None)),
+                ("--seg-root", getattr(args, "seg_root", None)),
+            )
+            if not value
+        ]
+        if missing:
+            raise SystemExit(
+                "strict disclosure requires explicit " + ", ".join(missing)
+            )
     golden_path = find_golden(task_dir, args.golden)
     delivered_path = find_environment(task_dir)
     generation = None
@@ -596,6 +611,8 @@ def select_payload(args) -> dict:
 
     regex = regex_closure(gold, targets)
     ast, ast_status = ast_closure_if_available(task_dir, targets, Path(args.ast_dir) if args.ast_dir else None)
+    if segmentation_mode == "strict" and ast is None:
+        raise SystemExit(f"strict disclosure requires bound AST closure: {ast_status}")
     closure = ast if ast is not None else regex
     selected = blanked_formula_cells(gold, delivered, closure)
 
@@ -605,6 +622,9 @@ def select_payload(args) -> dict:
         "task": task_dir.name,
         "task_dir": str(task_dir),
         "golden": str(golden_path),
+        "golden_sha256": hashlib.sha256(golden_path.read_bytes()).hexdigest(),
+        "ast_dir": str(Path(args.ast_dir).resolve()) if args.ast_dir else None,
+        "seg_root": str(Path(seg_root).resolve()) if seg_root else None,
         "delivered": str(delivered_path),
         "targets": list(targets_map),
         "target_keys": targets,
@@ -3239,6 +3259,16 @@ def detect_records(args) -> dict:
     payload = {
         "schema_version": "2.0",
         "task": task_dir.name,
+        "golden": selection["golden"],
+        "golden_sha256": selection["golden_sha256"],
+        "segmentation_mode": (
+            (selection.get("segmentation_generation") or {}).get("mode")
+            or "legacy"
+        ),
+        "segmentation_generation": selection.get("segmentation_generation"),
+        "selection": selection.get("selection"),
+        "ast_dir": selection.get("ast_dir"),
+        "seg_root": selection.get("seg_root"),
         "records": sorted(unique, key=lambda r: (r["disposition"], r["family"], r["band"] or "")),
         "method_assessments": method_assessments,
         "custom_calibration": custom_calibration,
@@ -3644,6 +3674,46 @@ def verify_task(task_dir: Path) -> dict:
     if not disclosure_path.exists():
         return {"task": task_dir.name, "passed": False, "faults": ["missing tests/disclosure.json"]}
     payload = json.loads(disclosure_path.read_text(encoding="utf-8"))
+    golden_path = Path(payload.get("golden", ""))
+    expected_golden_hash = payload.get("golden_sha256")
+    if (
+        not golden_path.is_file()
+        or not isinstance(expected_golden_hash, str)
+        or hashlib.sha256(golden_path.read_bytes()).hexdigest()
+        != expected_golden_hash
+    ):
+        faults.append("disclosure golden binding is missing or changed")
+    if payload.get("segmentation_mode") != "strict":
+        faults.append("production disclosure requires strict segmentation provenance")
+    else:
+        try:
+            generation = payload.get("segmentation_generation")
+            if not isinstance(generation, dict) or generation.get("mode") != "strict":
+                raise ValueError("strict segmentation generation is missing")
+            if payload.get("selection", {}).get("closure_source") != "ast":
+                raise ValueError("strict disclosure did not use AST closure")
+            generation_id = generation.get("generation_id")
+            ast_root = Path(payload.get("ast_dir", ""))
+            seg_root = Path(payload.get("seg_root", ""))
+            if (
+                not isinstance(generation_id, str)
+                or not ast_root.is_dir()
+                or not seg_root.is_dir()
+            ):
+                raise ValueError("strict disclosure provenance paths are missing")
+            workbook = golden_path.stem
+            from xl_seg.publication import resolve_for_consumer
+
+            resolve_for_consumer(
+                seg_root / workbook,
+                mode="strict",
+                source_path=golden_path,
+                ast_dir=ast_root / workbook,
+                require_pass=True,
+                expected_generation_id=generation_id,
+            )
+        except Exception as exc:
+            faults.append(f"strict disclosure provenance failed: {exc}")
     delivered = Book(find_environment(task_dir))
     shipped = payload.get("agent_records", [])
     visible_cells = sorted({
@@ -3708,7 +3778,16 @@ def verify_task(task_dir: Path) -> dict:
 
     if custom:
         try:
-            gold = Book(find_golden(task_dir))
+            golden_path = Path(payload.get("golden", ""))
+            expected_golden_hash = payload.get("golden_sha256")
+            if (
+                not golden_path.is_file()
+                or not isinstance(expected_golden_hash, str)
+                or hashlib.sha256(golden_path.read_bytes()).hexdigest()
+                != expected_golden_hash
+            ):
+                raise ValueError("disclosure golden binding is missing or changed")
+            gold = Book(golden_path)
             structural = []
             for rec in custom:
                 profile = formula_profile(gold, {
@@ -3896,7 +3975,7 @@ def main(argv=None):
         if name == "select":
             p.add_argument("--golden", default=None)
             p.add_argument("--ast-dir", default=None)
-            p.add_argument("--seg-root", default="seg_out")
+            p.add_argument("--seg-root", default=None)
             p.add_argument(
                 "--segmentation-mode",
                 choices=("strict", "shadow", "legacy"),

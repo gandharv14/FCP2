@@ -637,6 +637,10 @@ class EvalResult:
     # Dynamic/selector targets chosen on the final pass, sorted for stable
     # diagnostics and proof-closure signatures.
     resolved_targets: dict = dataclass_field(default_factory=dict)
+    # The same targets keyed by the exact AST operation that resolved them.
+    # Formula-level targets above are retained for dependency diagnostics, but
+    # cannot prove two dynamic calls in one formula independently.
+    resolved_operation_targets: dict = dataclass_field(default_factory=dict)
     # cell id served by the workbook cached-value oracle -> the formula cells
     # that consumed it. Every entry is a value the evaluator could not derive
     # and copied from the golden workbook instead.
@@ -730,11 +734,13 @@ class Evaluator:
         self.missing_reads: dict = {}
         self.runtime_address_radj: dict = {}
         self._resolved_targets: dict = {}
+        self._resolved_operation_targets: dict = {}
         self._selective_sources: dict = {}
         self._current_cell = None
         self._proof_endpoint_values: dict = {}
         self._proof_active_radj: dict = {}
         self._proof_resolved_targets: dict = {}
+        self._proof_resolved_operation_targets: dict = {}
 
     # -- AST walking ------------------------------------------------------
     def _arg_specs(self, node):
@@ -2294,10 +2300,12 @@ class Evaluator:
                 break
         return f"[{self.graph.wb}.xlsx]{target}"
 
-    def _record_resolved_targets(self, targets):
-        if self._current_cell is None:
+    def _record_resolved_targets(self, node, targets):
+        if node.kind != "op" or not node.owner:
             return
-        self._resolved_targets.setdefault(self._current_cell, set()).update(targets)
+        owner = self._current_cell or node.owner
+        self._resolved_targets.setdefault(owner, set()).update(targets)
+        self._resolved_operation_targets.setdefault(node.id, set()).update(targets)
 
     def _indirect_targets(self, node):
         """Resolve an A1-style INDIRECT string without consulting saved values."""
@@ -2333,7 +2341,7 @@ class Evaluator:
         targets = self._indirect_targets(node)
         if is_bad(targets):
             return targets
-        self._record_resolved_targets(targets)
+        self._record_resolved_targets(node, targets)
         values = [self._read(target) for target in targets]
         if len(targets) == 1:
             return values[0]
@@ -2376,7 +2384,7 @@ class Evaluator:
         targets = self._offset_targets(node)
         if is_bad(targets):
             return targets
-        self._record_resolved_targets(targets)
+        self._record_resolved_targets(node, targets)
         values = [self._read(target) for target in targets]
         groups = {
             edge.arg_index for edge in self.graph.in_edges.get(node.id, ())
@@ -2579,7 +2587,7 @@ class Evaluator:
                     add_slot(2)
 
         sources.update(selected_refs)
-        self._record_resolved_targets(selected_refs)
+        self._record_resolved_targets(node, selected_refs)
         return sources
 
     def _active_node_sources(self, node_id, seen=None):
@@ -2667,12 +2675,12 @@ class Evaluator:
             targets = self._offset_targets(node)
             if isinstance(targets, list):
                 sources.update(targets)
-                self._record_resolved_targets(targets)
+                self._record_resolved_targets(node, targets)
         elif node.op == "INDIRECT":
             targets = self._indirect_targets(node)
             if isinstance(targets, list):
                 sources.update(targets)
-                self._record_resolved_targets(targets)
+                self._record_resolved_targets(node, targets)
         return sources
 
     def _active_graph(self, cells):
@@ -2766,7 +2774,9 @@ class Evaluator:
     def _target_signature(self):
         return tuple(
             (target, tuple(sorted(sources)))
-            for target, sources in sorted(self._resolved_targets.items())
+            for target, sources in sorted(
+                self._resolved_operation_targets.items()
+            )
         )
 
     def _equation_residual(self, members, state=None):
@@ -2865,6 +2875,29 @@ class Evaluator:
                 "reason": "cycle_endpoint_targets_changed",
                 "expected_targets": expected_targets,
                 "actual_targets": actual_targets,
+            }
+        expected_operation_targets = {
+            operation: tuple(sorted(targets))
+            for operation, targets in sorted(
+                self._proof_resolved_operation_targets.items()
+            )
+            if self.graph.nodes.get(operation) is not None
+            and self.graph.nodes[operation].owner in members
+        }
+        actual_operation_targets = {
+            operation: tuple(sorted(targets))
+            for operation, targets in sorted(
+                checker._resolved_operation_targets.items()
+            )
+            if self.graph.nodes.get(operation) is not None
+            and self.graph.nodes[operation].owner in members
+        }
+        if actual_operation_targets != expected_operation_targets:
+            return {
+                "safe": False,
+                "reason": "cycle_endpoint_operation_targets_changed",
+                "expected_operation_targets": expected_operation_targets,
+                "actual_operation_targets": actual_operation_targets,
             }
 
         changes = [
@@ -3408,6 +3441,7 @@ class Evaluator:
         for graph_pass in range(1, MAX_ACTIVE_PASSES + 1):
             graph_passes = graph_pass
             self._resolved_targets = {}
+            self._resolved_operation_targets = {}
             self.runtime_address_radj = {}
             active_adj, active_radj = self._active_graph(cells)
             groups, topo, cyclic = self._component_plan(cells, active_adj)
@@ -3416,6 +3450,7 @@ class Evaluator:
             # Rebuild after the acyclic sweep so branch and address choices made
             # by newly computed selectors are what stabilization compares.
             self._resolved_targets = {}
+            self._resolved_operation_targets = {}
             self.runtime_address_radj = {}
             active_adj, active_radj = self._active_graph(cells)
             graph_signature = self._graph_signature(active_adj)
@@ -3502,6 +3537,7 @@ class Evaluator:
 
         # The final graph must be the same graph whose cycles were iterated.
         self._resolved_targets = {}
+        self._resolved_operation_targets = {}
         self.runtime_address_radj = {}
         final_active_adj, final_active_radj = self._active_graph(cells)
         final_graph_signature = self._graph_signature(final_active_adj)
@@ -3560,6 +3596,7 @@ class Evaluator:
                 spec["history"].append(changes[spec["members"]])
 
             self._resolved_targets = {}
+            self._resolved_operation_targets = {}
             self.runtime_address_radj = {}
             final_active_adj, final_active_radj = self._active_graph(cells)
             final_graph_signature = self._graph_signature(final_active_adj)
@@ -3578,6 +3615,10 @@ class Evaluator:
 
         canonical_resolved_targets = {
             target: set(sources) for target, sources in self._resolved_targets.items()
+        }
+        canonical_resolved_operation_targets = {
+            operation: set(targets)
+            for operation, targets in self._resolved_operation_targets.items()
         }
         canonical_runtime_address_radj = {
             target: set(sources)
@@ -3782,6 +3823,7 @@ class Evaluator:
 
             alternate_values = dict(self.values)
             self._resolved_targets = {}
+            self._resolved_operation_targets = {}
             probe_adj, _ = self._active_graph(cells)
             probe_graph_signature = self._graph_signature(probe_adj)
             probe_target_signature = self._target_signature()
@@ -3835,6 +3877,9 @@ class Evaluator:
                 })
             self.values = canonical_values
             self._resolved_targets = canonical_resolved_targets
+            self._resolved_operation_targets = (
+                canonical_resolved_operation_targets
+            )
             self.runtime_address_radj = canonical_runtime_address_radj
 
         # Preserve the canonical proof endpoint before compatibility unresolved
@@ -3846,6 +3891,10 @@ class Evaluator:
         self._proof_resolved_targets = {
             target: set(sources)
             for target, sources in canonical_resolved_targets.items()
+        }
+        self._proof_resolved_operation_targets = {
+            operation: set(targets)
+            for operation, targets in canonical_resolved_operation_targets.items()
         }
         for spec in relevant_specs:
             diagnostic = diagnostics_by_members[spec["members"]]
@@ -3938,6 +3987,12 @@ class Evaluator:
             resolved_targets={
                 target: tuple(sorted(sources))
                 for target, sources in sorted(self._resolved_targets.items())
+            },
+            resolved_operation_targets={
+                operation: tuple(sorted(targets))
+                for operation, targets in sorted(
+                    self._resolved_operation_targets.items()
+                )
             },
             oracle_reads=self.oracle_reads,
             oracle_accesses=self.oracle_accesses,

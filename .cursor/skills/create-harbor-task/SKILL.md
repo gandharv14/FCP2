@@ -26,12 +26,13 @@ pipeline repository root and set:
 WB=0256
 RAW_SOURCE_FILE="4-10 100/$WB.xlsx"
 SOURCE_RUN="source_out/$WB"
+RELEASE_ROOT="release_out/$WB"
 SOURCE_HEALTH="runs/$WB-source-health.json"
 RECALC_RUN="runs/$WB-source-recalc"
 TRUSTED_RUNNER_PUBLIC_KEY="/etc/harbor/excel-runner-public.pem"
 EXCEL_ENGINE_VERSION="<exact-approved-Microsoft-Excel-version>"
-# SOURCE, SOURCE_FILE, SOURCE_GENERATION_ID, and AST_ROOT are resolved after
-# immutable source preparation and strict activation.
+# SOURCE, SOURCE_FILE, SOURCE_GENERATION_ID, and AST_ROOT are resolved from one
+# immutable candidate tuple during staging, then from current-release.json.
 SEG_ROOT=seg_out
 BASE_INPUT_ROOT=inputs_out
 MCP_INPUT_ROOT=inputs_out_mcp
@@ -56,9 +57,12 @@ TASK="tasks_outputs/$WB-outputs"
 
 Expected artifacts:
 
-- `source_out/$WB/current.json` and immutable
+- `release_out/$WB/current-release.json`, immutable
+  `releases/<release_id>/release-manifest.json`, and immutable
+  `task-generations/<task_generation_id>/generation-manifest.json`
+- inactive immutable source
   `generations/<generation_id>/{source/$WB.xlsx,ast/$WB/{nodes.csv,edges.csv},ast-provenance.json,generation-manifest.json}`
-- `seg_out/$WB/curation.toml`, `current.json`, and the immutable current
+- `seg_out/$WB/curation.toml` and the inactive immutable candidate
   `generations/<generation_id>/{generation-manifest.json,segments.json,bands.csv,output_candidates.csv,lineage.json,lineage/}`
 - `inputs_out/$WB-inputs.xlsx`: unredacted baseline inputs
 - `runs/disclosure/$WB-outputs/{bands,probe,records,context,verify}.json`
@@ -87,10 +91,11 @@ Stage all requested workbooks before promoting any of them.
 ## Non-negotiable gates
 
 - Stop on every failed, skipped, missing, ambiguous, or unreviewed gate.
-- Every production golden-workbook read must use the activated immutable source
-  generation. Missing source/AST provenance or a hash mismatch is a blocker.
-- Segmentation must resolve through the versioned current-generation pointer and
-  pass the strict generation gate; direct legacy files are not production input.
+- Resolve one `current-release.json` once per production operation. During
+  staging, pass both explicit inactive source and segmentation generation IDs.
+  Never read source or segmentation `current.json` mid-operation.
+- A `restricted_pass` source and its segmentation stay inactive until the task
+  generation is immutable and the complete tuple passes release CAS.
 - Legacy direct artifacts are an offline compatibility layout. Publication never
   replaces existing direct files or directories; migrate them only while offline.
 - Preserve an existing `curation.toml`. Never pass `--recurate` unless the user
@@ -127,6 +132,9 @@ Only `.xlsx` is eligible for the authoritative-source path.
 python3 -m pip install -r requirements.txt
 test -f "$RAW_SOURCE_FILE"
 python3 xl_source_health.py observe "$RAW_SOURCE_FILE" -o "$SOURCE_HEALTH"
+SOURCE_ROUTE=$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["route"])' \
+  "$SOURCE_HEALTH")
 ```
 
 Read `"$SOURCE_HEALTH"`. Stop on `unsupported` or `insufficient_evidence`.
@@ -174,8 +182,18 @@ For `pass`, use the original as `EFFECTIVE_CANDIDATE` and
 `"$SOURCE_HEALTH"` as `EFFECTIVE_HEALTH`. Build a fresh production AST and
 publish an inactive immutable source generation:
 
+For `restricted_pass`, also use the original source and health report, but bind
+the exact frozen cohort inventory. This route may build only an inactive source
+and AST candidate. It cannot use ordinary identity or recalculation evidence:
+
 ```bash
-if [ "$EFFECTIVE_CANDIDATE" = "$RAW_SOURCE_FILE" ]; then
+if [ "$SOURCE_ROUTE" = "restricted_pass" ]; then
+  RESTRICTION_INVENTORY=verification_manifests/restricted_source_cohort_123.v2.json
+  test -f "$RESTRICTION_INVENTORY"
+  PREPARED=$(python3 xl_source_recalc.py prepare "$RAW_SOURCE_FILE" \
+    --workbook "$WB" --publication-root "$SOURCE_RUN" \
+    --health "$SOURCE_HEALTH" --inventory "$RESTRICTION_INVENTORY")
+elif [ "$EFFECTIVE_CANDIDATE" = "$RAW_SOURCE_FILE" ]; then
   PREPARED=$(python3 xl_source_recalc.py prepare "$EFFECTIVE_CANDIDATE" \
     --workbook "$WB" --publication-root "$SOURCE_RUN" \
     --health "$EFFECTIVE_HEALTH")
@@ -219,13 +237,18 @@ If curation exists, record its hash before running segmentation. Do not use
 ```bash
 test ! -f "$SEG_ROOT/$WB/curation.toml" || \
   shasum -a 256 "$SEG_ROOT/$WB/curation.toml"
-python3 xl_segment.py "$WB" --source "$SOURCE" \
-  --ast-dir "$AST_ROOT" -o "$SEG_ROOT"
-python3 -m xl_seg.publication validate "$SEG_ROOT/$WB" \
-  --source "$SOURCE/$WB.xlsx" --ast-dir "$AST_ROOT/$WB" \
+python3 xl_segment.py "$WB" \
+  --source-generation-root source_out \
+  --source-generation-id "$SOURCE_GENERATION_ID" -o "$SEG_ROOT"
+GENERATION_ID="<generation_id returned by xl_segment.py>"
+python3 -m xl_seg.publication validate-id "$SEG_ROOT/$WB" "$GENERATION_ID" \
+  --source "$SOURCE_FILE" --ast-dir "$AST_ROOT/$WB" \
+  --source-generation-dir "$SOURCE_RUN/generations/$SOURCE_GENERATION_ID" \
   --validate-live-evidence --require-pass
-GENERATION_ID=$(python3 -m xl_seg.publication validate "$SEG_ROOT/$WB" \
-  --source "$SOURCE/$WB.xlsx" --ast-dir "$AST_ROOT/$WB" \
+GENERATION_ID=$(python3 -m xl_seg.publication validate-id \
+  "$SEG_ROOT/$WB" "$GENERATION_ID" \
+  --source "$SOURCE_FILE" --ast-dir "$AST_ROOT/$WB" \
+  --source-generation-dir "$SOURCE_RUN/generations/$SOURCE_GENERATION_ID" \
   --validate-live-evidence --require-pass |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])')
 ```
@@ -245,20 +268,10 @@ Summarize every included output and the strongest exclusions from
 curation, re-run the same command. If an existing curation file changed without
 explicit approval, stop.
 
-After confirmation, activate the immutable source only through the strict
-segmentation proof that was just produced:
-
-```bash
-python3 -m xl_source_publication activate \
-  "$SOURCE_RUN" "$SOURCE_GENERATION_ID" \
-  --segmentation-dir "$SEG_ROOT/$WB" \
-  --expected-segmentation-generation-id "$GENERATION_ID"
-RESOLVED=$(python3 -m xl_source_publication resolve \
-  "$SOURCE_RUN" --expected-generation-id "$SOURCE_GENERATION_ID")
-test "$(python3 -c \
-  'import json,sys; print(json.load(sys.stdin)["source_path"])' \
-  <<<"$RESOLVED")" = "$SOURCE_FILE"
-```
+After confirmation, keep both generations inactive. All remaining build commands
+must pass `--source-generation-id "$SOURCE_GENERATION_ID"` and
+`--segmentation-generation-id "$GENERATION_ID"`. Do not run
+`xl_source_publication activate` for `restricted_pass`.
 
 Only the full validator command above establishes PASS. Record its returned
 `generation_id`; reading `current.json` or checking its schema alone is never a
@@ -271,7 +284,9 @@ Do not weaken the verifier, use `--no-verify`, or special-case the workbook.
 ```bash
 python3 xl_input_mask.py "$WB" --source "$SOURCE" \
   --seg-dir "$SEG_ROOT" --ast-dir "$AST_ROOT" \
-  --segmentation-mode strict --expected-generation-id "$GENERATION_ID" \
+  --segmentation-mode strict --source-generation-root source_out \
+  --source-generation-id "$SOURCE_GENERATION_ID" \
+  --segmentation-generation-id "$GENERATION_ID" \
   -o "$BASE_INPUT_ROOT"
 test -f "$BASE_INPUT_ROOT/$WB-inputs.xlsx"
 test -f "$BASE_INPUT_ROOT/$WB-inputs.segmentation.json"
@@ -288,6 +303,9 @@ unchanged: it is the input to the audit even after MCP masking exists.
 python3 xl_variable_source_audit.py "$WB" \
   --inputs-root "$BASE_INPUT_ROOT" \
   --seg-root "$SEG_ROOT" \
+  --segmentation-generation-id "$GENERATION_ID" \
+  --source-generation-root source_out \
+  --source-generation-id "$SOURCE_GENERATION_ID" \
   --audit-root runs \
   --model openai/gpt-5.6-sol
 ```
@@ -295,7 +313,8 @@ python3 xl_variable_source_audit.py "$WB" \
 Require complete metadata, matching inventory SHA-256, model
 `openai/gpt-5.6-sol`, and passed qualified-reference/value validation. Reject
 invented references or values. Cache reuse is allowed only when the baseline
-inventory hash, model, and prompt version match.
+inventory hash, model, prompt version, source generation, and segmentation
+generation match. Never activate a candidate merely to satisfy the audit.
 
 ### 5. Import every Markdown row
 
@@ -327,7 +346,11 @@ final JSON in place. Re-running it from the same inputs must be byte-identical.
 
 ```bash
 python3 gen_normalizer.py "$WB" \
-  --source-file "$SOURCE_FILE" --source-sha256 "$SOURCE_SHA256"
+  --source-file "$SOURCE_FILE" --source-sha256 "$SOURCE_SHA256" \
+  --source-generation-root source_out \
+  --source-generation-id "$SOURCE_GENERATION_ID" \
+  --segmentation-root "$SEG_ROOT" \
+  --segmentation-generation-id "$GENERATION_ID"
 python3 "$RUN/normalize_$WB.py"
 python3 - "$DRAFT" "$NORMALIZED" "$DISPOSITIONS" <<'PY'
 import json, sys
@@ -454,7 +477,9 @@ and all failed build directories as diagnostics until completion.
 BASE_SHA=$(shasum -a 256 "$BASE_INPUT_ROOT/$WB-inputs.xlsx" | awk '{print $1}')
 python3 xl_input_mask.py "$WB" --source "$SOURCE" \
   --seg-dir "$SEG_ROOT" --ast-dir "$AST_ROOT" \
-  --segmentation-mode strict --expected-generation-id "$GENERATION_ID" \
+  --segmentation-mode strict --source-generation-root source_out \
+  --source-generation-id "$SOURCE_GENERATION_ID" \
+  --segmentation-generation-id "$GENERATION_ID" \
   -o "$MCP_INPUT_ROOT" \
   --mask-cells "$MCP/mask_cells.json"
 test "$(shasum -a 256 "$BASE_INPUT_ROOT/$WB-inputs.xlsx" | awk '{print $1}')" \
@@ -476,7 +501,9 @@ python3 xl_output_task.py "$WB" \
   --seg-root "$SEG_ROOT" \
   --ast-dir "$AST_ROOT" \
   --segmentation-mode strict \
-  --expected-generation-id "$GENERATION_ID" \
+  --source-generation-root source_out \
+  --source-generation-id "$SOURCE_GENERATION_ID" \
+  --segmentation-generation-id "$GENERATION_ID" \
   --inputs-root "$MCP_INPUT_ROOT" \
   --variable-source-audit-inputs-root "$BASE_INPUT_ROOT" \
   --variable-source-audit-root runs \
@@ -512,7 +539,9 @@ python3 "$DISCLOSURE" select \
   --ast-dir "$AST_ROOT" \
   --seg-root "$SEG_ROOT" \
   --segmentation-mode strict \
-  --expected-generation-id "$GENERATION_ID"
+  --source-generation-root source_out \
+  --source-generation-id "$SOURCE_GENERATION_ID" \
+  --segmentation-generation-id "$GENERATION_ID"
 python3 "$DISCLOSURE" probe   --task-dir "$STAGED"
 python3 "$DISCLOSURE" roles   --task-dir "$STAGED"
 # Follow /task-disclosure: if ambiguous_roles.json has cases, launch one
@@ -745,8 +774,9 @@ in `instruction.md`.
 ### 16. Promote only after every gate passes
 
 If a requested set contains multiple workbooks, wait until every staged bundle
-passes before promoting the set. Promotion uses same-filesystem renames and
-rollback; do not delete or overwrite the current bundle in place.
+passes before promoting the set. Publication first freezes the final staged task
+as an immutable task generation, then atomically compare-and-swaps the one
+authoritative `current-release.json`. Compatibility task paths are copies only.
 
 After any additional-assumptions apply, verify that the live instruction still
 matches the naturalizer metadata hash:
@@ -758,25 +788,35 @@ python3 .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_re
 ```
 
 ```bash
-python3 - "$STAGED" "$TASK" <<'PY'
-import os, sys, time
+python3 - "$STAGED/tests/pipeline_bindings.json" "$RELEASE_ROOT/task-bindings.json" <<'PY'
+import json, sys
 from pathlib import Path
-stage, dest = map(Path, sys.argv[1:])
-if not stage.is_dir():
-    raise SystemExit("validated stage is missing")
-backup = dest.with_name(dest.name + ".previous-" + time.strftime("%Y%m%d%H%M%S"))
-if backup.exists():
-    raise SystemExit("backup path already exists: %s" % backup)
-if dest.exists():
-    os.replace(dest, backup)
-try:
-    os.replace(stage, dest)
-except Exception:
-    if backup.exists() and not dest.exists():
-        os.replace(backup, dest)
-    raise
-print("promoted %s; previous=%s" % (dest, backup if backup.exists() else "none"))
+value = json.loads(Path(sys.argv[1]).read_text())
+Path(sys.argv[2]).parent.mkdir(parents=True, exist_ok=True)
+Path(sys.argv[2]).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 PY
+TASK_GENERATION=$(python3 -m xl_release_publication publish-task \
+  "$STAGED" "$RELEASE_ROOT" "$WB" \
+  --bindings "$RELEASE_ROOT/task-bindings.json")
+TASK_GENERATION_ID=$(python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["generation_id"])' \
+  <<<"$TASK_GENERATION")
+if test -f "$RELEASE_ROOT/current-release.json"; then
+  EXPECTED_RELEASE_ID=$(python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["release_id"])' \
+    "$RELEASE_ROOT/current-release.json")
+  EXPECTED=(--expected-current-release-id "$EXPECTED_RELEASE_ID")
+else
+  EXPECTED=(--expect-absent)
+  # For legacy migration, run freeze-legacy first and add
+  # --legacy-snapshot-hash <frozen hash>.
+fi
+python3 -m xl_release_publication publish "$RELEASE_ROOT" "$WB" \
+  --source-root "$SOURCE_RUN" \
+  --source-generation-id "$SOURCE_GENERATION_ID" \
+  --segmentation-root "$SEG_ROOT/$WB" \
+  --segmentation-generation-id "$GENERATION_ID" \
+  --task-generation-id "$TASK_GENERATION_ID" "${EXPECTED[@]}"
 ```
 
 Do not run Harbor rollouts unless the user separately asks.

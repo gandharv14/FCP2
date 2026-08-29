@@ -3,13 +3,31 @@
 # Gate 15.5 (additional-assumptions-dialogue) is agent-only and is not part of
 # this shell automation.
 # Staging root tasks_outputs_mcp/ is shape-agnostic: MCP or plain.
-# Usage: build_one.sh <WB> [--resume-after-naturalization]
+# Usage: build_one.sh <WB> [--release-id ID]
+#        build_one.sh <WB> --source-generation-id ID --segmentation-generation-id ID
 set -uo pipefail
 # Every gate path below is relative, so a failed cd would run all 15 gates --
 # and stamp BUILDOK -- against whatever tree the caller happens to be in.
 cd "$(dirname "$0")" || { echo "BUILDFAIL cd :: cannot cd to the pipeline root"; exit 1; }
 
 WB="$1"
+shift
+RELEASE_BASE="${RELEASE_ROOT:-release_out}"
+SOURCE_GENERATION_ROOT="${SOURCE_GENERATION_ROOT:-source_out}"
+SEGMENTATION_ROOT="${SEGMENTATION_ROOT:-seg_out}"
+RELEASE_ID=""
+SOURCE_GENERATION_ID=""
+SEGMENTATION_GENERATION_ID=""
+RESUME=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --resume-after-naturalization) RESUME=1; shift ;;
+    --release-id) RELEASE_ID="$2"; shift 2 ;;
+    --source-generation-id) SOURCE_GENERATION_ID="$2"; shift 2 ;;
+    --segmentation-generation-id) SEGMENTATION_GENERATION_ID="$2"; shift 2 ;;
+    *) echo "BUILDFAIL $WB args :: unknown argument $1"; exit 1 ;;
+  esac
+done
 RUN="runs/$WB-variable-sources"
 STAGED="tasks_outputs_mcp/$WB-outputs"
 NAT_RUN="runs/$WB-instruction-naturalization"
@@ -17,7 +35,7 @@ D=.cursor/skills/task-disclosure/scripts/disclose.py
 LOG="/tmp/build/$WB.log"
 mkdir -p /tmp/build
 
-if [ "${2:-}" = "--resume-after-naturalization" ]; then
+if [ "$RESUME" -eq 1 ]; then
   python3 .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py \
     verify-applied "$NAT_RUN" >/dev/null 2>&1 \
     || { echo "BUILDFAIL $WB gate=13 :: naturalization is not safely applied"; exit 1; }
@@ -46,8 +64,41 @@ sys.exit(0 if r.get('score')==1.0 else 1)" \
   exit 76
 fi
 
-SOURCE_STATE=$(python3 -m xl_source_publication resolve "source_out/$WB" 2>/dev/null) \
-  || { echo "BUILDFAIL $WB gate=source :: no validated effective source"; exit 1; }
+if [ -n "$SOURCE_GENERATION_ID" ] || [ -n "$SEGMENTATION_GENERATION_ID" ]; then
+  [ -n "$SOURCE_GENERATION_ID" ] && [ -n "$SEGMENTATION_GENERATION_ID" ] \
+    || { echo "BUILDFAIL $WB args :: both candidate generation IDs are required"; exit 1; }
+  [ -z "$RELEASE_ID" ] \
+    || { echo "BUILDFAIL $WB args :: release and candidate modes conflict"; exit 1; }
+  SOURCE_STATE=$(python3 -m xl_release_publication resolve-candidate "$WB" \
+    --source-root "$SOURCE_GENERATION_ROOT/$WB" \
+    --source-generation-id "$SOURCE_GENERATION_ID" \
+    --segmentation-root "$SEGMENTATION_ROOT/$WB" \
+    --segmentation-generation-id "$SEGMENTATION_GENERATION_ID" 2>/dev/null) \
+    || { echo "BUILDFAIL $WB gate=source :: invalid inactive candidate tuple"; exit 1; }
+  PIN_ARGS=(--source-generation-root "$SOURCE_GENERATION_ROOT" \
+    --source-generation-id "$SOURCE_GENERATION_ID" \
+    --segmentation-generation-id "$SEGMENTATION_GENERATION_ID")
+  NORMALIZER_PIN_ARGS=(--source-generation-root "$SOURCE_GENERATION_ROOT" \
+    --source-generation-id "$SOURCE_GENERATION_ID" \
+    --segmentation-root "$SEGMENTATION_ROOT" \
+    --segmentation-generation-id "$SEGMENTATION_GENERATION_ID")
+else
+  RESOLVE_ARGS=()
+  [ -z "$RELEASE_ID" ] || RESOLVE_ARGS+=(--release-id "$RELEASE_ID")
+  SOURCE_STATE=$(python3 -m xl_release_publication resolve \
+    "$RELEASE_BASE/$WB" "$WB" \
+    --source-root "$SOURCE_GENERATION_ROOT/$WB" \
+    --segmentation-root "$SEGMENTATION_ROOT/$WB" \
+    "${RESOLVE_ARGS[@]}" 2>/dev/null) \
+    || { echo "BUILDFAIL $WB gate=source :: no validated current release"; exit 1; }
+  RELEASE_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["release_id"])' \
+    <<<"$SOURCE_STATE") || exit 1
+  PIN_ARGS=(--release-root "$RELEASE_BASE" --release-id "$RELEASE_ID" \
+    --source-generation-root "$SOURCE_GENERATION_ROOT")
+  NORMALIZER_PIN_ARGS=(--release-root "$RELEASE_BASE" --release-id "$RELEASE_ID" \
+    --source-generation-root "$SOURCE_GENERATION_ROOT" \
+    --segmentation-root "$SEGMENTATION_ROOT")
+fi
 SOURCE_ROOT=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_root"])' \
   <<<"$SOURCE_STATE") || exit 1
 SOURCE_FILE=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_path"])' \
@@ -56,17 +107,15 @@ SOURCE_SHA256=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_
   <<<"$SOURCE_STATE") || exit 1
 AST_ROOT=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["ast_root"])' \
   <<<"$SOURCE_STATE") || exit 1
+GENERATION_ID=$(python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["bindings"]["segmentation_generation_id"])' \
+  <<<"$SOURCE_STATE") || exit 1
 
 fail() { echo "BUILDFAIL $WB gate=$1 :: $2"; exit 1; }
 
 (
 PLAIN=0
 # ---- gate 4: versioned segmentation generation --------------------------
-SEG_VALIDATION=$(python3 -m xl_seg.publication validate "seg_out/$WB" \
-  --source "$SOURCE_FILE" --ast-dir "$AST_ROOT/$WB" \
-  --validate-live-evidence --require-pass 2>/dev/null) || exit 118
-GENERATION_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_id"])' \
-  <<<"$SEG_VALIDATION") || exit 118
 python3 - "$WB" "$GENERATION_ID" <<'PY' >/dev/null 2>&1 || exit 119
 import sys
 from pathlib import Path
@@ -85,7 +134,8 @@ python3 xl_variable_mcp.py import "$RUN/$WB-inputs-variable-sources.md" \
 
 # ---- gate 6: generate + run atomic normalizer ----------------------------
 python3 gen_normalizer.py "$WB" --source-file "$SOURCE_FILE" \
-  --source-sha256 "$SOURCE_SHA256" 2>/dev/null || exit 92
+  --source-sha256 "$SOURCE_SHA256" "${NORMALIZER_PIN_ARGS[@]}" \
+  2>/dev/null || exit 92
 python3 "$RUN/normalize_$WB.py" >/dev/null 2>&1 || exit 92
 cp "$RUN/normalized.json" "/tmp/build/$WB.n1.json"
 python3 "$RUN/normalize_$WB.py" >/dev/null 2>&1 || exit 92
@@ -147,9 +197,10 @@ uv run --python 3.12 --with fastmcp --with openpyxl \
 
 # ---- gate 10: mask MCP inputs separately -------------------------------
 BASE_SHA=$(shasum -a 256 "inputs_out/$WB-inputs.xlsx" | awk '{print $1}')
-python3 xl_input_mask.py "$WB" --source "$SOURCE_ROOT" --seg-dir seg_out \
+python3 xl_input_mask.py "$WB" --source "$SOURCE_ROOT" --seg-dir "$SEGMENTATION_ROOT" \
   --ast-dir "$AST_ROOT" --segmentation-mode strict \
   --expected-generation-id "$GENERATION_ID" \
+  "${PIN_ARGS[@]}" \
   -o inputs_out_mcp --mask-cells "$RUN/mcp/mask_cells.json" >/dev/null 2>&1 || exit 101
 NOW=$(shasum -a 256 "inputs_out/$WB-inputs.xlsx" | awk '{print $1}')
 [ "$BASE_SHA" = "$NOW" ] || exit 102
@@ -159,9 +210,9 @@ fi
 # ---- gate 11: package to staging ---------------------------------------
 rm -rf "$STAGED"
 if [ "$PLAIN" -eq 1 ]; then
-  python3 xl_output_task.py "$WB" --source "$SOURCE_ROOT" --seg-root seg_out \
+  python3 xl_output_task.py "$WB" --source "$SOURCE_ROOT" --seg-root "$SEGMENTATION_ROOT" \
     --ast-dir "$AST_ROOT" --segmentation-mode strict \
-    --expected-generation-id "$GENERATION_ID" \
+    "${PIN_ARGS[@]}" \
     --inputs-root inputs_out \
     --variable-source-audit-inputs-root inputs_out \
     --variable-source-audit-root runs \
@@ -200,9 +251,9 @@ report = check_plain_environment(Path(sys.argv[1]), sys.argv[2])
 raise SystemExit(0 if report.get("valid") else 1)
 PY
 else
-  python3 xl_output_task.py "$WB" --source "$SOURCE_ROOT" --seg-root seg_out \
+  python3 xl_output_task.py "$WB" --source "$SOURCE_ROOT" --seg-root "$SEGMENTATION_ROOT" \
     --ast-dir "$AST_ROOT" --segmentation-mode strict \
-    --expected-generation-id "$GENERATION_ID" \
+    "${PIN_ARGS[@]}" \
     --inputs-root inputs_out_mcp \
     --variable-source-audit-inputs-root inputs_out \
     --variable-source-audit-root runs \
@@ -218,8 +269,8 @@ fi
 
 # ---- gate 12: unified disclosure ---------------------------------------
 python3 "$D" select --task-dir "$STAGED" --golden "$SOURCE_FILE" \
-  --ast-dir "$AST_ROOT" --seg-root seg_out --segmentation-mode strict \
-  --expected-generation-id "$GENERATION_ID" \
+  --ast-dir "$AST_ROOT" --seg-root "$SEGMENTATION_ROOT" --segmentation-mode strict \
+  "${PIN_ARGS[@]}" \
   >/dev/null 2>&1 || exit 106
 python3 "$D" probe   --task-dir "$STAGED" >/dev/null 2>&1 || exit 106
 python3 "$D" roles   --task-dir "$STAGED" >/dev/null 2>&1 || exit 106

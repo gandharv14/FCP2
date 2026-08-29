@@ -798,31 +798,77 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
 # ---------------------------------------------------------------------------
 
 def process(wb_id, args):
-    source = None
-    for suffix in (".xlsx", ".xlsm"):
-        candidate = Path(args.source) / (wb_id + suffix)
-        if candidate.exists():
-            source = candidate
-            break
-    if source is None:
-        print("  %s: no workbook in %s" % (wb_id, args.source))
-        return False
+    pipeline_context = None
+    pinned = bool(
+        getattr(args, "release_root", None)
+        or getattr(args, "source_generation_id", None)
+        or getattr(args, "segmentation_generation_id", None)
+    )
+    if pinned:
+        try:
+            from xl_release_publication import (
+                ReleasePublicationError,
+                resolve_build_context,
+            )
+
+            pipeline_context = resolve_build_context(
+                wb_id,
+                release_root=(
+                    Path(args.release_root) / wb_id
+                    if getattr(args, "release_root", None)
+                    else None
+                ),
+                release_id=getattr(args, "release_id", None),
+                source_root=Path(args.source_generation_root) / wb_id,
+                source_generation_id=getattr(args, "source_generation_id", None),
+                segmentation_root=Path(args.seg_dir) / wb_id,
+                segmentation_generation_id=getattr(
+                    args, "segmentation_generation_id", None
+                ),
+            )
+            expected = getattr(args, "expected_generation_id", None)
+            if (
+                expected is not None
+                and pipeline_context["bindings"]["segmentation_generation_id"]
+                != expected
+            ):
+                raise ReleasePublicationError(
+                    "pinned segmentation generation changed"
+                )
+        except (OSError, ReleasePublicationError) as exc:
+            print("  %s: pinned release/candidate gate failed: %s" % (wb_id, exc))
+            return False
+        source = Path(pipeline_context["source_path"])
+        seg_dir = Path(pipeline_context["segmentation_dir"])
+        generation_manifest = pipeline_context["segmentation_manifest"]
+        ast_root = Path(pipeline_context["ast_root"])
+    else:
+        source = None
+        for suffix in (".xlsx", ".xlsm"):
+            candidate = Path(args.source) / (wb_id + suffix)
+            if candidate.exists():
+                source = candidate
+                break
+        if source is None:
+            print("  %s: no workbook in %s" % (wb_id, args.source))
+            return False
+        ast_root = Path(getattr(args, "ast_dir", "ast_out"))
     segmentation_mode = getattr(args, "segmentation_mode", "legacy")
-    ast_root = Path(getattr(args, "ast_dir", "ast_out"))
-    try:
-        seg_dir, generation_manifest = resolve_for_consumer(
-            Path(args.seg_dir) / wb_id,
-            mode=segmentation_mode,
-            source_path=source,
-            ast_dir=ast_root / wb_id,
-            require_pass=True,
-            expected_generation_id=getattr(
-                args, "expected_generation_id", None
-            ),
-        )
-    except GenerationValidationError as exc:
-        print("  %s: segmentation gate failed: %s" % (wb_id, exc))
-        return False
+    if not pinned:
+        try:
+            seg_dir, generation_manifest = resolve_for_consumer(
+                Path(args.seg_dir) / wb_id,
+                mode=segmentation_mode,
+                source_path=source,
+                ast_dir=ast_root / wb_id,
+                require_pass=True,
+                expected_generation_id=getattr(
+                    args, "expected_generation_id", None
+                ),
+            )
+        except GenerationValidationError as exc:
+            print("  %s: segmentation gate failed: %s" % (wb_id, exc))
+            return False
     bands = seg_dir / "bands.csv"
     if not bands.exists():
         print("  %s: no bands.csv under %s" % (wb_id, bands.parent))
@@ -952,6 +998,11 @@ def process(wb_id, args):
                 out_path,
                 seg_dir,
                 generation_manifest,
+                pipeline_bindings=(
+                    pipeline_context["bindings"]
+                    if pipeline_context is not None
+                    else None
+                ),
             )
         print("       verified: no formulas, no derived numbers, typed cells intact")
         return True
@@ -988,6 +1039,19 @@ def main(argv=None):
         default=None,
         help="fail if current.json no longer names this generation",
     )
+    parser.add_argument(
+        "--release-root",
+        default=None,
+        help="root containing <workbook>/current-release.json",
+    )
+    parser.add_argument("--release-id", default=None)
+    parser.add_argument(
+        "--source-generation-root",
+        default="source_out",
+        help="root containing <workbook>/generations/<source-generation-id>",
+    )
+    parser.add_argument("--source-generation-id", default=None)
+    parser.add_argument("--segmentation-generation-id", default=None)
     parser.add_argument("--source", default="4-10 100",
                         help="folder holding <wb>.xlsx")
     parser.add_argument("-o", "--out", default="inputs_out")
@@ -998,6 +1062,19 @@ def main(argv=None):
                              "additionally blank; used for variables served "
                              "through a mock MCP research service")
     args = parser.parse_args(argv)
+    if args.release_id and not args.release_root:
+        parser.error("--release-id requires --release-root")
+    if args.release_root and (
+        args.source_generation_id or args.segmentation_generation_id
+    ):
+        parser.error(
+            "--release-root is mutually exclusive with explicit candidate IDs"
+        )
+    if bool(args.source_generation_id) != bool(args.segmentation_generation_id):
+        parser.error(
+            "explicit staging requires both --source-generation-id and "
+            "--segmentation-generation-id"
+        )
 
     print("masking to inputs only (--keep %s)" % args.keep)
     ok = [process(wb, args) for wb in args.workbooks]

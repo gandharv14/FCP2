@@ -15,12 +15,17 @@ from collections import Counter
 from pathlib import Path
 from xml.etree import ElementTree
 
+from openpyxl.formula.translate import Translator, TranslatorError
+from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
+
 from xl_seg import diagnostics
 from xl_seg.evaluate import workbook_calculation_metadata
 
 
-SCHEMA_VERSION = "xlsx-source-health/v1"
-POLICY_VERSION = "source-recalc-policy/v1"
+SCHEMA_VERSION = "xlsx-source-health/v2"
+POLICY_VERSION = "source-recalc-policy/v2"
+LEGACY_SCHEMA_VERSION = "xlsx-source-health/v1"
+LEGACY_POLICY_VERSION = "source-recalc-policy/v1"
 ENGINE_REQUIREMENTS = {
     "authoritative_engine": "microsoft-excel",
     "isolated_session": True,
@@ -32,10 +37,12 @@ ENGINE_REQUIREMENTS = {
 }
 ROUTES = frozenset({
     "pass",
+    "restricted_pass",
     "recalc_candidate",
     "unsupported",
     "insufficient_evidence",
 })
+LEGACY_ROUTES = ROUTES - {"restricted_pass"}
 SAMPLE_LIMIT = 20
 MAX_ZIP_MEMBERS = 50_000
 MAX_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
@@ -50,10 +57,26 @@ VOLATILE_FUNCTIONS = frozenset({
     "RANDBETWEEN",
     "TODAY",
 })
-_VOLATILE_RE = re.compile(
-    r"(?i)(?<![A-Z0-9_.])(" + "|".join(sorted(VOLATILE_FUNCTIONS)) + r")\s*\("
+RESTRICTION_PROFILE = {
+    "schema_version": "source-restriction-profile/v2",
+    "allowlist": [
+        "confirmed_false_external_detection",
+        "worksheet_cell_filename",
+        "worksheet_indirect_a1",
+        "worksheet_now",
+        "worksheet_offset",
+        "worksheet_today",
+    ],
+}
+_FUNCTION_RE = re.compile(
+    r"(?i)(?<![A-Z0-9_.])(?:_xlfn\.)?("
+    + "|".join(sorted(VOLATILE_FUNCTIONS))
+    + r")\s*\("
 )
-_EXTERNAL_FORMULA_RE = re.compile(r"\[[^\]]+\]")
+_A1_REFERENCE_RE = re.compile(
+    r"(?i)^(?:(?:'(?:[^']|'')+'|[A-Z_\\][A-Z0-9_.\\]*)!)?"
+    r"\$?[A-Z]{1,3}\$?[1-9][0-9]*(?::\$?[A-Z]{1,3}\$?[1-9][0-9]*)?$"
+)
 _REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 
@@ -66,6 +89,254 @@ def _canonical_bytes(value: object) -> bytes:
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         + "\n"
     ).encode("utf-8")
+
+
+def _object_hash(value: object) -> str:
+    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _quoted_spans(formula: str) -> list[tuple[int, int, str]]:
+    """Return Excel double-quoted string spans, honoring doubled quotes."""
+    spans = []
+    index = 0
+    while index < len(formula):
+        if formula[index] != '"':
+            index += 1
+            continue
+        start = index
+        index += 1
+        value = []
+        while index < len(formula):
+            if formula[index] != '"':
+                value.append(formula[index])
+                index += 1
+                continue
+            if index + 1 < len(formula) and formula[index + 1] == '"':
+                value.append('"')
+                index += 2
+                continue
+            index += 1
+            break
+        spans.append((start, index, "".join(value)))
+    return spans
+
+
+def _code_mask(formula: str, spans: list[tuple[int, int, str]]) -> str:
+    characters = list(formula)
+    for start, end, _ in spans:
+        characters[start:end] = " " * (end - start)
+    return "".join(characters)
+
+
+def _call_arguments(formula: str, open_index: int) -> list[str] | None:
+    arguments = []
+    start = open_index + 1
+    depth = 1
+    index = start
+    quoted = False
+    while index < len(formula):
+        character = formula[index]
+        if quoted:
+            if character == '"' and index + 1 < len(formula) and formula[index + 1] == '"':
+                index += 2
+                continue
+            if character == '"':
+                quoted = False
+            index += 1
+            continue
+        if character == '"':
+            quoted = True
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                arguments.append(formula[start:index].strip())
+                return arguments
+        elif character in {",", ";"} and depth == 1:
+            arguments.append(formula[start:index].strip())
+            start = index + 1
+        index += 1
+    return None
+
+
+def _string_literal(argument: str) -> str | None:
+    spans = _quoted_spans(argument)
+    if len(spans) == 1 and spans[0][0] == 0 and spans[0][1] == len(argument):
+        return spans[0][2]
+    return None
+
+
+def _volatile_decision(
+    function: str,
+    formula: str,
+    open_index: int,
+    scope: str,
+) -> tuple[bool, str]:
+    if scope != "worksheet":
+        return False, "defined_name_dynamic"
+    arguments = _call_arguments(formula, open_index)
+    if arguments is None:
+        return False, "unparsed_volatile_call"
+    if function == "OFFSET":
+        if 3 <= len(arguments) <= 5 and all(arguments[:3]):
+            return True, "worksheet_offset"
+        return False, "unparsed_volatile_call"
+    if function in {"TODAY", "NOW"}:
+        if arguments == [""]:
+            return True, f"worksheet_{function.lower()}"
+        return False, "unparsed_volatile_call"
+    if function == "CELL":
+        first = _string_literal(arguments[0]) if arguments else None
+        if first is not None and first.casefold() == "filename":
+            return True, "worksheet_cell_filename"
+        return False, "cell_information_dynamic"
+    if function == "INDIRECT":
+        first = _string_literal(arguments[0]) if arguments else None
+        a1_mode = (
+            len(arguments) < 2
+            or arguments[1].strip().upper() in {"TRUE", "1"}
+        )
+        if first is not None and a1_mode and _A1_REFERENCE_RE.fullmatch(first):
+            return True, "worksheet_indirect_a1"
+        return False, (
+            "indirect_r1c1" if not a1_mode else "indirect_dynamic_or_non_a1"
+        )
+    if function in {"RAND", "RANDBETWEEN"}:
+        return False, "random_function"
+    if function == "INFO":
+        return False, "information_function"
+    return False, "unsupported_volatile_function"
+
+
+def _formula_restriction_events(
+    formula: str,
+    *,
+    scope: str,
+    location: str,
+) -> list[dict]:
+    """Classify formula tokens without confusing strings and structured refs."""
+    events = []
+    spans = _quoted_spans(formula)
+    code = _code_mask(formula, spans)
+    external_literal_starts: set[int] = set()
+    for match in _FUNCTION_RE.finditer(code):
+        function = match.group(1).upper()
+        open_index = code.find("(", match.start(), match.end())
+        allowed, reason = _volatile_decision(
+            function, formula, open_index, scope
+        )
+        events.append({
+            "allowed": allowed,
+            "event": "volatile_function",
+            "function": function,
+            "location": location,
+            "reason": reason,
+            "scope": scope,
+            "token_offset": match.start(),
+        })
+        if function == "INDIRECT":
+            arguments = _call_arguments(formula, open_index)
+            first = _string_literal(arguments[0]) if arguments else None
+            if first is not None and re.fullmatch(
+                r"(?i)(?:'(?:[^']|'')*\[[^\]]+\](?:[^']|'')*'|"
+                r"\[[^\]]+\](?:[A-Z_\\][A-Z0-9_.\\]*|'(?:[^']|'')*'))"
+                r"!\$?[A-Z]{1,3}\$?[1-9][0-9]*",
+                first,
+            ):
+                first_span = next(
+                    (
+                        start for start, _, value in spans
+                        if start > open_index and value == first
+                    ),
+                    None,
+                )
+                if first_span is not None:
+                    external_literal_starts.add(first_span)
+
+    external_spans: set[tuple[int, int]] = set()
+    external_pattern = re.compile(
+        r"(?i)(?:'(?:[^']|'')*\[[^\]]+\](?:[^']|'')*'|"
+        r"\[[^\]]+\](?:[A-Z_\\][A-Z0-9_.\\]*|'(?:[^']|'')*'))\s*!"
+    )
+    for match in external_pattern.finditer(code):
+        external_spans.add((match.start(), match.end()))
+        events.append({
+            "allowed": False,
+            "event": "external_workbook_reference",
+            "location": location,
+            "reason": "true_external_workbook_reference",
+            "scope": scope,
+            "token": formula[match.start():match.end()],
+            "token_offset": match.start(),
+        })
+    for match in re.finditer(r"\[[^\]]+\]", code):
+        if any(start <= match.start() < end for start, end in external_spans):
+            continue
+        content = match.group(0)[1:-1]
+        previous = code[match.start() - 1] if match.start() else ""
+        external_hint = (
+            content.isdigit()
+            or re.search(r"(?i)\.xls(?:x|m|b)?$", content) is not None
+            or "/" in content
+            or "\\" in content
+        )
+        if external_hint and not (previous.isalnum() or previous in {"_", "]"}):
+            events.append({
+                "allowed": False,
+                "event": "external_workbook_reference",
+                "location": location,
+                "reason": "true_external_workbook_reference",
+                "scope": scope,
+                "token": match.group(0),
+                "token_offset": match.start(),
+            })
+            continue
+        events.append({
+            "allowed": False,
+            "event": "structured_reference",
+            "location": location,
+            "reason": "structured_reference_unresolved_by_ast",
+            "scope": scope,
+            "token": match.group(0),
+            "token_offset": match.start(),
+        })
+    for start, _, value in spans:
+        for match in re.finditer(r"\[[^\]]+\]", value):
+            if start in external_literal_starts:
+                events.append({
+                    "allowed": False,
+                    "event": "external_workbook_reference",
+                    "location": location,
+                    "reason": "true_external_workbook_reference",
+                    "scope": scope,
+                    "token": value,
+                    "token_offset": start,
+                })
+                continue
+            events.append({
+                "allowed": True,
+                "event": "false_external_detection",
+                "location": location,
+                "reason": "confirmed_false_external_detection",
+                "scope": scope,
+                "token": match.group(0),
+                "token_offset": start + 1 + match.start(),
+            })
+    return events
+
+
+def _sorted_events(events: list[dict]) -> list[dict]:
+    return sorted(
+        events,
+        key=lambda item: (
+            item.get("scope", ""),
+            item.get("location", ""),
+            item.get("event", ""),
+            item.get("token_offset", -1),
+            _object_hash(item),
+        ),
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -246,6 +517,8 @@ def _diagnostics_record(route: str, reasons: list[str], formula_count: int) -> d
     evidence: dict = {"executed": True, "reason_counts": {}}
     if route == "recalc_candidate":
         evidence["source"] = {"recalc_required": True}
+    elif route == "restricted_pass":
+        evidence["source"] = {"restricted_policy_pass": True}
     elif route == "insufficient_evidence":
         evidence["missing_evidence"] = reasons or ["source_health_incomplete"]
     elif route == "unsupported":
@@ -295,6 +568,7 @@ def inspect_workbook(path: str | Path) -> dict:
             "size_bytes": source_size,
             "sha256": source_hash,
         },
+        "restriction_profile": RESTRICTION_PROFILE,
     }
     if source_problem is not None:
         reasons = [source_problem]
@@ -306,6 +580,8 @@ def inspect_workbook(path: str | Path) -> dict:
             "calculation": {"available": False},
             "counts": {},
             "samples": {},
+            "restriction_events": [],
+            "restriction_events_sha256": _object_hash([]),
             "diagnostics": _diagnostics_record(
                 "insufficient_evidence", reasons, 0
             ),
@@ -328,12 +604,66 @@ def inspect_workbook(path: str | Path) -> dict:
             cache_empty = 0
             missing_cache = 0
             data_tables = 0
+            shared_formula_followers_expanded = 0
+            shared_formula_followers_inherited_unrestricted = 0
+            shared_formula_followers_unexpanded = 0
             volatile = Counter()
             volatile_cells: list[str] = []
             external_formula_cells: list[str] = []
+            restriction_events: list[dict] = []
             for sheet_name, part in sheet_parts:
                 root = _parse_xml(archive, part)
-                for cell in root.findall(".//{*}c"):
+                cells = root.findall(".//{*}c")
+                shared_masters: dict[
+                    str,
+                    tuple[str, str, tuple[int, int, int, int], bool] | None,
+                ] = {}
+                for cell in cells:
+                    formula = cell.find("{*}f")
+                    if (
+                        formula is None
+                        or formula.attrib.get("t") != "shared"
+                        or not (formula.text or "").strip()
+                    ):
+                        continue
+                    shared_index = formula.attrib.get("si", "")
+                    origin = cell.attrib.get("r", "")
+                    reference = formula.attrib.get("ref", "")
+                    if (
+                        not shared_index
+                        or not origin
+                        or not reference
+                        or shared_index in shared_masters
+                    ):
+                        shared_masters[shared_index] = None
+                        continue
+                    try:
+                        bounds = range_boundaries(reference)
+                        minimum_column, minimum_row, maximum_column, maximum_row = bounds
+                        origin_row, origin_column = coordinate_to_tuple(origin)
+                    except (TypeError, ValueError):
+                        shared_masters[shared_index] = None
+                        continue
+                    if not (
+                        minimum_row <= origin_row <= maximum_row
+                        and minimum_column <= origin_column <= maximum_column
+                    ):
+                        shared_masters[shared_index] = None
+                        continue
+                    master_text = formula.text or ""
+                    requires_translation = bool(_formula_restriction_events(
+                        master_text,
+                        scope="worksheet",
+                        location=f"{sheet_name}!{origin}",
+                    ))
+                    shared_masters[shared_index] = (
+                        origin,
+                        master_text,
+                        bounds,
+                        requires_translation,
+                    )
+
+                for cell in cells:
                     formula = cell.find("{*}f")
                     if formula is None:
                         continue
@@ -349,17 +679,100 @@ def inspect_workbook(path: str | Path) -> dict:
                         else:
                             cache_populated += 1
                     text = formula.text or ""
+                    if (
+                        formula.attrib.get("t") == "shared"
+                        and not text.strip()
+                    ):
+                        shared_index = formula.attrib.get("si", "")
+                        master = shared_masters.get(shared_index)
+                        try:
+                            if master is None:
+                                raise ValueError("shared formula master is unavailable")
+                            (
+                                origin,
+                                master_text,
+                                bounds,
+                                requires_translation,
+                            ) = master
+                            (
+                                minimum_column,
+                                minimum_row,
+                                maximum_column,
+                                maximum_row,
+                            ) = bounds
+                            follower_row, follower_column = coordinate_to_tuple(
+                                cell.attrib.get("r", "")
+                            )
+                            if not (
+                                minimum_row <= follower_row <= maximum_row
+                                and minimum_column <= follower_column <= maximum_column
+                            ):
+                                raise ValueError(
+                                    "shared formula follower is outside master range"
+                                )
+                            if requires_translation:
+                                translated = Translator(
+                                    "=" + master_text.lstrip("="),
+                                    origin=origin,
+                                ).translate_formula(cell.attrib.get("r", ""))
+                                if (
+                                    not translated.startswith("=")
+                                    or len(translated) == 1
+                                ):
+                                    raise ValueError(
+                                        "shared formula translation is empty"
+                                    )
+                                text = translated[1:]
+                            else:
+                                # Translation changes references, not token kinds.
+                                # A master with no restricted token cannot acquire
+                                # one in a shared follower.
+                                text = ""
+                        except (KeyError, TypeError, ValueError, TranslatorError):
+                            shared_formula_followers_unexpanded += 1
+                            restriction_events.append({
+                                "allowed": False,
+                                "event": "shared_formula_follower_unexpanded",
+                                "location": coordinate,
+                                "reason": "shared_formula_follower_unexpanded",
+                                "scope": "worksheet",
+                                "shared_index": shared_index,
+                                "token_offset": 0,
+                            })
+                        else:
+                            if requires_translation:
+                                shared_formula_followers_expanded += 1
+                            else:
+                                shared_formula_followers_inherited_unrestricted += 1
                     if formula.attrib.get("t") == "dataTable":
                         data_tables += 1
+                        restriction_events.append({
+                            "allowed": False,
+                            "event": "data_table_formula",
+                            "location": coordinate,
+                            "reason": "data_table",
+                            "scope": "worksheet",
+                            "token_offset": 0,
+                        })
+                    formula_events = _formula_restriction_events(
+                        text,
+                        scope="worksheet",
+                        location=coordinate,
+                    )
+                    restriction_events.extend(formula_events)
                     functions = sorted({
-                        match.group(1).upper()
-                        for match in _VOLATILE_RE.finditer(text)
+                        event["function"]
+                        for event in formula_events
+                        if event["event"] == "volatile_function"
                     })
                     for function in functions:
                         volatile[function] += 1
                     if functions:
                         volatile_cells.append(coordinate)
-                    if _EXTERNAL_FORMULA_RE.search(text):
+                    if any(
+                        event["event"] == "external_workbook_reference"
+                        for event in formula_events
+                    ):
                         external_formula_cells.append(coordinate)
 
             workbook_root = _parse_xml(archive, "xl/workbook.xml")
@@ -372,15 +785,25 @@ def inspect_workbook(path: str | Path) -> dict:
                 coordinate = "DEFINED_NAME:" + defined_name.attrib.get(
                     "name", "<unnamed>"
                 )
+                formula_events = _formula_restriction_events(
+                    text,
+                    scope="defined_name",
+                    location=coordinate,
+                )
+                restriction_events.extend(formula_events)
                 functions = sorted({
-                    match.group(1).upper()
-                    for match in _VOLATILE_RE.finditer(text)
+                    event["function"]
+                    for event in formula_events
+                    if event["event"] == "volatile_function"
                 })
                 for function in functions:
                     volatile[function] += 1
                 if functions:
                     volatile_cells.append(coordinate)
-                if _EXTERNAL_FORMULA_RE.search(text):
+                if any(
+                    event["event"] == "external_workbook_reference"
+                    for event in formula_events
+                ):
                     external_formula_cells.append(coordinate)
 
             external_link_parts = sorted(
@@ -393,27 +816,101 @@ def inspect_workbook(path: str | Path) -> dict:
                 name for name in names if name.endswith(".rels")
             ):
                 relation_root = _parse_xml(archive, relationship_part)
-                relationship_types.extend(
-                    relation.attrib.get("Type", "")
-                    for relation in relation_root.findall(
-                        f"{{{_REL_NS}}}Relationship"
-                    )
-                )
+                for relation in relation_root.findall(
+                    f"{{{_REL_NS}}}Relationship"
+                ):
+                    relation_type = relation.attrib.get("Type", "")
+                    relationship_types.append(relation_type)
+                    if relation_type.endswith(
+                        ("/externalLink", "/externalLinkPath")
+                    ):
+                        restriction_events.append({
+                            "allowed": False,
+                            "event": "package_external_link_relationship",
+                            "location": relationship_part,
+                            "reason": "package_external_link",
+                            "relationship_id": relation.attrib.get("Id", ""),
+                            "scope": "package",
+                            "target": relation.attrib.get("Target", ""),
+                            "target_mode": relation.attrib.get("TargetMode", ""),
+                            "type": relation_type,
+                        })
+                    if relation_type.endswith("/oleObject"):
+                        restriction_events.append({
+                            "allowed": False,
+                            "event": "package_ole_relationship",
+                            "location": relationship_part,
+                            "reason": "ole_object",
+                            "relationship_id": relation.attrib.get("Id", ""),
+                            "scope": "package",
+                            "target": relation.attrib.get("Target", ""),
+                            "target_mode": relation.attrib.get("TargetMode", ""),
+                            "type": relation_type,
+                        })
+                    if relation_type.endswith("/vbaProject"):
+                        restriction_events.append({
+                            "allowed": False,
+                            "event": "package_macro_relationship",
+                            "location": relationship_part,
+                            "reason": "macro",
+                            "relationship_id": relation.attrib.get("Id", ""),
+                            "scope": "package",
+                            "target": relation.attrib.get("Target", ""),
+                            "target_mode": relation.attrib.get("TargetMode", ""),
+                            "type": relation_type,
+                        })
+                    if relation_type.endswith("/connections"):
+                        restriction_events.append({
+                            "allowed": False,
+                            "event": "package_connection_relationship",
+                            "location": relationship_part,
+                            "reason": "connection",
+                            "relationship_id": relation.attrib.get("Id", ""),
+                            "scope": "package",
+                            "target": relation.attrib.get("Target", ""),
+                            "target_mode": relation.attrib.get("TargetMode", ""),
+                            "type": relation_type,
+                        })
             external_link_relations = sum(
-                relation_type.endswith("/externalLink")
+                relation_type.endswith(("/externalLink", "/externalLinkPath"))
                 for relation_type in relationship_types
             )
             ole_relations = sum(
                 relation_type.endswith("/oleObject")
                 for relation_type in relationship_types
             )
+            macro_relations = sum(
+                relation_type.endswith("/vbaProject")
+                for relation_type in relationship_types
+            )
+            connection_relations = sum(
+                relation_type.endswith("/connections")
+                for relation_type in relationship_types
+            )
             connection_count = 0
             if "xl/connections.xml" in names:
-                connection_count = len(
-                    _parse_xml(archive, "xl/connections.xml").findall(
-                        ".//{*}connection"
-                    )
-                )
+                connections = _parse_xml(
+                    archive, "xl/connections.xml"
+                ).findall(".//{*}connection")
+                connection_count = len(connections)
+                restriction_events.append({
+                    "allowed": False,
+                    "event": "package_connections_part",
+                    "location": "xl/connections.xml",
+                    "reason": "connection",
+                    "scope": "package",
+                })
+                for index, connection in enumerate(connections):
+                    restriction_events.append({
+                        "allowed": False,
+                        "event": "package_connection",
+                        "location": "xl/connections.xml",
+                        "reason": "connection",
+                        "scope": "package",
+                        "connection_id": connection.attrib.get("id", ""),
+                        "connection_index": index,
+                        "connection_name": connection.attrib.get("name", ""),
+                    })
             macro_parts = sorted(
                 name for name in names
                 if name.lower().endswith(("vbaproject.bin", "vbadata.xml"))
@@ -428,6 +925,38 @@ def inspect_workbook(path: str | Path) -> dict:
                 if name.startswith("xl/embeddings/")
                 or "/oleObject" in name
             )
+            for part in external_link_parts:
+                restriction_events.append({
+                    "allowed": False,
+                    "event": "package_external_link_part",
+                    "location": part,
+                    "reason": "package_external_link",
+                    "scope": "package",
+                })
+            for part in macro_parts:
+                restriction_events.append({
+                    "allowed": False,
+                    "event": "package_macro_part",
+                    "location": part,
+                    "reason": "macro",
+                    "scope": "package",
+                })
+            if macro_content_type:
+                restriction_events.append({
+                    "allowed": False,
+                    "event": "package_macro_content_type",
+                    "location": "[Content_Types].xml",
+                    "reason": "macro",
+                    "scope": "package",
+                })
+            for part in ole_parts:
+                restriction_events.append({
+                    "allowed": False,
+                    "event": "package_ole_part",
+                    "location": part,
+                    "reason": "ole_object",
+                    "scope": "package",
+                })
             calculation = _calculation_record(source)
     except (
         OSError,
@@ -444,6 +973,8 @@ def inspect_workbook(path: str | Path) -> dict:
             "calculation": {"available": False, "reason": str(exc)},
             "counts": {},
             "samples": {"errors": [f"{type(exc).__name__}: {exc}"]},
+            "restriction_events": [],
+            "restriction_events_sha256": _object_hash([]),
             "diagnostics": _diagnostics_record(
                 "insufficient_evidence", reasons, 0
             ),
@@ -465,25 +996,47 @@ def inspect_workbook(path: str | Path) -> dict:
         "external_link_relationships": external_link_relations,
         "external_formula_references": len(external_formula_cells),
         "connections": connection_count,
+        "connection_relationships": connection_relations,
         "macro_parts": len(macro_parts),
+        "macro_relationships": macro_relations,
         "ole_parts": len(ole_parts),
         "ole_relationships": ole_relations,
         "volatile_formula_cells": len(volatile_cells),
         "data_table_formulas": data_tables,
+        "shared_formula_followers_expanded": shared_formula_followers_expanded,
+        "shared_formula_followers_inherited_unrestricted": (
+            shared_formula_followers_inherited_unrestricted
+        ),
+        "shared_formula_followers_unexpanded": shared_formula_followers_unexpanded,
     }
+    restriction_events = _sorted_events(restriction_events)
+    disallowed_events = [
+        event for event in restriction_events if event.get("allowed") is not True
+    ]
+    allowed_events = [
+        event for event in restriction_events if event.get("allowed") is True
+    ]
     unsupported = []
-    if macro_parts or macro_content_type:
+    if macro_parts or macro_content_type or macro_relations:
         unsupported.append("macros_present")
     if ole_parts or ole_relations:
         unsupported.append("ole_objects_present")
     if external_link_parts or external_link_relations or external_formula_cells:
         unsupported.append("external_links_present")
-    if "xl/connections.xml" in names:
+    if "xl/connections.xml" in names or connection_relations:
         unsupported.append("connections_present")
     if data_tables:
         unsupported.append("data_tables_present")
-    if volatile_cells:
-        unsupported.append("volatile_formulas_present")
+    if any(
+        event["event"] == "structured_reference" for event in disallowed_events
+    ):
+        unsupported.append("structured_references_present")
+    if any(
+        event["event"] == "volatile_function" for event in disallowed_events
+    ):
+        unsupported.append("unsupported_volatile_formulas_present")
+    if shared_formula_followers_unexpanded:
+        unsupported.append("shared_formula_followers_unexpanded")
 
     incomplete = []
     unknown_calc = any(
@@ -512,15 +1065,22 @@ def inspect_workbook(path: str | Path) -> dict:
     if formula_count and calculation.get("force_full_calc") is True:
         recalc.append("forced_full_calculation_requested")
 
-    if unsupported:
+    mixed_restricted_recalc = bool(allowed_events and recalc)
+    if mixed_restricted_recalc:
+        unsupported.append("mixed_restricted_recalc")
+
+    if unsupported or disallowed_events:
         route = "unsupported"
-        reasons = unsupported
+        reasons = unsupported or ["restriction_event_not_allowlisted"]
     elif incomplete:
         route = "insufficient_evidence"
         reasons = incomplete
     elif recalc:
         route = "recalc_candidate"
         reasons = recalc
+    elif allowed_events:
+        route = "restricted_pass"
+        reasons = sorted({event["reason"] for event in allowed_events})
     else:
         route = "pass"
         reasons = []
@@ -533,6 +1093,8 @@ def inspect_workbook(path: str | Path) -> dict:
         "calculation": calculation,
         "counts": counts,
         "volatile_functions": dict(sorted(volatile.items())),
+        "restriction_events": restriction_events,
+        "restriction_events_sha256": _object_hash(restriction_events),
         "samples": {
             "volatile_formula_cells": sorted(volatile_cells)[:SAMPLE_LIMIT],
             "external_formula_cells": sorted(external_formula_cells)[:SAMPLE_LIMIT],
@@ -560,11 +1122,22 @@ def validate_report(report: dict, source_path: str | Path | None = None) -> dict
     if not isinstance(report, dict):
         raise SourceHealthError("source-health report must be an object")
     failures = []
-    if report.get("schema_version") != SCHEMA_VERSION:
+    schema_version = report.get("schema_version")
+    policy_version = report.get("policy_version")
+    legacy = (
+        schema_version == LEGACY_SCHEMA_VERSION
+        and policy_version == LEGACY_POLICY_VERSION
+    )
+    current = (
+        schema_version == SCHEMA_VERSION
+        and policy_version == POLICY_VERSION
+    )
+    if not (legacy or current):
         failures.append("schema_version")
-    if report.get("policy_version") != POLICY_VERSION:
+    if not (legacy or current):
         failures.append("policy_version")
-    if report.get("route") not in ROUTES:
+    allowed_routes = LEGACY_ROUTES if legacy else ROUTES
+    if report.get("route") not in allowed_routes:
         failures.append("route")
     if report.get("routing") != report.get("route"):
         failures.append("routing")
@@ -572,6 +1145,24 @@ def validate_report(report: dict, source_path: str | Path | None = None) -> dict
         failures.append("reason_codes")
     if report.get("report_sha256") != _report_id(report):
         failures.append("report_sha256")
+    if current:
+        events = report.get("restriction_events")
+        profile = report.get("restriction_profile")
+        if not isinstance(events, list):
+            failures.append("restriction_events")
+        elif report.get("restriction_events_sha256") != _object_hash(events):
+            failures.append("restriction_events_sha256")
+        if profile != RESTRICTION_PROFILE:
+            failures.append("restriction_profile")
+        if report.get("route") == "restricted_pass" and (
+            not events
+            or any(event.get("allowed") is not True for event in events)
+            or any(
+                event.get("reason") not in RESTRICTION_PROFILE["allowlist"]
+                for event in events
+            )
+        ):
+            failures.append("restricted_pass_events")
     source = report.get("source")
     if not isinstance(source, dict):
         failures.append("source")

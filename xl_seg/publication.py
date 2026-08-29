@@ -13,10 +13,11 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from . import diagnostics
+from . import diagnostics, restriction_cone
 
 
-MANIFEST_SCHEMA_VERSION = "segmentation-generation/v1"
+MANIFEST_SCHEMA_VERSION = "segmentation-generation/v2"
+LEGACY_MANIFEST_SCHEMA_VERSION = "segmentation-generation/v1"
 POINTER_SCHEMA_VERSION = "segmentation-current/v1"
 INPUTS_POINTER_SCHEMA_VERSION = "segmentation-inputs/v1"
 SUPPORTED_VERIFICATION_SCHEMAS = frozenset({diagnostics.SCHEMA_VERSION})
@@ -94,7 +95,13 @@ def inputs_sidecar_path(inputs_path) -> Path:
     return path.with_name(f"{path.stem}.segmentation.json")
 
 
-def write_inputs_sidecar(inputs_path, generation_dir, manifest: dict) -> Path:
+def write_inputs_sidecar(
+    inputs_path,
+    generation_dir,
+    manifest: dict,
+    *,
+    pipeline_bindings: dict | None = None,
+) -> Path:
     """Bind one generated inputs workbook to one immutable segmentation."""
     inputs_path = Path(inputs_path)
     generation_dir = Path(generation_dir)
@@ -111,6 +118,16 @@ def write_inputs_sidecar(inputs_path, generation_dir, manifest: dict) -> Path:
         "generation_manifest_sha256":
             _sha256(generation_dir / "generation-manifest.json"),
     }
+    if pipeline_bindings is not None:
+        if (
+            not isinstance(pipeline_bindings, dict)
+            or pipeline_bindings.get("segmentation_generation_id")
+            != generation_id
+        ):
+            raise GenerationValidationError(
+                "inputs pipeline bindings do not match segmentation generation"
+            )
+        sidecar["pipeline_bindings"] = pipeline_bindings
     path = inputs_sidecar_path(inputs_path)
     _atomic_write(path, _canonical_bytes(sidecar))
     return path
@@ -121,6 +138,7 @@ def validate_inputs_sidecar(
     *,
     expected_generation_id,
     generation_dir=None,
+    expected_pipeline_bindings=None,
 ) -> dict:
     """Reject stale, copied, or cross-generation input artifacts."""
     inputs_path = Path(inputs_path)
@@ -143,6 +161,11 @@ def validate_inputs_sidecar(
         manifest_path = Path(generation_dir) / "generation-manifest.json"
         if sidecar.get("generation_manifest_sha256") != _sha256(manifest_path):
             failures.append("generation_manifest_sha256")
+    if (
+        expected_pipeline_bindings is not None
+        and sidecar.get("pipeline_bindings") != expected_pipeline_bindings
+    ):
+        failures.append("pipeline_bindings")
     if failures:
         raise GenerationValidationError(
             "inputs segmentation sidecar validation failed: "
@@ -166,6 +189,7 @@ def verifier_paths() -> tuple[Path, ...]:
         package / "evaluate.py",
         package / "diagnostics.py",
         package / "proof.py",
+        package / "restriction_cone.py",
         Path(__file__).resolve(),
     )
 
@@ -188,6 +212,143 @@ def attach_generation_contract(verification: dict) -> None:
             "generation_id": generation_id,
             "path": "generation-manifest.json",
         }
+
+
+def _value_fingerprint(value: object, logical_path: str) -> dict:
+    content = _canonical_bytes(value)
+    return {
+        "path": logical_path,
+        "available": True,
+        "algorithm": "sha256",
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size_bytes": len(content),
+    }
+
+
+def bind_source_generation(
+    verification: dict,
+    source_manifest: dict,
+    *,
+    certificate: dict | None = None,
+) -> None:
+    """Add exact source-policy bindings before deriving segmentation identity."""
+    if source_manifest.get("schema_version") != "source-generation/v2":
+        raise GenerationValidationError(
+            "new segmentation source bindings require source-generation/v2"
+        )
+    fingerprints = verification.get("fingerprints")
+    if not isinstance(fingerprints, dict):
+        raise GenerationValidationError("verification has no evidence fingerprints")
+    identity = source_manifest.get("identity") or {}
+    policy = identity.get("policy_decision") or {}
+    bindings = source_manifest.get("bindings") or {}
+    source_binding = {
+        "generation_id": source_manifest.get("generation_id"),
+        "source_sha256": bindings.get("source_sha256"),
+        "health_report_sha256": bindings.get("health_report_sha256"),
+        "policy_version": identity.get("policy_version"),
+        "route": policy.get("route"),
+    }
+    if (
+        not GENERATION_ID_RE.fullmatch(str(source_binding["generation_id"]))
+        or not GENERATION_ID_RE.fullmatch(str(source_binding["source_sha256"]))
+        or not GENERATION_ID_RE.fullmatch(
+            str(source_binding["health_report_sha256"])
+        )
+        or source_binding["route"] not in {
+            "pass", "recalc_candidate", "restricted_pass"
+        }
+        or not isinstance(source_binding["policy_version"], str)
+    ):
+        raise GenerationValidationError("source generation bindings are incomplete")
+    fingerprints["source_generation"] = _value_fingerprint(
+        source_binding, "source-generation"
+    )
+    verification["source_generation"] = source_binding
+    source_policy_bindings = {"source_generation": source_binding}
+    restricted = policy.get("route") == "restricted_pass"
+    if restricted:
+        if not isinstance(certificate, dict):
+            raise GenerationValidationError(
+                "restricted segmentation requires a cone certificate"
+            )
+        required_hashes = (
+            bindings.get("restriction_evidence_sha256"),
+            bindings.get("restriction_events_sha256"),
+            bindings.get("restriction_profile_sha256"),
+            certificate.get("certificate_sha256"),
+        )
+        if (
+            any(
+                not isinstance(value, str)
+                or not GENERATION_ID_RE.fullmatch(value)
+                for value in required_hashes
+            )
+            or not isinstance(policy.get("restriction_profile"), dict)
+        ):
+            raise GenerationValidationError(
+                "restricted source policy bindings are incomplete"
+            )
+        restriction_binding = {
+            "restriction_evidence_sha256": bindings.get(
+                "restriction_evidence_sha256"
+            ),
+            "restriction_events_sha256": bindings.get(
+                "restriction_events_sha256"
+            ),
+        }
+        profile_binding = {
+            "restriction_profile": policy.get("restriction_profile"),
+            "restriction_profile_sha256": bindings.get(
+                "restriction_profile_sha256"
+            ),
+        }
+        fingerprints["source_restriction_evidence"] = _value_fingerprint(
+            restriction_binding, "source-restriction-evidence"
+        )
+        fingerprints["source_restriction_profile"] = _value_fingerprint(
+            profile_binding, "source-restriction-profile"
+        )
+        fingerprints["restriction_cone_certificate"] = _value_fingerprint(
+            certificate, "restriction-cone-certificate.json"
+        )
+        verification["restriction_cone"] = {
+            "schema_version": restriction_cone.SCHEMA_VERSION,
+            "certificate_sha256": certificate.get("certificate_sha256"),
+            "artifact_sha256": fingerprints[
+                "restriction_cone_certificate"
+            ]["sha256"],
+        }
+        source_policy_bindings.update({
+            "restriction_evidence_sha256": bindings.get(
+                "restriction_evidence_sha256"
+            ),
+            "restriction_events_sha256": bindings.get(
+                "restriction_events_sha256"
+            ),
+            "restriction_profile_sha256": bindings.get(
+                "restriction_profile_sha256"
+            ),
+            "restriction_profile": policy.get("restriction_profile"),
+            "cone_certificate_sha256": certificate.get("certificate_sha256"),
+            "cone_certificate_artifact_sha256": fingerprints[
+                "restriction_cone_certificate"
+            ]["sha256"],
+        })
+    elif certificate is not None:
+        raise GenerationValidationError(
+            "ordinary segmentation cannot carry a restriction certificate"
+        )
+    verification["source_policy_bindings"] = source_policy_bindings
+    verification["generation_id"] = diagnostics.generation_id(fingerprints)
+
+
+def _manifest_bindings(fingerprints: dict) -> dict:
+    return {
+        key: fingerprints[key]
+        for key in sorted(restriction_cone.SEGMENTATION_BINDING_KEYS)
+        if key in fingerprints
+    }
 
 
 def _artifact_records(stage_dir: Path) -> dict:
@@ -241,6 +402,19 @@ def build_manifest(
         raise GenerationValidationError(
             f"generation stage is missing required artifacts: {missing}"
         )
+    bindings = _manifest_bindings(fingerprints)
+    restricted = "source_restriction_evidence" in bindings
+    if restricted and "restriction-cone-certificate.json" not in artifacts:
+        raise GenerationValidationError(
+            "restricted generation stage is missing its cone certificate"
+        )
+    if restricted and (
+        artifacts["restriction-cone-certificate.json"].get("sha256")
+        != bindings.get("restriction_cone_certificate", {}).get("sha256")
+    ):
+        raise GenerationValidationError(
+            "staged cone certificate disagrees with verification fingerprints"
+        )
     curation_record = artifacts.get("curation.toml")
     evidence_curation = fingerprints.get("curation")
     if (
@@ -265,6 +439,17 @@ def build_manifest(
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "generation_id": generation_id,
+        "identity": {
+            "schema_version": "segmentation-generation-identity/v2",
+            "generation_id": generation_id,
+            "evidence_sha256": diagnostics.generation_id(fingerprints),
+            "bindings": bindings,
+            "source_policy_bindings": verification.get(
+                "source_policy_bindings"
+            ),
+        },
+        "bindings": bindings,
+        "source_policy_bindings": verification.get("source_policy_bindings"),
         "verification_schema_version": verification.get("schema_version"),
         "evidence": fingerprints,
         "curated_output_cells": {
@@ -330,6 +515,7 @@ def validate_generation_directory(
     expected_generation_id=None,
     expected_manifest_sha256=None,
     require_pass=False,
+    source_generation_dir=None,
 ) -> dict:
     """Validate every bound byte and the verification/manifest agreement."""
     generation_dir = Path(generation_dir)
@@ -343,9 +529,13 @@ def validate_generation_directory(
             f"generation directory is missing: {generation_dir}"
         )
     manifest = _read_json(manifest_path, "generation manifest")
-    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+    manifest_schema = manifest.get("schema_version")
+    if manifest_schema not in {
+        LEGACY_MANIFEST_SCHEMA_VERSION,
+        MANIFEST_SCHEMA_VERSION,
+    }:
         raise GenerationValidationError(
-            f"unsupported generation manifest schema: {manifest.get('schema_version')!r}"
+            f"unsupported generation manifest schema: {manifest_schema!r}"
         )
     generation_id = manifest.get("generation_id")
     if not isinstance(generation_id, str) or not GENERATION_ID_RE.fullmatch(
@@ -359,6 +549,81 @@ def validate_generation_directory(
         raise GenerationValidationError(
             "generation manifest ID disagrees with evidence fingerprints"
         )
+    if manifest_schema == MANIFEST_SCHEMA_VERSION:
+        bindings = _manifest_bindings(manifest.get("evidence") or {})
+        source_policy_bindings = manifest.get("source_policy_bindings")
+        expected_identity = {
+            "schema_version": "segmentation-generation-identity/v2",
+            "generation_id": generation_id,
+            "evidence_sha256": computed_generation_id,
+            "bindings": bindings,
+            "source_policy_bindings": source_policy_bindings,
+        }
+        if manifest.get("bindings") != bindings:
+            raise GenerationValidationError(
+                "generation manifest source bindings disagree with evidence"
+            )
+        if manifest.get("identity") != expected_identity:
+            raise GenerationValidationError(
+                "generation manifest v2 identity is invalid"
+            )
+        if source_policy_bindings is not None:
+            if not isinstance(source_policy_bindings, dict):
+                raise GenerationValidationError(
+                    "source policy bindings must be an object"
+                )
+            source_binding = source_policy_bindings.get("source_generation")
+            if (
+                not isinstance(source_binding, dict)
+                or bindings.get("source_generation")
+                != _value_fingerprint(source_binding, "source-generation")
+            ):
+                raise GenerationValidationError(
+                    "source generation binding fingerprint is invalid"
+                )
+            restricted_binding = "source_restriction_evidence" in bindings
+            route = source_binding.get("route")
+            if route not in {"pass", "recalc_candidate", "restricted_pass"}:
+                raise GenerationValidationError(
+                    "source generation binding has an unsupported route"
+                )
+            if (route == "restricted_pass") != restricted_binding:
+                raise GenerationValidationError(
+                    "restricted source and cone bindings are inconsistent"
+                )
+            if restricted_binding:
+                restriction_value = {
+                    "restriction_evidence_sha256": source_policy_bindings.get(
+                        "restriction_evidence_sha256"
+                    ),
+                    "restriction_events_sha256": source_policy_bindings.get(
+                        "restriction_events_sha256"
+                    ),
+                }
+                profile_value = {
+                    "restriction_profile": source_policy_bindings.get(
+                        "restriction_profile"
+                    ),
+                    "restriction_profile_sha256": source_policy_bindings.get(
+                        "restriction_profile_sha256"
+                    ),
+                }
+                if bindings.get("source_restriction_evidence") != (
+                    _value_fingerprint(
+                        restriction_value, "source-restriction-evidence"
+                    )
+                ):
+                    raise GenerationValidationError(
+                        "restriction evidence binding fingerprint is invalid"
+                    )
+                if bindings.get("source_restriction_profile") != (
+                    _value_fingerprint(
+                        profile_value, "source-restriction-profile"
+                    )
+                ):
+                    raise GenerationValidationError(
+                        "restriction profile binding fingerprint is invalid"
+                    )
     if expected_generation_id is not None and generation_id != expected_generation_id:
         raise GenerationValidationError("pointer and manifest generation_id disagree")
     if (
@@ -419,8 +684,13 @@ def validate_generation_directory(
             "verification and manifest generation_id disagree"
         )
     contract = verification.get("generation_manifest")
+    expected_contract_schema = (
+        MANIFEST_SCHEMA_VERSION
+        if manifest_schema == MANIFEST_SCHEMA_VERSION
+        else LEGACY_MANIFEST_SCHEMA_VERSION
+    )
     if not isinstance(contract, dict) or (
-        contract.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        contract.get("schema_version") != expected_contract_schema
         or contract.get("generation_id") != generation_id
         or contract.get("path") != "generation-manifest.json"
     ):
@@ -430,6 +700,56 @@ def validate_generation_directory(
     if verification.get("fingerprints") != manifest.get("evidence"):
         raise GenerationValidationError(
             "verification and generation evidence fingerprints disagree"
+        )
+    if (
+        manifest_schema == MANIFEST_SCHEMA_VERSION
+        and verification.get("source_policy_bindings")
+        != manifest.get("source_policy_bindings")
+    ):
+        raise GenerationValidationError(
+            "verification and manifest source policy bindings disagree"
+        )
+    restricted = (
+        manifest_schema == MANIFEST_SCHEMA_VERSION
+        and "source_restriction_evidence" in manifest.get("bindings", {})
+    )
+    certificate_path = generation_dir / "restriction-cone-certificate.json"
+    if restricted and "restriction-cone-certificate.json" not in actual_files:
+        raise GenerationValidationError(
+            "restricted segmentation has no cone certificate artifact"
+        )
+    if restricted:
+        certificate = _read_json(
+            certificate_path, "restriction cone certificate"
+        )
+        source_policy = manifest.get("source_policy_bindings") or {}
+        certificate_source = certificate.get("source_generation") or {}
+        if (
+            source_policy.get("cone_certificate_sha256")
+            != certificate.get("certificate_sha256")
+            or source_policy.get("cone_certificate_artifact_sha256")
+            != manifest["artifacts"]["restriction-cone-certificate.json"].get(
+                "sha256"
+            )
+            or source_policy.get("source_generation", {}).get("generation_id")
+            != certificate_source.get("generation_id")
+            or source_policy.get("restriction_evidence_sha256")
+            != certificate_source.get("restriction_evidence_sha256")
+            or source_policy.get("restriction_events_sha256")
+            != certificate_source.get("restriction_events_sha256")
+            or source_policy.get("restriction_profile_sha256")
+            != certificate_source.get("restriction_profile_sha256")
+        ):
+            raise GenerationValidationError(
+                "cone certificate hashes disagree with generation bindings"
+            )
+    if (
+        manifest_schema == MANIFEST_SCHEMA_VERSION
+        and not restricted
+        and "restriction-cone-certificate.json" in actual_files
+    ):
+        raise GenerationValidationError(
+            "ordinary segmentation unexpectedly carries a cone certificate"
         )
 
     ordered_record = manifest.get("curated_output_cells")
@@ -491,6 +811,21 @@ def validate_generation_directory(
                 "strict production verification gate failed: "
                 + ", ".join(failures)
             )
+        if restricted:
+            if source_generation_dir is None:
+                raise GenerationValidationError(
+                    "restricted pass validation requires its source generation"
+                )
+            try:
+                restriction_cone.validate_certificate(
+                    certificate_path,
+                    source_generation_dir=source_generation_dir,
+                    segmentation_artifact=generation_dir / "segments.json",
+                )
+            except restriction_cone.RestrictionConeError as exc:
+                raise GenerationValidationError(
+                    f"restriction cone validation failed: {exc}"
+                ) from exc
     return manifest
 
 
@@ -520,7 +855,9 @@ def _verify_live_evidence(
         raise GenerationValidationError(
             f"current evidence is missing: {missing}"
         )
-    expected = manifest.get("evidence")
+    expected = restriction_cone.base_segmentation_fingerprints(
+        manifest.get("evidence") or {}
+    )
     if current != expected:
         differing = sorted(
             name
@@ -540,6 +877,7 @@ def resolve_current_generation(
     require_pass=False,
     validate_live_evidence=False,
     expected_generation_id=None,
+    source_generation_dir=None,
 ) -> tuple[Path, dict]:
     """Resolve one immutable generation, then validate it before returning."""
     seg_dir = Path(seg_dir)
@@ -575,6 +913,49 @@ def resolve_current_generation(
         expected_generation_id=generation_id,
         expected_manifest_sha256=pointer.get("manifest_sha256"),
         require_pass=require_pass,
+        source_generation_dir=source_generation_dir,
+    )
+    if validate_live_evidence:
+        if source_path is None or ast_dir is None:
+            raise GenerationValidationError(
+                "strict live-evidence validation requires source_path and ast_dir"
+            )
+        _verify_live_evidence(
+            manifest,
+            source_path=Path(source_path),
+            ast_dir=Path(ast_dir),
+            curation_path=seg_dir / "curation.toml",
+        )
+    return generation_dir, manifest
+
+
+def resolve_generation_by_id(
+    seg_dir,
+    generation_id,
+    *,
+    source_path=None,
+    ast_dir=None,
+    source_generation_dir=None,
+    require_pass=False,
+    validate_live_evidence=False,
+) -> tuple[Path, dict]:
+    """Resolve an inactive immutable candidate without consulting current.json."""
+    if not isinstance(generation_id, str) or not GENERATION_ID_RE.fullmatch(
+        generation_id
+    ):
+        raise GenerationValidationError("segmentation generation_id is invalid")
+    seg_dir = Path(seg_dir)
+    generations = seg_dir / "generations"
+    if generations.is_symlink():
+        raise GenerationValidationError("generations directory must not be a symlink")
+    generation_dir = generations / generation_id
+    if generation_dir.resolve().parent != generations.resolve():
+        raise GenerationValidationError("generation path escapes generations directory")
+    manifest = validate_generation_directory(
+        generation_dir,
+        expected_generation_id=generation_id,
+        require_pass=require_pass,
+        source_generation_dir=source_generation_dir,
     )
     if validate_live_evidence:
         if source_path is None or ast_dir is None:
@@ -676,6 +1057,7 @@ def publish_generation(
     fault=None,
     source_path=None,
     ast_dir=None,
+    source_generation_dir=None,
 ) -> tuple[Path, dict]:
     """Publish a complete immutable directory, then switch one small pointer."""
     stage_dir = Path(stage_dir)
@@ -713,11 +1095,17 @@ def publish_generation(
         fault("generation_published")
 
     try:
-        validate_generation_directory(destination, require_pass=True)
+        validate_generation_directory(
+            destination,
+            require_pass=True,
+            source_generation_dir=source_generation_dir,
+        )
         passing = True
     except GenerationValidationError:
         passing = False
     if not passing:
+        return destination, manifest
+    if "source_restriction_evidence" in manifest.get("bindings", {}):
         return destination, manifest
     if source_path is None or ast_dir is None:
         raise GenerationValidationError(
@@ -747,14 +1135,25 @@ def publish_generation(
 
 def _main_validate(args) -> int:
     try:
-        generation, manifest = resolve_current_generation(
-            args.seg_dir,
-            source_path=args.source,
-            ast_dir=args.ast_dir,
-            require_pass=args.require_pass,
-            validate_live_evidence=args.validate_live_evidence,
-            expected_generation_id=args.expected_generation_id,
-        )
+        if getattr(args, "generation_id", None):
+            generation, manifest = resolve_generation_by_id(
+                args.seg_dir,
+                args.generation_id,
+                source_path=args.source,
+                ast_dir=args.ast_dir,
+                source_generation_dir=args.source_generation_dir,
+                require_pass=args.require_pass,
+                validate_live_evidence=args.validate_live_evidence,
+            )
+        else:
+            generation, manifest = resolve_current_generation(
+                args.seg_dir,
+                source_path=args.source,
+                ast_dir=args.ast_dir,
+                require_pass=args.require_pass,
+                validate_live_evidence=args.validate_live_evidence,
+                expected_generation_id=args.expected_generation_id,
+            )
     except GenerationValidationError as exc:
         print(f"segmentation generation FAIL: {exc}")
         return 1
@@ -783,6 +1182,15 @@ def main(argv=None) -> int:
     validate.add_argument("--require-pass", action="store_true")
     validate.add_argument("--validate-live-evidence", action="store_true")
     validate.add_argument("--expected-generation-id")
+    validate_id = subparsers.add_parser("validate-id")
+    validate_id.add_argument("seg_dir")
+    validate_id.add_argument("generation_id")
+    validate_id.add_argument("--source")
+    validate_id.add_argument("--ast-dir")
+    validate_id.add_argument("--source-generation-dir")
+    validate_id.add_argument("--require-pass", action="store_true")
+    validate_id.add_argument("--validate-live-evidence", action="store_true")
+    validate_id.set_defaults(expected_generation_id=None)
     args = parser.parse_args(argv)
     if args.validate_live_evidence and (not args.source or not args.ast_dir):
         parser.error("--validate-live-evidence requires --source and --ast-dir")

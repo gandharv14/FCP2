@@ -27,17 +27,27 @@ from xml.etree import ElementTree
 
 from xl_source_health import (
     POLICY_VERSION,
+    RESTRICTION_PROFILE,
     _open_regular_nofollow,
     atomic_write_report,
     inspect_workbook,
     sha256_file,
+    validate_report,
     validate_ooxml_package,
 )
 
 
-REQUEST_SCHEMA_VERSION = "source-recalc-request/v1"
-RESULT_SCHEMA_VERSION = "source-recalc-result/v1"
+REQUEST_SCHEMA_VERSION = "source-recalc-request/v2"
+RESULT_SCHEMA_VERSION = "source-recalc-result/v2"
 SNAPSHOT_SCHEMA_VERSION = "xlsx-semantic-snapshot/v1"
+RESTRICTION_REQUEST_SCHEMA_VERSION = "source-restriction-request/v2"
+RESTRICTION_RESULT_SCHEMA_VERSION = "source-restriction-result/v2"
+RESTRICTED_SOURCE_COHORT_MANIFEST = (
+    Path(__file__).resolve().parent
+    / "verification_manifests"
+    / "restricted_source_cohort_123.v2.json"
+)
+RESTRICTED_SOURCE_COHORT_SIZE = 123
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 OFFICE_REL_NS = (
@@ -1174,10 +1184,153 @@ def _read_json(path: str | Path) -> dict:
     return value
 
 
+def _validated_restricted_inventory_selection(
+    inventory: dict,
+    *,
+    source_sha256: str,
+    workbook_id: str,
+    expected_cohort_sha256: str | None = None,
+) -> tuple[dict, str, str]:
+    from xl_source_inventory import validate_inventory_manifest
+
+    validate_inventory_manifest(inventory)
+    frozen_inventory = _read_json(RESTRICTED_SOURCE_COHORT_MANIFEST)
+    validate_inventory_manifest(frozen_inventory)
+    frozen_cohort = frozen_inventory.get("cohort")
+    supplied_cohort = inventory.get("cohort")
+    if (
+        not isinstance(frozen_cohort, dict)
+        or frozen_cohort.get("size") != RESTRICTED_SOURCE_COHORT_SIZE
+        or not isinstance(frozen_cohort.get("workbook_ids"), list)
+        or len(frozen_cohort["workbook_ids"]) != RESTRICTED_SOURCE_COHORT_SIZE
+    ):
+        raise RecalculationError("frozen restricted cohort contract is invalid")
+    cohort_hash = frozen_cohort.get("cohort_sha256")
+    if (
+        not isinstance(cohort_hash, str)
+        or expected_cohort_sha256 is not None
+        and expected_cohort_sha256 != cohort_hash
+    ):
+        raise RecalculationError("expected restricted cohort hash does not match")
+    if (
+        inventory != frozen_inventory
+        or supplied_cohort != frozen_cohort
+        or inventory.get("inventory_sha256")
+        != frozen_inventory.get("inventory_sha256")
+    ):
+        raise RecalculationError(
+            "restricted evidence requires the exact frozen 123-workbook inventory"
+        )
+    selected = [
+        item
+        for item in inventory.get("workbooks", [])
+        if isinstance(item, dict) and item.get("workbook_id") == workbook_id
+    ]
+    if len(selected) != 1 or selected[0].get("sha256") != source_sha256:
+        raise RecalculationError(
+            "source workbook ID/hash does not match the frozen inventory"
+        )
+    classification = selected[0].get("classification")
+    if classification not in {"native_source", "conversion_equivalent"}:
+        raise RecalculationError(
+            "restricted evidence rejects conversion_unverified source"
+        )
+    return selected[0], cohort_hash, frozen_inventory["inventory_sha256"]
+
+
+def create_restriction_documents(
+    source_path: str | Path,
+    health: dict,
+    inventory: dict,
+    *,
+    workbook_id: str | None = None,
+    expected_cohort_sha256: str | None = None,
+) -> tuple[dict, dict]:
+    """Create deterministic evidence for one v2 restricted-policy decision."""
+    source = Path(source_path)
+    try:
+        validate_report(health, source)
+    except ValueError as exc:
+        raise RecalculationError(f"restricted evidence input is invalid: {exc}") from exc
+    source_hash = sha256_file(source)
+    if health.get("route") != "restricted_pass":
+        raise RecalculationError("restricted evidence requires restricted_pass health")
+    if health.get("policy_version") != POLICY_VERSION:
+        raise RecalculationError("restricted evidence requires the current policy")
+    selected_workbook_id = workbook_id or source.stem
+    try:
+        selected, cohort_hash, inventory_hash = (
+            _validated_restricted_inventory_selection(
+                inventory,
+                source_sha256=source_hash,
+                workbook_id=selected_workbook_id,
+                expected_cohort_sha256=expected_cohort_sha256,
+            )
+        )
+    except ValueError as exc:
+        raise RecalculationError(
+            f"restricted evidence input is invalid: {exc}"
+        ) from exc
+    classification = selected["classification"]
+    events = health.get("restriction_events")
+    if (
+        not isinstance(events, list)
+        or not events
+        or any(event.get("allowed") is not True for event in events)
+        or any(
+            event.get("reason") not in RESTRICTION_PROFILE["allowlist"]
+            for event in events
+        )
+    ):
+        raise RecalculationError("restricted health contains non-allowlisted events")
+    restriction = {
+        "classification": classification,
+        "cohort_sha256": cohort_hash,
+        "cohort_size": RESTRICTED_SOURCE_COHORT_SIZE,
+        "health_report_sha256": health["report_sha256"],
+        "inventory_sha256": inventory_hash,
+        "policy_version": POLICY_VERSION,
+        "profile": RESTRICTION_PROFILE,
+        "reason_codes": health["reason_codes"],
+        "restriction_events": events,
+        "restriction_events_sha256": health["restriction_events_sha256"],
+        "source_sha256": source_hash,
+        "workbook_id": selected_workbook_id,
+    }
+    request = {
+        "schema_version": RESTRICTION_REQUEST_SCHEMA_VERSION,
+        "request_id": (
+            f"restricted-{source_hash[:16]}-{cohort_hash[:16]}-"
+            f"{inventory_hash[:16]}"
+        ),
+        "policy_version": POLICY_VERSION,
+        "source_sha256": source_hash,
+        "cohort_sha256": cohort_hash,
+        "inventory_sha256": inventory_hash,
+        "mode": "restricted_policy",
+        "restriction": restriction,
+    }
+    request["request_sha256"] = _unsigned_hash(request, "request_sha256")
+    result = {
+        "schema_version": RESTRICTION_RESULT_SCHEMA_VERSION,
+        "request_id": request["request_id"],
+        "request_sha256": request["request_sha256"],
+        "policy_version": POLICY_VERSION,
+        "source_sha256": source_hash,
+        "output_sha256": source_hash,
+        "cohort_sha256": cohort_hash,
+        "inventory_sha256": inventory_hash,
+        "mode": "restricted",
+        "restriction": restriction,
+    }
+    result["result_sha256"] = _unsigned_hash(result, "result_sha256")
+    return request, result
+
+
 def _identity_documents(source: Path) -> tuple[dict, dict]:
     source_hash = sha256_file(source)
     request = {
-        "schema_version": "source-identity-request/v1",
+        "schema_version": "source-identity-request/v2",
         "request_id": f"identity-{source_hash[:24]}",
         "policy_version": POLICY_VERSION,
         "source_sha256": source_hash,
@@ -1185,7 +1338,7 @@ def _identity_documents(source: Path) -> tuple[dict, dict]:
     }
     request["request_sha256"] = _unsigned_hash(request, "request_sha256")
     result = {
-        "schema_version": "source-identity-result/v1",
+        "schema_version": "source-identity-result/v2",
         "request_id": request["request_id"],
         "request_sha256": request["request_sha256"],
         "source_sha256": source_hash,
@@ -1209,6 +1362,7 @@ def prepare_source_generation(
     result: dict | None = None,
     trusted_runner_public_key: str | Path | None = None,
     original_source_path: str | Path | None = None,
+    inventory: dict | str | Path | None = None,
 ) -> tuple[Path, dict]:
     """Build a fresh production AST and publish an inactive immutable generation."""
     source = Path(source_path)
@@ -1219,18 +1373,68 @@ def prepare_source_generation(
     health_value = health or inspect_workbook(source)
     if health_value.get("source_sha256") != sha256_file(source):
         raise RecalculationError("source-health report is not bound to prepared source")
-    if health_value.get("route") not in {"pass", "recalc_candidate"}:
+    try:
+        validate_report(health_value, source)
+    except ValueError as exc:
+        raise RecalculationError(f"source-health report is invalid: {exc}") from exc
+    if (
+        health_value.get("schema_version") != "xlsx-source-health/v2"
+        or health_value.get("policy_version") != POLICY_VERSION
+    ):
+        raise RecalculationError(
+            "new source generations require current v2 source health"
+        )
+    if health_value.get("route") not in {
+        "pass",
+        "restricted_pass",
+        "recalc_candidate",
+    }:
         raise RecalculationError("source health does not permit AST generation")
+    inventory_value = _read_json(inventory) if isinstance(
+        inventory, (str, Path)
+    ) else inventory
     if (request is None) != (result is None):
         raise RecalculationError("request and result must be supplied together")
-    if request is None and health_value.get("route") != "pass":
+    if request is None and health_value.get("route") == "recalc_candidate":
         raise RecalculationError(
             "recalculation candidate cannot use identity evidence"
         )
-    if request is None:
+    if request is None and health_value.get("route") == "pass":
         identity_request, identity_result = _identity_documents(source)
         request = identity_request
         result = identity_result
+    elif request is None and health_value.get("route") == "restricted_pass":
+        if inventory_value is None:
+            raise RecalculationError(
+                "restricted pass requires a bound source inventory"
+            )
+        request, result = create_restriction_documents(
+            source,
+            health_value,
+            inventory_value,
+            workbook_id=workbook_id,
+        )
+    route_schemas = {
+        "pass": {
+            ("source-identity-request/v2", "source-identity-result/v2"),
+            (REQUEST_SCHEMA_VERSION, RESULT_SCHEMA_VERSION),
+        },
+        "restricted_pass": {
+            (
+                RESTRICTION_REQUEST_SCHEMA_VERSION,
+                RESTRICTION_RESULT_SCHEMA_VERSION,
+            )
+        },
+        "recalc_candidate": {(REQUEST_SCHEMA_VERSION, RESULT_SCHEMA_VERSION)},
+    }
+    evidence_schemas = (
+        request.get("schema_version"),
+        result.get("schema_version"),
+    )
+    if evidence_schemas not in route_schemas[health_value["route"]]:
+        raise RecalculationError(
+            "source-health route does not match evidence schemas"
+        )
     if result.get("output_sha256") != sha256_file(source):
         raise RecalculationError("recalculation result is not bound to prepared source")
 
@@ -1278,6 +1482,7 @@ def prepare_source_generation(
             activate=False,
             trusted_runner_public_key=trusted_runner_public_key,
             original_source_path=original_source_path,
+            inventory=inventory_value,
         )
         return destination, manifest
     finally:
@@ -1315,6 +1520,7 @@ def main(argv: list[str] | None = None) -> int:
     prepare_command.add_argument("--result")
     prepare_command.add_argument("--trusted-runner-public-key")
     prepare_command.add_argument("--original-source")
+    prepare_command.add_argument("--inventory")
     observe_command = commands.add_parser("diff")
     observe_command.add_argument("before")
     observe_command.add_argument("after")
@@ -1368,6 +1574,7 @@ def main(argv: list[str] | None = None) -> int:
                 result=_read_json(args.result) if args.result else None,
                 trusted_runner_public_key=args.trusted_runner_public_key,
                 original_source_path=args.original_source,
+                inventory=args.inventory,
             )
             print(json.dumps({
                 "generation_dir": str(destination),

@@ -8,7 +8,7 @@ import pytest
 import replay_segmentation_verification as replay
 import xl_output_task
 from replay_segmentation_verification import check_rollout_performance
-from xl_seg import diagnostics, publication
+from xl_seg import diagnostics, model, publication, restriction_cone
 
 
 CURATION = """\
@@ -20,6 +20,23 @@ score = 10
 include = true
 name = "Output"
 """
+
+
+def test_packaging_uses_same_pinned_audit_binding():
+    context = {
+        "bindings": {
+            "source_generation_id": "source-id",
+            "segmentation_generation_id": "segmentation-id",
+            "segmentation_manifest_sha256": "a" * 64,
+        }
+    }
+
+    assert xl_output_task.audit_segmentation_binding(context) == {
+        "generation_id": "segmentation-id",
+        "manifest_sha256": "a" * 64,
+        "source_generation_id": "source-id",
+    }
+    assert xl_output_task.audit_segmentation_binding(None) is None
 
 
 def _case(tmp_path: Path, name="case", *, status="pass"):
@@ -62,7 +79,13 @@ def _case(tmp_path: Path, name="case", *, status="pass"):
     return source, ast, seg, verification
 
 
-def _stage(tmp_path: Path, name: str, verification: dict) -> Path:
+def _stage(
+    tmp_path: Path,
+    name: str,
+    verification: dict,
+    *,
+    proof: dict | None = None,
+) -> Path:
     stage = publication.make_staging_directory(tmp_path / "seg", name)
     (stage / "bands.csv").write_text(
         "band,bucket\nout,output\n",
@@ -79,9 +102,103 @@ def _stage(tmp_path: Path, name: str, verification: dict) -> Path:
     (stage / "segments.json").write_text(json.dumps({
         "outputs": [{"band": "out", "cells": ["Sheet!B1"]}],
         "verification": verification,
-        "proof": {"closure": {"stabilized": True}},
+        "proof": proof or {"closure": {"stabilized": True}},
     }, indent=2), encoding="utf-8")
     return stage
+
+
+def _restricted_offset_graph():
+    def cell(ref, kind, value, formula=""):
+        sheet, row, col = model.split_ref(ref)
+        return model.Node(
+            id=ref,
+            kind=kind,
+            sheet=sheet,
+            coordinate=ref.rpartition("!")[2],
+            row=row,
+            col=col,
+            owner="",
+            op="",
+            op_kind="",
+            arity="",
+            expr="",
+            label=ref,
+            formula=formula,
+            value=str(value),
+            in_cycle=False,
+            parse_status="ok" if kind == "formula" else "not_applicable",
+        )
+
+    def ast(node_id, kind, *, op="", arity="", value="", expr=""):
+        return model.Node(
+            id=node_id,
+            kind=kind,
+            sheet="Sheet",
+            coordinate="",
+            row=None,
+            col=None,
+            owner="Sheet!B1",
+            op=op,
+            op_kind="func" if kind == "op" else "const",
+            arity=str(arity),
+            expr=expr,
+            label=op or value,
+            formula="",
+            value=str(value),
+            in_cycle=False,
+        )
+
+    base = cell("Sheet!A1", "input", 0)
+    output = cell(
+        "Sheet!B1", "formula", 7, "=OFFSET(A1,0,2)"
+    )
+    target = cell("Sheet!C1", "input", 7)
+    rows = ast("Sheet!B1#0:const", "const", value="0")
+    columns = ast("Sheet!B1#1:const", "const", value="2")
+    operation = ast(
+        "Sheet!B1#2:OFFSET",
+        "op",
+        op="OFFSET",
+        arity=3,
+        expr="OFFSET(A1,0,2)",
+    )
+    edges = [
+        model.Edge(
+            source=source,
+            target=operation.id,
+            role="address" if index == 0 else "arg",
+            arg_index=index,
+            op="OFFSET",
+            cell=output.id,
+            ref="",
+            via_range="",
+            cross_sheet=False,
+        )
+        for index, source in enumerate([base.id, rows.id, columns.id])
+    ]
+    edges.append(model.Edge(
+        source=operation.id,
+        target=output.id,
+        role="result",
+        arg_index=0,
+        op="OFFSET",
+        cell=output.id,
+        ref="",
+        via_range="",
+        cross_sheet=False,
+    ))
+    graph = model.Graph(
+        "case",
+        {
+            node.id: node
+            for node in [base, output, target, rows, columns, operation]
+        },
+        edges,
+    )
+    for edge in edges:
+        graph.in_edges.setdefault(edge.target, []).append(edge)
+        graph.out_edges.setdefault(edge.source, []).append(edge)
+    return graph, output, target, operation
 
 
 def test_atomic_publication_resolves_one_immutable_generation(tmp_path):
@@ -434,6 +551,152 @@ def test_existing_direct_legacy_artifacts_are_never_replaced(tmp_path):
             else path.read_bytes()
         )
         assert actual == content
+
+
+def test_restricted_generation_requires_certificate_and_stays_inactive(
+    tmp_path, monkeypatch
+):
+    _, _, seg, verification = _case(tmp_path)
+    profile = {
+        "schema_version": "source-restriction-profile/v2",
+        "allowlist": ["worksheet_offset"],
+        "immutable_cells": [],
+    }
+    events = [{
+        "allowed": True,
+        "event": "volatile_function",
+        "function": "OFFSET",
+        "location": "Sheet!B1",
+        "reason": "worksheet_offset",
+        "scope": "worksheet",
+        "token_offset": 0,
+    }]
+    source_dir = tmp_path / "source-generation"
+    source_dir.mkdir()
+    health = {
+        "route": "restricted_pass",
+        "policy_version": "source-recalc-policy/v2",
+        "report_sha256": "c" * 64,
+        "restriction_profile": profile,
+        "restriction_events": events,
+        "restriction_events_sha256": restriction_cone.object_hash(events),
+    }
+    result = {
+        "restriction": {
+            "profile": profile,
+            "restriction_events": events,
+        }
+    }
+    source_manifest = {
+        "schema_version": "source-generation/v2",
+        "generation_id": "a" * 64,
+        "layout": {
+            "workbook_id": "case",
+            "ast_directory": "ast/case",
+        },
+        "identity": {
+            "policy_version": "source-recalc-policy/v2",
+            "policy_decision": {
+                "route": "restricted_pass",
+                "restriction_profile": profile,
+            },
+        },
+        "bindings": {
+            "source_sha256": "b" * 64,
+            "health_sha256": "9" * 64,
+            "health_report_sha256": "c" * 64,
+            "restriction_evidence_sha256": "d" * 64,
+            "restriction_events_sha256": health[
+                "restriction_events_sha256"
+            ],
+            "restriction_profile_sha256": restriction_cone.object_hash(
+                profile
+            ),
+        },
+    }
+    (source_dir / "health.json").write_text(
+        json.dumps(health), encoding="utf-8"
+    )
+    (source_dir / "result.json").write_text(
+        json.dumps(result), encoding="utf-8"
+    )
+    (source_dir / "generation-manifest.json").write_text(
+        json.dumps(source_manifest), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "xl_source_publication.validate_source_generation",
+        lambda path: source_manifest,
+    )
+    graph, output, target, operation = _restricted_offset_graph()
+    monkeypatch.setattr(
+        restriction_cone.model, "load", lambda *args: graph
+    )
+    proof = {
+        "runtime_radj": {output.id: [target.id]},
+        "resolved_targets": {output.id: [target.id]},
+        "resolved_operation_targets": {operation.id: [target.id]},
+        "closure": {"stabilized": True, "targets_stable": True},
+    }
+    verification["ordered_output_cells"] = [output.id]
+    verification["provenance"]["runtime"]["closure"] = proof["closure"]
+    certificate = restriction_cone.build_certificate(
+        source_generation_dir=source_dir,
+        graph=graph,
+        proof=proof,
+        verification=verification,
+        ordered_outputs=[output.id],
+        segmentation_fingerprints=verification["fingerprints"],
+    )
+    publication.bind_source_generation(
+        verification,
+        source_manifest,
+        certificate=certificate,
+    )
+    publication.attach_generation_contract(verification)
+
+    missing_stage = _stage(tmp_path, "restricted-missing", verification)
+    with pytest.raises(
+        publication.GenerationValidationError,
+        match="missing its cone certificate",
+    ):
+        publication.publish_generation(
+            missing_stage,
+            seg,
+            verification,
+            ["Sheet!B1"],
+            source_generation_dir=source_dir,
+        )
+
+    stage = _stage(
+        tmp_path, "restricted", verification, proof=proof
+    )
+    (stage / "restriction-cone-certificate.json").write_bytes(
+        publication._canonical_bytes(certificate)
+    )
+    generation, manifest = publication.publish_generation(
+        stage,
+        seg,
+        verification,
+        ["Sheet!B1"],
+        source_generation_dir=source_dir,
+    )
+
+    assert generation.is_dir()
+    assert not (seg / "current.json").exists()
+    resolved, resolved_manifest = publication.resolve_generation_by_id(
+        seg,
+        manifest["generation_id"],
+        require_pass=True,
+        source_generation_dir=source_dir,
+    )
+    assert resolved == generation
+    assert resolved_manifest == manifest
+
+    (generation / "restriction-cone-certificate.json").write_text(
+        '{"tampered":true}\n', encoding="utf-8"
+    )
+    with pytest.raises(publication.GenerationValidationError, match="tampered"):
+        publication.resolve_generation_by_id(seg, manifest["generation_id"])
 
 
 def test_packaged_task_copies_inputs_generation_binding(tmp_path):

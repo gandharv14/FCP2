@@ -14,7 +14,8 @@ import time
 from pathlib import Path
 
 
-MANIFEST_SCHEMA_VERSION = "source-generation/v1"
+MANIFEST_SCHEMA_VERSION = "source-generation/v2"
+LEGACY_MANIFEST_SCHEMA_VERSION = "source-generation/v1"
 POINTER_SCHEMA_VERSION = "source-current/v1"
 PROVENANCE_SCHEMA_VERSION = "ast-provenance/v2"
 GENERATION_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -311,6 +312,7 @@ def _make_manifest(
     layout: dict,
     health: dict,
     result: dict,
+    inventory: dict | None,
 ) -> dict:
     artifacts = {}
     for path in sorted(stage.rglob("*")):
@@ -321,10 +323,29 @@ def _make_manifest(
         if path.is_file() and path.name != "generation-manifest.json":
             relative = path.relative_to(stage).as_posix()
             artifacts[relative] = _file_record(path, relative)
+    restricted = health.get("route") == "restricted_pass"
+    policy_decision = {
+        "health_report_sha256": health.get("report_sha256"),
+        "policy_version": health.get("policy_version"),
+        "route": health.get("route"),
+    }
+    if restricted:
+        policy_decision.update({
+            "inventory_sha256": inventory.get("inventory_sha256"),
+            "restriction_evidence_sha256": result.get("result_sha256"),
+            "restriction_events_sha256": health.get(
+                "restriction_events_sha256"
+            ),
+            "restriction_profile": health.get("restriction_profile"),
+            "restriction_profile_sha256": _binding_hash(
+                health.get("restriction_profile")
+            ),
+        })
     identity = {
-        "schema_version": "source-generation-identity/v1",
+        "schema_version": "source-generation-identity/v2",
         "source_sha256": artifacts[layout["source_workbook"]]["sha256"],
         "policy_version": health.get("policy_version"),
+        "policy_decision": policy_decision,
         "engine": {
             "name": result.get("engine"),
             "version": result.get("engine_version"),
@@ -338,24 +359,36 @@ def _make_manifest(
             "sha256"
         ],
     }
+    bindings = {
+        "request_sha256": artifacts["request.json"]["sha256"],
+        "result_sha256": artifacts["result.json"]["sha256"],
+        "health_sha256": artifacts["health.json"]["sha256"],
+        "health_report_sha256": health.get("report_sha256"),
+        "ast_provenance_sha256": artifacts["ast-provenance.json"]["sha256"],
+        "source_sha256": artifacts[layout["source_workbook"]]["sha256"],
+        "nodes_sha256": artifacts[
+            f'{layout["ast_directory"]}/nodes.csv'
+        ]["sha256"],
+        "edges_sha256": artifacts[
+            f'{layout["ast_directory"]}/edges.csv'
+        ]["sha256"],
+    }
+    if restricted:
+        bindings.update({
+            "inventory_artifact_sha256": artifacts["inventory.json"]["sha256"],
+            "inventory_sha256": inventory["inventory_sha256"],
+            "restriction_evidence_sha256": result["result_sha256"],
+            "restriction_events_sha256": health["restriction_events_sha256"],
+            "restriction_profile_sha256": _binding_hash(
+                health["restriction_profile"]
+            ),
+        })
     core = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "artifacts": artifacts,
         "layout": layout,
         "identity": identity,
-        "bindings": {
-            "request_sha256": artifacts["request.json"]["sha256"],
-            "result_sha256": artifacts["result.json"]["sha256"],
-            "health_sha256": artifacts["health.json"]["sha256"],
-            "ast_provenance_sha256": artifacts["ast-provenance.json"]["sha256"],
-            "source_sha256": artifacts[layout["source_workbook"]]["sha256"],
-            "nodes_sha256": artifacts[
-                f'{layout["ast_directory"]}/nodes.csv'
-            ]["sha256"],
-            "edges_sha256": artifacts[
-                f'{layout["ast_directory"]}/edges.csv'
-            ]["sha256"],
-        },
+        "bindings": bindings,
         "ast_provenance": provenance,
     }
     return {**core, "generation_id": _binding_hash(identity)}
@@ -375,6 +408,7 @@ def publish_source_generation(
     activate: bool = False,
     trusted_runner_public_key: str | Path | None = None,
     original_source_path: str | Path | None = None,
+    inventory: dict | str | Path | None = None,
     fault=None,
 ) -> tuple[Path, dict]:
     """Publish immutable bytes; activation is a separate proof-gated operation."""
@@ -399,6 +433,9 @@ def publish_source_generation(
     request_value = _json_value(request, "recalculation request")
     result_value = _json_value(result, "recalculation result")
     health_value = _json_value(health, "source-health report")
+    inventory_value = (
+        None if inventory is None else _json_value(inventory, "source inventory")
+    )
     provenance = (
         create_ast_provenance(
             source,
@@ -429,7 +466,7 @@ def publish_source_generation(
     if result_hash is not None and result_hash != source_hash:
         raise SourcePublicationError("result is not bound to source workbook")
     route = health_value.get("route")
-    if route not in {"pass", "recalc_candidate"}:
+    if route not in {"pass", "restricted_pass", "recalc_candidate"}:
         raise SourcePublicationError(
             "source health does not permit generation publication"
         )
@@ -467,9 +504,13 @@ def publish_source_generation(
         raise SourcePublicationError(
             f"health report validation failed: {exc}"
         ) from exc
+    if health_value.get("schema_version") != "xlsx-source-health/v2":
+        raise SourcePublicationError(
+            "new source generations require v2 source health"
+        )
     identity_pair = (
-        request_value.get("schema_version") == "source-identity-request/v1"
-        and result_value.get("schema_version") == "source-identity-result/v1"
+        request_value.get("schema_version") == "source-identity-request/v2"
+        and result_value.get("schema_version") == "source-identity-result/v2"
         and result_value.get("mode") == "identity"
     )
     engine_evidence = result_value.get("engine_evidence") or {}
@@ -479,8 +520,8 @@ def publish_source_generation(
     permitted_versions = engine_constraints.get("permitted_versions")
     allowed_engines = engine_constraints.get("allowed_engines")
     recalc_pair = (
-        request_value.get("schema_version") == "source-recalc-request/v1"
-        and result_value.get("schema_version") == "source-recalc-result/v1"
+        request_value.get("schema_version") == "source-recalc-request/v2"
+        and result_value.get("schema_version") == "source-recalc-result/v2"
         and result_value.get("authoritative") is True
         and result_value.get("policy_version") == health_value.get("policy_version")
         and isinstance(result_value.get("engine"), str)
@@ -589,6 +630,40 @@ def publish_source_generation(
         )
     if route == "pass" and not (identity_pair or recalc_pair):
         raise SourcePublicationError("source generation has invalid evidence schemas")
+    restricted_pair = (
+        request_value.get("schema_version") == "source-restriction-request/v2"
+        and result_value.get("schema_version") == "source-restriction-result/v2"
+        and request_value.get("mode") == "restricted_policy"
+        and result_value.get("mode") == "restricted"
+    )
+    if route == "restricted_pass":
+        if not restricted_pair or inventory_value is None:
+            raise SourcePublicationError(
+                "restricted pass requires dedicated restriction evidence and inventory"
+            )
+        try:
+            from xl_source_inventory import validate_inventory_manifest
+            from xl_source_recalc import create_restriction_documents
+
+            validate_inventory_manifest(inventory_value)
+            expected_request, expected_result = create_restriction_documents(
+                source, health_value, inventory_value
+            )
+            if (
+                request_value != expected_request
+                or result_value != expected_result
+            ):
+                raise ValueError(
+                    "restriction evidence does not match independent observation"
+                )
+        except ValueError as exc:
+            raise SourcePublicationError(
+                f"restriction evidence validation failed: {exc}"
+            ) from exc
+    elif restricted_pair or inventory_value is not None:
+        raise SourcePublicationError(
+            "restriction evidence cannot be reinterpreted for another route"
+        )
 
     stage = Path(tempfile.mkdtemp(prefix=".source-stage-", dir=str(root)))
     try:
@@ -604,6 +679,8 @@ def publish_source_generation(
             "health.json": health_value,
             "ast-provenance.json": provenance,
         }
+        if route == "restricted_pass":
+            documents["inventory.json"] = inventory_value
         for name, value in documents.items():
             (stage / name).write_bytes(_canonical_bytes(value))
         manifest = _make_manifest(
@@ -612,6 +689,7 @@ def publish_source_generation(
             layout,
             health_value,
             result_value,
+            inventory_value,
         )
         (stage / "generation-manifest.json").write_bytes(_canonical_bytes(manifest))
         validate_source_generation(stage)
@@ -673,7 +751,11 @@ def validate_source_generation(
         directory / "generation-manifest.json", "source generation manifest"
     )
     failures = []
-    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+    manifest_schema = manifest.get("schema_version")
+    if manifest_schema not in {
+        LEGACY_MANIFEST_SCHEMA_VERSION,
+        MANIFEST_SCHEMA_VERSION,
+    }:
         failures.append("schema_version")
     generation_id = manifest.get("generation_id")
     if not isinstance(generation_id, str) or not GENERATION_ID_RE.fullmatch(
@@ -735,9 +817,9 @@ def validate_source_generation(
         "request_sha256": artifacts.get("request.json", {}).get("sha256"),
         "result_sha256": artifacts.get("result.json", {}).get("sha256"),
         "health_sha256": artifacts.get("health.json", {}).get("sha256"),
-        "ast_provenance_sha256": artifacts.get(
-            "ast-provenance.json", {}
-        ).get("sha256"),
+        "ast_provenance_sha256": artifacts.get("ast-provenance.json", {}).get(
+            "sha256"
+        ),
         "source_sha256": artifacts.get(source_relative, {}).get("sha256"),
         "nodes_sha256": artifacts.get(f"{ast_relative}/nodes.csv", {}).get(
             "sha256"
@@ -746,8 +828,138 @@ def validate_source_generation(
             "sha256"
         ),
     }
+    if manifest_schema == MANIFEST_SCHEMA_VERSION:
+        try:
+            health_document = _read_json(
+                directory / "health.json", "source health"
+            )
+            result_document = _read_json(
+                directory / "result.json", "source evidence result"
+            )
+        except SourcePublicationError:
+            health_document = {}
+            result_document = {}
+            failures.append("policy_documents")
+        expected_bindings["health_report_sha256"] = health_document.get(
+            "report_sha256"
+        )
+        if health_document.get("route") == "restricted_pass":
+            try:
+                inventory_document = _read_json(
+                    directory / "inventory.json", "source inventory"
+                )
+            except SourcePublicationError:
+                inventory_document = {}
+                failures.append("inventory")
+            expected_bindings.update({
+                "inventory_artifact_sha256": artifacts.get(
+                    "inventory.json", {}
+                ).get("sha256"),
+                "inventory_sha256": inventory_document.get("inventory_sha256"),
+                "restriction_evidence_sha256": result_document.get(
+                    "result_sha256"
+                ),
+                "restriction_events_sha256": health_document.get(
+                    "restriction_events_sha256"
+                ),
+                "restriction_profile_sha256": _binding_hash(
+                    health_document.get("restriction_profile")
+                ),
+            })
     if bindings != expected_bindings:
         failures.append("bindings")
+    if manifest_schema == MANIFEST_SCHEMA_VERSION and not failures:
+        policy_decision = {
+            "health_report_sha256": health_document.get("report_sha256"),
+            "policy_version": health_document.get("policy_version"),
+            "route": health_document.get("route"),
+        }
+        if health_document.get("route") == "restricted_pass":
+            policy_decision.update({
+                "inventory_sha256": inventory_document.get("inventory_sha256"),
+                "restriction_evidence_sha256": result_document.get(
+                    "result_sha256"
+                ),
+                "restriction_events_sha256": health_document.get(
+                    "restriction_events_sha256"
+                ),
+                "restriction_profile": health_document.get(
+                    "restriction_profile"
+                ),
+                "restriction_profile_sha256": _binding_hash(
+                    health_document.get("restriction_profile")
+                ),
+            })
+        expected_identity = {
+            "schema_version": "source-generation-identity/v2",
+            "source_sha256": artifacts[source_relative]["sha256"],
+            "policy_version": health_document.get("policy_version"),
+            "policy_decision": policy_decision,
+            "engine": {
+                "name": result_document.get("engine"),
+                "version": result_document.get("engine_version"),
+                "mode": result_document.get("mode", "recalculated"),
+            },
+            "builder": manifest["ast_provenance"]["builder"],
+            "nodes_sha256": artifacts[f"{ast_relative}/nodes.csv"]["sha256"],
+            "edges_sha256": artifacts[f"{ast_relative}/edges.csv"]["sha256"],
+        }
+        if identity != expected_identity:
+            failures.append("identity")
+        try:
+            from xl_source_health import inspect_workbook, validate_report
+
+            source_path = directory / source_relative
+            validate_report(health_document, source_path)
+            if health_document != inspect_workbook(source_path):
+                raise ValueError("source health does not match fresh observation")
+            request_document = _read_json(
+                directory / "request.json", "source evidence request"
+            )
+            route = health_document.get("route")
+            evidence_schemas = (
+                request_document.get("schema_version"),
+                result_document.get("schema_version"),
+            )
+            accepted = {
+                "pass": {
+                    ("source-identity-request/v2", "source-identity-result/v2"),
+                    ("source-recalc-request/v2", "source-recalc-result/v2"),
+                },
+                "recalc_candidate": {
+                    ("source-recalc-request/v2", "source-recalc-result/v2")
+                },
+                "restricted_pass": {
+                    (
+                        "source-restriction-request/v2",
+                        "source-restriction-result/v2",
+                    )
+                },
+            }
+            if evidence_schemas not in accepted.get(route, set()):
+                raise ValueError("evidence schemas do not match route")
+            if (
+                request_document.get("policy_version")
+                != health_document.get("policy_version")
+                or result_document.get("policy_version")
+                not in {None, health_document.get("policy_version")}
+            ):
+                raise ValueError("evidence policy does not match health policy")
+            if route == "restricted_pass":
+                from xl_source_inventory import validate_inventory_manifest
+                from xl_source_recalc import create_restriction_documents
+
+                validate_inventory_manifest(inventory_document)
+                expected_request, expected_result = create_restriction_documents(
+                    source_path, health_document, inventory_document
+                )
+                if (
+                    request_document != expected_request
+                    or result_document != expected_result
+                ):
+                    raise ValueError("restriction evidence changed")
+        except (OSError, ValueError, SourcePublicationError):
+            failures.append("policy_validation")
     if not failures:
         provenance = _read_json(
             directory / "ast-provenance.json", "AST provenance"
@@ -797,6 +1009,19 @@ def activate_source_generation(
     manifest = validate_source_generation(
         generation_dir, expected_generation_id=generation_id
     )
+    route = (
+        (manifest.get("identity") or {})
+        .get("policy_decision", {})
+        .get("route")
+    )
+    if (
+        manifest.get("schema_version") == MANIFEST_SCHEMA_VERSION
+        and route == "restricted_pass"
+    ):
+        raise SourcePublicationError(
+            "restricted v2 source generations stay inactive; promote the exact "
+            "source/segmentation/task tuple through xl_release_publication"
+        )
     layout = manifest["layout"]
     source_path = generation_dir / layout["source_workbook"]
     ast_dir = generation_dir / layout["ast_directory"]
@@ -863,6 +1088,29 @@ def resolve_current_source_generation(
     )
     if pointer.get("source_sha256") != manifest["bindings"]["source_sha256"]:
         raise SourcePublicationError("source pointer workbook hash mismatch")
+    return directory, manifest
+
+
+def resolve_source_generation_by_id(
+    publication_root: str | Path,
+    generation_id: str,
+) -> tuple[Path, dict]:
+    """Resolve and validate an immutable generation without consulting current."""
+    if not isinstance(generation_id, str) or not GENERATION_ID_RE.fullmatch(
+        generation_id
+    ):
+        raise SourcePublicationError("source generation ID is invalid")
+    root = Path(publication_root)
+    generations = root / "generations"
+    if generations.is_symlink():
+        raise SourcePublicationError("generations directory is a symlink")
+    directory = generations / generation_id
+    if directory.resolve().parent != generations.resolve():
+        raise SourcePublicationError("source generation escapes publication root")
+    manifest = validate_source_generation(
+        directory,
+        expected_generation_id=generation_id,
+    )
     return directory, manifest
 
 

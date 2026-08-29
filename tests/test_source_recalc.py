@@ -20,9 +20,12 @@ from openpyxl.workbook.defined_name import DefinedName
 import xl_source_publication as publication
 from xl_source_health import inspect_workbook, sha256_file
 from xl_source_recalc import (
+    RESTRICTED_SOURCE_COHORT_MANIFEST,
     RecalculationError,
     MacOSExcelEngine,
+    _validated_restricted_inventory_selection,
     create_identity_documents,
+    create_restriction_documents,
     create_recalc_request,
     execute_recalc,
     prepare_source_generation,
@@ -30,6 +33,7 @@ from xl_source_recalc import (
     validate_recalc_request,
     verify_signed_runner_receipt,
 )
+from xl_source_inventory import build_inventory_manifest
 
 
 def _workbook(
@@ -301,6 +305,7 @@ def test_signed_runner_receipt_rejects_forgery(tmp_path):
         check=True,
         capture_output=True,
     )
+    public_key.chmod(0o600)
     payload = {
         "request_sha256": "a" * 64,
         "source_sha256": "b" * 64,
@@ -553,6 +558,99 @@ def test_recalc_candidate_cannot_publish_with_identity_evidence(tmp_path):
             "0003",
             tmp_path / "published",
         )
+
+
+def test_restricted_prepare_rejects_non_frozen_inventory(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "0004.xlsx"
+    _workbook(source, formula="NOW()", cache="2")
+    health = inspect_workbook(source)
+    inventory = build_inventory_manifest(source_root, workbook_ids=["0004"])
+
+    def fake_ast_main(args):
+        output_root = Path(args[args.index("-o") + 1])
+        output_root.mkdir()
+        _ast(output_root / "0004", "restricted")
+
+    monkeypatch.setattr("xl_ast_graph.main", fake_ast_main)
+
+    with pytest.raises(RecalculationError, match="exact frozen 123-workbook"):
+        prepare_source_generation(
+            source,
+            "0004",
+            tmp_path / "published",
+            health=health,
+            inventory=inventory,
+        )
+
+
+def test_restricted_publication_rejects_identity_and_non_frozen_inventory(tmp_path):
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "0005.xlsx"
+    _workbook(source, formula='CELL("filename",A1)', cache="2")
+    health = inspect_workbook(source)
+    inventory = build_inventory_manifest(source_root, workbook_ids=["0005"])
+    ast = tmp_path / "ast"
+    _ast(ast, "restricted")
+    identity_request, identity_result = create_identity_documents(source)
+
+    with pytest.raises(
+        publication.SourcePublicationError,
+        match="restriction evidence",
+    ):
+        publication.publish_source_generation(
+            source,
+            ast,
+            tmp_path / "identity-published",
+            request=identity_request,
+            result=identity_result,
+            health=health,
+            inventory=inventory,
+        )
+
+    with pytest.raises(RecalculationError, match="exact frozen 123-workbook"):
+        create_restriction_documents(source, health, inventory)
+
+
+def test_frozen_inventory_classification_controls_restricted_evidence():
+    inventory = json.loads(RESTRICTED_SOURCE_COHORT_MANIFEST.read_text())
+    records = {
+        record["workbook_id"]: record for record in inventory["workbooks"]
+    }
+    unverified_id = inventory["classification_cohorts"][
+        "conversion_unverified"
+    ][0]
+    allowed_ids = (
+        inventory["classification_cohorts"]["conversion_equivalent"]
+        + inventory["classification_cohorts"]["native_source"]
+    )
+    allowed_id = allowed_ids[0]
+
+    with pytest.raises(RecalculationError, match="conversion_unverified"):
+        _validated_restricted_inventory_selection(
+            inventory,
+            source_sha256=records[unverified_id]["sha256"],
+            workbook_id=unverified_id,
+        )
+
+    selected, cohort_hash, inventory_hash = (
+        _validated_restricted_inventory_selection(
+            inventory,
+            source_sha256=records[allowed_id]["sha256"],
+            workbook_id=allowed_id,
+            expected_cohort_sha256=inventory["cohort"]["cohort_sha256"],
+        )
+    )
+    assert selected["classification"] in {
+        "native_source",
+        "conversion_equivalent",
+    }
+    assert cohort_hash == inventory["cohort"]["cohort_sha256"]
+    assert inventory_hash == inventory["inventory_sha256"]
 
 
 def test_generation_identity_ignores_receipt_request_id(tmp_path):

@@ -86,3 +86,46 @@ def test_agent_records_keep_cells_for_blankness_verification() -> None:
     shipped = disclose.agent_records([record])
 
     assert shipped[0]["cell_keys"] == ["Model!B2"]
+
+
+def test_records_preserve_pinned_pipeline_bindings() -> None:
+    bindings = {
+        "source_generation_id": "source-id",
+        "segmentation_generation_id": "segmentation-id",
+    }
+    selection = {
+        "golden": "/tmp/golden.xlsx",
+        "golden_sha256": "a" * 64,
+        "pipeline_bindings": bindings,
+        "segmentation_generation": {
+            "generation_id": "segmentation-id",
+            "mode": "strict",
+        },
+        "selection": {"closure_source": "ast"},
+        "ast_dir": "/tmp/ast",
+        "seg_root": "/tmp/seg",
+    }
+
+    provenance = disclose.records_provenance(selection)
+
+    assert provenance["pipeline_bindings"] == bindings
+    assert provenance["segmentation_mode"] == "strict"
+    assert provenance["segmentation_generation"]["generation_id"] == (
+        "segmentation-id"
+    )
+
+
+def test_compound_currency_unit_is_not_used_as_row_label(tmp_path: Path) -> None:
+    path = tmp_path / "units.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Inputs Care Home"
+    sheet["B164"] = "Utilities per bed"
+    sheet["K164"] = "£ / bed / year"
+    sheet["L164"] = 100
+    workbook.save(path)
+
+    book = disclose.Book(path)
+
+    assert disclose.is_unit_stamp("£ / bed / year")
+    assert book.row_label("Inputs Care Home!L164") == "Utilities per bed"

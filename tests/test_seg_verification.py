@@ -227,6 +227,38 @@ def test_strict_verification_rejects_missing_ast_capabilities(tmp_path):
     assert "missing_required_proof_evidence" in report["blocking_reasons"]
 
 
+def test_strict_verification_rejects_unknown_output_cone_operation(tmp_path):
+    graph, cg, bg, cd, part, source, outputs = _verification_fixture()
+    result = Evaluator(
+        graph,
+        cg,
+        strict_proof=True,
+        calculation=CalculationMetadata(available=True, iterate=False),
+    ).run({source.id})
+    result.coverage["unknown_ops"] = {"UNSUPPORTED": 1}
+    source_path, ast_dir, curation = _evidence_paths(tmp_path)
+
+    report = _verify(
+        cg,
+        result,
+        {source.id},
+        {node.id for node in outputs},
+        part,
+        cd,
+        bg,
+        SimpleNamespace(sample=10),
+        expected_cache=FakeExpectedCache(1),
+        calculation=CalculationMetadata(available=True, iterate=False),
+        source_path=source_path,
+        ast_dir=ast_dir,
+        curation_path=curation,
+    )
+
+    assert report["status"] == "fail"
+    assert report["passed"] is False
+    assert "unknown_operation" in report["blocking_reasons"]
+
+
 def test_curated_output_identity_does_not_expand_scc_sibling_bands():
     bg = SimpleNamespace(bands={
         "chosen": SimpleNamespace(cells=["Sheet!A1"]),

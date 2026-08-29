@@ -597,7 +597,7 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
          formula_report=None, formula_hints=None, audit_root="runs",
          proof_contract=None, generation_manifest=None,
          generation_manifest_path=None, inputs_generation=None,
-         inputs_generation_path=None):
+         inputs_generation_path=None, pipeline_bindings=None):
     if out_dir.exists():
         shutil.rmtree(out_dir)
     (out_dir / "environment").mkdir(parents=True)
@@ -693,6 +693,28 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
         metadata.update({
             "inputs_generation": "tests/inputs_generation.json",
             "inputs_generation_id": inputs_generation["generation_id"],
+        })
+    if pipeline_bindings is not None:
+        binding_path = out_dir / "tests" / "pipeline_bindings.json"
+        binding_path.write_text(
+            json.dumps(pipeline_bindings, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        metadata.update({
+            "pipeline_bindings": "tests/pipeline_bindings.json",
+            "release_id": pipeline_bindings.get("release_id") or "",
+            "source_generation_id":
+                pipeline_bindings.get("source_generation_id"),
+            "source_health_sha256":
+                pipeline_bindings.get("source_health_sha256"),
+            "source_restriction_evidence_sha256":
+                pipeline_bindings.get("restriction_evidence_sha256") or "",
+            "segmentation_generation_id":
+                pipeline_bindings.get("segmentation_generation_id"),
+            "cone_certificate_sha256":
+                pipeline_bindings.get("cone_certificate_sha256") or "",
+            "task_generation_id":
+                pipeline_bindings.get("task_generation_id") or "",
         })
     if audit_meta is not None:
         metadata.update({
@@ -807,6 +829,18 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
                      out_dir / "tests" / "masked_inputs.json")
 
 
+def audit_segmentation_binding(pipeline_context):
+    """Return the exact audit cache binding for a pinned build context."""
+    if pipeline_context is None:
+        return None
+    bindings = pipeline_context["bindings"]
+    return {
+        "generation_id": bindings["segmentation_generation_id"],
+        "manifest_sha256": bindings["segmentation_manifest_sha256"],
+        "source_generation_id": bindings["source_generation_id"],
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Build rebuild-the-model tasks from curated outputs")
@@ -830,6 +864,19 @@ def main(argv=None):
         default=None,
         help="fail if current.json no longer names this generation",
     )
+    parser.add_argument(
+        "--release-root",
+        default=None,
+        help="root containing <workbook>/current-release.json",
+    )
+    parser.add_argument("--release-id", default=None)
+    parser.add_argument(
+        "--source-generation-root",
+        default="source_out",
+        help="root containing immutable source generations",
+    )
+    parser.add_argument("--source-generation-id", default=None)
+    parser.add_argument("--segmentation-generation-id", default=None)
     parser.add_argument("--inputs-root", default="inputs_out")
     parser.add_argument("--taxonomy", default="taxonomy_out/workbooks.json")
     parser.add_argument("--env-file", default=".env")
@@ -890,6 +937,19 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.hints and args.semantic_hints:
         parser.error("--hints and --semantic-hints are mutually exclusive")
+    if args.release_id and not args.release_root:
+        parser.error("--release-id requires --release-root")
+    if args.release_root and (
+        args.source_generation_id or args.segmentation_generation_id
+    ):
+        parser.error(
+            "--release-root is mutually exclusive with explicit candidate IDs"
+        )
+    if bool(args.source_generation_id) != bool(args.segmentation_generation_id):
+        parser.error(
+            "explicit staging requires both --source-generation-id and "
+            "--segmentation-generation-id"
+        )
     formula_paths = (
         args.custom_formula_context,
         args.custom_formula_report,
@@ -924,21 +984,61 @@ def main(argv=None):
     out_root.mkdir(parents=True, exist_ok=True)
     for workbook in args.workbooks:
         family = families.get(workbook, "")
-        source_path = Path(args.source) / ("%s.xlsx" % workbook)
-        try:
-            seg_dir, generation_manifest = resolve_for_consumer(
-                Path(args.seg_root) / workbook,
-                mode=args.segmentation_mode,
-                source_path=source_path,
-                ast_dir=Path(args.ast_dir) / workbook,
-                require_pass=True,
-                expected_generation_id=args.expected_generation_id,
-            )
-        except GenerationValidationError as exc:
-            raise SystemExit(
-                "%s: segmentation generation gate failed: %s"
-                % (workbook, exc)
-            ) from exc
+        pipeline_context = None
+        pinned = bool(
+            args.release_root
+            or args.source_generation_id
+            or args.segmentation_generation_id
+        )
+        if pinned:
+            try:
+                from xl_release_publication import resolve_build_context
+
+                pipeline_context = resolve_build_context(
+                    workbook,
+                    release_root=(
+                        Path(args.release_root) / workbook
+                        if args.release_root else None
+                    ),
+                    release_id=args.release_id,
+                    source_root=Path(args.source_generation_root) / workbook,
+                    source_generation_id=args.source_generation_id,
+                    segmentation_root=Path(args.seg_root) / workbook,
+                    segmentation_generation_id=args.segmentation_generation_id,
+                )
+                if (
+                    args.expected_generation_id is not None
+                    and pipeline_context["bindings"][
+                        "segmentation_generation_id"
+                    ] != args.expected_generation_id
+                ):
+                    raise ValueError("pinned segmentation generation changed")
+            except ValueError as exc:
+                raise SystemExit(
+                    "%s: pinned release/candidate gate failed: %s"
+                    % (workbook, exc)
+                ) from exc
+            source_path = Path(pipeline_context["source_path"])
+            source_dir_for_collect = Path(pipeline_context["source_root"])
+            seg_dir = Path(pipeline_context["segmentation_dir"])
+            generation_manifest = pipeline_context["segmentation_manifest"]
+        else:
+            source_path = Path(args.source) / ("%s.xlsx" % workbook)
+            source_dir_for_collect = Path(args.source)
+            try:
+                seg_dir, generation_manifest = resolve_for_consumer(
+                    Path(args.seg_root) / workbook,
+                    mode=args.segmentation_mode,
+                    source_path=source_path,
+                    ast_dir=Path(args.ast_dir) / workbook,
+                    require_pass=True,
+                    expected_generation_id=args.expected_generation_id,
+                )
+            except GenerationValidationError as exc:
+                raise SystemExit(
+                    "%s: segmentation generation gate failed: %s"
+                    % (workbook, exc)
+                ) from exc
         proof_contract = load_proof_contract(seg_dir)
         artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
         inputs_generation = None
@@ -950,13 +1050,18 @@ def main(argv=None):
                     artifact,
                     expected_generation_id=generation_manifest["generation_id"],
                     generation_dir=seg_dir,
+                    expected_pipeline_bindings=(
+                        pipeline_context["bindings"]
+                        if pipeline_context is not None
+                        else None
+                    ),
                 )
             except GenerationValidationError as exc:
                 raise SystemExit(
                     "%s: inputs generation binding failed: %s"
                     % (workbook, exc)
                 ) from exc
-        outputs, targets = collect(workbook, args.source, args.seg_root,
+        outputs, targets = collect(workbook, source_dir_for_collect, args.seg_root,
                                    args.inputs_root, seg_dir=seg_dir)
         formula_report = None
         formula_hints = None
@@ -981,6 +1086,7 @@ def main(argv=None):
                 Path(args.variable_source_audit_inputs_root)
                 / ("%s-inputs.xlsx" % workbook)
             )
+            audit_segmentation = audit_segmentation_binding(pipeline_context)
             audit_meta = generate_audit(
                 workbook,
                 audit_artifact,
@@ -993,6 +1099,7 @@ def main(argv=None):
                 project_id=args.project_id,
                 refresh=args.refresh_variable_source_audit,
                 log=lambda message: print("   ", message),
+                segmentation=audit_segmentation,
             )
         hints = None
         hint_style = ""
@@ -1038,7 +1145,11 @@ def main(argv=None):
                  if generation_manifest is not None else None
              ),
              inputs_generation=inputs_generation,
-             inputs_generation_path=inputs_generation_path)
+             inputs_generation_path=inputs_generation_path,
+             pipeline_bindings=(
+                 pipeline_context["bindings"]
+                 if pipeline_context is not None else None
+             ))
         n_vars = mcp_variable_count(mcp_dir) if mcp_dir is not None else 0
         print("%s  %-16s %2d outputs, %3d cells%s, timeout %.0fs -> %s"
               % (workbook, family, len(outputs), len(targets),

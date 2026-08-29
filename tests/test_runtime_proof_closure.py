@@ -6,9 +6,11 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from xl_ast_graph import role_for
 from xl_input_mask import stabilized_proof_inputs
-from xl_seg import lineage, project
+from xl_seg import diagnostics, lineage, project, restriction_cone
 from xl_seg.evaluate import CalculationMetadata, EvalResult, Evaluator, Unresolved
 from xl_seg.model import Edge, Graph, Node, split_ref
 from xl_seg.proof import load_contract
@@ -36,7 +38,17 @@ def _cell(ref, kind, value, formula=""):
     )
 
 
-def _ast(node_id, owner, kind, *, op="", arity="", value="", expr=""):
+def _ast(
+    node_id,
+    owner,
+    kind,
+    *,
+    op="",
+    arity="",
+    value="",
+    expr="",
+    op_kind=None,
+):
     sheet = owner.rpartition("!")[0]
     return Node(
         id=node_id,
@@ -47,7 +59,7 @@ def _ast(node_id, owner, kind, *, op="", arity="", value="", expr=""):
         col=None,
         owner=owner,
         op=op,
-        op_kind="func" if kind == "op" else "const",
+        op_kind=op_kind or ("func" if kind == "op" else "const"),
         arity=str(arity),
         expr=expr,
         label=op or value,
@@ -176,6 +188,7 @@ def test_dynamic_indirect_discovers_computed_target_and_seed():
     assert proof_inputs == {address.id, target.id}
     assert proof_radj[output.id] == {address.id, target.id}
     assert proof["resolved_targets"][output.id] == [target.id]
+    assert proof["resolved_operation_targets"][op.id] == [target.id]
 
 
 def test_index_match_prunes_unselected_result_cells_and_unrelated_seeds():
@@ -365,11 +378,643 @@ def test_nonstabilizing_closure_is_bounded_and_diagnostic():
 
     assert proof["closure"] == {
         "stabilized": False,
+        "targets_stable": False,
         "passes": 3,
         "max_passes": 3,
         "diagnostic": "runtime_dependency_closure_not_stabilized",
         "history": proof["closure"]["history"],
     }
+
+
+def _restricted_certificate_source(tmp_path, monkeypatch, events):
+    profile = {
+        "schema_version": "source-restriction-profile/v2",
+        "allowlist": [
+            "confirmed_false_external_detection",
+            "worksheet_cell_filename",
+            "worksheet_indirect_a1",
+            "worksheet_now",
+            "worksheet_offset",
+            "worksheet_today",
+        ],
+    }
+    health = {
+        "route": "restricted_pass",
+        "policy_version": "source-recalc-policy/v2",
+        "report_sha256": "1" * 64,
+        "restriction_profile": profile,
+        "restriction_events": events,
+        "restriction_events_sha256": restriction_cone.object_hash(events),
+    }
+    result = {"restriction": {"profile": profile, "restriction_events": events}}
+    source_dir = tmp_path / "source-generation"
+    source_dir.mkdir(parents=True)
+    (source_dir / "health.json").write_text(json.dumps(health), encoding="utf-8")
+    (source_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+    (source_dir / "generation-manifest.json").write_text(
+        json.dumps({
+            "layout": {"ast_directory": "ast", "workbook_id": "book"}
+        }),
+        encoding="utf-8",
+    )
+    manifest = {
+        "schema_version": "source-generation/v2",
+        "generation_id": "a" * 64,
+        "bindings": {
+            "source_sha256": "b" * 64,
+            "health_sha256": "c" * 64,
+            "health_report_sha256": health["report_sha256"],
+            "restriction_evidence_sha256": "d" * 64,
+            "restriction_events_sha256": health["restriction_events_sha256"],
+        },
+    }
+    monkeypatch.setattr(
+        "xl_source_publication.validate_source_generation",
+        lambda path: manifest,
+    )
+    return source_dir
+
+
+def _passing_certificate_verification(proof, ordered_outputs=None):
+    fingerprints = {
+        "source": {
+            "path": "book.xlsx",
+            "available": True,
+            "algorithm": "sha256",
+            "sha256": "e" * 64,
+            "size_bytes": 1,
+        }
+    }
+    return {
+        "status": "pass",
+        "disposition": "pass",
+        "blocking_reasons": [],
+        "skipped": False,
+        "passed": True,
+        "provenance": {
+            "proof": {"strict": True},
+            "runtime": {"closure": proof["closure"]},
+        },
+        "counts": {"cache_reads": {"proof": 0}},
+        "fingerprints": fingerprints,
+        "ordered_output_cells": list(ordered_outputs or ["Sheet!D1"]),
+    }
+
+
+def test_restriction_events_are_covered_once_and_time_is_outside_cone(
+    tmp_path, monkeypatch
+):
+    events = [
+        {
+            "allowed": True,
+            "event": "volatile_function",
+            "function": "TODAY",
+            "location": "Sheet!B1",
+            "reason": "worksheet_today",
+            "scope": "worksheet",
+            # Source-health offsets are measured in OOXML formula text, which
+            # omits the AST model's leading "=".
+            "token_offset": 0,
+        },
+        {
+            "allowed": True,
+            "event": "false_external_detection",
+            "location": "Sheet!C1",
+            "reason": "confirmed_false_external_detection",
+            "scope": "worksheet",
+            "token": "[label]",
+            "token_offset": 1,
+        },
+    ]
+    source_dir = _restricted_certificate_source(tmp_path, monkeypatch, events)
+    source = _cell("Sheet!A1", "input", 1)
+    today_host = _cell("Sheet!B1", "formula", 1, "=TODAY()")
+    false_host = _cell("Sheet!C1", "formula", 1, '="[label]"')
+    output = _cell("Sheet!D1", "formula", 1, "=A1")
+    today = _ast(
+        "Sheet!B1#TODAY",
+        today_host.id,
+        "op",
+        op="TODAY",
+        arity=0,
+        expr="TODAY()",
+    )
+    graph, _ = _graph(
+        [source, today_host, false_host, output, today],
+        [_edge(today.id, today_host.id, role="result")],
+    )
+    proof = {
+        "runtime_radj": {output.id: [source.id]},
+        "resolved_targets": {},
+        "resolved_operation_targets": {},
+        "closure": {"stabilized": True, "targets_stable": True},
+    }
+    verification = _passing_certificate_verification(proof, [output.id])
+
+    certificate = restriction_cone.build_certificate(
+        source_generation_dir=source_dir,
+        graph=graph,
+        proof=proof,
+        verification=verification,
+        ordered_outputs=[output.id],
+        segmentation_fingerprints=verification["fingerprints"],
+    )
+
+    assert certificate["event_count"] == 2
+    assert len({item["event_id"] for item in certificate["events"]}) == 2
+    assert certificate["events"][0]["in_output_cone"] is False
+    assert certificate["events"][0]["disposition"] == (
+        "allowed_only_outside_output_cone"
+    )
+
+
+def test_shared_offset_follower_requires_its_own_health_event(
+    tmp_path, monkeypatch
+):
+    master_event = {
+        "allowed": True,
+        "event": "volatile_function",
+        "function": "OFFSET",
+        "location": "Sheet!B1",
+        "reason": "worksheet_offset",
+        "scope": "worksheet",
+        "token_offset": 0,
+    }
+    source_dir = _restricted_certificate_source(
+        tmp_path, monkeypatch, [master_event]
+    )
+    master = _cell("Sheet!B1", "formula", 1, "=OFFSET(A1,0,0)")
+    follower = _cell("Sheet!B2", "formula", 2, "=OFFSET(A2,0,0)")
+    target = _cell("Sheet!A2", "input", 2)
+    master_op = _ast(
+        "Sheet!B1#0:OFFSET",
+        master.id,
+        "op",
+        op="OFFSET",
+        arity=3,
+        expr="OFFSET(A1,0,0)",
+    )
+    follower_op = _ast(
+        "Sheet!B2#0:OFFSET",
+        follower.id,
+        "op",
+        op="OFFSET",
+        arity=3,
+        expr="OFFSET(A2,0,0)",
+    )
+    graph, _ = _graph(
+        [master, follower, target, master_op, follower_op],
+        [
+            _edge(master_op.id, master.id, role="result", op="OFFSET"),
+            _edge(follower_op.id, follower.id, role="result", op="OFFSET"),
+        ],
+    )
+    proof = {
+        "runtime_radj": {follower.id: [target.id]},
+        "resolved_targets": {follower.id: [target.id]},
+        "resolved_operation_targets": {follower_op.id: [target.id]},
+        "closure": {"stabilized": True, "targets_stable": True},
+    }
+    verification = _passing_certificate_verification(proof, [follower.id])
+
+    assert follower.id in restriction_cone._proof_cone(
+        [follower.id], proof["runtime_radj"]
+    )
+    assert master.id not in restriction_cone._proof_cone(
+        [follower.id], proof["runtime_radj"]
+    )
+    with pytest.raises(
+        restriction_cone.RestrictionConeError,
+        match="restricted volatile AST operations lack one-to-one",
+    ):
+        restriction_cone.build_certificate(
+            source_generation_dir=source_dir,
+            graph=graph,
+            proof=proof,
+            verification=verification,
+            ordered_outputs=[follower.id],
+            segmentation_fingerprints=verification["fingerprints"],
+        )
+
+
+def _offset_certificate_graph(*, rows_node_kind="const", height=1):
+    base = _cell("Sheet!A1", "input", 0)
+    rows = (
+        _cell("Sheet!B1", "input", 1)
+        if rows_node_kind == "input"
+        else _ast("Sheet!C1#rows", "Sheet!C1", "const", value="0")
+    )
+    columns = _ast("Sheet!C1#cols", "Sheet!C1", "const", value="1")
+    height_node = _ast(
+        "Sheet!C1#height", "Sheet!C1", "const", value=str(height)
+    )
+    width = _ast("Sheet!C1#width", "Sheet!C1", "const", value="1")
+    output = _cell("Sheet!C1", "formula", 9, "=OFFSET(A1,0,1,1,1)")
+    target = _cell("Sheet!B1", "input", 9)
+    op = _ast(
+        "Sheet!C1#OFFSET",
+        output.id,
+        "op",
+        op="OFFSET",
+        arity=5,
+        expr="OFFSET(A1,0,1,1,1)",
+    )
+    graph, _ = _graph(
+        [base, rows, columns, height_node, width, output, target, op],
+        [
+            _edge(base.id, op.id, 0, role="address", op="OFFSET"),
+            _edge(rows.id, op.id, 1, op="OFFSET"),
+            _edge(columns.id, op.id, 2, op="OFFSET"),
+            _edge(height_node.id, op.id, 3, op="OFFSET"),
+            _edge(width.id, op.id, 4),
+            _edge(op.id, output.id, role="result", op="OFFSET"),
+        ],
+    )
+    return graph, output, target
+
+
+def _two_offset_certificate_graph():
+    base = _cell("Sheet!A1", "input", 0)
+    first_target = _cell("Sheet!B1", "input", 4)
+    second_target = _cell("Sheet!C1", "input", 5)
+    output = _cell(
+        "Sheet!D1",
+        "formula",
+        9,
+        "=OFFSET(A1,0,1)+OFFSET(A1,0,2)",
+    )
+    first_row = _ast("Sheet!D1#0:const", output.id, "const", value="0")
+    first_col = _ast("Sheet!D1#1:const", output.id, "const", value="1")
+    first_op = _ast(
+        "Sheet!D1#2:OFFSET",
+        output.id,
+        "op",
+        op="OFFSET",
+        arity=3,
+        expr="OFFSET(A1,0,1)",
+    )
+    second_row = _ast("Sheet!D1#3:const", output.id, "const", value="0")
+    second_col = _ast("Sheet!D1#4:const", output.id, "const", value="2")
+    second_op = _ast(
+        "Sheet!D1#5:OFFSET",
+        output.id,
+        "op",
+        op="OFFSET",
+        arity=3,
+        expr="OFFSET(A1,0,2)",
+    )
+    root = _ast(
+        "Sheet!D1#6:+", output.id, "op", op="+", arity=2,
+        expr="(OFFSET(A1,0,1)+OFFSET(A1,0,2))",
+        op_kind="infix",
+    )
+    graph, _ = _graph(
+        [
+            base,
+            first_target,
+            second_target,
+            output,
+            first_row,
+            first_col,
+            first_op,
+            second_row,
+            second_col,
+            second_op,
+            root,
+        ],
+        [
+            _edge(base.id, first_op.id, 0, role="address", op="OFFSET"),
+            _edge(first_row.id, first_op.id, 1, op="OFFSET"),
+            _edge(first_col.id, first_op.id, 2, op="OFFSET"),
+            _edge(base.id, second_op.id, 0, role="address", op="OFFSET"),
+            _edge(second_row.id, second_op.id, 1, op="OFFSET"),
+            _edge(second_col.id, second_op.id, 2, op="OFFSET"),
+            _edge(first_op.id, root.id, 0, op="+"),
+            _edge(second_op.id, root.id, 1, op="+"),
+            _edge(root.id, output.id, role="result", op="+"),
+        ],
+    )
+    return graph, output, first_target, second_target, first_op, second_op
+
+
+def _two_offset_events():
+    formula = "OFFSET(A1,0,1)+OFFSET(A1,0,2)"
+    offsets = [
+        index for index in range(len(formula))
+        if formula.startswith("OFFSET", index)
+    ]
+    return [
+        {
+            "allowed": True,
+            "event": "volatile_function",
+            "function": "OFFSET",
+            "location": "Sheet!D1",
+            "reason": "worksheet_offset",
+            "scope": "worksheet",
+            "token_offset": offset,
+        }
+        for offset in offsets
+    ]
+
+
+def _two_offset_proof(output, first_target, second_target, first_op, second_op):
+    return {
+        "runtime_radj": {
+            output.id: [first_target.id, second_target.id],
+        },
+        "resolved_targets": {
+            output.id: [first_target.id, second_target.id],
+        },
+        "resolved_operation_targets": {
+            first_op.id: [first_target.id],
+            second_op.id: [second_target.id],
+        },
+        "closure": {"stabilized": True, "targets_stable": True},
+    }
+
+
+def test_evaluator_records_two_dynamic_calls_by_operation():
+    graph, output, first, second, first_op, second_op = (
+        _two_offset_certificate_graph()
+    )
+    result, proof_inputs, _, proof = stabilize_runtime_proof(
+        graph,
+        project.build(graph),
+        {first.id, second.id},
+        {output.id},
+        calculation=CALC,
+    )
+
+    assert result.values[output.id] == 9
+    assert proof_inputs == {first.id, second.id}
+    assert result.resolved_operation_targets == {
+        first_op.id: (first.id,),
+        second_op.id: (second.id,),
+    }
+    assert proof["resolved_operation_targets"] == {
+        first_op.id: [first.id],
+        second_op.id: [second.id],
+    }
+
+
+def test_two_dynamic_calls_require_separate_operation_evidence(
+    tmp_path, monkeypatch
+):
+    events = _two_offset_events()
+    source_dir = _restricted_certificate_source(
+        tmp_path, monkeypatch, events
+    )
+    graph, output, first, second, first_op, second_op = (
+        _two_offset_certificate_graph()
+    )
+    proof = _two_offset_proof(output, first, second, first_op, second_op)
+    verification = _passing_certificate_verification(proof, [output.id])
+
+    certificate = restriction_cone.build_certificate(
+        source_generation_dir=source_dir,
+        graph=graph,
+        proof=proof,
+        verification=verification,
+        ordered_outputs=[output.id],
+        segmentation_fingerprints=verification["fingerprints"],
+    )
+
+    assert [
+        record["ast_operation_node"] for record in certificate["events"]
+    ] == [first_op.id, second_op.id]
+    assert certificate["events"][0]["runtime_targets"] == [first.id]
+    assert certificate["events"][1]["runtime_targets"] == [second.id]
+    assert all(
+        record["stability_equality_check"]["static_runtime_equal"] is True
+        for record in certificate["events"]
+    )
+
+    mismatched = _two_offset_proof(
+        output, first, second, first_op, second_op
+    )
+    mismatched["resolved_operation_targets"][second_op.id] = [first.id]
+    mismatched_verification = _passing_certificate_verification(
+        mismatched, [output.id]
+    )
+    with pytest.raises(
+        restriction_cone.RestrictionConeError,
+        match="static/runtime targets differ",
+    ):
+        restriction_cone.build_certificate(
+            source_generation_dir=source_dir,
+            graph=graph,
+            proof=mismatched,
+            verification=mismatched_verification,
+            ordered_outputs=[output.id],
+            segmentation_fingerprints=mismatched_verification["fingerprints"],
+        )
+
+
+def test_duplicate_and_missing_dynamic_operation_mapping_fail(
+    tmp_path, monkeypatch
+):
+    events = _two_offset_events()
+    graph, output, first, second, first_op, second_op = (
+        _two_offset_certificate_graph()
+    )
+    proof = _two_offset_proof(output, first, second, first_op, second_op)
+
+    duplicate_events = [events[0], dict(events[1], token_offset=events[0]["token_offset"])]
+    duplicate_source = _restricted_certificate_source(
+        tmp_path / "duplicate", monkeypatch, duplicate_events
+    )
+    verification = _passing_certificate_verification(proof, [output.id])
+    with pytest.raises(
+        restriction_cone.RestrictionConeError, match="mapping is ambiguous"
+    ):
+        restriction_cone.build_certificate(
+            source_generation_dir=duplicate_source,
+            graph=graph,
+            proof=proof,
+            verification=verification,
+            ordered_outputs=[output.id],
+            segmentation_fingerprints=verification["fingerprints"],
+        )
+
+    missing_source = _restricted_certificate_source(
+        tmp_path / "missing", monkeypatch, events
+    )
+    missing = _two_offset_proof(
+        output, first, second, first_op, second_op
+    )
+    del missing["resolved_operation_targets"][second_op.id]
+    missing_verification = _passing_certificate_verification(
+        missing, [output.id]
+    )
+    with pytest.raises(
+        restriction_cone.RestrictionConeError,
+        match="runtime targets were omitted for operation",
+    ):
+        restriction_cone.build_certificate(
+            source_generation_dir=missing_source,
+            graph=graph,
+            proof=missing,
+            verification=missing_verification,
+            ordered_outputs=[output.id],
+            segmentation_fingerprints=missing_verification["fingerprints"],
+        )
+
+
+def test_tampered_per_operation_certificate_fails_rebuild_validation(
+    tmp_path, monkeypatch
+):
+    events = _two_offset_events()
+    source_dir = _restricted_certificate_source(
+        tmp_path, monkeypatch, events
+    )
+    graph, output, first, second, first_op, second_op = (
+        _two_offset_certificate_graph()
+    )
+    proof = _two_offset_proof(output, first, second, first_op, second_op)
+    verification = _passing_certificate_verification(proof, [output.id])
+    certificate = restriction_cone.build_certificate(
+        source_generation_dir=source_dir,
+        graph=graph,
+        proof=proof,
+        verification=verification,
+        ordered_outputs=[output.id],
+        segmentation_fingerprints=verification["fingerprints"],
+    )
+    tampered = json.loads(json.dumps(certificate))
+    tampered["events"][1]["runtime_targets"] = [first.id]
+    tampered["events"][1]["record_sha256"] = restriction_cone.object_hash({
+        key: value
+        for key, value in tampered["events"][1].items()
+        if key != "record_sha256"
+    })
+    tampered["event_coverage_sha256"] = restriction_cone.object_hash([
+        {
+            "event_id": record["event_id"],
+            "event_sha256": record["event_sha256"],
+            "record_sha256": record["record_sha256"],
+        }
+        for record in tampered["events"]
+    ])
+    tampered["certificate_sha256"] = restriction_cone._unsigned_hash(
+        tampered, "certificate_sha256"
+    )
+    monkeypatch.setattr(restriction_cone.model, "load", lambda *args: graph)
+
+    with pytest.raises(
+        restriction_cone.RestrictionConeError,
+        match="does not match exact source and segmentation",
+    ):
+        restriction_cone.validate_certificate(
+            tampered,
+            source_generation_dir=source_dir,
+            segmentation_artifact={
+                "verification": verification,
+                "proof": proof,
+            },
+        )
+
+
+def test_in_cone_offset_requires_literal_bounded_stable_equal_targets(
+    tmp_path, monkeypatch
+):
+    event = {
+        "allowed": True,
+        "event": "volatile_function",
+        "function": "OFFSET",
+        "location": "Sheet!C1",
+        "reason": "worksheet_offset",
+        "scope": "worksheet",
+        "token_offset": 0,
+    }
+    source_dir = _restricted_certificate_source(
+        tmp_path, monkeypatch, [event]
+    )
+    graph, output, target = _offset_certificate_graph()
+    proof = {
+        "runtime_radj": {output.id: [target.id]},
+        "resolved_targets": {output.id: [target.id]},
+        "resolved_operation_targets": {"Sheet!C1#OFFSET": [target.id]},
+        "closure": {"stabilized": True, "targets_stable": True},
+    }
+    verification = _passing_certificate_verification(proof, [output.id])
+
+    certificate = restriction_cone.build_certificate(
+        source_generation_dir=source_dir,
+        graph=graph,
+        proof=proof,
+        verification=verification,
+        ordered_outputs=[output.id],
+        segmentation_fingerprints=verification["fingerprints"],
+    )
+
+    record = certificate["events"][0]
+    assert record["static_targets"] == [target.id]
+    assert record["runtime_targets"] == [target.id]
+    assert record["resolution_status"] == "bounded_static_runtime_equal"
+
+
+def test_dynamic_input_oversize_unstable_and_closed_events_fail(
+    tmp_path, monkeypatch
+):
+    offset_event = {
+        "allowed": True,
+        "event": "volatile_function",
+        "function": "OFFSET",
+        "location": "Sheet!C1",
+        "reason": "worksheet_offset",
+        "scope": "worksheet",
+        "token_offset": 0,
+    }
+
+    def build(graph, output, target, events, *, stable=True):
+        source_dir = _restricted_certificate_source(
+            tmp_path / str(len(list(tmp_path.iterdir()))),
+            monkeypatch,
+            events,
+        )
+        proof = {
+            "runtime_radj": {output.id: [target.id]},
+            "resolved_targets": {output.id: [target.id]},
+            "resolved_operation_targets": {
+                "Sheet!C1#OFFSET": [target.id]
+            },
+            "closure": {"stabilized": stable, "targets_stable": stable},
+        }
+        verification = _passing_certificate_verification(proof, [output.id])
+        return restriction_cone.build_certificate(
+            source_generation_dir=source_dir,
+            graph=graph,
+            proof=proof,
+            verification=verification,
+            ordered_outputs=[output.id],
+            segmentation_fingerprints=verification["fingerprints"],
+        )
+
+    graph, output, target = _offset_certificate_graph(rows_node_kind="input")
+    with pytest.raises(restriction_cone.RestrictionConeError, match="task-editable"):
+        build(graph, output, target, [offset_event])
+
+    graph, output, target = _offset_certificate_graph(height=10_001)
+    with pytest.raises(restriction_cone.RestrictionConeError, match="hard cap"):
+        build(graph, output, target, [offset_event])
+
+    graph, output, target = _offset_certificate_graph()
+    with pytest.raises(
+        restriction_cone.RestrictionConeError,
+        match="strict segmentation verification",
+    ):
+        build(graph, output, target, [offset_event], stable=False)
+
+    closed = {
+        "allowed": False,
+        "event": "structured_reference",
+        "location": "DEFINED_NAME:Unsafe",
+        "reason": "structured_reference_unresolved_by_ast",
+        "scope": "defined_name",
+        "token_offset": 0,
+    }
+    with pytest.raises(restriction_cone.RestrictionConeError, match="remains closed"):
+        build(graph, output, target, [closed])
 
 
 def test_mask_and_task_load_stabilized_proof_with_legacy_fallback(tmp_path):

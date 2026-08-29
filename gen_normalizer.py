@@ -17,7 +17,9 @@ The emitted script writes ``normalized.json``, ``exclusions.json`` and
 
 from __future__ import annotations
 
+import argparse
 import collections
+import hashlib
 import json
 import os
 import pprint
@@ -71,9 +73,12 @@ CAUSE_PROSE = {
 }
 
 
-def _source_root(wb):
-    from pathlib import Path as _P
-    return "4-10 100" if _P(f"4-10 100/{wb}.xlsx").exists() else "batch-src"
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def extract_refs(text, sheets=None):
@@ -178,12 +183,20 @@ def atomic_json(path, payload):
     os.replace(tmp, path)
 
 
-def analyse(wb):
+def analyse(wb, source_file, expected_source_sha256):
     run = Path(f"runs/{wb}-variable-sources")
     draft = json.loads((run / "draft.json").read_text(encoding="utf-8"))
-    SR = _source_root(wb)
-    G = openpyxl.load_workbook(f"{SR}/{wb}.xlsx", data_only=False)
-    GV = openpyxl.load_workbook(f"{SR}/{wb}.xlsx", data_only=True)
+    source = Path(source_file)
+    if source.name != f"{wb}.xlsx" or not source.is_file() or source.is_symlink():
+        raise SystemExit("normalizer requires the activated <workbook>.xlsx source")
+    actual_sha256 = _sha256(source)
+    if actual_sha256 != expected_source_sha256:
+        raise SystemExit(
+            "normalizer source hash mismatch: expected %s, got %s"
+            % (expected_source_sha256, actual_sha256)
+        )
+    G = openpyxl.load_workbook(source, data_only=False)
+    GV = openpyxl.load_workbook(source, data_only=True)
     BI = openpyxl.load_workbook(f"inputs_out/{wb}-inputs.xlsx", data_only=False)
     sheets = {s.strip().upper(): s for s in G.sheetnames}
 
@@ -293,7 +306,7 @@ def analyse(wb):
     return draft, rows
 
 
-def emit(wb, draft, rows):
+def emit(wb, draft, rows, *, pipeline_bindings=None):
     # Cells the packager creates (e.g. the Embedded Assumptions disclosure sheet)
     # only exist in the delivered bundle, so the oracle is the first thing that can
     # see those duplicates. Feed its verdict back in here.
@@ -395,6 +408,9 @@ def emit(wb, draft, rows):
                              width=96, sort_dicts=True),
         first_atomic=int(first.get("atomic_variables") or 0),
         forced=pprint.pformat(sorted(forced), indent=4, width=96),
+        pipeline_bindings=pprint.pformat(
+            pipeline_bindings, indent=4, width=96, sort_dicts=True
+        ),
     ), encoding="utf-8")
     print(f"{wb}: {len(draft['rows'])} draft rows -> {len(inc_map)} included, "
           f"{len(exc_map)} excluded, {len(var_defs)} atomic variables, "
@@ -439,6 +455,8 @@ EXCLUSION_REASON_CODES = {codes}
 FIRST_ATOMIC_VARIABLES = {first_atomic}
 
 FORCED_EXCLUSIONS = {forced}
+
+PIPELINE_BINDINGS = {pipeline_bindings}
 
 
 def build_variables():
@@ -524,6 +542,8 @@ def main():
         "seed": {seed},
         "variables": variables,
     }}
+    if PIPELINE_BINDINGS is not None:
+        spec["pipeline_bindings"] = PIPELINE_BINDINGS
     if PROFILES.exists():
         spec["source_profiles"] = (
             json.loads(PROFILES.read_text(encoding="utf-8")).get("profiles") or [])
@@ -552,6 +572,8 @@ def main():
         "forced_exclusions": FORCED_EXCLUSIONS,
         "extra_cell_reasons": EXTRA_CELL_REASONS,
         "dispositions": dispositions,
+        **({{"pipeline_bindings": PIPELINE_BINDINGS}}
+           if PIPELINE_BINDINGS is not None else {{}}),
     }})
     print("{wb}: %d draft rows -> %d included, %d excluded, %d atomic variables"
           % (len(draft_ids), len(INCLUDED), len(EXCLUDED), len(variables)))
@@ -563,6 +585,62 @@ if __name__ == "__main__":
 
 
 if __name__ == "__main__":
-    wb = sys.argv[1]
-    draft, rows = analyse(wb)
-    emit(wb, draft, rows)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("workbook")
+    parser.add_argument("--source-file", required=True)
+    parser.add_argument("--source-sha256", required=True)
+    parser.add_argument("--release-root")
+    parser.add_argument("--release-id")
+    parser.add_argument("--source-generation-root", default="source_out")
+    parser.add_argument("--source-generation-id")
+    parser.add_argument("--segmentation-root", default="seg_out")
+    parser.add_argument("--segmentation-generation-id")
+    args = parser.parse_args()
+    if args.release_id and not args.release_root:
+        parser.error("--release-id requires --release-root")
+    if args.release_root and (
+        args.source_generation_id or args.segmentation_generation_id
+    ):
+        parser.error(
+            "--release-root is mutually exclusive with explicit candidate IDs"
+        )
+    if bool(args.source_generation_id) != bool(args.segmentation_generation_id):
+        parser.error(
+            "explicit staging requires both generation IDs"
+        )
+    pipeline_bindings = None
+    if (
+        args.release_root
+        or args.source_generation_id
+        or args.segmentation_generation_id
+    ):
+        from xl_release_publication import resolve_build_context
+
+        context = resolve_build_context(
+            args.workbook,
+            release_root=(
+                Path(args.release_root) / args.workbook
+                if args.release_root else None
+            ),
+            release_id=args.release_id,
+            source_root=Path(args.source_generation_root) / args.workbook,
+            source_generation_id=args.source_generation_id,
+            segmentation_root=Path(args.segmentation_root) / args.workbook,
+            segmentation_generation_id=args.segmentation_generation_id,
+        )
+        resolved_source = Path(context["source_path"]).resolve()
+        if Path(args.source_file).resolve() != resolved_source:
+            raise SystemExit(
+                "normalizer source path does not match pinned release/candidate"
+            )
+        if args.source_sha256 != context["bindings"].get(
+            "source_health_sha256"
+        ) and _sha256(resolved_source) != args.source_sha256:
+            raise SystemExit("normalizer source hash does not match pinned context")
+        pipeline_bindings = context["bindings"]
+    draft, rows = analyse(
+        args.workbook,
+        args.source_file,
+        args.source_sha256,
+    )
+    emit(args.workbook, draft, rows, pipeline_bindings=pipeline_bindings)

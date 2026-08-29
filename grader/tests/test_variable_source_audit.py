@@ -4,11 +4,16 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import openpyxl
 
 from xl_task_build import read_env_key
-from xl_variable_source_audit import build_inventory, validate_table
+from xl_variable_source_audit import (
+    build_inventory,
+    resolve_segmentation_directory,
+    validate_table,
+)
 
 
 class VariableSourceAuditTests(unittest.TestCase):
@@ -93,6 +98,56 @@ class VariableSourceAuditTests(unittest.TestCase):
         violations = validate_table(unknown_value, rows, metadata)
         self.assertTrue(any("value not in inventory: 0.3" in item
                             for item in violations))
+
+    def test_pinned_inactive_segmentation_generation_is_resolved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source_dir = root / "source-generation"
+            generation_dir = root / "segmentation-generation"
+            generation_dir.mkdir()
+            manifest = generation_dir / "generation-manifest.json"
+            manifest.write_text('{"generation_id":"seg-id"}', encoding="utf-8")
+
+            with (
+                mock.patch(
+                    "xl_source_publication.resolve_source_generation_by_id",
+                    return_value=(source_dir, {"generation_id": "source-id"}),
+                ) as source_resolver,
+                mock.patch(
+                    "xl_seg.publication.resolve_generation_by_id",
+                    return_value=(generation_dir, {"generation_id": "seg-id"}),
+                ) as segmentation_resolver,
+            ):
+                resolved, provenance = resolve_segmentation_directory(
+                    root / "seg-root",
+                    "0001",
+                    segmentation_generation_id="seg-id",
+                    source_generation_root=root / "source-root",
+                    source_generation_id="source-id",
+                )
+
+            self.assertEqual(resolved, generation_dir)
+            self.assertEqual(provenance["generation_id"], "seg-id")
+            self.assertEqual(
+                provenance["source_generation_id"], "source-id"
+            )
+            source_resolver.assert_called_once_with(
+                root / "source-root" / "0001", "source-id"
+            )
+            segmentation_resolver.assert_called_once_with(
+                root / "seg-root" / "0001",
+                "seg-id",
+                source_generation_dir=source_dir,
+                require_pass=True,
+            )
+
+    def test_partial_generation_binding_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "pinned audit requires"):
+            resolve_segmentation_directory(
+                "seg_out",
+                "0001",
+                segmentation_generation_id="seg-id",
+            )
 
 
 if __name__ == "__main__":

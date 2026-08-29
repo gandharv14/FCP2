@@ -203,8 +203,18 @@ def test_production_csv_matches_default_and_skips_debug_artifacts(small_model, t
         json.dumps({"targets": {"Summary!B3": 110}, "tolerance": {}}, indent=2),
         encoding="utf-8",
     )
-    default_select = _select(task_dir, small_model, default_root)
-    production_select = _select(task_dir, small_model, production_root)
+    default_select = _select(
+        task_dir,
+        small_model,
+        default_root,
+        seg_root=default_seg,
+    )
+    production_select = _select(
+        task_dir,
+        small_model,
+        production_root,
+        seg_root=production_seg,
+    )
     shutil.copy2(
         generation / "generation-manifest.json",
         tests / "segmentation_generation_manifest.json",
@@ -315,3 +325,17 @@ def test_harbor_skill_uses_only_full_validator_for_pass():
 
     assert "Only the full validator command above establishes PASS" in skill
     assert 'print("segmentation generation"' not in skill
+
+
+def test_harbor_skill_binds_restricted_pass_to_frozen_inventory():
+    skill = (REPO / ".cursor/skills/create-harbor-task/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'if [ "$SOURCE_ROUTE" = "restricted_pass" ]' in skill
+    assert (
+        "verification_manifests/restricted_source_cohort_123.v2.json"
+        in skill
+    )
+    assert '--health "$SOURCE_HEALTH" --inventory "$RESTRICTION_INVENTORY"' in skill
+    assert "This route may build only an inactive source" in skill

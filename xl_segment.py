@@ -19,6 +19,8 @@ is provably sufficient.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import random
 import sys
 import time
@@ -26,7 +28,7 @@ import tracemalloc
 from pathlib import Path
 
 from xl_seg import adjudicate, bands, condense, diagnostics, emit, evaluate, frontier, lineage
-from xl_seg import model, partition, project, publication
+from xl_seg import model, partition, project, publication, restriction_cone
 
 
 MAX_PROOF_CLOSURE_PASSES = 12
@@ -73,6 +75,26 @@ def _proof_edge_signature(radj, cone):
     ))
 
 
+def _resolved_target_signature(result, cone, graph=None):
+    operation_targets = getattr(result, "resolved_operation_targets", None)
+    if operation_targets is not None:
+        return tuple(
+            (operation, tuple(sorted(targets)))
+            for operation, targets in sorted(operation_targets.items())
+            if graph is None
+            or (
+                graph.nodes.get(operation) is not None
+                and graph.nodes[operation].owner in cone
+            )
+        )
+    targets = getattr(result, "resolved_targets", None) or {}
+    return tuple(
+        (owner, tuple(sorted(sources)))
+        for owner, sources in sorted(targets.items())
+        if owner in cone
+    )
+
+
 def _active_cycle_groups(cone, radj):
     """Find exact active SCCs in the stabilized output proof graph."""
     adjacency = {cell: set() for cell in cone}
@@ -113,6 +135,53 @@ def _curated_output_identity(entries, chosen, cd, bg):
     return components, selected_bands, set(ordered_cells), ordered_cells
 
 
+def _pinned_source_generation(wb: str, args):
+    generation_id = getattr(args, "source_generation_id", None)
+    generation_path = getattr(args, "source_generation_path", None)
+    if not generation_id and not generation_path:
+        return None
+    try:
+        from xl_source_publication import (
+            resolve_source_generation_by_id,
+            validate_source_generation,
+        )
+
+        if generation_path:
+            directory = Path(generation_path)
+            manifest = validate_source_generation(
+                directory,
+                expected_generation_id=generation_id,
+            )
+        else:
+            root = Path(
+                getattr(args, "source_generation_root", "source_out")
+            ) / wb
+            directory, manifest = resolve_source_generation_by_id(
+                root, generation_id
+            )
+    except ValueError as exc:
+        raise SystemExit(f"source generation gate failed: {exc}") from exc
+    layout = manifest.get("layout") or {}
+    if layout.get("workbook_id") != wb:
+        raise SystemExit(
+            f"source generation workbook ID does not match requested {wb}"
+        )
+    source = directory / str(layout.get("source_workbook", ""))
+    ast_dir = directory / str(layout.get("ast_directory", ""))
+    return {
+        "directory": directory,
+        "manifest": manifest,
+        "source": source,
+        "ast_dir": ast_dir,
+        "health": json.loads(
+            (directory / "health.json").read_text(encoding="utf-8")
+        ),
+        "result": json.loads(
+            (directory / "result.json").read_text(encoding="utf-8")
+        ),
+    }
+
+
 def stabilize_runtime_proof(
     graph,
     cg,
@@ -133,6 +202,7 @@ def stabilize_runtime_proof(
     proof_scope = set(static_cone)
     previous_edges = None
     previous_seeds = None
+    previous_targets = None
     history = []
     stabilized = False
 
@@ -153,22 +223,36 @@ def stabilize_runtime_proof(
         }
         edge_signature = _proof_edge_signature(radj, cone)
         seed_signature = tuple(sorted(next_inputs))
+        target_signature = _resolved_target_signature(discovery, cone, graph)
         history.append({
             "pass": pass_index,
             "cone_cells": len(cone),
             "value_edges": len(edge_signature),
             "proof_inputs": len(next_inputs),
+            "resolved_targets": sum(len(item[1]) for item in target_signature),
+            "resolved_targets_sha256": hashlib.sha256(
+                json.dumps(
+                    target_signature,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
             "added_inputs": sorted(next_inputs - proof_inputs),
             "removed_inputs": sorted(proof_inputs - next_inputs),
             "active_graph_passes": discovery.coverage.get("active_graph_passes", 0),
             "workbook_iterations": discovery.coverage.get("workbook_iterations", 0),
         })
-        if edge_signature == previous_edges and seed_signature == previous_seeds:
+        if (
+            edge_signature == previous_edges
+            and seed_signature == previous_seeds
+            and target_signature == previous_targets
+        ):
             proof_inputs = next_inputs
             stabilized = True
             break
         previous_edges = edge_signature
         previous_seeds = seed_signature
+        previous_targets = target_signature
         proof_inputs = next_inputs
         proof_scope = set(cone)
 
@@ -189,7 +273,12 @@ def stabilize_runtime_proof(
         cell for cell in final_cone if _eligible_proof_input(cg, cell)
     }
     final_edges = _proof_edge_signature(final_radj, final_cone)
-    if final_inputs != proof_inputs or final_edges != previous_edges:
+    final_targets = _resolved_target_signature(result, final_cone, graph)
+    if (
+        final_inputs != proof_inputs
+        or final_edges != previous_edges
+        or final_targets != previous_targets
+    ):
         stabilized = False
 
     address_radj = {
@@ -217,6 +306,17 @@ def stabilize_runtime_proof(
             )
             if target in final_cone
         },
+        "resolved_operation_targets": {
+            operation: list(targets)
+            for operation, targets in sorted(
+                (
+                    getattr(result, "resolved_operation_targets", None)
+                    or {}
+                ).items()
+            )
+            if graph.nodes.get(operation) is not None
+            and graph.nodes[operation].owner in final_cone
+        },
         "attempted_reads": {
             source: sorted(
                 consumer for consumer in consumers
@@ -232,6 +332,7 @@ def stabilize_runtime_proof(
         },
         "closure": {
             "stabilized": stabilized,
+            "targets_stable": stabilized and final_targets == previous_targets,
             "passes": len(history),
             "max_passes": max_passes,
             "diagnostic": (
@@ -259,9 +360,25 @@ def stabilize_runtime_proof(
 
 def segment(wb: str, args) -> dict:
     started = time.time()
-    ast_dir = Path(args.ast_dir) / wb
+    source_generation = _pinned_source_generation(wb, args)
+    if source_generation is None:
+        ast_dir = Path(args.ast_dir) / wb
+        source = Path(args.source) / f"{wb}.xlsx"
+    else:
+        ast_dir = source_generation["ast_dir"]
+        source = source_generation["source"]
     if not (ast_dir / "nodes.csv").exists():
         raise SystemExit(f"no graph at {ast_dir}")
+    try:
+        from xl_source_publication import validate_bound_ast_if_required
+
+        validate_bound_ast_if_required(
+            source,
+            ast_dir,
+            require=not getattr(args, "allow_legacy_ast", True),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"source/AST provenance gate failed: {exc}") from exc
     out_dir = Path(args.out) / wb
     out_dir.mkdir(parents=True, exist_ok=True)
     curation_path = out_dir / "curation.toml"
@@ -347,7 +464,6 @@ def segment(wb: str, args) -> dict:
             f"{wb}: curated output identity does not match selected output cells"
         )
 
-    source = Path(args.source) / f"{wb}.xlsx"
     verify = _not_run_verification(
         source,
         ast_dir,
@@ -427,6 +543,32 @@ def segment(wb: str, args) -> dict:
             f"{wb}: existing curation.toml changed outside explicit recuration"
         )
 
+    cone_certificate = None
+    if source_generation is not None:
+        source_route = source_generation["health"].get("route")
+        if source_route == "restricted_pass":
+            if proof is None:
+                raise SystemExit(
+                    f"{wb}: restricted segmentation requires strict verification"
+                )
+            try:
+                cone_certificate = restriction_cone.build_certificate(
+                    source_generation_dir=source_generation["directory"],
+                    graph=graph,
+                    proof=proof,
+                    verification=verify,
+                    ordered_outputs=ordered_curated_cells,
+                    segmentation_fingerprints=verify.get("fingerprints") or {},
+                )
+            except restriction_cone.RestrictionConeError as exc:
+                raise SystemExit(
+                    f"{wb}: restriction cone certification failed: {exc}"
+                ) from exc
+        publication.bind_source_generation(
+            verify,
+            source_generation["manifest"],
+            certificate=cone_certificate,
+        )
     publication.attach_generation_contract(verify)
     stage_dir = publication.make_staging_directory(Path(args.out), wb)
     emit.write_candidates(stage_dir, candidates, bg)
@@ -445,6 +587,10 @@ def segment(wb: str, args) -> dict:
         selected_output_bands=selected_output_bands,
     )
     emit.write_lineage(stage_dir, wb, traces, values, proof=proof)
+    if cone_certificate is not None:
+        (stage_dir / "restriction-cone-certificate.json").write_bytes(
+            restriction_cone.certificate_bytes(cone_certificate)
+        )
     generation_dir, generation_manifest = publication.publish_generation(
         stage_dir,
         out_dir,
@@ -452,6 +598,11 @@ def segment(wb: str, args) -> dict:
         ordered_curated_cells,
         source_path=source,
         ast_dir=ast_dir,
+        source_generation_dir=(
+            source_generation["directory"]
+            if source_generation is not None
+            else None
+        ),
     )
 
     payload["elapsed_s"] = round(time.time() - started, 2)
@@ -887,6 +1038,7 @@ def _verify(
         and not missing_ast_capabilities
         and not ast_integrity_errors
         and proof_within_limits
+        and not result.coverage.get("unknown_ops")
     )
 
     source_path = Path(source_path) if source_path is not None else Path("")
@@ -936,6 +1088,10 @@ def _verify(
         ),
         "proof_benchmark_limits_exceeded": int(not proof_within_limits),
         "ast_integrity_error": len(ast_integrity_errors),
+        "unknown_operation": sum(
+            int(count)
+            for count in (result.coverage.get("unknown_ops") or {}).values()
+        ),
         **cycle_reason_counts,
     }
     classification = diagnostics.classify_disposition({
@@ -1107,6 +1263,7 @@ def _verify(
         },
         "fingerprints": fingerprints,
         "generation_id": diagnostics.generation_id(fingerprints),
+        "ordered_output_cells": ordered_output_cells,
         "missing_evidence": missing_evidence,
         "ast_integrity": {
             "schema_version": getattr(cg.graph, "ast_schema_version", ""),
@@ -1166,6 +1323,24 @@ def main(argv=None):
     parser.add_argument("workbooks", nargs="+", help="workbook ids under --ast-dir")
     parser.add_argument("--ast-dir", default="ast_out")
     parser.add_argument("--source", default="4-10 100", help="folder holding <wb>.xlsx")
+    parser.add_argument(
+        "--source-generation-id",
+        help="pinned immutable source generation ID (never reads current.json)",
+    )
+    parser.add_argument(
+        "--source-generation-path",
+        help="exact immutable source generation directory",
+    )
+    parser.add_argument(
+        "--source-generation-root",
+        default="source_out",
+        help="root containing <workbook>/generations/<source-generation-id>",
+    )
+    parser.add_argument(
+        "--allow-legacy-ast",
+        action="store_true",
+        help="offline compatibility only: allow AST CSVs without provenance",
+    )
     parser.add_argument("-o", "--out", default="seg_out")
     parser.add_argument("--threshold", type=float, default=6.0,
                         help="auto-include outputs scoring at least this")
@@ -1181,6 +1356,10 @@ def main(argv=None):
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--no-verify", action="store_true")
     args = parser.parse_args(argv)
+    if (
+        args.source_generation_path or args.source_generation_id
+    ) and len(args.workbooks) != 1:
+        parser.error("pinned source generation options require exactly one workbook")
 
     failures = 0
     for wb in args.workbooks:

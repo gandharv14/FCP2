@@ -12,9 +12,12 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
 ast_out/
+source_out/
 seg_out/
 inputs_out/
 tasks_outputs*/
 jobs/
 runs/
+/4-10 100

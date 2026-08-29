@@ -107,7 +107,7 @@ def _cell_value(book, ref):
     return book[sheet][coord].value
 
 
-def build_inventory(workbook, artifact, seg_dir):
+def build_inventory(workbook, artifact, seg_dir, *, segmentation=None):
     """Return a compact, deterministic inventory of relevant input bands."""
     segments = json.loads(
         (Path(seg_dir) / "segments.json").read_text(encoding="utf-8")
@@ -154,6 +154,8 @@ def build_inventory(workbook, artifact, seg_dir):
                 if getattr(props, key, None)
             },
         }
+        if segmentation is not None:
+            metadata["segmentation"] = segmentation
         return {"metadata": metadata, "variables": rows}
     finally:
         book.close()
@@ -300,7 +302,8 @@ def _canonical_hash(value):
 def generate_audit(
         workbook, artifact, seg_dir, output_dir, api_key, *,
         model=DEFAULT_MODEL, endpoint=PROD_ENDPOINT,
-        project_id=DEFAULT_PROJECT_ID, refresh=False, log=print):
+        project_id=DEFAULT_PROJECT_ID, refresh=False, log=print,
+        segmentation=None):
     """Generate (or reuse) the Markdown audit and return its metadata."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -309,7 +312,9 @@ def generate_audit(
     inventory_path = output_dir / (stem + ".inventory.json")
     metadata_path = output_dir / (stem + ".metadata.json")
 
-    inventory = build_inventory(workbook, artifact, seg_dir)
+    inventory = build_inventory(
+        workbook, artifact, seg_dir, segmentation=segmentation
+    )
     inventory_hash = _canonical_hash(inventory)
     inventory_path.write_text(
         json.dumps(inventory, indent=2, ensure_ascii=False) + "\n",
@@ -441,6 +446,46 @@ def generate_audit(
     return metadata
 
 
+def resolve_segmentation_directory(
+        seg_root, workbook, *, segmentation_generation_id=None,
+        source_generation_root=None, source_generation_id=None):
+    """Resolve a pinned inactive generation, or the explicit legacy directory."""
+    seg_dir = Path(seg_root) / workbook
+    pinned = (
+        segmentation_generation_id,
+        source_generation_root,
+        source_generation_id,
+    )
+    if not any(pinned):
+        return seg_dir, None
+    if not all(pinned):
+        raise RuntimeError(
+            "pinned audit requires segmentation generation ID, source "
+            "generation root, and source generation ID"
+        )
+
+    from xl_seg.publication import resolve_generation_by_id
+    from xl_source_publication import resolve_source_generation_by_id
+
+    source_dir, source_manifest = resolve_source_generation_by_id(
+        Path(source_generation_root) / workbook,
+        source_generation_id,
+    )
+    generation_dir, generation_manifest = resolve_generation_by_id(
+        seg_dir,
+        segmentation_generation_id,
+        source_generation_dir=source_dir,
+        require_pass=True,
+    )
+    return generation_dir, {
+        "generation_id": generation_manifest["generation_id"],
+        "manifest_sha256": hashlib.sha256(
+            (generation_dir / "generation-manifest.json").read_bytes()
+        ).hexdigest(),
+        "source_generation_id": source_manifest["generation_id"],
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate variable/source audit Markdown with GPT 5.6 Sol"
@@ -448,6 +493,9 @@ def main(argv=None):
     parser.add_argument("workbooks", nargs="+")
     parser.add_argument("--inputs-root", default="inputs_out")
     parser.add_argument("--seg-root", default="seg_out")
+    parser.add_argument("--segmentation-generation-id")
+    parser.add_argument("--source-generation-root")
+    parser.add_argument("--source-generation-id")
     parser.add_argument("--audit-root", default="runs")
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -460,15 +508,31 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    if args.segmentation_generation_id and len(args.workbooks) != 1:
+        parser.error("a pinned segmentation generation requires one workbook")
+
     api_key = "" if args.inventory_only else read_env_key(args.env_file)
     results = []
     for workbook in args.workbooks:
         artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
         output_dir = Path(args.audit_root) / ("%s-variable-sources" % workbook)
+        try:
+            seg_dir, segmentation = resolve_segmentation_directory(
+                args.seg_root,
+                workbook,
+                segmentation_generation_id=args.segmentation_generation_id,
+                source_generation_root=args.source_generation_root,
+                source_generation_id=args.source_generation_id,
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            parser.error(str(exc))
         if args.inventory_only:
             output_dir.mkdir(parents=True, exist_ok=True)
             inventory = build_inventory(
-                workbook, artifact, Path(args.seg_root) / workbook
+                workbook,
+                artifact,
+                seg_dir,
+                segmentation=segmentation,
             )
             path = output_dir / ("%s-inputs-variable-sources.inventory.json"
                                  % workbook)
@@ -480,9 +544,10 @@ def main(argv=None):
                             "rows": len(inventory["variables"])})
         else:
             results.append(generate_audit(
-                workbook, artifact, Path(args.seg_root) / workbook, output_dir,
+                workbook, artifact, seg_dir, output_dir,
                 api_key, model=args.model, endpoint=args.endpoint,
                 project_id=args.project_id, refresh=args.refresh,
+                segmentation=segmentation,
             ))
     print(json.dumps(results, indent=2))
     return 0

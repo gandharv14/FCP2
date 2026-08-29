@@ -327,7 +327,11 @@ def is_unit_stamp(text: str) -> bool:
         lowered,
     ):
         return True
-    if re.fullmatch(r"(?:usd|eur|gbp|aed|sar|[$€£])\s*/\s*[a-z]+", lowered):
+    if re.fullmatch(
+        r"(?:usd|eur|gbp|aed|sar|[$€£])"
+        r"\s*(?:/\s*[a-z][a-z0-9() -]*)+",
+        lowered,
+    ):
         return True
     if re.fullmatch(r"(?:usd|eur|gbp|aed|sar|[$€£])\s*\d{4}[kmbn]*", lowered):
         return True
@@ -511,8 +515,53 @@ def make_band(gold: Book, sheet: str, row: int, pattern: str, run: list[tuple[in
 
 def select_payload(args) -> dict:
     task_dir = Path(args.task_dir).resolve()
-    golden_path = find_golden(task_dir, args.golden)
+    segmentation_mode = getattr(args, "segmentation_mode", "strict")
+    pipeline_context = None
+    pinned = bool(
+        getattr(args, "release_root", None)
+        or getattr(args, "source_generation_id", None)
+        or getattr(args, "segmentation_generation_id", None)
+    )
     delivered_path = find_environment(task_dir)
+    if pinned:
+        workbook = delivered_path.stem
+        if workbook.endswith("-inputs"):
+            workbook = workbook[:-7]
+        from xl_release_publication import resolve_build_context
+
+        pipeline_context = resolve_build_context(
+            workbook,
+            release_root=(
+                Path(args.release_root) / workbook
+                if getattr(args, "release_root", None) else None
+            ),
+            release_id=getattr(args, "release_id", None),
+            source_root=Path(args.source_generation_root) / workbook,
+            source_generation_id=getattr(args, "source_generation_id", None),
+            segmentation_root=Path(args.seg_root) / workbook,
+            segmentation_generation_id=getattr(
+                args, "segmentation_generation_id", None
+            ),
+        )
+    if segmentation_mode == "strict" and pipeline_context is None:
+        missing = [
+            name
+            for name, value in (
+                ("--golden", getattr(args, "golden", None)),
+                ("--ast-dir", getattr(args, "ast_dir", None)),
+                ("--seg-root", getattr(args, "seg_root", None)),
+            )
+            if not value
+        ]
+        if missing:
+            raise SystemExit(
+                "strict disclosure requires explicit " + ", ".join(missing)
+            )
+    golden_path = (
+        Path(pipeline_context["source_path"])
+        if pipeline_context is not None
+        else find_golden(task_dir, args.golden)
+    )
     generation = None
     seg_root = getattr(args, "seg_root", None)
     if seg_root:
@@ -525,6 +574,7 @@ def select_payload(args) -> dict:
         expected_generation_id = getattr(
             args, "expected_generation_id", None
         )
+        inputs_generation = {}
         packaged_manifest_path = (
             task_dir / "tests" / "segmentation_generation_manifest.json"
         )
@@ -570,17 +620,35 @@ def select_payload(args) -> dict:
                 raise SystemExit(
                     "packaged inputs generation binding is invalid"
                 )
-        generation_dir, manifest = resolve_for_consumer(
-            Path(seg_root) / workbook,
-            mode=getattr(args, "segmentation_mode", "strict"),
-            source_path=golden_path,
-            ast_dir=(
-                Path(args.ast_dir) / workbook
-                if getattr(args, "ast_dir", None) else None
-            ),
-            require_pass=True,
-            expected_generation_id=expected_generation_id,
-        )
+        if pipeline_context is not None:
+            generation_dir = Path(pipeline_context["segmentation_dir"])
+            manifest = pipeline_context["segmentation_manifest"]
+            if (
+                expected_generation_id is not None
+                and manifest.get("generation_id") != expected_generation_id
+            ):
+                raise SystemExit(
+                    "packaged and pinned segmentation generation IDs disagree"
+                )
+            packaged_bindings = inputs_generation.get("pipeline_bindings")
+            if packaged_manifest_path.is_file() and (
+                packaged_bindings != pipeline_context["bindings"]
+            ):
+                raise SystemExit(
+                    "packaged inputs do not preserve pinned pipeline bindings"
+                )
+        else:
+            generation_dir, manifest = resolve_for_consumer(
+                Path(seg_root) / workbook,
+                mode=getattr(args, "segmentation_mode", "strict"),
+                source_path=golden_path,
+                ast_dir=(
+                    Path(args.ast_dir) / workbook
+                    if getattr(args, "ast_dir", None) else None
+                ),
+                require_pass=True,
+                expected_generation_id=expected_generation_id,
+            )
         generation = {
             "generation_id": (
                 manifest.get("generation_id") if manifest is not None else None
@@ -595,7 +663,14 @@ def select_payload(args) -> dict:
     targets = [parse_ref(t, default_sheet) for t in targets_map]
 
     regex = regex_closure(gold, targets)
-    ast, ast_status = ast_closure_if_available(task_dir, targets, Path(args.ast_dir) if args.ast_dir else None)
+    ast_root = (
+        Path(pipeline_context["ast_root"])
+        if pipeline_context is not None
+        else Path(args.ast_dir) if args.ast_dir else None
+    )
+    ast, ast_status = ast_closure_if_available(task_dir, targets, ast_root)
+    if segmentation_mode == "strict" and ast is None:
+        raise SystemExit(f"strict disclosure requires bound AST closure: {ast_status}")
     closure = ast if ast is not None else regex
     selected = blanked_formula_cells(gold, delivered, closure)
 
@@ -605,6 +680,9 @@ def select_payload(args) -> dict:
         "task": task_dir.name,
         "task_dir": str(task_dir),
         "golden": str(golden_path),
+        "golden_sha256": hashlib.sha256(golden_path.read_bytes()).hexdigest(),
+        "ast_dir": str(ast_root.resolve()) if ast_root else None,
+        "seg_root": str(Path(seg_root).resolve()) if seg_root else None,
         "delivered": str(delivered_path),
         "targets": list(targets_map),
         "target_keys": targets,
@@ -622,6 +700,8 @@ def select_payload(args) -> dict:
     }
     if generation is not None:
         payload["segmentation_generation"] = generation
+    if pipeline_context is not None:
+        payload["pipeline_bindings"] = pipeline_context["bindings"]
     return payload
 
 
@@ -3148,6 +3228,23 @@ def coalesce_same_band(records: list[dict]) -> list[dict]:
     return out
 
 
+def records_provenance(selection: dict) -> dict:
+    """Carry immutable-generation bindings from selection through writing."""
+    return {
+        "golden": selection["golden"],
+        "golden_sha256": selection["golden_sha256"],
+        "pipeline_bindings": selection.get("pipeline_bindings"),
+        "segmentation_mode": (
+            (selection.get("segmentation_generation") or {}).get("mode")
+            or "legacy"
+        ),
+        "segmentation_generation": selection.get("segmentation_generation"),
+        "selection": selection.get("selection"),
+        "ast_dir": selection.get("ast_dir"),
+        "seg_root": selection.get("seg_root"),
+    }
+
+
 def detect_records(args) -> dict:
     task_dir = Path(args.task_dir).resolve()
     selection = read_stage(task_dir, "bands", Path(args.runs_root))
@@ -3239,6 +3336,7 @@ def detect_records(args) -> dict:
     payload = {
         "schema_version": "2.0",
         "task": task_dir.name,
+        **records_provenance(selection),
         "records": sorted(unique, key=lambda r: (r["disposition"], r["family"], r["band"] or "")),
         "method_assessments": method_assessments,
         "custom_calibration": custom_calibration,
@@ -3644,6 +3742,67 @@ def verify_task(task_dir: Path) -> dict:
     if not disclosure_path.exists():
         return {"task": task_dir.name, "passed": False, "faults": ["missing tests/disclosure.json"]}
     payload = json.loads(disclosure_path.read_text(encoding="utf-8"))
+    golden_path = Path(payload.get("golden", ""))
+    expected_golden_hash = payload.get("golden_sha256")
+    if (
+        not golden_path.is_file()
+        or not isinstance(expected_golden_hash, str)
+        or hashlib.sha256(golden_path.read_bytes()).hexdigest()
+        != expected_golden_hash
+    ):
+        faults.append("disclosure golden binding is missing or changed")
+    if payload.get("segmentation_mode") != "strict":
+        faults.append("production disclosure requires strict segmentation provenance")
+    else:
+        try:
+            generation = payload.get("segmentation_generation")
+            if not isinstance(generation, dict) or generation.get("mode") != "strict":
+                raise ValueError("strict segmentation generation is missing")
+            if payload.get("selection", {}).get("closure_source") != "ast":
+                raise ValueError("strict disclosure did not use AST closure")
+            generation_id = generation.get("generation_id")
+            ast_root = Path(payload.get("ast_dir", ""))
+            seg_root = Path(payload.get("seg_root", ""))
+            if (
+                not isinstance(generation_id, str)
+                or not ast_root.is_dir()
+                or not seg_root.is_dir()
+            ):
+                raise ValueError("strict disclosure provenance paths are missing")
+            workbook = golden_path.stem
+            pipeline_bindings = payload.get("pipeline_bindings")
+            if pipeline_bindings is not None:
+                if (
+                    pipeline_bindings.get("segmentation_generation_id")
+                    != generation_id
+                    or pipeline_bindings.get("source_generation_id")
+                    is None
+                ):
+                    raise ValueError("disclosure pipeline bindings changed")
+                from xl_seg.publication import resolve_generation_by_id
+
+                resolve_generation_by_id(
+                    seg_root / workbook,
+                    generation_id,
+                    source_path=golden_path,
+                    ast_dir=ast_root / workbook,
+                    source_generation_dir=golden_path.parent.parent,
+                    require_pass=True,
+                    validate_live_evidence=True,
+                )
+            else:
+                from xl_seg.publication import resolve_for_consumer
+
+                resolve_for_consumer(
+                    seg_root / workbook,
+                    mode="strict",
+                    source_path=golden_path,
+                    ast_dir=ast_root / workbook,
+                    require_pass=True,
+                    expected_generation_id=generation_id,
+                )
+        except Exception as exc:
+            faults.append(f"strict disclosure provenance failed: {exc}")
     delivered = Book(find_environment(task_dir))
     shipped = payload.get("agent_records", [])
     visible_cells = sorted({
@@ -3708,7 +3867,16 @@ def verify_task(task_dir: Path) -> dict:
 
     if custom:
         try:
-            gold = Book(find_golden(task_dir))
+            golden_path = Path(payload.get("golden", ""))
+            expected_golden_hash = payload.get("golden_sha256")
+            if (
+                not golden_path.is_file()
+                or not isinstance(expected_golden_hash, str)
+                or hashlib.sha256(golden_path.read_bytes()).hexdigest()
+                != expected_golden_hash
+            ):
+                raise ValueError("disclosure golden binding is missing or changed")
+            gold = Book(golden_path)
             structural = []
             for rec in custom:
                 profile = formula_profile(gold, {
@@ -3896,13 +4064,18 @@ def main(argv=None):
         if name == "select":
             p.add_argument("--golden", default=None)
             p.add_argument("--ast-dir", default=None)
-            p.add_argument("--seg-root", default="seg_out")
+            p.add_argument("--seg-root", default=None)
             p.add_argument(
                 "--segmentation-mode",
                 choices=("strict", "shadow", "legacy"),
                 default="strict",
             )
             p.add_argument("--expected-generation-id", default=None)
+            p.add_argument("--release-root", default=None)
+            p.add_argument("--release-id", default=None)
+            p.add_argument("--source-generation-root", default="source_out")
+            p.add_argument("--source-generation-id", default=None)
+            p.add_argument("--segmentation-generation-id", default=None)
         if name == "detect":
             p.add_argument("--role-resolutions", default=None)
         if name == "write":

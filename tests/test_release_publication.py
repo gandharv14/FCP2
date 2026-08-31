@@ -140,6 +140,7 @@ def _fixture(
     *,
     restricted=True,
     freeze_legacy=True,
+    recovery_mode=None,
 ):
     workbook = "case"
     source_root = tmp_path / "source"
@@ -165,9 +166,15 @@ def _fixture(
             release.PREVIOUS_SOURCE_POLICY_VERSION
         ):
             source_bindings.update({
-                "inventory_approval_sha256": H["approval"],
                 "recalc_signals_sha256": H["signals"],
             })
+            if recovery_mode is None:
+                source_bindings["inventory_approval_sha256"] = H["approval"]
+    policy_decision = {
+        "route": "restricted_pass" if restricted else "pass",
+    }
+    if recovery_mode is not None:
+        policy_decision["recovery_mode"] = recovery_mode
     source_manifest = {
         "schema_version": release.SOURCE_SCHEMA_VERSION,
         "generation_id": source_id,
@@ -180,9 +187,7 @@ def _fixture(
         },
         "identity": {
             "policy_version": release.SOURCE_POLICY_VERSION,
-            "policy_decision": {
-                "route": "restricted_pass" if restricted else "pass",
-            },
+            "policy_decision": policy_decision,
         },
         "bindings": source_bindings,
     }
@@ -218,9 +223,10 @@ def _fixture(
             release.PREVIOUS_SOURCE_POLICY_VERSION
         ):
             policy.update({
-                "inventory_approval_sha256": H["approval"],
                 "recalc_signals_sha256": H["signals"],
             })
+            if recovery_mode is None:
+                policy["inventory_approval_sha256"] = H["approval"]
         (segmentation_dir / "restriction-cone-certificate.json").write_text(
             json.dumps({
                 "schema_version": release.CONE_SCHEMA_VERSION,
@@ -270,6 +276,7 @@ def _fixture(
             if restricted
             and release.SOURCE_POLICY_VERSION
             != release.PREVIOUS_SOURCE_POLICY_VERSION
+            and recovery_mode is None
             else None
         ),
         "recalc_signals_sha256": (
@@ -298,6 +305,8 @@ def _fixture(
         "segmentation_id": segmentation_id,
         "task_id": task_manifest["generation_id"],
         "task_dir": task_dir,
+        "source_manifest": source_manifest,
+        "segmentation_manifest": segmentation_manifest,
     }
     if freeze_legacy:
         case["legacy_snapshot_hash"] = _freeze_fixture_legacy(case)
@@ -415,6 +424,153 @@ def test_current_restricted_release_requires_approval_and_signal_bindings(
         release.ReleasePublicationError,
         match="current restricted source bindings are incomplete",
     ):
+        _publish(case)
+
+
+def test_data_table_recovery_release_uses_hash_bound_recalc_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        recovery_mode="data_tables_outside_output_cone",
+    )
+
+    _, manifest = _publish(case)
+
+    assert manifest["bindings"]["inventory_approval_sha256"] is None
+    assert manifest["bindings"]["recalc_signals_sha256"] == H["signals"]
+
+
+def test_restricted_recovery_mode_still_requires_recalc_binding(
+    tmp_path,
+    monkeypatch,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        recovery_mode="data_tables_outside_output_cone",
+    )
+    case["source_manifest"]["bindings"].pop("recalc_signals_sha256")
+    case["segmentation_manifest"]["source_policy_bindings"].pop(
+        "recalc_signals_sha256"
+    )
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="current restricted source bindings are incomplete",
+    ):
+        _publish(case)
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "restriction_evidence_sha256",
+        "restriction_events_sha256",
+        "restriction_profile_sha256",
+    ],
+)
+def test_restricted_recovery_mode_requires_restriction_hashes(
+    tmp_path,
+    monkeypatch,
+    binding,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        recovery_mode="data_tables_outside_output_cone",
+    )
+    case["source_manifest"]["bindings"].pop(binding)
+    case["segmentation_manifest"]["source_policy_bindings"].pop(binding)
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="current restricted source bindings are incomplete",
+    ):
+        _publish(case)
+
+
+def test_restricted_recovery_mode_requires_bound_cone_certificate(
+    tmp_path,
+    monkeypatch,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        recovery_mode="data_tables_outside_output_cone",
+    )
+    certificate = (
+        case["segmentation_root"]
+        / "generations"
+        / case["segmentation_id"]
+        / "restriction-cone-certificate.json"
+    )
+    certificate.write_text(
+        json.dumps({
+            "schema_version": release.CONE_SCHEMA_VERSION,
+            "certificate_sha256": "0" * 64,
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="restriction cone certificate is incomplete or changed",
+    ):
+        _publish(case)
+
+
+def test_restricted_recovery_mode_rejects_inventory_approval(
+    tmp_path,
+    monkeypatch,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        recovery_mode="data_tables_outside_output_cone",
+    )
+    case["source_manifest"]["bindings"]["inventory_approval_sha256"] = H[
+        "approval"
+    ]
+    case["segmentation_manifest"]["source_policy_bindings"][
+        "inventory_approval_sha256"
+    ] = H["approval"]
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="must omit inventory approval",
+    ):
+        _publish(case)
+
+
+@pytest.mark.parametrize(
+    ("restricted", "recovery_mode", "error"),
+    [
+        (True, "unknown_mode", "unsupported restricted recovery mode"),
+        (
+            False,
+            "data_tables_outside_output_cone",
+            "not bound to the source route",
+        ),
+    ],
+)
+def test_restricted_recovery_mode_is_exact_and_restricted(
+    tmp_path,
+    monkeypatch,
+    restricted,
+    recovery_mode,
+    error,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        restricted=restricted,
+        recovery_mode=recovery_mode,
+    )
+
+    with pytest.raises(release.ReleasePublicationError, match=error):
         _publish(case)
 
 

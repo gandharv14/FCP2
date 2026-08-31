@@ -35,6 +35,9 @@ PREVIOUS_SOURCE_HEALTH_SCHEMA_VERSION = "xlsx-source-health/v2"
 SEGMENTATION_VERIFICATION_SCHEMA_VERSION = "segmentation-verification/v2"
 CONE_SCHEMA_VERSION = "restriction-cone-certificate/v1"
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+RECOVERY_RESTRICTED_MODES = frozenset({
+    "data_tables_outside_output_cone",
+})
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TRUE_EXTERNAL_XLSX_PARTS = (
     "xl/externalLinks/",
@@ -457,18 +460,43 @@ def _release_components(
         "restricted_pass",
         "restricted_recalc_pass",
     }
+    policy_decision = source_identity.get("policy_decision") or {}
+    recovery_mode = policy_decision.get("recovery_mode")
+    recovery_restricted = recovery_mode in RECOVERY_RESTRICTED_MODES
+    if recovery_mode is not None and not recovery_restricted:
+        raise ReleasePublicationError("unsupported restricted recovery mode")
+    if recovery_restricted and (
+        source_policy_version == PREVIOUS_SOURCE_POLICY_VERSION
+        or not restricted
+        or policy_decision.get("route") != source_binding.get("route")
+    ):
+        raise ReleasePublicationError(
+            "restricted recovery mode is not bound to the source route"
+        )
     policy_bindings = segmentation_manifest.get("source_policy_bindings") or {}
     if restricted:
+        required_source_bindings = (
+            "restriction_evidence_sha256",
+            "restriction_events_sha256",
+            "restriction_profile_sha256",
+            "recalc_signals_sha256",
+        )
+        if not recovery_restricted:
+            required_source_bindings += ("inventory_approval_sha256",)
         if source_policy_version != PREVIOUS_SOURCE_POLICY_VERSION and any(
             not isinstance(source_bindings.get(key), str)
             or HASH_RE.fullmatch(source_bindings[key]) is None
-            for key in (
-                "inventory_approval_sha256",
-                "recalc_signals_sha256",
-            )
+            for key in required_source_bindings
         ):
             raise ReleasePublicationError(
                 "current restricted source bindings are incomplete"
+            )
+        if recovery_restricted and (
+            source_bindings.get("inventory_approval_sha256") is not None
+            or policy_bindings.get("inventory_approval_sha256") is not None
+        ):
+            raise ReleasePublicationError(
+                "restricted recovery mode must omit inventory approval"
             )
         if (
             policy_bindings.get("restriction_evidence_sha256")
@@ -487,8 +515,16 @@ def _release_components(
             segmentation_dir / "restriction-cone-certificate.json",
             "restriction cone certificate",
         )
-        if certificate.get("schema_version") != CONE_SCHEMA_VERSION:
-            raise ReleasePublicationError("unsupported restriction cone schema")
+        certificate_hash = policy_bindings.get("cone_certificate_sha256")
+        if (
+            certificate.get("schema_version") != CONE_SCHEMA_VERSION
+            or not isinstance(certificate_hash, str)
+            or HASH_RE.fullmatch(certificate_hash) is None
+            or certificate.get("certificate_sha256") != certificate_hash
+        ):
+            raise ReleasePublicationError(
+                "restriction cone certificate is incomplete or changed"
+            )
     elif any(
         policy_bindings.get(key) is not None
         for key in (

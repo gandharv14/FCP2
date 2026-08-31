@@ -7,7 +7,7 @@ import re
 
 
 CELL_PHRASE_RE = re.compile(
-    r"(?P<kind>cell|range)\s+"
+    r"(?:fixed\s+)?(?P<kind>cell|range)\s+"
     r"(?P<sheet>'[^']+'|[A-Za-z0-9_][A-Za-z0-9_ .&-]*)!"
     r"(?P<a>\$?[A-Z]{1,3}\$?\d{1,7})"
     r"(?::(?P<b>\$?[A-Z]{1,3}\$?\d{1,7}))?"
@@ -410,6 +410,19 @@ def _join_and(parts: list[str]) -> str:
     return ", ".join(parts[:-1]) + ", and " + parts[-1]
 
 
+def _locked_role(node: dict, role: str) -> str:
+    text = _plain(node)
+    if "locked input" not in text.lower():
+        return text
+    return re.sub(
+        r"\bthe locked input\b",
+        f"the {role} locked input",
+        text,
+        count=1,
+        flags=re.I,
+    )
+
+
 CMP = {
     "eq": "equals",
     "ne": "does not equal",
@@ -480,7 +493,9 @@ def _linearize(node: dict) -> tuple[str, list[str]]:
         return f"{_wrap(args[0])} raised to {_wrap(args[1])}", []
     if op == "if":
         cond = _plain(args[0])
-        yes = _wrap(args[1])
+        yes = _locked_role(args[1], "result")
+        if not _simple(args[1]):
+            yes = f"({yes})"
         no = _wrap(args[2]) if len(args) > 2 else "false"
         return f"if {cond}, use {yes}; otherwise {no}", []
     if op == "iferror":
@@ -490,7 +505,15 @@ def _linearize(node: dict) -> tuple[str, list[str]]:
     if op == "round":
         return f"round {_plain(args[0])} to the nearest multiple of {_plain(args[1])}", []
     if op in CMP:
-        return f"{_plain(args[0])} {CMP[op]} {_plain(args[1])}", []
+        role = (
+            "lower bound"
+            if op in {"gt", "ge"}
+            else "upper bound"
+            if op in {"lt", "le"}
+            else ""
+        )
+        right = _locked_role(args[1], role) if role else _plain(args[1])
+        return f"{_plain(args[0])} {CMP[op]} {right}", []
     return _plain(args[0]) if args else (node.get("text") or ""), []
 
 

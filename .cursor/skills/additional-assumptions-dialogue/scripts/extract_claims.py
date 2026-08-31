@@ -23,6 +23,10 @@ from spoken_formula import needs_spoken, speak_record
 
 
 LABEL_RE = re.compile(r'"([^"]+)"')
+SOURCE_TAB_RE = re.compile(
+    r"\bon the ([A-Za-z0-9][A-Za-z0-9 _&.'()/-]*?) tab\b",
+    re.I,
+)
 LOCATOR_ATOMS = (
     "last period",
     "this period",
@@ -40,6 +44,9 @@ OPERATOR_ATOMS = (
     "plus",
     "average",
     "held flat",
+    "lower bound",
+    "upper bound",
+    "result locked input",
     "otherwise",
     "errors",
 )
@@ -98,6 +105,9 @@ def must_say_atoms(spoken: str, sheet: str = "", row_label: str = "") -> list[st
         if label.strip() in NON_LABEL_LITERALS:
             continue
         add(f'the row labelled "{label}"')
+    for tab in SOURCE_TAB_RE.findall(blob):
+        if tab.strip().casefold() != sheet.strip().casefold():
+            add(f"the {tab.strip()} tab")
     for atom in LOCATOR_ATOMS:
         if atom in low:
             add(atom)

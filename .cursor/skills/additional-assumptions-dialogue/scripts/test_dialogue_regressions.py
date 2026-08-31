@@ -43,6 +43,21 @@ IFERROR_STEPS = (
     'use (cell Model!C20 on the row labelled "IRR"), or use ("N/A") '
     "if that calculation errors"
 )
+LOCKED_WINDOW_STEPS = (
+    "when ((cell 'Monthly Build Projections'!C372 with its row fixed when copied) "
+    "is greater than (fixed cell 'Assumptions Matrix'!F63 on the row labelled "
+    '"MVP Development Phase Cost Total") and (cell '
+    "'Monthly Build Projections'!C372 with its row fixed when copied) is at most "
+    "(fixed cell 'Assumptions Matrix'!G63 on the row labelled "
+    '"MVP Development Phase Cost Total")) is true, use (fixed cell '
+    "'Assumptions Matrix'!I63 on the row labelled "
+    '"MVP Development Phase Cost Total"); otherwise use (0)'
+)
+LOCKED_WINDOW_EVIDENCE = (
+    "=IF(AND(C$372>'Assumptions Matrix'!$F$63,"
+    "C$372<='Assumptions Matrix'!$G$63),"
+    "'Assumptions Matrix'!$I$63,0)"
+)
 
 
 TASK = Path()
@@ -357,6 +372,34 @@ def test_iferror_literal_is_not_a_row_label() -> None:
     _ok("iferror-requires-errors", "errors" in " ".join(atoms).lower(), str(atoms))
 
 
+def test_same_label_locked_inputs_keep_distinct_roles() -> None:
+    spoken = speak_steps(
+        LOCKED_WINDOW_STEPS,
+        representative="'Monthly Build Projections'!C393",
+        evidence=LOCKED_WINDOW_EVIDENCE,
+        sheet="Monthly Build Projections",
+        row_label="MVP Development Phase Costs",
+    )
+    atoms = must_say_atoms(
+        spoken + "\n" + LOCKED_WINDOW_STEPS,
+        "Monthly Build Projections",
+        "MVP Development Phase Costs",
+    )
+    blob = " ".join(atoms).lower()
+    _ok("locked-window-lower-role", "lower bound locked input" in spoken, spoken)
+    _ok("locked-window-upper-role", "upper bound locked input" in spoken, spoken)
+    _ok("locked-window-result-role", "result locked input" in spoken, spoken)
+    _ok("locked-window-no-fixed-the", "fixed the locked input" not in spoken, spoken)
+    _ok("locked-window-requires-lower", "lower bound" in blob, str(atoms))
+    _ok("locked-window-requires-upper", "upper bound" in blob, str(atoms))
+    _ok("locked-window-requires-result", "result locked input" in blob, str(atoms))
+    _ok(
+        "locked-window-requires-source-tab",
+        "assumptions matrix tab" in blob,
+        str(atoms),
+    )
+
+
 def test_pasted_spoken_fails() -> None:
     spoken = speak_steps(
         RCF_STEPS,
@@ -493,6 +536,7 @@ def main() -> int:
         test_rcf_must_say_atoms()
         test_bounded_window_preserves_both_conditions_and_branches()
         test_iferror_literal_is_not_a_row_label()
+        test_same_label_locked_inputs_keep_distinct_roles()
         test_pasted_spoken_fails()
         test_sheet_only_when_unclear()
         test_paren_ast_draft_fails()

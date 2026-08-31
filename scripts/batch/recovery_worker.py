@@ -544,6 +544,7 @@ def _safe_tree_size(
     root: Path,
     *,
     excluded_names: frozenset[str] = frozenset(),
+    allow_internal_symlinks: bool = False,
 ) -> int:
     try:
         root_mode = root.lstat().st_mode
@@ -565,7 +566,22 @@ def _safe_tree_size(
             mode = entry.stat(follow_symlinks=False).st_mode
             relative = Path(entry.path).relative_to(root).as_posix()
             if stat.S_ISLNK(mode):
-                raise RecoveryError(f"evidence tree contains a symlink: {relative}")
+                if not allow_internal_symlinks:
+                    raise RecoveryError(
+                        f"evidence tree contains a symlink: {relative}"
+                    )
+                target = Path(os.readlink(entry.path))
+                resolved = (
+                    Path(entry.path).parent / target
+                ).resolve(strict=False)
+                if target.is_absolute() or not resolved.is_relative_to(
+                    root.resolve(strict=False)
+                ):
+                    raise RecoveryError(
+                        f"evidence tree contains an escaping symlink: {relative}"
+                    )
+                total += entry.stat(follow_symlinks=False).st_size
+                continue
             if stat.S_ISDIR(mode):
                 pending.append(Path(entry.path))
             elif stat.S_ISREG(mode):
@@ -2148,7 +2164,11 @@ class RecoveryWorker:
         excluded = frozenset({".git", ".venv", ".env", "__pycache__"})
         if worktree.is_symlink() or not worktree.is_dir():
             raise RecoveryError("unsafe worktree cannot be copied to quarantine")
-        size_bytes = _safe_tree_size(worktree, excluded_names=excluded)
+        size_bytes = _safe_tree_size(
+            worktree,
+            excluded_names=excluded,
+            allow_internal_symlinks=True,
+        )
         _check_evidence_capacity(self.config, size_bytes)
         parent = (
             self.config.state / "worktree-quarantine" / row.workbook_id
@@ -2169,10 +2189,13 @@ class RecoveryWorker:
             shutil.copytree(
                 worktree,
                 temporary,
-                symlinks=False,
+                symlinks=True,
                 ignore=ignore,
             )
-            if _safe_tree_size(temporary) != size_bytes:
+            if _safe_tree_size(
+                temporary,
+                allow_internal_symlinks=True,
+            ) != size_bytes:
                 raise RecoveryError("worktree quarantine size changed during copy")
             atomic_write_json(
                 temporary / "quarantine.json",
@@ -2184,7 +2207,10 @@ class RecoveryWorker:
                     "quarantined_at": _timestamp(),
                 },
             )
-            staged_size = _safe_tree_size(temporary)
+            staged_size = _safe_tree_size(
+                temporary,
+                allow_internal_symlinks=True,
+            )
             _check_evidence_capacity(
                 self.config,
                 staged_size,

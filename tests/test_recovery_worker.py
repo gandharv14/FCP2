@@ -2513,6 +2513,59 @@ def test_evidence_limits_leave_latest_usable_artifacts(
     assert first_snapshot.is_dir()
 
 
+def test_worktree_quarantine_preserves_internal_publication_symlinks(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    row = rows[0]
+    recovery = RecoveryWorker(config)
+    worktree = create_isolated_worktree(
+        config.baseline_repo, config.work_root, row.workbook_id
+    )
+    generation = (
+        worktree
+        / "seg_out"
+        / row.workbook_id
+        / "generations"
+        / "generation-1"
+    )
+    generation.mkdir(parents=True)
+    (generation / "manifest.json").write_text("{}\n", encoding="utf-8")
+    current = worktree / "seg_out" / row.workbook_id / "current"
+    current.symlink_to(Path("generations") / generation.name)
+
+    quarantine = recovery._quarantine_worktree(
+        row, worktree, "baseline changed"
+    )
+
+    assert quarantine is not None
+    preserved = quarantine / "seg_out" / row.workbook_id / "current"
+    assert preserved.is_symlink()
+    assert os.readlink(preserved) == f"generations/{generation.name}"
+    assert not worktree.exists()
+
+
+def test_worktree_quarantine_rejects_escaping_symlink(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    row = rows[0]
+    recovery = RecoveryWorker(config)
+    worktree = create_isolated_worktree(
+        config.baseline_repo, config.work_root, row.workbook_id
+    )
+    external = tmp_path / "external"
+    external.mkdir()
+    link = worktree / "seg_out" / row.workbook_id / "current"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(worker_module.RecoveryError, match="escaping symlink"):
+        recovery._quarantine_worktree(row, worktree, "baseline changed")
+
+    assert worktree.is_dir()
+
+
 def test_queue_mutation_writes_full_ledger_and_current_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

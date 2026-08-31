@@ -19,7 +19,7 @@ the run; you will not find those directories in a fresh clone.
 | `xl_segment.py` | The CLI that runs the stages and verifies the result. |
 | `xl_input_mask.py` | Turns the segmentation into an inputs-only workbook (section 17). |
 | `xl_level_split.py` | Writes one workbook per dependency level; `xl_input_mask.py` reuses its XML rewriter. |
-| `/create-harbor-task` | Fail-closed Cursor skill: raw workbook → verified, source-profiled MCP Harbor task (section 21). |
+| `/harbor-orchestrator` | Autonomous Cursor fleet: launches one isolated agent per workbook, routes bounded repairs, records promotion failures, and promotes each qualified task independently (section 21). |
 | `/profile-mcp-sources` | GPT 5.6 Sol subagent skill: bounded public-source reads → reviewed terminology, dataset, cadence, and excerpt profiles; auth/blocked pages are skipped. |
 | `/custom-formula-gate` | Pre-package GPT 5.6 Terra skill: identifies key formula variables, matches them against a closed textbook catalog, and emits audited custom-method hints (section 22). |
 | `/naturalize-finance-task-instruction` | Final GPT 5.6 Sol skill: losslessly rewrites only the opening and input prose, then fail-closed validates and atomically applies the complete instruction. |
@@ -91,7 +91,7 @@ the thing that makes the segmentation trustworthy.
 18. [Results](#18-results)
 19. [Bugs found along the way](#19-bugs-found-along-the-way)
 20. [Glossary](#20-glossary)
-21. [`/create-harbor-task`](#21-create-harbor-task)
+21. [`/harbor-orchestrator`](#21-harbor-orchestrator)
 22. [`/custom-formula-gate`](#22-custom-formula-gate)
 23. [Variable-source MCP environments](#23-variable-source-mcp-environments)
 
@@ -1864,74 +1864,129 @@ in the graph to begin with (section 3.10).
 
 ---
 
-## 21. `/create-harbor-task`
+## 21. `/harbor-orchestrator`
 
-Package a raw golden workbook into a verified Harbor task. The Cursor skill at
-`.cursor/skills/create-harbor-task/` is fail-closed: no skipped segmentation
-proof, and no promotion before the grader pass. When normalization yields
-maskable variables the task is MCP-backed and must also pass the live sidecar
-oracle. When every audit row is genuinely excluded, a plain (no-MCP) task may
-ship after `plain_eligibility.py` passes. The golden `.xlsx` stays outside the
-task environment.
+The autonomous entry point for Harbor task creation is the Cursor skill at
+`.cursor/skills/harbor-orchestrator/SKILL.md`. Give it a batch name and one or
+more workbook IDs. It launches one isolated task agent per workbook, runs those
+agents in bounded parallel, and gives every workbook its own final verdict:
+`PROMOTED` or `STOPPED`. One failed workbook never cancels or blocks healthy
+siblings.
 
-Accepts a path like `4-10 100/0256.xlsx`, a file under the default source
-folder, or a workbook id such as `0256`.
+Each task agent owns only its workbook's tracker, immutable generations,
+diagnostics, staged bundle, repair budget, and publication state. The default
+fleet limits are four concurrent workbook agents and two concurrent
+model-heavy operations; the orchestrator lowers those limits when host or
+service capacity is constrained.
 
-### Pipeline
+### Kickoff
 
-1. **AST and segment**; preserve curation and require `verification.passed`.
-2. **Custom-formula gate** with pinned `gpt-5.6-terra-high`; identify every
-   key calculation variable in curated-output lineage, compare all usable
-   periods with the closed textbook catalog, and produce audited method hints.
-3. **Baseline mask** to `inputs_out/`; this unredacted-input copy drives the
-   source audit and is never replaced by the MCP-masked copy.
-4. **Audit** with GPT 5.6 Sol through Labelbox LiteLLM.
-5. **Import and normalize** every audit row into an atomic variable or an
-   explicit exclusion; discover duplicate representations and `extra_cells`.
-6. **Profile public sources** with `/profile-mcp-sources`. GPT 5.6 Sol reads at
-   most three public pages per canonical URL and retains only reviewed source
-   vocabulary, dataset names, field conventions, cadence, and short attributed
-   excerpts. Login, SSO, 401/403, paywall, bot-challenge, unreachable, and
-   unsupported pages are skipped and keep the generic source renderer.
-7. **Validate and build** the network-free, seed-deterministic MCP environment;
-   golden-value mismatch aborts.
-8. **Smoke-test** the generated FastMCP server.
-9. **MCP mask** to a separate `inputs_out_mcp/` workbook.
-10. **Package one workbook** under `tasks_outputs_mcp/` (shape-agnostic name)
-    with `--mcp` when variables exist, or without `--mcp` from `inputs_out/`
-    when the task is plain; custom method hints enter `instruction.md`.
-11. **Naturalize the complete instruction** with pinned `gpt-5.6-sol-high`.
-    Only the opening and `Input` prose may change; every other section remains
-    byte-identical. Deterministic invariants and a clause-level semantic review
-    must pass before the candidate is atomically applied.
-12. **Live oracle** the shipped Docker sidecar with `xl_mcp_oracle.py` (MCP
-    mode). Plain tasks skip the oracle and run the closed-world `environment/`
-    check instead.
-13. **Grade an exact submission** and structurally inspect the bundle.
-14. **Promote** into `tasks_outputs/` only after every requested workbook passes.
+Invoke the skill explicitly in Cursor:
 
-Variable/source audits need `lbx_api_key` in `.env`. The audit is pinned by
-default to `openai/gpt-5.6-sol`; public-source profiling and final instruction
-naturalization use pinned `gpt-5.6-sol-high` Cursor subagents.
-`/create-harbor-task` packages with `--no-naturalize` so the earlier
-scenario-only Luna rewrite cannot run before all instruction sections exist,
-then invokes the final fail-closed skill. It never uses
-`--no-variable-source-audit`. Do not invent a taxonomy entry when a workbook is
-missing from `workbooks.json`.
+```text
+Use @.cursor/skills/harbor-orchestrator/SKILL.md.
 
-In Cursor, invoke `/create-harbor-task` with the workbook path or id.
+Start Harbor batch raw-workbooks-2026-08-31.
+Requested workbook IDs: 0256, 0262, 0449, 0450
+Raw sources: 4-10 100/<id>.xlsx
+max_parallel_tasks: 4
+max_model_heavy_tasks: 2
 
-**Automatic invocation boundary.** When the workflow is started through
-`/create-harbor-task`, it automatically loads `/custom-formula-gate`, launches
-the pinned `gpt-5.6-terra-high` subagent, validates its artifacts, and passes
-them into packaging. After packaging it loads
-`/naturalize-finance-task-instruction`, launches the pinned
-`gpt-5.6-sol-high` subagent, validates the complete rewrite, and applies it
-before the oracle and grader. Running `xl_output_task.py` or the individual
-Python stages directly does not launch a Cursor skill or model. Direct callers
-must generate and validate the formula context/report/hints separately and
-supply all three `--custom-formula-*` arguments; they must also invoke the
-instruction skill after packaging or that standalone path bypasses these gates.
+Run autonomously. Promote each qualified workbook independently, stop only
+the workbook whose closed repair path is exhausted, and do not run rollouts.
+```
+
+The orchestrator performs dependency provisioning once, then keeps a stable
+queue of requested IDs. As a task agent finishes or stops, the next queued
+workbook takes its slot. Model-heavy work uses a separate fleet semaphore, and
+publication uses a singleton queue so release compare-and-swap operations
+remain serial.
+
+### Per-workbook specialist lane
+
+Every task agent invokes the specialist skills in this order:
+
+1. **Source warden** — source health, trusted recalculation routing, immutable
+   source generation, and production AST.
+2. **Segmentation analyst** — preserve curation, require strict live-evidence
+   `PASS`, and require healthy preflight.
+3. **Research auditor** — build baseline inputs and run the pinned
+   `openai/gpt-5.6-sol` variable/source audit.
+4. **Normalization engineer, phase 1** — import every audit row, write the
+   atomic normalizer, resolve every disposition, and choose plain or MCP mode.
+5. **Source profiler** — independently profile and review canonical public
+   sources for an MCP task; plain tasks record a validated no-op.
+6. **Normalization engineer, phase 2** — bind accepted profiles, validate the
+   final specification, and pass maskability and leakscan.
+7. **Environment packager** — deterministic double MCP build, smoke, separate
+   masking, and staging under `tasks_outputs_mcp/`.
+8. **Disclosure writer** — select, detect, render, faithcheck, and verify the
+   complete workbook disclosure.
+9. **Instruction naturalizer** — two-attempt, frozen-span, semantically
+   reviewed rewrite with journaled apply.
+10. **Independent verifier** — fresh disclosure review, generalized live HTTP
+    oracle (MCP mode), and exact-answer grader score `1.0`.
+11. **Dialogue author** — produce and validate the colleagues Q&A file, apply
+    it transactionally, and smoke the final main image.
+
+Normalization is one lane invoked in two phases, so this list contains ten
+specialist skills across eleven ordered invocations. The golden `.xlsx` remains
+build-time evidence and never enters the task environment.
+
+### Repairs, failure classes, and agent notes
+
+Lane agents do not weaken gates or repair their own output. The orchestrator
+classifies each failure and may route one bounded repair to:
+
+- `harbor-spec-fixer` for workbook-specific normalization, masking, and leak
+  defects;
+- `harbor-prose-fixer` for an existing disclosure, naturalization, or dialogue
+  retry slot;
+- `harbor-infra-fixer` for approved infrastructure and routing faults.
+
+After a repair, the workbook re-enters at the earliest invalidated gate and
+reruns every hash-dependent downstream gate. Unsupported sources, uncertified
+circular calculations, post-semantic oracle failures, exhausted retry budgets,
+and unresolved shared-code defects stop only that workbook.
+
+Every non-promoted task has:
+
+```text
+runs/harbor-fleet/<batch>/workbooks/<id>.json
+runs/harbor-fleet/<batch>/workbooks/<id>-agent-notes.md
+```
+
+The tracker stores the current `promotion_failure` plus append-only failure and
+repair history. Agent notes explain why promotion did not happen, identify the
+common failure class and subclass, link the exact evidence and hashes, list
+repair attempts, record confidence impact and next action, and end with the
+workbook's promote/stop decision. The batch completion report aggregates the
+same closed failure classes across every requested workbook.
+
+### Promotion
+
+As soon as one workbook passes every applicable gate with high or qualified
+medium confidence, it enters the serial publication queue. The publication
+worker freezes its staged task generation, performs the workbook-local release
+CAS, verifies `tasks_outputs/<id>-outputs`, and marks that workbook `PROMOTED`.
+A publication failure marks only that workbook `STOPPED`; other task agents
+continue.
+
+Batch results are written to
+`runs/harbor-fleet/<batch>/completion.json` and may contain a mix of promoted
+and stopped workbooks. Harbor rollout is a separate operation and is never
+started by this skill.
+
+Variable/source audits require `lbx_api_key` in `.env`. Audit generation is
+pinned to `openai/gpt-5.6-sol`; public-source profiling, disclosure arbitration,
+naturalization, independent review, and dialogue generation use pinned
+`gpt-5.6-sol-high` agents.
+
+**Automatic invocation boundary.** Running `xl_output_task.py` or an individual
+Python stage directly does not launch Cursor task agents, specialist skills,
+fixers, model reviewers, or the publication controller. Start task creation
+through `/harbor-orchestrator` (or attach its `SKILL.md` explicitly) so every
+gate, repair, note, and publication verdict is tracked.
 
 ---
 

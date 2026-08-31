@@ -475,6 +475,33 @@ def _rate_value(nper, pmt, pv, fv, ptype, guess):
     key = (nper, pmt, pv, fv, ptype, guess)
     if key in _RATE_CACHE:
         return _RATE_CACHE[key]
+    # With no periodic payment the equation has a closed-form solution.
+    # Newton from Excel's default guess can miss roots extremely close to -1,
+    # while the broad fallback scan intentionally stops at -0.9999.
+    if pmt == 0 and pv != 0:
+        ratio = -fv / pv
+        if ratio > 0:
+            result = ratio ** (1.0 / nper) - 1.0
+            _RATE_CACHE[key] = result
+            return result
+        if fv == 0:
+            # Excel's Newton solver returns a near--1 approximation even
+            # though the zero-future-value equation has no finite root.
+            rate = guess
+            for _ in range(100):
+                growth = (1.0 + rate) ** nper
+                derivative = nper * (1.0 + rate) ** (nper - 1.0)
+                if derivative == 0:
+                    break
+                nxt = rate - growth / derivative
+                if nxt <= -1.0:
+                    nxt = (rate - 1.0) / 2.0
+                if abs(nxt - rate) < 1e-7:
+                    rate = nxt
+                    break
+                rate = nxt
+            _RATE_CACHE[key] = rate
+            return rate
     periods = int(nper)
     if periods == nper:
         shift = 1.0 if ptype else 0.0
@@ -3237,6 +3264,18 @@ class Evaluator:
                     total = combine(total, arg)
                 if node.op == "AVERAGE" and args:
                     total = scale(total, 1.0 / len(args))
+                return total
+            if node.op == "PRODUCT":
+                total = constant(1.0)
+                for arg in args:
+                    total_constant = is_constant(total)
+                    arg_constant = is_constant(arg)
+                    if not total_constant and not arg_constant:
+                        return reject(node_id, "bilinear_product")
+                    if total_constant:
+                        total = scale(arg, total[1])
+                    else:
+                        total = scale(total, arg[1])
                 return total
             if node.op in ("MIN", "MAX") and args:
                 endpoint = [

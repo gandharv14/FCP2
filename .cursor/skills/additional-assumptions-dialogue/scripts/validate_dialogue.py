@@ -379,16 +379,27 @@ def numeric_faults_with_budget(
     text: str, task_dir: Path, allowed: Counter | None = None
 ) -> list[str]:
     """Audit target collisions while consuming only proven literal occurrences."""
+    strict_unlicensed = allowed is None
     budget = Counter(allowed or {})
+    licensed = set(budget)
+    targets = disclose.numeric_targets(task_dir)
     faults = []
-    for fault in disclose.audit_text(text, task_dir):
-        match = re.fullmatch(r"numeric literal ([^ ]+) matches target .+", fault)
-        if not match:
-            continue
+    for raw in disclose.NUMBER_RE.findall(text):
         try:
-            value = float(match.group(1).replace(",", ""))
+            value = float(raw.replace(",", ""))
         except ValueError:
-            faults.append(fault)
+            continue
+        matched_target = next(
+            (
+                target
+                for target in targets
+                if abs(float(target)) > 1e-12
+                and not (float(target).is_integer() and abs(target) <= 1)
+                and disclose.same_number(value, float(target))
+            ),
+            None,
+        )
+        if matched_target is None:
             continue
         permitted = next(
             (
@@ -398,10 +409,17 @@ def numeric_faults_with_budget(
             ),
             None,
         )
-        if permitted is None:
-            faults.append(fault)
-        else:
+        if permitted is not None:
             budget[permitted] -= 1
+            continue
+        if (
+            strict_unlicensed
+            or any(disclose.same_number(value, number) for number in licensed)
+            or disclose.significant_digits(raw) >= 4
+        ):
+            faults.append(
+                f"numeric literal {raw} matches target {matched_target}"
+            )
     return faults
 
 
@@ -762,7 +780,10 @@ def instruction_faults(instruction: str, claims_payload: dict, task_dir: Path) -
             faults.append(f"{label} does not say working directory")
     if "read" not in input_body.lower() or "before" not in input_body.lower():
         faults.append("Input pointer is not must-read language")
-    for label, body in (("Input", input_body), ("Additional assumptions", assumptions)):
+    input_pointer, _ = expected_pointer(task_dir, claims_payload)
+    if input_pointer not in input_body:
+        faults.append("Input pointer does not match the generated must-read text")
+    for label, body in (("Additional assumptions", assumptions),):
         if LEFTOVER_TITLE_RE.search(body):
             faults.append(f"{label} still names a senior banker/investor")
         hits = sorted({m.group(0) for m in REBUILD_FRAME_RE.finditer(body)})

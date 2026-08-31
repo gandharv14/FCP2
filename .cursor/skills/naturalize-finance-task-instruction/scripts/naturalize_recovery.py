@@ -563,7 +563,7 @@ def verify_naturalizer_metadata(
     required = {
         "model": "gpt-5.6-sol-high",
         "endpoint": "cursor-subagent",
-        "prompt_version": "finance-instruction-naturalizer-v1",
+        "prompt_version": "finance-instruction-naturalizer-v3",
         "naturalized": True,
     }
     failures = [

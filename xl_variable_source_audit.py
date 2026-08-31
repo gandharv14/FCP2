@@ -224,6 +224,58 @@ def _call_model(endpoint, api_key, model, project_id, messages):
     return choice["message"]["content"].strip(), choice.get("finish_reason", "")
 
 
+def _request_config_fingerprint(endpoint, model, project_id):
+    """Hash non-secret routing configuration without prompt or workbook data."""
+    return _canonical_hash({
+        "endpoint": endpoint.rstrip("/"),
+        "model": model,
+        "project_id": project_id,
+        "prompt_version": PROMPT_VERSION,
+    })
+
+
+def _http_error_details(exc):
+    """Return bounded gateway diagnostics without retaining request content."""
+    details = {
+        "status": getattr(exc, "code", None),
+        "reason": str(getattr(exc, "reason", "") or ""),
+    }
+    try:
+        raw = exc.read(4096)
+    except (AttributeError, OSError):
+        raw = b""
+    if not raw:
+        return details
+    details["response_sha256"] = hashlib.sha256(raw).hexdigest()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return details
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return details
+    safe = {
+        key: value
+        for key in ("type", "param", "code")
+        if isinstance((value := error.get(key)), (str, int, float, bool))
+    }
+    message = error.get("message")
+    if (
+        isinstance(message, str)
+        and len(message) <= 512
+        and "\n" not in message
+        and not re.search(r"\bR\d{4}\b|Workbook metadata:|![A-Z]{1,3}\d+", message)
+    ):
+        safe["message"] = re.sub(
+            r"(?i)\b(bearer|api[_-]?key)\s*[:=]?\s*\S+",
+            r"\1 [REDACTED]",
+            message,
+        )
+    if safe:
+        details["response_error"] = safe
+    return details
+
+
 def _clean_table(text):
     text = text.strip()
     if text.startswith("```") and text.endswith("```"):
@@ -541,10 +593,16 @@ def generate_audit(
             "workbook": workbook,
             "model": model,
             "endpoint": endpoint,
+            "project_id": project_id,
+            "request_config_sha256": _request_config_fingerprint(
+                endpoint, model, project_id
+            ),
             "inventory_sha256": inventory_hash,
             "error": str(exc),
             "generated_at": generated_at,
         }
+        if isinstance(exc, urllib.error.HTTPError):
+            failure["http_error"] = _http_error_details(exc)
         metadata_path.write_text(
             json.dumps(failure, indent=2) + "\n", encoding="utf-8"
         )

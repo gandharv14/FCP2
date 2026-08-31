@@ -58,7 +58,7 @@ except ImportError:  # pragma: no cover
 from openpyxl.utils import get_column_letter
 
 PIPELINE_VERSION = "1.0.0"
-DEFAULT_PROJECT_ID = "cmt3hsyg401o1073mdwttb3w0"
+DEFAULT_PROJECT_ID = "cms6m4urm006n07z8ecxi1oi2"
 PROD_ENDPOINT = "https://litellm.labelbox.com"
 DEV_ENDPOINT = "https://litellm.lb-dev.xyz"
 

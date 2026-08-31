@@ -314,7 +314,8 @@ class Book:
         blocks. Naming a row "Base" identifies nothing.
         """
         return not bool(re.fullmatch(
-            r"(?:base(?: case| plus| stressed)?|downside|lender|pancake|optimistic|pessimistic)",
+            r"(?:base(?: case| plus| stressed)?|downside|lender|pancake|"
+            r"optimistic|pessimistic|salary only|hourly only)",
             text.strip(),
             re.I,
         ))
@@ -1148,6 +1149,7 @@ def merge_vertical_singletons(gold: Book, bands: list[dict],
             if run and not (
                 item[0] == run[-1][0] + 1
                 and copy_equivalent(gold, run[-1][1], item[1])
+                and gold.row_label(run[-1][1]) == gold.row_label(item[1])
             ):
                 runs.append(run)
                 run = []
@@ -1815,8 +1817,27 @@ def walk_ast(node):
 
 
 def method_subbands(gold: Book, band: dict) -> list[dict]:
-    """Selection already split mixed shapes by normalized formula pattern."""
-    return [band]
+    """Split a selected band when it spans distinct semantic row labels."""
+    cells = list(
+        band.get("stated_cell_keys") or band.get("cell_keys") or []
+    )
+    labels = [gold.row_label(cell) for cell in cells]
+    if len(cells) <= 1 or len(set(labels)) <= 1:
+        return [band]
+
+    by_row: dict[tuple[str, int, str], list[tuple[int, str]]] = defaultdict(list)
+    for cell, label in zip(cells, labels):
+        sheet, coord = cell.split("!", 1)
+        parsed = split_coord(coord)
+        if not parsed:
+            return [band]
+        col, row = parsed
+        by_row[(sheet, row, label)].append((col_to_num(col), cell))
+
+    return [
+        make_band(gold, sheet, row, sorted(run))
+        for (sheet, row, _label), run in sorted(by_row.items())
+    ]
 
 
 def formula_profile(gold: Book, band: dict) -> dict:
@@ -2483,7 +2504,6 @@ def expand_method_band(gold: Book, delivered: Book, band: dict) -> dict:
         gold,
         sheet,
         row,
-        pattern,
         [(col, key(sheet, f"{num_to_col(col)}{row}")) for col in range(lo, hi + 1)],
     )
 
@@ -3151,7 +3171,12 @@ def detect_npv_timing(gold: Book, scope: set[str]) -> list[dict]:
 
 
 def q(text: str) -> str:
-    return '"%s"' % str(text).replace('"', "'")
+    text = str(text)
+    if '"' not in text:
+        return f'"{text}"'
+    if "'" not in text:
+        return f"'{text}'"
+    return f"“{text}”"
 
 
 def ingredient_phrase(gold: Book, evidence: str, cells: list[str], own_label: str = "") -> str:
@@ -4969,7 +4994,10 @@ def _fault(faults: list, rec, kind: str, claim: str, expected: str = "", found: 
 
 def _unquote_label(text) -> str:
     text = str(text or "").strip()
-    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+    if (
+        len(text) >= 2
+        and (text[0], text[-1]) in {('"', '"'), ("'", "'"), ("“", "”")}
+    ):
         return text[1:-1]
     return text
 
@@ -4982,6 +5010,26 @@ def _stated_keys(rec: dict) -> list[str]:
             if split_coord(coord):
                 out.append(key(sheet, coord))
     return out
+
+
+def _heterogeneous_scope_partitioned(
+    gold: Book,
+    span: list[str],
+    disclosed: list[dict],
+    entry: str,
+) -> bool:
+    """Accept a copied family split into exact, per-row-labelled records."""
+    if len({gold.row_label(cell) for cell in span}) <= 1:
+        return False
+    covered = set()
+    for candidate in disclosed:
+        if candidate.get("entry") != entry:
+            continue
+        claimed = _unquote_label((candidate.get("fields") or {}).get("label"))
+        for cell in _stated_keys(candidate) or candidate.get("cell_keys") or []:
+            if claimed and claimed == gold.row_label(cell):
+                covered.add(cell)
+    return set(span) <= covered
 
 
 def _claimed_rows(rec: dict) -> set[tuple]:
@@ -5166,7 +5214,9 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
                             found="%s against %s" % (pretty(a), pretty(b)),
                         )
                         break
-            elif len(span) > 1:
+            elif len(span) > 1 and not _heterogeneous_scope_partitioned(
+                gold, span, disclosed, entry
+            ):
                 _fault(
                     faults, rec, "scope",
                     "stated scope is a fragment of a copied family",

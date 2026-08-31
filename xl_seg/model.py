@@ -276,7 +276,12 @@ def load(ast_dir: Path, wb: str) -> Graph:
                 "missing": missing[:2],
             })
     for node in nodes.values():
-        if node.kind in AST_KINDS and (
+        # Range nodes are shared dependency sources when expansion would be
+        # excessive, so they intentionally have no single formula owner. A
+        # top-level array/CSE range may still carry an owner and must validate.
+        requires_owner = node.kind in {"op", "const"}
+        validates_owner = requires_owner or bool(node.owner)
+        if validates_owner and node.kind in AST_KINDS and (
             not node.owner
             or node.owner not in nodes
             or nodes[node.owner].kind != "formula"

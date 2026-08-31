@@ -391,8 +391,12 @@ def validate(
             str(exc), exc.reason_code, **exc.details
         ) from exc
     if candidate_bytes != expected_candidate:
+        expected_text = expected_candidate.decode("utf-8-sig", "replace")
+        candidate_text = candidate_bytes.decode("utf-8-sig", "replace")
         raise RewriteValidationError(
-            "protected section preserved byte-for-byte",
+            "protected section preserved byte-for-byte"
+            " | expected: %s | found: candidate protected bytes differ"
+            % first_diff(expected_text, candidate_text),
             "protected_section_changed",
         )
 
@@ -541,6 +545,8 @@ def validate(
             "named example outputs preserved",
             checks,
             "named_outputs_changed",
+            expected=repr(phrase.lower()),
+            found=repr(" ".join(candidate_preamble.split()).lower()),
         )
 
     for category in SOURCE_CATEGORIES:
@@ -569,6 +575,8 @@ def validate(
                 "semantic anchor preserved: %s" % source_anchor,
                 checks,
                 "semantic_anchor_lost",
+                expected=repr(source_anchor),
+                found=repr(candidate_mutable_lower),
             )
 
     if "only" in source_input:
@@ -584,6 +592,8 @@ def validate(
             "Input permission modality preserved",
             checks,
             "input_modality_lost",
+            expected=repr("may "),
+            found=repr(candidate_input),
         )
     if "present" in source_input:
         require(

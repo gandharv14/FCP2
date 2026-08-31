@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -18,11 +19,13 @@ from validate_dialogue import (
     audit_dialogue,
     check_draft,
     fill_faults,
+    instruction_faults,
     map_turns_to_claims,
     review_accuracy_faults,
     review_accuracy_passed,
     review_faults,
     review_passed,
+    rewrite_instruction,
     whole_axis_refs,
 )
 
@@ -112,6 +115,26 @@ def test_unknown_and_legacy_titles() -> None:
     for name, text in (("unknown", unknown), ("legacy", legacy)):
         report = check_draft(text, CLAIMS, TASK)
         _ok(f"{name}-cast", bool(report["cast_faults"]), str(report["cast_faults"]))
+
+
+def test_colon_in_turn_prose_is_not_a_speaker_title() -> None:
+    text = (
+        "<!-- claim:projection_rule::Operations::Fee -->\n"
+        "**Analyst:**\n"
+        'Last one from me: how should the row labelled "Fee" run?\n'
+        "**VP:**\n"
+        'The row labelled "Fee" is worked out from the row labelled "Revenue".\n'
+    )
+
+    turns = parse_turns(text)
+
+    _ok("prose-colon-turn-count", len(turns) == 2, str(turns))
+    _ok(
+        "prose-colon-stays-junior-text",
+        turns[0]["speaker"] == "Analyst"
+        and turns[0]["text"].startswith("Last one from me:"),
+        str(turns),
+    )
 
 
 def test_marker_coverage() -> None:
@@ -205,6 +228,8 @@ def test_stale_pack() -> None:
 
 def _build_apply_fixture(tmp: Path) -> tuple[Path, Path]:
     task = tmp / "0042-outputs"
+    if task.exists():
+        shutil.rmtree(task)
     (task / "environment").mkdir(parents=True)
     (task / "tests").mkdir()
     (task / "instruction.md").write_text(
@@ -638,6 +663,26 @@ def test_rebuild_frame_blocked() -> None:
     _ok("rebuild-blocked", "rebuild/restore" in blob, blob)
 
 
+def test_existing_input_rebuild_anchor_survives_pointer_apply() -> None:
+    original = (
+        "Build the model.\n\n"
+        "## Input\n\n"
+        "Use the workbook to rebuild every calculation.\n\n"
+        "## Workbook disclosure\n\n"
+        "- remove me\n\n"
+        "## Output\n\n"
+        "Write answers.\n"
+    )
+    rewritten = rewrite_instruction(original, TASK, CLAIMS)
+    faults = instruction_faults(rewritten, CLAIMS, TASK)
+
+    _ok(
+        "input-rebuild-anchor-allowed",
+        not any("Input frames the work as a rebuild/restore" in f for f in faults),
+        str(faults),
+    )
+
+
 COMPOSE_CLAIMS = {
     "schema_version": "1.1",
     "junior_titles": ["Analyst", "Associate"],
@@ -873,6 +918,8 @@ def test_compose_and_fill_check_cli(tmp: Path) -> None:
     _ok("compose-cli-slots-schema", "slots" in slots and "slot_order" in slots, str(slots)[:200])
 
     task = tmp / "0042-outputs"
+    if task.exists():
+        shutil.rmtree(task)
     (task / "tests").mkdir(parents=True)
     (task / "environment").mkdir()
     (task / "tests" / "answer_key.json").write_text(json.dumps({"targets": {}}), encoding="utf-8")
@@ -933,6 +980,7 @@ def main() -> int:
     test_senior_kickoff_unclaimed()
     test_associate_junior_and_ack()
     test_unknown_and_legacy_titles()
+    test_colon_in_turn_prose_is_not_a_speaker_title()
     test_marker_coverage()
     test_review_coverage()
     test_stale_pack()
@@ -947,6 +995,7 @@ def main() -> int:
     test_writer_pack_skeleton()
     test_senior_cell_refs()
     test_rebuild_frame_blocked()
+    test_existing_input_rebuild_anchor_survives_pointer_apply()
     test_rcf_spoken_disambiguated()
     test_rcf_must_say_atoms()
     test_pasted_spoken_fails()

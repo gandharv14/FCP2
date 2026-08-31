@@ -11,6 +11,7 @@ from xl_seg.evaluate import (
     Evaluator,
     Unresolved,
     _excel_date_parts,
+    _rate_value,
     to_serial,
 )
 from xl_seg.model import load
@@ -45,6 +46,20 @@ def _strict_evaluate(path: Path, outputs: set[str]):
         calculation=CalculationMetadata(available=True, iterate=False),
     )
     return graph, result, inputs, proof
+
+
+def test_rate_without_payments_resolves_root_near_negative_one() -> None:
+    expected = -0.9999999
+
+    actual = _rate_value(2, 0, -1, 1e-14, 0, 0.1)
+
+    assert abs(actual - expected) < 1e-12
+
+
+def test_rate_without_payments_matches_excel_zero_future_value_limit() -> None:
+    actual = _rate_value(2, 0, -337.7, 0, 0, 0.1)
+
+    assert abs(actual - -0.9999998807237069) < 1e-7
 
 
 def test_subtotal_excludes_nested_subtotal_lineage_but_sum_does_not(tmp_path):

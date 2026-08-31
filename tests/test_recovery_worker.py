@@ -1665,6 +1665,51 @@ def test_worker_defect_incident_stops_same_row_until_worker_changes(
     assert checkpoint["incident_reports"][-1]["worker_fix_needed"] is True
 
 
+def test_unchanged_worker_defect_does_not_retry_or_skip_ahead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, rows, _ = _config(
+        tmp_path,
+        workbook_ids=("0001", "0002"),
+        attempt_count=1,
+    )
+    recovery = RecoveryWorker(config)
+    config.state.mkdir()
+    (config.state / "summary.json").write_text(
+        json.dumps(
+            {
+                "tasks": {
+                    "0001": {
+                        "batch_id": "batch-001",
+                        "status": "worker_fix_needed",
+                        "worker_fix_baseline_hash": recovery.baseline_hash,
+                    },
+                    "0002": {
+                        "batch_id": "batch-001",
+                        "status": "recovery_pending",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    processed: list[str] = []
+    monkeypatch.setattr(
+        recovery,
+        "process",
+        lambda row: processed.append(row.workbook_id) or {
+            "workbook_id": row.workbook_id,
+            "status": "generated",
+        },
+    )
+
+    ledger = recovery.run()
+
+    assert processed == []
+    assert ledger["records"][0]["status"] == "worker_fix_needed"
+    assert ledger["records"][1]["status"] == "recovery_pending"
+
+
 def test_full_ledger_preserves_unprocessed_detailed_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

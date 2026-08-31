@@ -3005,11 +3005,14 @@ every check succeeds without uncertainty.
                     task["status"] = "recovery_pending"
                 self.tasks[row.workbook_id] = task
             self._write_summary()
-            selected = [
-                row
-                for row in rows
-                if self.tasks[row.workbook_id]["status"] != "generated"
-            ]
+            selected: list[QueueRow] = []
+            for row in rows:
+                status = self.tasks[row.workbook_id]["status"]
+                if status == "generated":
+                    continue
+                if status == "worker_fix_needed":
+                    break
+                selected.append(row)
             if config.task_limit:
                 selected = selected[: config.task_limit]
             results: list[dict[str, object]] = []

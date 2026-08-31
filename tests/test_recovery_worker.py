@@ -1282,6 +1282,41 @@ def test_fairness_stdout_fail_wins_over_file_pass() -> None:
     assert not worker_module.fairness_passed(merged)
 
 
+def test_fairness_verifier_is_read_only_and_returns_report_in_final(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    worker = RecoveryWorker(config)
+    prompt = worker._verifier_prompt(
+        rows[0],
+        _candidate(tmp_path),
+        tmp_path / "vm-code-diff.txt",
+    )
+
+    assert "Do not modify, create, delete, rename, or write any file" in prompt
+    assert "Return the complete verification report in your" in prompt
+    assert "the recovery controller will persist it" in prompt
+    assert "restricted_pass" in prompt
+
+
+def test_fairness_stdout_is_persisted_by_controller(tmp_path: Path) -> None:
+    config, rows, _ = _config(tmp_path)
+    worker = RecoveryWorker(config)
+    final = "Independent review.\nFAIRNESS_VERDICT: PASS\n"
+    result = _attempt(tmp_path, 90, final)
+    report = (
+        config.state
+        / "verification-inputs"
+        / rows[0].workbook_id
+        / "candidate"
+        / "fairness.md"
+    )
+    report.parent.mkdir(parents=True)
+
+    assert worker._read_fairness_report(result, report) == final
+    assert report.read_text(encoding="utf-8") == final
+
+
 def test_fairness_retry_preserves_release(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1336,6 +1371,73 @@ def test_copytree_skips_variant_generated_roots(tmp_path: Path) -> None:
     )
     try:
         assert not (worktree / "tasks_outputs_mcp_assumption").exists()
+    finally:
+        worker_module.recycle_isolated_worktree(worktree, config.baseline_repo)
+
+
+def test_vm_diff_for_unversioned_copy_contains_verified_content(
+    tmp_path: Path,
+) -> None:
+    config, _, _ = _config(tmp_path)
+    worker = RecoveryWorker(config)
+    worktree = create_isolated_worktree(
+        config.baseline_repo, config.work_root, "0001"
+    )
+    try:
+        changed = worktree / "xl_seg" / "emit.py"
+        changed.write_text("CHANGED_EMIT = True\n", encoding="utf-8")
+        state = worker_module._code_state(worktree, worker.baseline, "0001")
+        evidence = {
+            "baseline_diff": worker_module._baseline_diff(state, worker.baseline),
+            "changed_during_run": ["xl_seg/emit.py"],
+        }
+
+        path = worker_module._write_vm_diff(
+            worktree,
+            config.baseline_repo,
+            config.state,
+            "0001",
+            evidence,
+        )
+        text = path.read_text(encoding="utf-8")
+
+        assert "--- a/xl_seg/emit.py" in text
+        assert "+++ b/xl_seg/emit.py" in text
+        assert "-BASELINE_EMIT = True" in text
+        assert "+CHANGED_EMIT = True" in text
+        assert "Not a git repository" not in text
+    finally:
+        worker_module.recycle_isolated_worktree(worktree, config.baseline_repo)
+
+
+def test_vm_diff_rejects_symlinked_changed_file(tmp_path: Path) -> None:
+    config, _, _ = _config(tmp_path)
+    worktree = create_isolated_worktree(
+        config.baseline_repo, config.work_root, "0001"
+    )
+    try:
+        changed = worktree / "xl_seg" / "emit.py"
+        changed.unlink()
+        changed.symlink_to(config.baseline_repo / "xl_seg" / "emit.py")
+        evidence = {
+            "baseline_diff": {
+                "xl_seg/emit.py": {
+                    "baseline": worker_module.sha256_file(
+                        config.baseline_repo / "xl_seg" / "emit.py"
+                    ),
+                    "current": "symlink",
+                }
+            }
+        }
+
+        with pytest.raises(PolicyViolation, match="contains a symlink"):
+            worker_module._write_vm_diff(
+                worktree,
+                config.baseline_repo,
+                config.state,
+                "0001",
+                evidence,
+            )
     finally:
         worker_module.recycle_isolated_worktree(worktree, config.baseline_repo)
 

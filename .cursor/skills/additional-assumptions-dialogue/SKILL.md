@@ -70,8 +70,9 @@ If `claims.json` reports `"empty": true`, stop.
    pack, `$RUN/draft.r1.md`, and `$RUN/review.r1.json`. Output `$RUN/draft.r2.md`
    (also copy to `$RUN/draft.md`), then run the paraphrase pass again.
 7. Reviewer scores the new draft → `$RUN/review.r2.json`.
-8. After two rounds, apply the last draft if **accuracy and cast** pass.
-   Reviewer **naturalness** may still fail. Do not start a third write.
+8. After two rounds, apply the last draft only if the full independent review
+   passes. Do not package `review_passed: false` or `draft_passed: false`.
+   Do not start a third write.
 
 The reviewer never edits the draft. The writer never applies.
 
@@ -86,8 +87,8 @@ python3 $S/validate_dialogue.py apply \
   --report "$RUN/apply.json"
 ```
 
-Use `--round 2` on the second apply so a failed **naturalness** verdict does
-not block. These still block in both rounds: missing `must_say`, missing
+Use `--round 2` on the second apply. Full review still must pass. These block
+in both rounds: missing `must_say`, missing
 row label, missing sheet when the thread has not already named the tab,
 unknown or leftover speaker titles, empty/stale review coverage,
 **and any cell/range token in a senior turn**. Do not replace working

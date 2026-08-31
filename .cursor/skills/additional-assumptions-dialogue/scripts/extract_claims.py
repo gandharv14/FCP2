@@ -32,13 +32,18 @@ LOCATOR_ATOMS = (
 OPERATOR_ATOMS = (
     "smaller",
     "greater",
+    "at least",
+    "at most",
     "floor",
     "flip",
     "minus",
     "plus",
     "average",
     "held flat",
+    "otherwise",
+    "errors",
 )
+NON_LABEL_LITERALS = frozenset({"", "N/A", "#N/A", "NA"})
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +95,8 @@ def must_say_atoms(spoken: str, sheet: str = "", row_label: str = "") -> list[st
     if row_label:
         add(f'the row labelled "{row_label}"')
     for label in LABEL_RE.findall(blob):
+        if label.strip() in NON_LABEL_LITERALS:
+            continue
         add(f'the row labelled "{label}"')
     for atom in LOCATOR_ATOMS:
         if atom in low:
@@ -113,7 +120,11 @@ def build_claim(record: dict, index: int) -> dict:
         if not spoken:
             spoken = strip_cell_refs(rendered)
             spoken = re.sub(r"\bFor\s+on the row\b", "On the row", spoken)
-        must_say = must_say_atoms(spoken, sheet, row_label)
+        must_say = must_say_atoms(
+            spoken + "\n" + raw_steps,
+            sheet,
+            row_label,
+        )
     else:
         spoken = strip_cell_refs(rendered)
         spoken = re.sub(r"\bFor\s+on the row\b", "On the row", spoken)

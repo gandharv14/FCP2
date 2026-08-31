@@ -334,7 +334,9 @@ class IsolationAndProfileTests(unittest.TestCase):
             )
             (root / "tests").mkdir()
             (root / "tests" / "dialogue-applied.json").write_text(
-                "{}\n", encoding="utf-8"
+                '{"applied": true, "review_passed": true, '
+                '"draft_passed": true}\n',
+                encoding="utf-8",
             )
             report = check_environment(root, workbook)
             self.assertTrue(report["valid"], report)

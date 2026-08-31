@@ -1223,6 +1223,81 @@ def test_external_package_artifacts_are_blocked(tmp_path):
         )
 
 
+@pytest.mark.parametrize("failed_field", ["applied", "review_passed", "draft_passed"])
+def test_dialogue_application_must_pass_before_task_publication(
+    tmp_path, failed_field
+):
+    task = tmp_path / "task"
+    (task / "environment").mkdir(parents=True)
+    (task / "tests").mkdir()
+    (task / "environment" / "Dockerfile").write_text(
+        "FROM scratch\n"
+        "COPY additional-assumptions.md /app/additional-assumptions.md\n",
+        encoding="utf-8",
+    )
+    (task / "environment" / "additional-assumptions.md").write_text(
+        "Conversation notes.\n",
+        encoding="utf-8",
+    )
+    marker = {
+        "applied": True,
+        "review_passed": True,
+        "draft_passed": True,
+    }
+    marker[failed_field] = False
+    (task / "tests" / "dialogue-applied.json").write_text(
+        json.dumps(marker),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(release.ReleasePublicationError, match="did not pass"):
+        release.publish_task_generation(
+            task,
+            tmp_path / "release",
+            "case",
+            bindings={
+                "source_generation_id": "a" * 64,
+                "segmentation_generation_id": "b" * 64,
+            },
+        )
+
+
+def test_passing_dialogue_application_can_publish(tmp_path):
+    task = tmp_path / "task"
+    (task / "environment").mkdir(parents=True)
+    (task / "tests").mkdir()
+    (task / "environment" / "Dockerfile").write_text(
+        "FROM scratch\n"
+        "COPY additional-assumptions.md /app/additional-assumptions.md\n",
+        encoding="utf-8",
+    )
+    (task / "environment" / "additional-assumptions.md").write_text(
+        "Conversation notes.\n",
+        encoding="utf-8",
+    )
+    (task / "tests" / "dialogue-applied.json").write_text(
+        json.dumps(
+            {
+                "applied": True,
+                "review_passed": True,
+                "draft_passed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    directory, _ = release.publish_task_generation(
+        task,
+        tmp_path / "release",
+        "case",
+        bindings={
+            "source_generation_id": "a" * 64,
+            "segmentation_generation_id": "b" * 64,
+        },
+    )
+    assert directory.is_dir()
+
+
 @pytest.mark.parametrize(
     "relationship_type,target_mode",
     [

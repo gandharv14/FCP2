@@ -21,12 +21,22 @@ DIALOGUE_APPLIED_MARKER = "tests/dialogue-applied.json"
 
 
 def dialogue_notes_expected(bundle: Path) -> bool:
-    """True when apply left a marker and the main Dockerfile copies the notes."""
+    """True when a passing dialogue apply copied notes into the main image."""
     marker = bundle / DIALOGUE_APPLIED_MARKER
     dockerfile = bundle / "environment" / "Dockerfile"
     if not marker.is_file() or not dockerfile.is_file():
         return False
-    return DIALOGUE_NOTES_COPY in dockerfile.read_text(encoding="utf-8")
+    try:
+        applied = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(applied, dict)
+        and applied.get("applied") is True
+        and applied.get("review_passed") is True
+        and applied.get("draft_passed") is True
+        and DIALOGUE_NOTES_COPY in dockerfile.read_text(encoding="utf-8")
+    )
 
 
 def _load(path: Path):

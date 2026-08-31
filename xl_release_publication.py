@@ -200,7 +200,38 @@ def _workbook_lock(root: Path):
         os.close(descriptor)
 
 
+def _validate_dialogue_application(task_dir: Path) -> None:
+    marker_path = task_dir / "tests" / "dialogue-applied.json"
+    if not marker_path.exists() and not marker_path.is_symlink():
+        return
+    if marker_path.is_symlink() or not marker_path.is_file():
+        raise ReleasePublicationError("dialogue application marker is unsafe")
+    marker = _read_json(marker_path, "dialogue application marker")
+    if (
+        marker.get("applied") is not True
+        or marker.get("review_passed") is not True
+        or marker.get("draft_passed") is not True
+    ):
+        raise ReleasePublicationError(
+            "dialogue application did not pass draft and independent review"
+        )
+    notes = task_dir / "environment" / "additional-assumptions.md"
+    dockerfile = task_dir / "environment" / "Dockerfile"
+    if (
+        notes.is_symlink()
+        or not notes.is_file()
+        or dockerfile.is_symlink()
+        or not dockerfile.is_file()
+        or "COPY additional-assumptions.md /app/additional-assumptions.md"
+        not in dockerfile.read_text(encoding="utf-8")
+    ):
+        raise ReleasePublicationError(
+            "passing dialogue application is not bound into the task image"
+        )
+
+
 def _reject_external_package_artifacts(task_dir: Path) -> None:
+    _validate_dialogue_application(task_dir)
     environment = task_dir / "environment"
     if not environment.is_dir() or environment.is_symlink():
         raise ReleasePublicationError("task environment is missing or unsafe")

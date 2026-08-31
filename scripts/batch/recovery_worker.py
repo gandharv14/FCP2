@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import difflib
 import fcntl
 import hashlib
 import json
@@ -1359,25 +1360,98 @@ def _baseline_diff(
 
 def _write_vm_diff(
     repo: Path,
+    baseline_repo: Path,
     state_dir: Path,
     workbook_id: str,
-    baseline_diff: Mapping[str, object],
+    modification_evidence: Mapping[str, object],
 ) -> Path:
+    raw_changes = modification_evidence.get("baseline_diff", {})
+    if not isinstance(raw_changes, Mapping):
+        raise RecoveryError("modification evidence has no baseline diff")
+
+    def read_diff_file(root: Path, relative_text: str) -> bytes | None:
+        relative = Path(relative_text)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.as_posix() in {"", "."}
+            or any(
+                part in {".git", ".venv", "__pycache__"}
+                or part == ".env"
+                or part.startswith(".env.")
+                for part in relative.parts
+            )
+        ):
+            raise PolicyViolation(f"unsafe VM diff path: {relative_text!r}")
+        candidate = root
+        for part in relative.parts:
+            candidate = candidate / part
+            if not candidate.exists() and not candidate.is_symlink():
+                return None
+            mode = candidate.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise PolicyViolation(
+                    f"VM diff path contains a symlink: {relative.as_posix()}"
+                )
+        mode = candidate.lstat().st_mode
+        if not stat.S_ISREG(mode):
+            raise PolicyViolation(
+                f"VM diff path is not a regular file: {relative.as_posix()}"
+            )
+        return candidate.read_bytes()
+
+    sections: list[str] = []
+    for raw_relative in sorted(str(path) for path in raw_changes):
+        details = raw_changes[raw_relative]
+        if not isinstance(details, Mapping):
+            raise RecoveryError(f"invalid baseline diff record: {raw_relative}")
+        before = read_diff_file(baseline_repo, raw_relative)
+        after = read_diff_file(repo, raw_relative)
+        expected_before = details.get("baseline")
+        expected_after = details.get("current")
+        if (
+            before is not None
+            and isinstance(expected_before, str)
+            and HASH_RE.fullmatch(expected_before)
+            and _sha256_bytes(before) != expected_before
+        ):
+            raise PolicyViolation(
+                f"VM diff baseline content changed: {raw_relative}"
+            )
+        if (
+            after is not None
+            and isinstance(expected_after, str)
+            and HASH_RE.fullmatch(expected_after)
+            and _sha256_bytes(after) != expected_after
+        ):
+            raise PolicyViolation(
+                f"VM diff worktree content changed: {raw_relative}"
+            )
+        try:
+            before_text = "" if before is None else before.decode("utf-8")
+            after_text = "" if after is None else after.decode("utf-8")
+        except UnicodeDecodeError:
+            sections.append(
+                f"Binary change {raw_relative}: "
+                f"before_sha256={_sha256_bytes(before) if before is not None else 'absent'} "
+                f"after_sha256={_sha256_bytes(after) if after is not None else 'absent'}\n"
+            )
+            continue
+        sections.extend(
+            difflib.unified_diff(
+                before_text.splitlines(keepends=True),
+                after_text.splitlines(keepends=True),
+                fromfile=f"a/{raw_relative}",
+                tofile=f"b/{raw_relative}",
+            )
+        )
+
     destination = state_dir / "verification-inputs" / workbook_id / "vm-code-diff.txt"
-    command = ["git", "diff", "--no-ext-diff", "--binary", "--", "."]
-    result = subprocess.run(
-        command,
-        cwd=repo,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
     content = (
         "CODE_BASELINE differences:\n"
-        + json.dumps(baseline_diff, indent=2, sort_keys=True)
-        + "\n\nGit worktree diff (informational; baseline hashes are authoritative):\n"
-        + result.stdout
+        + json.dumps(modification_evidence, indent=2, sort_keys=True)
+        + "\n\nVerified baseline-to-worktree content diff:\n"
+        + "".join(sections)
     )
     atomic_write_text(destination, content)
     return destination
@@ -2953,7 +3027,11 @@ The separate incident investigator is read-only and is not a generation lane.
                 file_text = report_path.read_text(encoding="utf-8")
             except OSError:
                 file_text = ""
-        return _combine_fairness_reports(stdout_text, file_text)
+        report = _combine_fairness_reports(stdout_text, file_text)
+        if report_path.is_symlink():
+            raise PolicyViolation("fairness report path is a symlink")
+        atomic_write_text(report_path, report)
+        return report
 
     def _modified(
         self,
@@ -2989,16 +3067,15 @@ The separate incident investigator is read-only and is not a generation lane.
         row: QueueRow,
         candidate: ReleaseCandidate,
         vm_diff: Path,
-        report_path: Path,
     ) -> str:
         task = candidate.task_dir
         return f"""
 You are the fresh, independent fairness verifier for workbook
 {row.workbook_id}. This prompt is separate from generation. The worktree is
-read-only except you may write only this verification report:
-{report_path}.
-Do not modify, create, delete, rename, or write any other file. Do not run a
-command that writes other files. Do not read or print .env.
+read-only. Do not modify, create, delete, rename, or write any file. Do not run
+a command that writes files. Return the complete verification report in your
+final response; the recovery controller will persist it. Do not read or print
+.env.
 
 Inspect the original workbook at {row.run_source_path} (SHA-256
 {row.run_source_sha256}), the immutable task bundle at {task}, its instruction
@@ -3013,6 +3090,12 @@ keys/acceptance thresholds, and every source/segmentation/task/current-release
 binding. Confirm a.md (when recovery was used) fully records the exact blocker,
 evidence, failing stage, exact fix, changed files, before/after, commands, and
 verifier outcome. Do not accept fabricated gate success.
+
+When source health uses restricted routing, `route: restricted_pass` is a
+source-stage routing decision. A nested source-observation diagnostic may
+remain `insufficient_evidence` until strict segmentation and its hash-bound
+restriction-cone proof pass. Do not treat those scoped fields as contradictory
+by themselves; verify the downstream proof and bindings.
 
 Give a detailed report. Approval is fail-closed. Your final non-empty line must
 be exactly FAIRNESS_VERDICT: PASS or FAIRNESS_VERDICT: FAIL. Use PASS only when
@@ -3039,7 +3122,7 @@ every check succeeds without uncertainty.
             self.config.model,
             "--workspace",
             str(self._task_repo()),
-            self._verifier_prompt(row, candidate, vm_diff, report_path),
+            self._verifier_prompt(row, candidate, vm_diff),
         ]
         return run_ready_attempt(
             record,
@@ -3067,6 +3150,7 @@ every check succeeds without uncertainty.
             validate_recovery_amd(candidate.task_dir)
             vm_diff = _write_vm_diff(
                 repo,
+                self.config.baseline_repo,
                 self.config.state,
                 row.workbook_id,
                 modification_evidence,

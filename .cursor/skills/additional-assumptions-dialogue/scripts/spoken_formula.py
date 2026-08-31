@@ -19,6 +19,7 @@ A1_RE = re.compile(r"\$?([A-Z]{1,3})\$?(\d{1,7})", re.I)
 LABEL_RE = re.compile(r'"([^"]+)"')
 NEEDS_SPOKEN_RE = re.compile(r"\b(?:copied-column|cell |range )", re.I)
 SHOWN_FOR_RE = re.compile(r"\s*,?\s*shown for\b.*$", re.I)
+UNQUOTED_STRING_LITERALS = frozenset({"", "N/A", "#N/A", "NA"})
 
 
 def col_to_num(letters: str) -> int:
@@ -240,6 +241,11 @@ class _Parser:
         self.skip()
         if self.eat("("):
             node = self.parse_expr()
+            conjunctions = [node]
+            while self.eat("and "):
+                conjunctions.append(self.parse_expr())
+            if len(conjunctions) > 1:
+                node = {"op": "and", "args": conjunctions}
             self.skip()
             if not self.eat(")"):
                 rest = self.parse_atom()
@@ -355,7 +361,11 @@ def _clause_text(node: dict) -> str:
     if not node:
         return ""
     if node.get("op") == "atom":
-        return (node.get("text") or "").strip()
+        text = (node.get("text") or "").strip()
+        literal = re.fullmatch(r'"([^"]*)"', text)
+        if literal and literal.group(1) in UNQUOTED_STRING_LITERALS:
+            return literal.group(1)
+        return text
     core, suffix = _linearize(node)
     return "; ".join(part for part in [core, *suffix] if part)
 
@@ -415,6 +425,9 @@ def _linearize(node: dict) -> tuple[str, list[str]]:
     args = node.get("args") or []
     if op == "atom":
         text = (node.get("text") or "").strip()
+        literal = re.fullmatch(r'"([^"]*)"', text)
+        if literal and literal.group(1) in UNQUOTED_STRING_LITERALS:
+            return literal.group(1), []
         return text, []
     if op == "neg":
         inner = args[0] if args else {"op": "atom", "text": ""}
@@ -459,6 +472,8 @@ def _linearize(node: dict) -> tuple[str, list[str]]:
         return f"{_wrap(args[0])} minus {_wrap(args[1])}", []
     if op == "add":
         return " plus ".join(_wrap(arg) for arg in args), []
+    if op == "and":
+        return _join_and([_wrap(arg) for arg in args]), []
     if op == "div":
         return f"{_wrap(args[0])} divided by {_wrap(args[1])}", []
     if op == "pow":

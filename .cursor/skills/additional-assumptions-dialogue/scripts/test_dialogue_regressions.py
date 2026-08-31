@@ -32,9 +32,20 @@ RCF_STEPS = (
     '(cell LBO!J151 on the row labelled "Revolving Credit Facility (L+4.50%)")'
 )
 RCF_EVIDENCE = "=-MAX(0,MIN(O138,N141-O146))*$J$151"
+BOUNDED_WINDOW_STEPS = (
+    'when ((cell Model!C10 on the row labelled "Date") is at least '
+    '(cell Model!C8 on the row labelled "Start Date") and '
+    '(cell Model!C10 on the row labelled "Date") is at most '
+    '(cell Model!C9 on the row labelled "End Date")) is true, use '
+    '(cell Model!C11 on the row labelled "Operating Cost"); otherwise use (0)'
+)
+IFERROR_STEPS = (
+    'use (cell Model!C20 on the row labelled "IRR"), or use ("N/A") '
+    "if that calculation errors"
+)
 
 
-TASK = Path("/Users/henryhu/Documents/GDM_FCP/08_19_30_samples_tasks_outputs_unified/0042-outputs")
+TASK = Path()
 
 CLAIMS = {
     "schema_version": "1.1",
@@ -223,6 +234,42 @@ def test_apply_blocks_missing_must_say(tmp_path: Path) -> None:
     else:
         _ok("round2-missing-must-say", False, "apply did not raise")
 
+    draft.write_text(
+        "<!-- claim:projection_rule::Operations::Fee -->\n"
+        "**Associate:** How should Fee work?\n"
+        "**VP:** On Operations, The row labelled \"Fee\" is worked out from "
+        "the row labelled \"Revenue\".\n",
+        encoding="utf-8",
+    )
+    review = {
+        "passed": False,
+        "accuracy": {
+            "verdict": "pass",
+            "claims": [
+                {
+                    "record_id": "projection_rule::Operations::Fee",
+                    "must_say": "entailed",
+                }
+            ],
+            "extras": [],
+            "cell_refs_in_senior_turns": [],
+        },
+        "naturalness": {"verdict": "fail", "findings": ["too repetitive"]},
+    }
+    try:
+        apply(
+            task,
+            draft,
+            CLAIMS,
+            review,
+            require_review_pass=False,
+            skip_smoke=True,
+        )
+    except DialogueError as exc:
+        _ok("round2-full-review-required", "full review" in str(exc).lower(), str(exc))
+    else:
+        _ok("round2-full-review-required", False, "apply accepted failed review")
+
 
 def test_rcf_spoken_disambiguated() -> None:
     spoken = speak_steps(
@@ -262,6 +309,52 @@ def test_rcf_must_say_atoms() -> None:
     _ok("atoms-cash", "Total Cash for Discretionary Debt Paydown" in " ".join(atoms), atoms)
     _ok("atoms-rcf", "Revolving Credit Facility (L+4.50%)" in " ".join(atoms), atoms)
     _ok("atoms-no-copied", "copied across the forecast" not in blob, atoms)
+
+
+def test_bounded_window_preserves_both_conditions_and_branches() -> None:
+    spoken = speak_steps(
+        BOUNDED_WINDOW_STEPS,
+        representative="Model!C11",
+        evidence="=IF(AND(C10>=C8,C10<=C9),C11,0)",
+        sheet="Model",
+        row_label="Operating Cost",
+    )
+    atoms = must_say_atoms(
+        spoken + "\n" + BOUNDED_WINDOW_STEPS,
+        "Model",
+        "Operating Cost",
+    )
+    blob = " ".join(atoms).lower()
+    _ok("bounds-lower-preserved", "at least" in spoken, spoken)
+    _ok("bounds-upper-preserved", "at most" in spoken, spoken)
+    _ok("bounds-true-branch-preserved", "Operating Cost" in spoken, spoken)
+    _ok("bounds-false-branch-preserved", "otherwise 0" in spoken, spoken)
+    _ok("bounds-required-lower", "at least" in blob, str(atoms))
+    _ok("bounds-required-upper", "at most" in blob, str(atoms))
+    _ok("bounds-required-branch", "otherwise" in blob, str(atoms))
+
+
+def test_iferror_literal_is_not_a_row_label() -> None:
+    spoken = speak_steps(
+        IFERROR_STEPS,
+        representative="Model!C20",
+        evidence='=IFERROR(C20,"N/A")',
+        sheet="Model",
+        row_label="IRR",
+    )
+    atoms = must_say_atoms(
+        spoken + "\n" + IFERROR_STEPS,
+        "Model",
+        "IRR",
+    )
+    _ok("iferror-keeps-fallback", "N/A" in spoken, spoken)
+    _ok("iferror-no-literal-row", 'row labelled "N/A"' not in spoken, spoken)
+    _ok(
+        "iferror-no-literal-atom",
+        not any('row labelled "N/A"' in atom for atom in atoms),
+        str(atoms),
+    )
+    _ok("iferror-requires-errors", "errors" in " ".join(atoms).lower(), str(atoms))
 
 
 def test_pasted_spoken_fails() -> None:
@@ -379,21 +472,30 @@ def test_senior_cell_refs() -> None:
 
 
 def main() -> int:
-    test_senior_kickoff_unclaimed()
-    test_associate_junior_and_ack()
-    test_unknown_and_legacy_titles()
-    test_marker_coverage()
-    test_review_coverage()
-    test_stale_pack()
-    test_senior_cell_refs()
-    test_rebuild_frame_blocked()
-    test_rcf_spoken_disambiguated()
-    test_rcf_must_say_atoms()
-    test_pasted_spoken_fails()
-    test_sheet_only_when_unclear()
-    test_paren_ast_draft_fails()
+    global TASK
     with tempfile.TemporaryDirectory() as raw:
         tmp_path = Path(raw)
+        TASK = tmp_path / "dialogue-check-outputs"
+        (TASK / "tests").mkdir(parents=True)
+        (TASK / "tests" / "answer_key.json").write_text(
+            '{"targets": {}, "tolerance": {}}\n',
+            encoding="utf-8",
+        )
+        test_senior_kickoff_unclaimed()
+        test_associate_junior_and_ack()
+        test_unknown_and_legacy_titles()
+        test_marker_coverage()
+        test_review_coverage()
+        test_stale_pack()
+        test_senior_cell_refs()
+        test_rebuild_frame_blocked()
+        test_rcf_spoken_disambiguated()
+        test_rcf_must_say_atoms()
+        test_bounded_window_preserves_both_conditions_and_branches()
+        test_iferror_literal_is_not_a_row_label()
+        test_pasted_spoken_fails()
+        test_sheet_only_when_unclear()
+        test_paren_ast_draft_fails()
         test_formula_literal_target_collision_is_claim_scoped(tmp_path)
         test_apply_blocks_missing_must_say(tmp_path)
     print("all regressions passed")

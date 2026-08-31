@@ -9,6 +9,8 @@ import pytest
 
 from xl_seg.evaluate import workbook_calculation_metadata
 from xl_source_health import (
+    PREVIOUS_POLICY_VERSION,
+    PREVIOUS_SCHEMA_VERSION,
     SourceHealthError,
     atomic_write_report,
     inspect_workbook,
@@ -241,14 +243,43 @@ def test_formula_tokens_are_cross_checked(tmp_path, formula, route, event):
     assert report["restriction_events"][0]["event"] == event
 
 
-def test_restricted_plus_missing_cache_is_unsupported(tmp_path):
+def test_restricted_plus_missing_cache_has_bound_restricted_route(tmp_path):
     source = tmp_path / "mixed.xlsx"
     _workbook(source, formula="OFFSET(A1,0,0)", cache=None)
 
     report = inspect_workbook(source)
 
-    assert report["route"] == "unsupported"
+    assert report["route"] == "restricted_recalc_pass"
     assert "mixed_restricted_recalc" in report["reason_codes"]
+    assert report["recalc_signals"]
+    assert report["recalc_signals"][0]["signal"] in {
+        "formula_cache_empty",
+        "formula_cache_incomplete",
+    }
+    previous = inspect_workbook(
+        source,
+        policy_version=PREVIOUS_POLICY_VERSION,
+    )
+    assert previous["schema_version"] == PREVIOUS_SCHEMA_VERSION
+    assert previous["route"] == "unsupported"
+    assert "mixed_restricted_recalc" in previous["reason_codes"]
+    assert "recalc_signals" not in previous
+
+
+def test_mixed_restricted_route_never_overrides_hard_external_reason(tmp_path):
+    source = tmp_path / "mixed-external.xlsx"
+    sheet = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/'
+        'main"><sheetData><row r="1"><c r="A1"><v>1</v></c>'
+        '<c r="B1"><f>OFFSET(A1,0,0)</f></c>'
+        '<c r="C1"><f>[1]Sheet1!A1</f></c></row></sheetData></worksheet>'
+    )
+    _workbook(source, sheet_xml=sheet)
+
+    report = inspect_workbook(source)
+
+    assert report["route"] == "unsupported"
+    assert "external_links_present" in report["reason_codes"]
 
 
 def test_restriction_ledger_is_complete_not_sample_limited(tmp_path):
@@ -350,6 +381,14 @@ def test_inventory_cli_uses_id_manifest_instead_of_directory_scan(tmp_path):
     assert manifest["cohort"]["workbook_ids"] == ["0002"]
 
 
+def test_plaintext_inventory_manifest_rejects_padded_id(tmp_path):
+    ids_path = tmp_path / "ids.txt"
+    ids_path.write_text(" 0001 \n", encoding="utf-8")
+
+    with pytest.raises(SourceInventoryError, match="unsafe workbook ID"):
+        read_workbook_ids(ids_path)
+
+
 def test_inventory_rejects_missing_duplicate_and_unexpected_ids(tmp_path):
     source_root = tmp_path / "sources"
     source_root.mkdir()
@@ -362,6 +401,12 @@ def test_inventory_rejects_missing_duplicate_and_unexpected_ids(tmp_path):
             source_root,
             workbook_ids=["0001", "0001"],
         )
+    for unsafe_id in (1, " 0001 ", "\t0001"):
+        with pytest.raises(SourceInventoryError, match="unsafe workbook ID"):
+            build_inventory_manifest(
+                source_root,
+                workbook_ids=[unsafe_id],
+            )
     with pytest.raises(SourceInventoryError, match="absent"):
         build_inventory_manifest(source_root, workbook_ids=["9999"])
     duplicate_root = tmp_path / "duplicate"

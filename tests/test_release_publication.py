@@ -13,10 +13,12 @@ from openpyxl import Workbook
 import gen_normalizer
 import xl_release_publication as release
 import xl_output_task
+import xl_inventory_approval
 import xl_source_publication as source_publication
 import xl_source_recalc as source_recalc
 from xl_source_health import inspect_workbook
 from xl_source_inventory import build_inventory_manifest
+from xl_inventory_approval import approval_claims, object_hash
 from xl_source_recalc import create_identity_documents
 from xl_seg import diagnostics as segmentation_diagnostics
 from xl_seg import model as segmentation_model
@@ -34,6 +36,8 @@ H = {
         "events": "5",
         "profile": "6",
         "cone": "7",
+        "approval": "8",
+        "signals": "9",
     }.items()
 }
 
@@ -136,6 +140,7 @@ def _fixture(
     *,
     restricted=True,
     freeze_legacy=True,
+    recovery_mode=None,
 ):
     workbook = "case"
     source_root = tmp_path / "source"
@@ -157,6 +162,19 @@ def _fixture(
             "restriction_events_sha256": H["events"],
             "restriction_profile_sha256": H["profile"],
         })
+        if release.SOURCE_POLICY_VERSION != (
+            release.PREVIOUS_SOURCE_POLICY_VERSION
+        ):
+            source_bindings.update({
+                "recalc_signals_sha256": H["signals"],
+            })
+            if recovery_mode is None:
+                source_bindings["inventory_approval_sha256"] = H["approval"]
+    policy_decision = {
+        "route": "restricted_pass" if restricted else "pass",
+    }
+    if recovery_mode is not None:
+        policy_decision["recovery_mode"] = recovery_mode
     source_manifest = {
         "schema_version": release.SOURCE_SCHEMA_VERSION,
         "generation_id": source_id,
@@ -169,9 +187,7 @@ def _fixture(
         },
         "identity": {
             "policy_version": release.SOURCE_POLICY_VERSION,
-            "policy_decision": {
-                "route": "restricted_pass" if restricted else "pass",
-            },
+            "policy_decision": policy_decision,
         },
         "bindings": source_bindings,
     }
@@ -203,6 +219,14 @@ def _fixture(
             "restriction_profile_sha256": H["profile"],
             "cone_certificate_sha256": H["cone"],
         })
+        if release.SOURCE_POLICY_VERSION != (
+            release.PREVIOUS_SOURCE_POLICY_VERSION
+        ):
+            policy.update({
+                "recalc_signals_sha256": H["signals"],
+            })
+            if recovery_mode is None:
+                policy["inventory_approval_sha256"] = H["approval"]
         (segmentation_dir / "restriction-cone-certificate.json").write_text(
             json.dumps({
                 "schema_version": release.CONE_SCHEMA_VERSION,
@@ -247,6 +271,21 @@ def _fixture(
         ),
         "restriction_events_sha256": H["events"] if restricted else None,
         "restriction_profile_sha256": H["profile"] if restricted else None,
+        "inventory_approval_sha256": (
+            H["approval"]
+            if restricted
+            and release.SOURCE_POLICY_VERSION
+            != release.PREVIOUS_SOURCE_POLICY_VERSION
+            and recovery_mode is None
+            else None
+        ),
+        "recalc_signals_sha256": (
+            H["signals"]
+            if restricted
+            and release.SOURCE_POLICY_VERSION
+            != release.PREVIOUS_SOURCE_POLICY_VERSION
+            else None
+        ),
         "segmentation_generation_id": segmentation_id,
         "segmentation_manifest_sha256": release._sha256(
             segmentation_dir / "generation-manifest.json"
@@ -266,6 +305,8 @@ def _fixture(
         "segmentation_id": segmentation_id,
         "task_id": task_manifest["generation_id"],
         "task_dir": task_dir,
+        "source_manifest": source_manifest,
+        "segmentation_manifest": segmentation_manifest,
     }
     if freeze_legacy:
         case["legacy_snapshot_hash"] = _freeze_fixture_legacy(case)
@@ -305,6 +346,234 @@ def test_full_binding_preservation_and_first_cas(tmp_path, monkeypatch):
     assert manifest["bindings"]["cone_certificate_sha256"] == H["cone"]
 
 
+def test_previous_v2_source_policy_release_remains_valid(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        release, "SOURCE_POLICY_VERSION", release.PREVIOUS_SOURCE_POLICY_VERSION
+    )
+    monkeypatch.setattr(
+        release,
+        "SOURCE_HEALTH_SCHEMA_VERSION",
+        release.PREVIOUS_SOURCE_HEALTH_SCHEMA_VERSION,
+    )
+    case = _fixture(tmp_path, monkeypatch)
+    manifest = release.build_release_manifest(
+        case["workbook"],
+        source_root=case["source_root"],
+        source_generation_id=case["source_id"],
+        segmentation_root=case["segmentation_root"],
+        segmentation_generation_id=case["segmentation_id"],
+        task_root=case["release_root"],
+        task_generation_id=case["task_id"],
+        prior_release_id=None,
+        legacy_snapshot_hash=case["legacy_snapshot_hash"],
+        source_policy_version=release.PREVIOUS_SOURCE_POLICY_VERSION,
+        source_health_schema_version=release.PREVIOUS_SOURCE_HEALTH_SCHEMA_VERSION,
+    )
+    directory = (
+        case["release_root"] / "releases" / manifest["release_id"]
+    )
+    directory.mkdir(parents=True)
+    (directory / "release-manifest.json").write_bytes(
+        release._canonical_bytes(manifest)
+    )
+    monkeypatch.setattr(release, "SOURCE_POLICY_VERSION", "source-recalc-policy/v3")
+    monkeypatch.setattr(
+        release, "SOURCE_HEALTH_SCHEMA_VERSION", "xlsx-source-health/v3"
+    )
+
+    validated = release.validate_release(
+        directory,
+        source_root=case["source_root"],
+        segmentation_root=case["segmentation_root"],
+        task_root=case["release_root"],
+    )
+
+    assert validated == manifest
+    assert manifest["versions"]["source_policy_version"] == (
+        release.PREVIOUS_SOURCE_POLICY_VERSION
+    )
+
+
+def test_current_restricted_release_requires_approval_and_signal_bindings(
+    tmp_path,
+    monkeypatch,
+):
+    case = _fixture(tmp_path, monkeypatch)
+    source_manifest_path = (
+        case["source_root"]
+        / "generations"
+        / case["source_id"]
+        / "generation-manifest.json"
+    )
+    source_manifest = json.loads(source_manifest_path.read_text())
+    source_manifest["bindings"].pop("inventory_approval_sha256")
+    source_manifest["bindings"].pop("recalc_signals_sha256")
+    source_manifest_path.write_text(json.dumps(source_manifest) + "\n")
+    monkeypatch.setattr(
+        "xl_source_publication.resolve_source_generation_by_id",
+        lambda _root, _generation_id: (
+            source_manifest_path.parent,
+            source_manifest,
+        ),
+    )
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="current restricted source bindings are incomplete",
+    ):
+        _publish(case)
+
+
+def test_data_table_recovery_release_uses_hash_bound_recalc_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        recovery_mode="data_tables_outside_output_cone",
+    )
+
+    _, manifest = _publish(case)
+
+    assert manifest["bindings"]["inventory_approval_sha256"] is None
+    assert manifest["bindings"]["recalc_signals_sha256"] == H["signals"]
+
+
+def test_restricted_recovery_mode_still_requires_recalc_binding(
+    tmp_path,
+    monkeypatch,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        recovery_mode="data_tables_outside_output_cone",
+    )
+    case["source_manifest"]["bindings"].pop("recalc_signals_sha256")
+    case["segmentation_manifest"]["source_policy_bindings"].pop(
+        "recalc_signals_sha256"
+    )
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="current restricted source bindings are incomplete",
+    ):
+        _publish(case)
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "restriction_evidence_sha256",
+        "restriction_events_sha256",
+        "restriction_profile_sha256",
+    ],
+)
+def test_restricted_recovery_mode_requires_restriction_hashes(
+    tmp_path,
+    monkeypatch,
+    binding,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        recovery_mode="data_tables_outside_output_cone",
+    )
+    case["source_manifest"]["bindings"].pop(binding)
+    case["segmentation_manifest"]["source_policy_bindings"].pop(binding)
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="current restricted source bindings are incomplete",
+    ):
+        _publish(case)
+
+
+def test_restricted_recovery_mode_requires_bound_cone_certificate(
+    tmp_path,
+    monkeypatch,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        recovery_mode="data_tables_outside_output_cone",
+    )
+    certificate = (
+        case["segmentation_root"]
+        / "generations"
+        / case["segmentation_id"]
+        / "restriction-cone-certificate.json"
+    )
+    certificate.write_text(
+        json.dumps({
+            "schema_version": release.CONE_SCHEMA_VERSION,
+            "certificate_sha256": "0" * 64,
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="restriction cone certificate is incomplete or changed",
+    ):
+        _publish(case)
+
+
+def test_restricted_recovery_mode_rejects_inventory_approval(
+    tmp_path,
+    monkeypatch,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        recovery_mode="data_tables_outside_output_cone",
+    )
+    case["source_manifest"]["bindings"]["inventory_approval_sha256"] = H[
+        "approval"
+    ]
+    case["segmentation_manifest"]["source_policy_bindings"][
+        "inventory_approval_sha256"
+    ] = H["approval"]
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="must omit inventory approval",
+    ):
+        _publish(case)
+
+
+@pytest.mark.parametrize(
+    ("restricted", "recovery_mode", "error"),
+    [
+        (True, "unknown_mode", "unsupported restricted recovery mode"),
+        (
+            False,
+            "data_tables_outside_output_cone",
+            "not bound to the source route",
+        ),
+    ],
+)
+def test_restricted_recovery_mode_is_exact_and_restricted(
+    tmp_path,
+    monkeypatch,
+    restricted,
+    recovery_mode,
+    error,
+):
+    case = _fixture(
+        tmp_path,
+        monkeypatch,
+        restricted=restricted,
+        recovery_mode=recovery_mode,
+    )
+
+    with pytest.raises(release.ReleasePublicationError, match=error):
+        _publish(case)
+
+
 def test_first_cas_without_validated_legacy_snapshot_is_rejected(
     tmp_path, monkeypatch
 ):
@@ -317,6 +586,77 @@ def test_first_cas_without_validated_legacy_snapshot_is_rejected(
         _publish(case, legacy_snapshot_hash=None)
 
     assert not (case["release_root"] / "current-release.json").exists()
+
+
+def test_first_cas_accepts_hash_bound_absent_legacy_snapshot(
+    tmp_path, monkeypatch
+):
+    case = _fixture(tmp_path, monkeypatch, freeze_legacy=False)
+    _, snapshot = release.freeze_absent_legacy_snapshot(
+        case["release_root"],
+        case["workbook"],
+        source_root=case["source_root"],
+        segmentation_root=case["segmentation_root"],
+    )
+
+    directory, manifest = _publish(
+        case,
+        legacy_snapshot_hash=snapshot["snapshot_hash"],
+    )
+
+    assert directory.is_dir()
+    assert manifest["legacy_snapshot_hash"] == snapshot["snapshot_hash"]
+    assert (case["release_root"] / "current-release.json").is_file()
+
+
+def test_absent_legacy_snapshot_rejects_appearing_or_wrong_legacy_state(
+    tmp_path, monkeypatch
+):
+    case = _fixture(tmp_path, monkeypatch, freeze_legacy=False)
+    _, snapshot = release.freeze_absent_legacy_snapshot(
+        case["release_root"],
+        case["workbook"],
+        source_root=case["source_root"],
+        segmentation_root=case["segmentation_root"],
+    )
+    source_pointer = case["source_root"] / "current.json"
+    source_pointer.write_text(
+        '{"schema_version":"source-current/v1"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="legacy state appeared",
+    ):
+        _publish(
+            case,
+            legacy_snapshot_hash=snapshot["snapshot_hash"],
+        )
+
+    assert not (case["release_root"] / "current-release.json").exists()
+
+
+def test_absent_legacy_snapshot_rejects_partial_legacy_tuple(
+    tmp_path, monkeypatch
+):
+    case = _fixture(tmp_path, monkeypatch, freeze_legacy=False)
+    source_pointer = case["source_root"] / "current.json"
+    source_pointer.write_text(
+        '{"schema_version":"source-current/v1"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="both legacy pointers absent",
+    ):
+        release.freeze_absent_legacy_snapshot(
+            case["release_root"],
+            case["workbook"],
+            source_root=case["source_root"],
+            segmentation_root=case["segmentation_root"],
+        )
 
 
 def test_end_to_end_release_uses_real_source_and_segmentation_resolvers(tmp_path):
@@ -510,15 +850,22 @@ def test_end_to_end_restricted_release_uses_real_validators_and_resolvers(
         cohort_root,
         workbook_ids=cohort_ids,
     )
-    frozen_inventory = tmp_path / "synthetic-restricted-inventory.json"
-    frozen_inventory.write_text(
-        json.dumps(inventory, sort_keys=True),
-        encoding="utf-8",
-    )
+    batch_id = "synthetic-restricted-batch"
+    approval = approval_claims(inventory, batch_id=batch_id)
+    registry_core = {
+        "schema_version": "source-inventory-approval-registry/v1",
+        "approvals": [approval],
+    }
+    registry = {
+        **registry_core,
+        "registry_sha256": object_hash(registry_core),
+    }
+    registry_path = tmp_path / "approved-source-inventories.json"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
     monkeypatch.setattr(
-        source_recalc,
-        "RESTRICTED_SOURCE_COHORT_MANIFEST",
-        frozen_inventory,
+        xl_inventory_approval,
+        "DEFAULT_REGISTRY",
+        registry_path,
     )
 
     health = inspect_workbook(source)
@@ -539,6 +886,7 @@ def test_end_to_end_restricted_release_uses_real_validators_and_resolvers(
         source_root,
         health=health,
         inventory=inventory,
+        inventory_batch_id=batch_id,
     )
     source_path = source_dir / source_manifest["layout"]["source_workbook"]
     ast_dir = source_dir / source_manifest["layout"]["ast_directory"]
@@ -689,6 +1037,12 @@ def test_end_to_end_restricted_release_uses_real_validators_and_resolvers(
         ],
         "restriction_profile_sha256": source_bindings[
             "restriction_profile_sha256"
+        ],
+        "inventory_approval_sha256": source_bindings[
+            "inventory_approval_sha256"
+        ],
+        "recalc_signals_sha256": source_bindings[
+            "recalc_signals_sha256"
         ],
         "segmentation_generation_id": segmentation_manifest["generation_id"],
         "segmentation_manifest_sha256": release._sha256(
@@ -867,6 +1221,81 @@ def test_external_package_artifacts_are_blocked(tmp_path):
                 "segmentation_generation_id": "b" * 64,
             },
         )
+
+
+@pytest.mark.parametrize("failed_field", ["applied", "review_passed", "draft_passed"])
+def test_dialogue_application_must_pass_before_task_publication(
+    tmp_path, failed_field
+):
+    task = tmp_path / "task"
+    (task / "environment").mkdir(parents=True)
+    (task / "tests").mkdir()
+    (task / "environment" / "Dockerfile").write_text(
+        "FROM scratch\n"
+        "COPY additional-assumptions.md /app/additional-assumptions.md\n",
+        encoding="utf-8",
+    )
+    (task / "environment" / "additional-assumptions.md").write_text(
+        "Conversation notes.\n",
+        encoding="utf-8",
+    )
+    marker = {
+        "applied": True,
+        "review_passed": True,
+        "draft_passed": True,
+    }
+    marker[failed_field] = False
+    (task / "tests" / "dialogue-applied.json").write_text(
+        json.dumps(marker),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(release.ReleasePublicationError, match="did not pass"):
+        release.publish_task_generation(
+            task,
+            tmp_path / "release",
+            "case",
+            bindings={
+                "source_generation_id": "a" * 64,
+                "segmentation_generation_id": "b" * 64,
+            },
+        )
+
+
+def test_passing_dialogue_application_can_publish(tmp_path):
+    task = tmp_path / "task"
+    (task / "environment").mkdir(parents=True)
+    (task / "tests").mkdir()
+    (task / "environment" / "Dockerfile").write_text(
+        "FROM scratch\n"
+        "COPY additional-assumptions.md /app/additional-assumptions.md\n",
+        encoding="utf-8",
+    )
+    (task / "environment" / "additional-assumptions.md").write_text(
+        "Conversation notes.\n",
+        encoding="utf-8",
+    )
+    (task / "tests" / "dialogue-applied.json").write_text(
+        json.dumps(
+            {
+                "applied": True,
+                "review_passed": True,
+                "draft_passed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    directory, _ = release.publish_task_generation(
+        task,
+        tmp_path / "release",
+        "case",
+        bindings={
+            "source_generation_id": "a" * 64,
+            "segmentation_generation_id": "b" * 64,
+        },
+    )
+    assert directory.is_dir()
 
 
 @pytest.mark.parametrize(

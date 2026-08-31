@@ -30,7 +30,12 @@ RELEASE_ROOT="release_out/$WB"
 SOURCE_HEALTH="runs/$WB-source-health.json"
 RECALC_RUN="runs/$WB-source-recalc"
 TRUSTED_RUNNER_PUBLIC_KEY="/etc/harbor/excel-runner-public.pem"
+EXCEL_ISOLATION_ATTESTATION="/Library/Application Support/FCP2/recalc/excel-isolation-attestation.json"
+EXCEL_SANDBOX_RUNNER="/Library/Application Support/FCP2/recalc/harbor-excel-sandbox"
 EXCEL_ENGINE_VERSION="<exact-approved-Microsoft-Excel-version>"
+SOURCE_BATCH_ID="<approved-batch-id>"
+SOURCE_INVENTORY="<approved-source-inventory.json>"
+SOURCE_INVENTORY_APPROVAL=verification_manifests/approved_source_inventories.v1.json
 # SOURCE, SOURCE_FILE, SOURCE_GENERATION_ID, and AST_ROOT are resolved from one
 # immutable candidate tuple during staging, then from current-release.json.
 SEG_ROOT=seg_out
@@ -94,7 +99,8 @@ Stage all requested workbooks before promoting any of them.
 - Resolve one `current-release.json` once per production operation. During
   staging, pass both explicit inactive source and segmentation generation IDs.
   Never read source or segmentation `current.json` mid-operation.
-- A `restricted_pass` source and its segmentation stay inactive until the task
+- A `restricted_pass` or `restricted_recalc_pass` source and its segmentation
+  stay inactive until the task
   generation is immutable and the complete tuple passes release CAS.
 - Legacy direct artifacts are an offline compatibility layout. Publication never
   replaces existing direct files or directories; migrate them only while offline.
@@ -168,8 +174,8 @@ engine/version, isolation, calculation-complete, and completion-time claims:
 python3 xl_source_recalc.py execute "$RECALC_RUN/request.json" \
   --source "$RAW_SOURCE_FILE" \
   --allowed-root "$RECALC_RUN/recalculated" \
-  --isolation-attestation /etc/harbor/excel-isolation-attestation.json \
-  --sandbox-runner /usr/local/sbin/harbor-excel-sandbox \
+  --isolation-attestation "$EXCEL_ISOLATION_ATTESTATION" \
+  --sandbox-runner "$EXCEL_SANDBOX_RUNNER" \
   -o "$RECALC_RUN/result.json"
 python3 xl_source_health.py observe \
   "$RECALC_RUN/recalculated/$WB.xlsx" \
@@ -182,17 +188,22 @@ For `pass`, use the original as `EFFECTIVE_CANDIDATE` and
 `"$SOURCE_HEALTH"` as `EFFECTIVE_HEALTH`. Build a fresh production AST and
 publish an inactive immutable source generation:
 
-For `restricted_pass`, also use the original source and health report, but bind
-the exact frozen cohort inventory. This route may build only an inactive source
-and AST candidate. It cannot use ordinary identity or recalculation evidence:
+For `restricted_pass` or `restricted_recalc_pass`, also use the original source
+and health report, but bind the exact commit-approved batch inventory. The
+approval must include the complete native/conversion source ledger. These
+routes may build only an inactive source and AST candidate. They cannot use
+ordinary identity or recalculation evidence:
 
 ```bash
-if [ "$SOURCE_ROUTE" = "restricted_pass" ]; then
-  RESTRICTION_INVENTORY=verification_manifests/restricted_source_cohort_123.v2.json
-  test -f "$RESTRICTION_INVENTORY"
+if [ "$SOURCE_ROUTE" = "restricted_pass" ] || \
+   [ "$SOURCE_ROUTE" = "restricted_recalc_pass" ]; then
+  test -f "$SOURCE_INVENTORY"
+  test -f "$SOURCE_INVENTORY_APPROVAL"
   PREPARED=$(python3 xl_source_recalc.py prepare "$RAW_SOURCE_FILE" \
     --workbook "$WB" --publication-root "$SOURCE_RUN" \
-    --health "$SOURCE_HEALTH" --inventory "$RESTRICTION_INVENTORY")
+    --health "$SOURCE_HEALTH" --inventory "$SOURCE_INVENTORY" \
+    --inventory-batch-id "$SOURCE_BATCH_ID" \
+    --inventory-approval-registry "$SOURCE_INVENTORY_APPROVAL")
 elif [ "$EFFECTIVE_CANDIDATE" = "$RAW_SOURCE_FILE" ]; then
   PREPARED=$(python3 xl_source_recalc.py prepare "$EFFECTIVE_CANDIDATE" \
     --workbook "$WB" --publication-root "$SOURCE_RUN" \
@@ -271,7 +282,8 @@ explicit approval, stop.
 After confirmation, keep both generations inactive. All remaining build commands
 must pass `--source-generation-id "$SOURCE_GENERATION_ID"` and
 `--segmentation-generation-id "$GENERATION_ID"`. Do not run
-`xl_source_publication activate` for `restricted_pass`.
+`xl_source_publication activate` for `restricted_pass` or
+`restricted_recalc_pass`.
 
 Only the full validator command above establishes PASS. Record its returned
 `generation_id`; reading `current.json` or checking its schema alone is never a
@@ -806,17 +818,31 @@ if test -f "$RELEASE_ROOT/current-release.json"; then
     'import json,sys; print(json.load(open(sys.argv[1]))["release_id"])' \
     "$RELEASE_ROOT/current-release.json")
   EXPECTED=(--expected-current-release-id "$EXPECTED_RELEASE_ID")
+  LEGACY=()
 else
   EXPECTED=(--expect-absent)
-  # For legacy migration, run freeze-legacy first and add
-  # --legacy-snapshot-hash <frozen hash>.
+  if test -e "$SOURCE_RUN/current.json" || test -L "$SOURCE_RUN/current.json" \
+    || test -e "$SEG_ROOT/$WB/current.json" \
+    || test -L "$SEG_ROOT/$WB/current.json"; then
+    echo "legacy state exists; freeze the complete legacy tuple before cutover" >&2
+    exit 1
+  fi
+  ABSENT_SNAPSHOT=$(python3 -m xl_release_publication freeze-absent-legacy \
+    "$RELEASE_ROOT" "$WB" \
+    --source-root "$SOURCE_RUN" \
+    --segmentation-root "$SEG_ROOT/$WB")
+  LEGACY_SNAPSHOT_HASH=$(python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["snapshot_hash"])' \
+    <<<"$ABSENT_SNAPSHOT")
+  LEGACY=(--legacy-snapshot-hash "$LEGACY_SNAPSHOT_HASH")
 fi
 python3 -m xl_release_publication publish "$RELEASE_ROOT" "$WB" \
   --source-root "$SOURCE_RUN" \
   --source-generation-id "$SOURCE_GENERATION_ID" \
   --segmentation-root "$SEG_ROOT/$WB" \
   --segmentation-generation-id "$GENERATION_ID" \
-  --task-generation-id "$TASK_GENERATION_ID" "${EXPECTED[@]}"
+  --task-generation-id "$TASK_GENERATION_ID" \
+  "${EXPECTED[@]}" "${LEGACY[@]}"
 ```
 
 Do not run Harbor rollouts unless the user separately asks.

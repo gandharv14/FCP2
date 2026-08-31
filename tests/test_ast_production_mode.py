@@ -327,15 +327,14 @@ def test_harbor_skill_uses_only_full_validator_for_pass():
     assert 'print("segmentation generation"' not in skill
 
 
-def test_harbor_skill_binds_restricted_pass_to_frozen_inventory():
+def test_harbor_skill_binds_restricted_routes_to_approved_inventory():
     skill = (REPO / ".cursor/skills/create-harbor-task/SKILL.md").read_text(
         encoding="utf-8"
     )
 
-    assert 'if [ "$SOURCE_ROUTE" = "restricted_pass" ]' in skill
-    assert (
-        "verification_manifests/restricted_source_cohort_123.v2.json"
-        in skill
-    )
-    assert '--health "$SOURCE_HEALTH" --inventory "$RESTRICTION_INVENTORY"' in skill
-    assert "This route may build only an inactive source" in skill
+    assert '[ "$SOURCE_ROUTE" = "restricted_pass" ]' in skill
+    assert '[ "$SOURCE_ROUTE" = "restricted_recalc_pass" ]' in skill
+    assert "--inventory-batch-id" in skill
+    assert "--inventory-approval-registry" in skill
+    assert "commit-approved batch inventory" in skill
+    assert "inactive source and AST candidate" in skill

@@ -217,7 +217,9 @@ class PlainEligibilityTests(unittest.TestCase):
             (env / "additional-assumptions.md").write_text("notes\n", encoding="utf-8")
             (bundle / "tests").mkdir()
             (bundle / "tests" / "dialogue-applied.json").write_text(
-                "{}\n", encoding="utf-8"
+                '{"applied": true, "review_passed": true, '
+                '"draft_passed": true}\n',
+                encoding="utf-8",
             )
             report = plain_eligibility.check_plain_environment(bundle, "0001")
             self.assertTrue(report["valid"], report)
@@ -244,7 +246,9 @@ class PlainEligibilityTests(unittest.TestCase):
             (env / "additional-assumptions.md").write_text("notes\n", encoding="utf-8")
             (bundle / "tests").mkdir()
             (bundle / "tests" / "dialogue-applied.json").write_text(
-                "{}\n", encoding="utf-8"
+                '{"applied": true, "review_passed": true, '
+                '"draft_passed": true}\n',
+                encoding="utf-8",
             )
             report = plain_eligibility.check_plain_environment(bundle, "0001")
             self.assertFalse(report["valid"])

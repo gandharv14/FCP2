@@ -70,8 +70,9 @@ If `claims.json` reports `"empty": true`, stop.
    pack, `$RUN/draft.r1.md`, and `$RUN/review.r1.json`. Output `$RUN/draft.r2.md`
    (also copy to `$RUN/draft.md`), then run the paraphrase pass again.
 7. Reviewer scores the new draft → `$RUN/review.r2.json`.
-8. After two rounds, apply the last draft if **accuracy and cast** pass.
-   Reviewer **naturalness** may still fail. Do not start a third write.
+8. After two rounds, apply the last draft only if the full independent review
+   passes. Do not package `review_passed: false` or `draft_passed: false`.
+   Do not start a third write.
 
 The reviewer never edits the draft. The writer never applies.
 
@@ -86,8 +87,8 @@ python3 $S/validate_dialogue.py apply \
   --report "$RUN/apply.json"
 ```
 
-Use `--round 2` on the second apply so a failed **naturalness** verdict does
-not block. These still block in both rounds: missing `must_say`, missing
+Use `--round 2` on the second apply. Full review still must pass. These block
+in both rounds: missing `must_say`, missing
 row label, missing sheet when the thread has not already named the tab,
 unknown or leftover speaker titles, empty/stale review coverage,
 **and any cell/range token in a senior turn**. Do not replace working
@@ -134,7 +135,11 @@ HARD RULES
 5. `spoken` is the spec, not the line to paste. Paraphrase it into Slack:
    short turns, contractions, varied sentence order. Do not add or drop
    operators. If the card says last period / this period / locked input,
-   those words (or close equivalents) must appear in the senior turn.
+   those words (or close equivalents) must appear in the senior turn. Keep
+   lower-bound, upper-bound, and result locked inputs distinct when the card
+   names those roles; never collapse them into "that input." Keep first and
+   second locked inputs or input blocks distinct, and preserve any required
+   row count and corresponding-value operation.
    FORBIDDEN senior shapes: "On {sheet}, the row labelled \"X\" is copied
    across the forecast:"; pasting `spoken` with a speaker prefix; "use this
    copied-column calculation"; paren-AST ("multiply (take the").
@@ -197,7 +202,10 @@ HARD RULES
    - A1 / cell / range addresses
    - rebuild, restore, original model, original logic
 4. If the card says last period / this period / locked input / floor / flip,
-   those words (or close equivalents) must remain.
+   those words (or close equivalents) must remain. Lower-bound, upper-bound,
+   and result locked inputs must remain three distinct roles. First and second
+   locked inputs or blocks, row counts, and corresponding-value operations
+   must also remain distinct.
 5. No new modelling facts. No dropped operators.
 6. Slack: contractions, short turns. A senior may split one claim across
    two turns. Do not make juniors ask again.
@@ -250,7 +258,11 @@ must_say is entailed, extras is empty, and cell_refs_in_senior_turns is empty.
 ACCURACY — fail if any:
 - A must_say clause is missing or contradicted in the senior turns for that claim.
 - A distinguishing locator from the card is missing (last period / this
-  period / locked input / next period) when the card used it.
+  period / locked input / next period / source tab) when the card used it.
+- Lower-bound, upper-bound, and result locked inputs are collapsed into one
+  ambiguous input.
+- First and second locked inputs or input blocks are collapsed, or a required
+  block row count or corresponding-value operation is omitted.
 - A modelling assertion that is not on any claim card.
 - An alternative named and left open.
 - Catalogue ids, or a numeric literal that looks like a graded target.

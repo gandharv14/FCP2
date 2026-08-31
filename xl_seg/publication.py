@@ -256,7 +256,10 @@ def bind_source_generation(
             str(source_binding["health_report_sha256"])
         )
         or source_binding["route"] not in {
-            "pass", "recalc_candidate", "restricted_pass"
+            "pass",
+            "recalc_candidate",
+            "restricted_pass",
+            "restricted_recalc_pass",
         }
         or not isinstance(source_binding["policy_version"], str)
     ):
@@ -266,18 +269,31 @@ def bind_source_generation(
     )
     verification["source_generation"] = source_binding
     source_policy_bindings = {"source_generation": source_binding}
-    restricted = policy.get("route") == "restricted_pass"
+    restricted = policy.get("route") in {
+        "restricted_pass",
+        "restricted_recalc_pass",
+    }
     if restricted:
+        from xl_source_health import POLICY_VERSION as CURRENT_SOURCE_POLICY
+
+        requires_current_bindings = (
+            policy.get("policy_version") == CURRENT_SOURCE_POLICY
+        )
         if not isinstance(certificate, dict):
             raise GenerationValidationError(
                 "restricted segmentation requires a cone certificate"
             )
-        required_hashes = (
+        required_hashes = [
             bindings.get("restriction_evidence_sha256"),
             bindings.get("restriction_events_sha256"),
             bindings.get("restriction_profile_sha256"),
             certificate.get("certificate_sha256"),
-        )
+        ]
+        if requires_current_bindings:
+            required_hashes.extend([
+                bindings.get("inventory_approval_sha256"),
+                bindings.get("recalc_signals_sha256"),
+            ])
         if (
             any(
                 not isinstance(value, str)
@@ -335,6 +351,30 @@ def bind_source_generation(
                 "restriction_cone_certificate"
             ]["sha256"],
         })
+        inventory_approval_sha256 = bindings.get(
+            "inventory_approval_sha256"
+        )
+        if inventory_approval_sha256 is not None:
+            approval_binding = {
+                "inventory_approval_sha256": inventory_approval_sha256,
+            }
+            fingerprints["source_inventory_approval"] = _value_fingerprint(
+                approval_binding, "source-inventory-approval"
+            )
+            source_policy_bindings["inventory_approval_sha256"] = (
+                inventory_approval_sha256
+            )
+        recalc_signals_sha256 = bindings.get("recalc_signals_sha256")
+        if recalc_signals_sha256 is not None:
+            signals_binding = {
+                "recalc_signals_sha256": recalc_signals_sha256,
+            }
+            fingerprints["source_recalc_signals"] = _value_fingerprint(
+                signals_binding, "source-recalc-signals"
+            )
+            source_policy_bindings["recalc_signals_sha256"] = (
+                recalc_signals_sha256
+            )
     elif certificate is not None:
         raise GenerationValidationError(
             "ordinary segmentation cannot carry a restriction certificate"
@@ -583,11 +623,18 @@ def validate_generation_directory(
                 )
             restricted_binding = "source_restriction_evidence" in bindings
             route = source_binding.get("route")
-            if route not in {"pass", "recalc_candidate", "restricted_pass"}:
+            if route not in {
+                "pass",
+                "recalc_candidate",
+                "restricted_pass",
+                "restricted_recalc_pass",
+            }:
                 raise GenerationValidationError(
                     "source generation binding has an unsupported route"
                 )
-            if (route == "restricted_pass") != restricted_binding:
+            if (
+                route in {"restricted_pass", "restricted_recalc_pass"}
+            ) != restricted_binding:
                 raise GenerationValidationError(
                     "restricted source and cone bindings are inconsistent"
                 )
@@ -624,6 +671,36 @@ def validate_generation_directory(
                     raise GenerationValidationError(
                         "restriction profile binding fingerprint is invalid"
                     )
+                approval_sha256 = source_policy_bindings.get(
+                    "inventory_approval_sha256"
+                )
+                if approval_sha256 is not None:
+                    approval_value = {
+                        "inventory_approval_sha256": approval_sha256,
+                    }
+                    if bindings.get("source_inventory_approval") != (
+                        _value_fingerprint(
+                            approval_value, "source-inventory-approval"
+                        )
+                    ):
+                        raise GenerationValidationError(
+                            "inventory approval binding fingerprint is invalid"
+                        )
+                signals_sha256 = source_policy_bindings.get(
+                    "recalc_signals_sha256"
+                )
+                if signals_sha256 is not None:
+                    signals_value = {
+                        "recalc_signals_sha256": signals_sha256,
+                    }
+                    if bindings.get("source_recalc_signals") != (
+                        _value_fingerprint(
+                            signals_value, "source-recalc-signals"
+                        )
+                    ):
+                        raise GenerationValidationError(
+                            "recalc signals binding fingerprint is invalid"
+                        )
     if expected_generation_id is not None and generation_id != expected_generation_id:
         raise GenerationValidationError("pointer and manifest generation_id disagree")
     if (
@@ -739,6 +816,10 @@ def validate_generation_directory(
             != certificate_source.get("restriction_events_sha256")
             or source_policy.get("restriction_profile_sha256")
             != certificate_source.get("restriction_profile_sha256")
+            or source_policy.get("inventory_approval_sha256")
+            != certificate_source.get("inventory_approval_sha256")
+            or source_policy.get("recalc_signals_sha256")
+            != certificate_source.get("recalc_signals_sha256")
         ):
             raise GenerationValidationError(
                 "cone certificate hashes disagree with generation bindings"

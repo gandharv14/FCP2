@@ -134,7 +134,11 @@ def review_accuracy_passed(review: dict | None, claims_payload: dict) -> bool:
         return False
     if any((row.get("must_say") != "entailed") for row in rows):
         return False
-    if accuracy.get("cell_refs_in_senior_turns"):
+    if (
+        accuracy.get("verdict") != "pass"
+        or accuracy.get("extras")
+        or accuracy.get("cell_refs_in_senior_turns")
+    ):
         return False
     return True
 
@@ -602,10 +606,10 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
           require_review_pass: bool, skip_smoke: bool) -> dict:
     if claims_payload.get("empty") or not claims_payload.get("claims"):
         raise DialogueError("empty agent_records: do not apply")
-    if require_review_pass and not review_passed(review, claims_payload):
-        raise DialogueError("review did not pass; not applying after round 1")
     if not review_accuracy_passed(review, claims_payload):
         raise DialogueError("reviewer accuracy did not pass; not applying")
+    if not review_passed(review, claims_payload):
+        raise DialogueError("full review did not pass; not applying")
     if DOCKER_IMAGE_RE.search((task_dir / "task.toml").read_text(encoding="utf-8")):
         raise DialogueError("refuse apply: bare docker_image task")
 
@@ -633,9 +637,7 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
     toml = update_instruction_hash(original_toml, sha256_text(instruction))
 
     faults = list(draft_report["faults"])
-    blocking = []
-    blocking.extend(draft_report.get("accuracy_faults") or [])
-    blocking.extend(draft_report.get("cast_faults") or [])
+    blocking = list(faults)
     blocking.extend(instruction_faults(instruction, claims_payload, task_dir))
     blocking.extend(identity_faults(original_instruction, instruction))
     try:

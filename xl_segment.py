@@ -193,6 +193,7 @@ def stabilize_runtime_proof(
     evaluator_factory=evaluate.Evaluator,
 ):
     """Discover active edges and primitive seeds until both stop changing."""
+    closure_started = time.perf_counter()
     declared_inputs = set(declared_inputs)
     static_cone = _proof_cone(output_cells, cg.radj)
     proof_inputs = {
@@ -204,9 +205,11 @@ def stabilize_runtime_proof(
     previous_seeds = None
     previous_targets = None
     history = []
+    discovery_benchmarks = []
     stabilized = False
 
     for pass_index in range(1, max_passes + 1):
+        pass_started = time.perf_counter()
         discovery = evaluator_factory(
             graph,
             cg,
@@ -216,6 +219,11 @@ def stabilize_runtime_proof(
             run_probes=False,
             proof_scope=proof_scope,
         ).run(proof_inputs)
+        discovery_benchmarks.append({
+            "pass": pass_index,
+            "seconds": time.perf_counter() - pass_started,
+            "evaluator": dict(getattr(discovery, "benchmark", {}) or {}),
+        })
         radj = _runtime_proof_radj(cg, discovery)
         cone = _proof_cone(output_cells, radj)
         next_inputs = {
@@ -259,6 +267,7 @@ def stabilize_runtime_proof(
     # The result used for grading is intentionally produced by a new strict
     # evaluator after discovery. It has no expected-value oracle or saved-cache
     # handle, so discovery state cannot bleed into the proof.
+    final_started = time.perf_counter()
     result = evaluator_factory(
         graph,
         cg,
@@ -267,6 +276,7 @@ def stabilize_runtime_proof(
         proof_outputs=output_cells,
         proof_scope=proof_scope,
     ).run(proof_inputs)
+    final_seconds = time.perf_counter() - final_started
     final_radj = _runtime_proof_radj(cg, result)
     final_cone = _proof_cone(output_cells, final_radj)
     final_inputs = {
@@ -354,6 +364,13 @@ def stabilize_runtime_proof(
                 )
             ),
         },
+    }
+    result.benchmark = dict(getattr(result, "benchmark", {}) or {})
+    result.benchmark["proof_closure"] = {
+        "seconds": time.perf_counter() - closure_started,
+        "discovery_runs": discovery_benchmarks,
+        "final_run_seconds": final_seconds,
+        "evaluator_runs": len(discovery_benchmarks) + 1,
     }
     return result, proof_inputs, final_radj, proof
 
@@ -475,6 +492,7 @@ def segment(wb: str, args) -> dict:
     proof_inputs = set(input_cells)
     proof_radj = None
     proof = None
+    evaluator_benchmark = {}
     already_tracing = tracemalloc.is_tracing()
     if not already_tracing:
         tracemalloc.start()
@@ -490,6 +508,7 @@ def segment(wb: str, args) -> dict:
             output_cells,
             calculation=calculation,
         )
+        evaluator_benchmark = dict(getattr(result, "benchmark", {}) or {})
         values = result.values
         # The expected cache is not opened until bounded discovery and the
         # final fresh strict proof have both completed.
@@ -546,7 +565,7 @@ def segment(wb: str, args) -> dict:
     cone_certificate = None
     if source_generation is not None:
         source_route = source_generation["health"].get("route")
-        if source_route == "restricted_pass":
+        if source_route in {"restricted_pass", "restricted_recalc_pass"}:
             if proof is None:
                 raise SystemExit(
                     f"{wb}: restricted segmentation requires strict verification"
@@ -609,6 +628,7 @@ def segment(wb: str, args) -> dict:
     payload["benchmark"] = {
         "verifier_runtime_s": verification_runtime_s,
         "peak_memory_bytes": peak_memory_bytes,
+        "evaluator": evaluator_benchmark,
     }
     payload["generation"] = {
         "generation_id": generation_manifest["generation_id"],

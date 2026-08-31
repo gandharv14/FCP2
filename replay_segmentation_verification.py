@@ -214,8 +214,8 @@ def _hash_json(value) -> str:
 
 
 def _semantic_verification(verification):
-    """Stable verifier meaning, excluding host paths and performance fields."""
-    return {
+    """Stable verifier meaning, excluding identity, paths, and performance."""
+    selected = {
         key: verification.get(key)
         for key in (
             "schema_version",
@@ -231,9 +231,77 @@ def _semantic_verification(verification):
             "counts",
             "samples",
             "provenance",
-            "generation_id",
         )
     }
+    return _without_nonsemantic_fields(selected)
+
+
+def _without_nonsemantic_fields(value):
+    if isinstance(value, list):
+        return [_without_nonsemantic_fields(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    omitted = {
+        "benchmark",
+        "created_at",
+        "directory",
+        "elapsed_s",
+        "generation_id",
+        "host",
+        "path",
+        "runtime_s",
+        "timing",
+        "updated_at",
+        "verifier",
+        "verifier_fingerprint",
+        "verifier_identity",
+    }
+    return {
+        key: _without_nonsemantic_fields(item)
+        for key, item in sorted(value.items())
+        if key not in omitted
+        and not key.endswith("_path")
+        and not key.endswith("_runtime_s")
+    }
+
+
+def _baseline_snapshot(generation_payload):
+    verification = generation_payload.get("verification") or {}
+    proof = generation_payload.get("proof")
+    proof_dict = proof if isinstance(proof, dict) else {}
+    return {
+        "normalized_verification": _semantic_verification(verification),
+        "proof": proof,
+        "effective_inputs": proof_dict.get("effective_inputs"),
+        "runtime_graph": {
+            "runtime_radj": proof_dict.get("runtime_radj"),
+            "runtime_address_radj": proof_dict.get("runtime_address_radj"),
+        },
+        "target_ledgers": {
+            "resolved_targets": proof_dict.get("resolved_targets"),
+            "resolved_operation_targets":
+                proof_dict.get("resolved_operation_targets"),
+            "attempted_reads": proof_dict.get("attempted_reads"),
+        },
+        "disposition": verification.get("disposition"),
+        "blocking_reasons": verification.get("blocking_reasons", []),
+    }
+
+
+def _compare_baseline(baseline, candidate):
+    fields = {
+        key: baseline.get(key) == candidate.get(key)
+        for key in (
+            "normalized_verification",
+            "proof",
+            "effective_inputs",
+            "runtime_graph",
+            "target_ledgers",
+            "disposition",
+            "blocking_reasons",
+        )
+    }
+    return {"all_match": all(fields.values()), "fields": fields}
 
 
 def _percentile(values, percentile):
@@ -398,6 +466,8 @@ def execute_shadow_replay(
         raise ValueError("shadow_root must not be a symlink")
     results = []
     benchmark_measurements = []
+    baseline_available = 0
+    baseline_equivalent = 0
 
     from xl_segment import segment
     from xl_seg.publication import (
@@ -454,6 +524,20 @@ def execute_shadow_replay(
             name: diagnostics.fingerprint_file(artifacts[name])
             for name in preserved_names
         }
+        baseline_snapshot = None
+        baseline_error = None
+        if artifacts.get("segments", Path()).is_file():
+            try:
+                baseline_payload = json.loads(
+                    artifacts["segments"].read_text(encoding="utf-8")
+                )
+                baseline_snapshot = _baseline_snapshot(baseline_payload)
+                baseline_available += 1
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                baseline_error = {
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
         runs = []
         try:
             for run_index in range(1, SHADOW_RUNS + 1):
@@ -518,6 +602,12 @@ def execute_shadow_replay(
                 ]
                 benchmark = payload.get("benchmark") or {}
                 benchmark_measurements.append(benchmark)
+                candidate_snapshot = _baseline_snapshot(generation_payload)
+                baseline_comparison = (
+                    _compare_baseline(baseline_snapshot, candidate_snapshot)
+                    if baseline_snapshot is not None
+                    else None
+                )
                 runs.append({
                     "run": run_index,
                     "state": "completed",
@@ -538,6 +628,7 @@ def execute_shadow_replay(
                     "semantic_classification_sha256": semantic_hash,
                     "proof_sha256": proof_hash,
                     "comparison": comparison,
+                    "baseline_comparison": baseline_comparison,
                     "verdict_transitions": transitions,
                     "benchmark": benchmark,
                 })
@@ -582,6 +673,18 @@ def execute_shadow_replay(
             len(runs) == SHADOW_RUNS
             and all(run["comparison"]["all_match"] for run in runs)
         )
+        baseline_matches = (
+            baseline_snapshot is None
+            or (
+                len(runs) == SHADOW_RUNS
+                and all(
+                    run["baseline_comparison"]["all_match"]
+                    for run in runs
+                )
+            )
+        )
+        if baseline_snapshot is not None and baseline_matches:
+            baseline_equivalent += 1
         generation_ids_match = (
             len(generation_ids) == 1
             and len(manifest_ids) == 1
@@ -600,7 +703,12 @@ def execute_shadow_replay(
             "id": case_id,
             "state": (
                 "completed"
-                if deterministic and not mutations and comparisons_match
+                if (
+                    deterministic
+                    and not mutations
+                    and comparisons_match
+                    and baseline_matches
+                )
                 else "failed"
             ),
             "expected": _expected_diagnostics(
@@ -609,6 +717,17 @@ def execute_shadow_replay(
             "runs": runs,
             "deterministic": deterministic,
             "expected_diagnostics_match": comparisons_match,
+            "baseline": {
+                "state": (
+                    "available"
+                    if baseline_snapshot is not None
+                    else "invalid"
+                    if baseline_error is not None
+                    else "missing"
+                ),
+                "equivalent": baseline_matches if baseline_snapshot is not None else None,
+                "error": baseline_error,
+            },
             "preserved_inputs": not mutations,
             "mutated_artifacts": mutations,
             "verdict_transitions": [
@@ -627,6 +746,10 @@ def execute_shadow_replay(
         "validation": validation["counts"],
         "case_count": len(results),
         "shadow_runs_per_ready_case": SHADOW_RUNS,
+        "baseline": {
+            "available_cases": baseline_available,
+            "equivalent_cases": baseline_equivalent,
+        },
         "benchmark": _benchmark_summary(benchmark_measurements),
         "results": results,
     }

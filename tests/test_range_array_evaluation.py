@@ -229,6 +229,34 @@ def test_model_loader_accepts_legacy_node_columns(tmp_path):
     assert graph.capabilities["schema_version_v2"] is False
 
 
+def test_large_explicit_range_has_valid_formula_owner(tmp_path):
+    workbook = tmp_path / "large-range.xlsx"
+    book = openpyxl.Workbook()
+    ws = book.active
+    ws["A1"], ws["A2"], ws["A3"] = 1, 2, 3
+    ws["B1"] = "=SUM(A1:A3)"
+    book.save(workbook)
+
+    built = AstGraph(
+        workbook,
+        max_range_expand=2,
+        verbose=False,
+    ).build()
+    out = tmp_path / "large-range-ast"
+    out.mkdir()
+    write_csv(out, built.nodes, built.edges)
+    graph = load(out, workbook.stem)
+
+    range_id = "Sheet!A1:A3"
+    assert built.nodes[range_id]["owner"] == "Sheet!B1"
+    assert graph.nodes[range_id].owner == "Sheet!B1"
+    assert not [
+        error
+        for error in graph.integrity_errors
+        if error["code"] == "invalid_ast_owner"
+    ]
+
+
 def test_formula_nodes_survive_parse_failure_with_bounded_diagnostics(
     tmp_path, monkeypatch
 ):

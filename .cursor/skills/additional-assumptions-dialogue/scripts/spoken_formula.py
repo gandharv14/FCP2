@@ -7,7 +7,7 @@ import re
 
 
 CELL_PHRASE_RE = re.compile(
-    r"(?P<kind>cell|range)\s+"
+    r"(?:fixed\s+)?(?P<kind>cell|range)\s+"
     r"(?P<sheet>'[^']+'|[A-Za-z0-9_][A-Za-z0-9_ .&-]*)!"
     r"(?P<a>\$?[A-Z]{1,3}\$?\d{1,7})"
     r"(?::(?P<b>\$?[A-Z]{1,3}\$?\d{1,7}))?"
@@ -19,6 +19,7 @@ A1_RE = re.compile(r"\$?([A-Z]{1,3})\$?(\d{1,7})", re.I)
 LABEL_RE = re.compile(r'"([^"]+)"')
 NEEDS_SPOKEN_RE = re.compile(r"\b(?:copied-column|cell |range )", re.I)
 SHOWN_FOR_RE = re.compile(r"\s*,?\s*shown for\b.*$", re.I)
+UNQUOTED_STRING_LITERALS = frozenset({"", "N/A", "#N/A", "NA"})
 
 
 def col_to_num(letters: str) -> int:
@@ -135,6 +136,31 @@ def is_locked(phrase: dict, evidence: str) -> bool:
     )
 
 
+def range_cardinality(phrase: dict) -> int:
+    if phrase.get("kind") != "range":
+        return 1
+    if phrase["col"] == phrase["end_col"]:
+        return abs(int(phrase["end_row"]) - int(phrase["row"])) + 1
+    if phrase["row"] == phrase["end_row"]:
+        return abs(col_to_num(phrase["end_col"]) - col_to_num(phrase["col"])) + 1
+    return 1
+
+
+def locked_ordinal(phrase: dict, phrases: list[dict], evidence: str) -> str:
+    peers = [
+        item
+        for item in phrases
+        if is_locked(item, evidence)
+        and item.get("sheet") == phrase.get("sheet")
+        and item.get("labels") == phrase.get("labels")
+    ]
+    if len(peers) < 2:
+        return ""
+    words = ("first", "second", "third", "fourth", "fifth")
+    index = next((i for i, item in enumerate(peers) if item is phrase), 0)
+    return words[index] if index < len(words) else f"number {index + 1}"
+
+
 def spoken_locator(phrase: dict, phrases: list[dict], representative: str, evidence: str) -> str:
     label = phrase["label"]
     label_cells = {
@@ -161,9 +187,17 @@ def spoken_locator(phrase: dict, phrases: list[dict], representative: str, evide
     if unique and not locked:
         return named + tab
     if locked:
+        ordinal = locked_ordinal(phrase, phrases, evidence)
+        prefix = f"{ordinal} " if ordinal else ""
+        cardinality = range_cardinality(phrase)
+        if cardinality > 1:
+            return (
+                f"the {prefix}locked {cardinality}-row input block on "
+                f"{named}{tab}"
+            )
         if label:
-            return f"the locked input on {named}{tab}"
-        return f"the locked input{tab}"
+            return f"the {prefix}locked input on {named}{tab}"
+        return f"the {prefix}locked input{tab}"
     if not rep_col:
         return named + tab
     period = period_word(phrase["col"], rep_col)
@@ -240,6 +274,11 @@ class _Parser:
         self.skip()
         if self.eat("("):
             node = self.parse_expr()
+            conjunctions = [node]
+            while self.eat("and "):
+                conjunctions.append(self.parse_expr())
+            if len(conjunctions) > 1:
+                node = {"op": "and", "args": conjunctions}
             self.skip()
             if not self.eat(")"):
                 rest = self.parse_atom()
@@ -299,6 +338,11 @@ class _Parser:
             return {"op": "avg", "args": self.parse_and_list_after(first)}
         if self.eat("take the negative of "):
             return {"op": "neg", "args": [self.parse_operand()]}
+        if self.eat("sum the products of corresponding values in "):
+            first = self.parse_operand()
+            self.eat("and ")
+            second = self.parse_operand()
+            return {"op": "sumproduct", "args": [first, second]}
         if self.eat("multiply "):
             a = self.parse_operand()
             self.eat("by ")
@@ -355,7 +399,11 @@ def _clause_text(node: dict) -> str:
     if not node:
         return ""
     if node.get("op") == "atom":
-        return (node.get("text") or "").strip()
+        text = (node.get("text") or "").strip()
+        literal = re.fullmatch(r'"([^"]*)"', text)
+        if literal and literal.group(1) in UNQUOTED_STRING_LITERALS:
+            return literal.group(1)
+        return text
     core, suffix = _linearize(node)
     return "; ".join(part for part in [core, *suffix] if part)
 
@@ -400,6 +448,19 @@ def _join_and(parts: list[str]) -> str:
     return ", ".join(parts[:-1]) + ", and " + parts[-1]
 
 
+def _locked_role(node: dict, role: str) -> str:
+    text = _plain(node)
+    if "locked input" not in text.lower():
+        return text
+    return re.sub(
+        r"\bthe (?:(?:first|second|third|fourth|fifth|number \d+) )?locked input\b",
+        f"the {role} locked input",
+        text,
+        count=1,
+        flags=re.I,
+    )
+
+
 CMP = {
     "eq": "equals",
     "ne": "does not equal",
@@ -415,6 +476,9 @@ def _linearize(node: dict) -> tuple[str, list[str]]:
     args = node.get("args") or []
     if op == "atom":
         text = (node.get("text") or "").strip()
+        literal = re.fullmatch(r'"([^"]*)"', text)
+        if literal and literal.group(1) in UNQUOTED_STRING_LITERALS:
+            return literal.group(1), []
         return text, []
     if op == "neg":
         inner = args[0] if args else {"op": "atom", "text": ""}
@@ -440,6 +504,13 @@ def _linearize(node: dict) -> tuple[str, list[str]]:
     if op == "avg":
         parts = [_plain(arg) for arg in args]
         return f"the average of {_join_and(parts)}", []
+    if op == "sumproduct":
+        parts = [_wrap(arg) for arg in args]
+        return (
+            "sum the products of corresponding values in "
+            f"{_join_and(parts)}",
+            [],
+        )
     if op == "mul":
         a, b = args[0], args[1]
         if _is_neg_one(b):
@@ -459,13 +530,17 @@ def _linearize(node: dict) -> tuple[str, list[str]]:
         return f"{_wrap(args[0])} minus {_wrap(args[1])}", []
     if op == "add":
         return " plus ".join(_wrap(arg) for arg in args), []
+    if op == "and":
+        return _join_and([_wrap(arg) for arg in args]), []
     if op == "div":
         return f"{_wrap(args[0])} divided by {_wrap(args[1])}", []
     if op == "pow":
         return f"{_wrap(args[0])} raised to {_wrap(args[1])}", []
     if op == "if":
         cond = _plain(args[0])
-        yes = _wrap(args[1])
+        yes = _locked_role(args[1], "result")
+        if not _simple(args[1]):
+            yes = f"({yes})"
         no = _wrap(args[2]) if len(args) > 2 else "false"
         return f"if {cond}, use {yes}; otherwise {no}", []
     if op == "iferror":
@@ -475,7 +550,15 @@ def _linearize(node: dict) -> tuple[str, list[str]]:
     if op == "round":
         return f"round {_plain(args[0])} to the nearest multiple of {_plain(args[1])}", []
     if op in CMP:
-        return f"{_plain(args[0])} {CMP[op]} {_plain(args[1])}", []
+        role = (
+            "lower bound"
+            if op in {"gt", "ge"}
+            else "upper bound"
+            if op in {"lt", "le"}
+            else ""
+        )
+        right = _locked_role(args[1], role) if role else _plain(args[1])
+        return f"{_plain(args[0])} {CMP[op]} {right}", []
     return _plain(args[0]) if args else (node.get("text") or ""), []
 
 

@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from replay_segmentation_verification import (
     DEFAULT_MANIFEST,
     EXPECTED_PRIMARY_COUNTS,
+    _baseline_snapshot,
+    _compare_baseline,
     build_replay_report,
     load_manifest,
 )
@@ -503,3 +505,52 @@ def test_replay_compares_existing_execution_diagnostics(tmp_path):
         record["matches"]
         for record in case["execution_diagnostics"]["comparison"]["fields"].values()
     )
+
+
+def test_baseline_comparison_excludes_identity_paths_and_timing_only():
+    proof = {
+        "effective_inputs": ["Sheet!A1"],
+        "runtime_radj": {"Sheet!B1": ["Sheet!A1"]},
+        "runtime_address_radj": {},
+        "resolved_targets": {},
+        "resolved_operation_targets": {},
+        "attempted_reads": {"Sheet!A1": ["Sheet!B1"]},
+    }
+    baseline = {
+        "proof": proof,
+        "verification": {
+            "schema_version": 1,
+            "status": "pass",
+            "disposition": "pass",
+            "blocking_reasons": [],
+            "counts": {"outputs": 1},
+            "generation_id": "old",
+            "provenance": {
+                "source_path": "/old/host/0042.xlsx",
+                "runtime_s": 10,
+                "sha256": "a" * 64,
+            },
+        },
+    }
+    candidate = json.loads(json.dumps(baseline))
+    candidate["verification"]["generation_id"] = "new"
+    candidate["verification"]["provenance"]["source_path"] = "/new/host/0042.xlsx"
+    candidate["verification"]["provenance"]["runtime_s"] = 1
+
+    comparison = _compare_baseline(
+        _baseline_snapshot(baseline),
+        _baseline_snapshot(candidate),
+    )
+    assert comparison["all_match"] is True
+    assert comparison["fields"]["proof"] is True
+
+    candidate["proof"]["resolved_targets"] = {
+        "Sheet!B1": ["Sheet!C1"]
+    }
+    changed = _compare_baseline(
+        _baseline_snapshot(baseline),
+        _baseline_snapshot(candidate),
+    )
+    assert changed["all_match"] is False
+    assert changed["fields"]["proof"] is False
+    assert changed["fields"]["target_ledgers"] is False

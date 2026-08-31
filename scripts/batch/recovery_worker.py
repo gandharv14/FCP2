@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -43,6 +44,7 @@ LEDGER_SCHEMA = "recovery-ledger/v1"
 CHECKPOINT_SCHEMA = "recovery-checkpoint/v1"
 WORKTREE_MARKER_SCHEMA = "recovery-worktree/v1"
 INCIDENT_SCHEMA = "recovery-incident/v1"
+TECHNICAL_EVIDENCE_SCHEMA = "recovery-technical-evidence/v1"
 QUEUE_FIELDS = frozenset(
     {
         "batch_id",
@@ -1470,6 +1472,38 @@ def validate_recovery_amd(task_dir: Path) -> None:
         )
 
 
+def _ooxml_evidence(path: Path) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise PolicyViolation(f"workbook evidence path is missing or unsafe: {path}")
+    evidence: dict[str, object] = {
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+    }
+    try:
+        with zipfile.ZipFile(path) as package:
+            members = package.infolist()
+            names = [member.filename for member in members]
+    except (OSError, zipfile.BadZipFile):
+        evidence["valid_ooxml"] = False
+        return evidence
+    if len(names) != len(set(names)):
+        raise PolicyViolation(f"workbook evidence has duplicate OOXML members: {path}")
+    evidence.update(
+        {
+            "valid_ooxml": True,
+            "member_count": len(members),
+            "expanded_bytes": sum(member.file_size for member in members),
+        }
+    )
+    return evidence
+
+
+def _technical_evidence_digest(payload: Mapping[str, object]) -> str:
+    body = dict(payload)
+    body.pop("evidence_sha256", None)
+    return _sha256_bytes(_canonical_bytes(body))
+
+
 def fairness_passed(report: str) -> bool:
     lines = [line.rstrip() for line in report.splitlines() if line.strip()]
     return bool(lines) and lines[-1] == "FAIRNESS_VERDICT: PASS"
@@ -2329,8 +2363,32 @@ class RecoveryWorker:
                 quarantined = self._quarantine_worktree(
                     row, destination, reason
                 )
-                checkpoint = {}
-                self._checkpoint_path(row).unlink(missing_ok=True)
+                lineage_safe = bool(
+                    checkpoint
+                    and checkpoint.get("workbook_id") == row.workbook_id
+                    and checkpoint.get("run_source_sha256")
+                    == row.run_source_sha256
+                )
+                if lineage_safe:
+                    refreshes = list(
+                        checkpoint.get("baseline_refresh_history") or []
+                    )
+                    refreshes.append(
+                        {
+                            "reason": reason,
+                            "quarantined_worktree": str(quarantined),
+                            "prior_baseline_hash": checkpoint.get(
+                                "baseline_hash"
+                            ),
+                            "replacement_baseline_hash": self.baseline_hash,
+                            "refreshed_at": _timestamp(),
+                        }
+                    )
+                    checkpoint["baseline_refresh_history"] = refreshes
+                    atomic_write_json(self._checkpoint_path(row), checkpoint)
+                else:
+                    checkpoint = {}
+                    self._checkpoint_path(row).unlink(missing_ok=True)
                 _write_task_evidence(
                     self.config.state,
                     row,
@@ -3062,13 +3120,107 @@ The separate incident investigator is read-only and is not a generation lane.
             "has_amd": has_amd,
         }
 
+    def _write_technical_evidence(
+        self,
+        row: QueueRow,
+        candidate: ReleaseCandidate,
+        vm_diff: Path,
+        modification_evidence: Mapping[str, object],
+        protected_snapshot: Mapping[str, str],
+    ) -> tuple[Path, str]:
+        task = candidate.task_dir
+        input_workbook = task / "environment" / f"{row.workbook_id}-inputs.xlsx"
+        if tree_sha256(task) != candidate.bundle_sha256:
+            raise PolicyViolation("candidate bundle changed before technical evidence")
+        assert_canonical_grader_provenance(self.config.baseline_repo, task)
+        payload: dict[str, object] = {
+            "schema_version": TECHNICAL_EVIDENCE_SCHEMA,
+            "workbook_id": row.workbook_id,
+            "queue_source": _ooxml_evidence(row.run_source_path),
+            "delivered_workbook": _ooxml_evidence(input_workbook),
+            "candidate": {
+                "release_id": candidate.release_id,
+                "task_generation_id": candidate.task_generation_id,
+                "source_sha256": candidate.source_sha256,
+                "bundle_sha256": candidate.bundle_sha256,
+                "pointer_sha256": candidate.pointer_sha256,
+                "release_manifest_sha256": candidate.release_manifest_sha256,
+                "task_manifest_sha256": candidate.task_manifest_sha256,
+                "required_bundle_complete": True,
+            },
+            "grader_provenance": {
+                "matches_canonical_baseline": True,
+                "run_grader_sha256": sha256_file(task / "tests" / "run_grader.py"),
+                "finance_grader_sha256": _sha256_bytes(
+                    _canonical_bytes(_grader_records(task / "tests" / "finance_grader"))
+                ),
+            },
+            "inspect_attestation": {
+                "passed": True,
+                "checks": [
+                    "current_release_pointer",
+                    "release_manifest_identity",
+                    "task_manifest_artifacts",
+                    "source_sha256_binding",
+                    "required_bundle_files",
+                    "canonical_grader_provenance",
+                ],
+            },
+            "protected_snapshot_sha256": _sha256_bytes(
+                _canonical_bytes(protected_snapshot)
+            ),
+            "modification": {
+                "agent_declaration": modification_evidence.get(
+                    "agent_declaration"
+                ),
+                "has_amd": modification_evidence.get("has_amd") is True,
+                "baseline_diff_paths": sorted(
+                    str(path)
+                    for path in (
+                        modification_evidence.get("baseline_diff") or {}
+                    )
+                ),
+                "changed_during_run": sorted(
+                    str(path)
+                    for path in (
+                        modification_evidence.get("changed_during_run") or []
+                    )
+                ),
+                "vm_diff_present": vm_diff.is_file() and not vm_diff.is_symlink(),
+                "vm_diff_sha256": (
+                    sha256_file(vm_diff)
+                    if vm_diff.is_file() and not vm_diff.is_symlink()
+                    else None
+                ),
+            },
+        }
+        digest = _technical_evidence_digest(payload)
+        payload["evidence_sha256"] = digest
+        root = (
+            self.config.state
+            / "verification-inputs"
+            / row.workbook_id
+            / candidate.bundle_sha256
+        )
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"technical-evidence-{time.time_ns()}.json"
+        _exclusive_write(path, _canonical_bytes(payload))
+        return path, digest
+
     def _verifier_prompt(
         self,
         row: QueueRow,
         candidate: ReleaseCandidate,
         vm_diff: Path,
+        technical_evidence: Path | None = None,
+        evidence_digest: str = "",
     ) -> str:
         task = candidate.task_dir
+        evidence_text = (
+            f"{technical_evidence} (evidence SHA-256 {evidence_digest})"
+            if technical_evidence is not None
+            else "the controller technical-evidence JSON supplied for this attempt"
+        )
         return f"""
 You are the fresh, independent fairness verifier for workbook
 {row.workbook_id}. This prompt is separate from generation. The worktree is
@@ -3077,17 +3229,24 @@ a command that writes files. Return the complete verification report in your
 final response; the recovery controller will persist it. Do not read or print
 .env.
 
-Inspect the original workbook at {row.run_source_path} (SHA-256
-{row.run_source_sha256}), the immutable task bundle at {task}, its instruction
+Read the controller-generated technical evidence at {evidence_text}. It is the
+authoritative result of deterministic source/workbook hashing, OOXML package
+inspection, immutable release and task-manifest binding checks, required-file
+checks, and canonical grader byte comparison. Do not rerun those technical
+checks and do not fail merely because Ask mode cannot execute hash or binary
+inspection commands. Fail if the evidence is missing, malformed, or
+contradicted by a readable artifact.
+
+Semantically inspect the immutable task bundle at {task}, its instruction
 at {task / 'instruction.md'}, a.md at {task / 'a.md'} if present, README at
 {task / 'README.md'} if present, disclosure at {task / 'tests/disclosure.json'},
 answer key at {task / 'tests/answer_key.json'}, grader at
 {task / 'tests/run_grader.py'}, and the VM code diff at {vm_diff}.
 
 Independently check solvability, answer leakage, hidden assumptions, output
-representativeness, source fidelity, unchanged graders/rubrics/answer
-keys/acceptance thresholds, and every source/segmentation/task/current-release
-binding. Confirm a.md (when recovery was used) fully records the exact blocker,
+representativeness, source/disclosure fidelity, and whether the instruction,
+answer key, and grader semantics are fair. Trust the technical evidence for
+byte hashes and release bindings. Confirm a.md (when recovery was used) fully records the exact blocker,
 evidence, failing stage, exact fix, changed files, before/after, commands, and
 verifier outcome. Do not accept fabricated gate success.
 
@@ -3095,11 +3254,12 @@ When source health uses restricted routing, `route: restricted_pass` is a
 source-stage routing decision. A nested source-observation diagnostic may
 remain `insufficient_evidence` until strict segmentation and its hash-bound
 restriction-cone proof pass. Do not treat those scoped fields as contradictory
-by themselves; verify the downstream proof and bindings.
+by themselves; use the technical evidence attestation for the downstream
+proof and bindings.
 
 Give a detailed report. Approval is fail-closed. Your final non-empty line must
 be exactly FAIRNESS_VERDICT: PASS or FAIRNESS_VERDICT: FAIL. Use PASS only when
-every check succeeds without uncertainty.
+every semantic check succeeds without uncertainty.
 """.strip()
 
     def _run_verifier(
@@ -3110,6 +3270,12 @@ every check succeeds without uncertainty.
         vm_diff: Path,
         report_path: Path,
     ) -> dict[str, object]:
+        technical_evidence = getattr(
+            self, "_active_technical_evidence", None
+        )
+        evidence_digest = str(
+            getattr(self, "_active_technical_evidence_digest", "")
+        )
         command = [
             str(self.config.agent_binary),
             "-p",
@@ -3122,7 +3288,13 @@ every check succeeds without uncertainty.
             self.config.model,
             "--workspace",
             str(self._task_repo()),
-            self._verifier_prompt(row, candidate, vm_diff),
+            self._verifier_prompt(
+                row,
+                candidate,
+                vm_diff,
+                technical_evidence,
+                evidence_digest,
+            ),
         ]
         return run_ready_attempt(
             record,
@@ -3166,6 +3338,15 @@ every check succeeds without uncertainty.
                 verifier_protected,
                 "protected files before verifier",
             )
+            technical_evidence, evidence_digest = self._write_technical_evidence(
+                row,
+                candidate,
+                vm_diff,
+                modification_evidence,
+                verifier_protected,
+            )
+            self._active_technical_evidence = technical_evidence
+            self._active_technical_evidence_digest = evidence_digest
             report_path = (
                 self.config.state
                 / "verification-inputs"

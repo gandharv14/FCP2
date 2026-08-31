@@ -137,7 +137,9 @@ HARD RULES
    operators. If the card says last period / this period / locked input,
    those words (or close equivalents) must appear in the senior turn. Keep
    lower-bound, upper-bound, and result locked inputs distinct when the card
-   names those roles; never collapse them into "that input."
+   names those roles; never collapse them into "that input." Keep first and
+   second locked inputs or input blocks distinct, and preserve any required
+   row count and corresponding-value operation.
    FORBIDDEN senior shapes: "On {sheet}, the row labelled \"X\" is copied
    across the forecast:"; pasting `spoken` with a speaker prefix; "use this
    copied-column calculation"; paren-AST ("multiply (take the").
@@ -201,7 +203,9 @@ HARD RULES
    - rebuild, restore, original model, original logic
 4. If the card says last period / this period / locked input / floor / flip,
    those words (or close equivalents) must remain. Lower-bound, upper-bound,
-   and result locked inputs must remain three distinct roles.
+   and result locked inputs must remain three distinct roles. First and second
+   locked inputs or blocks, row counts, and corresponding-value operations
+   must also remain distinct.
 5. No new modelling facts. No dropped operators.
 6. Slack: contractions, short turns. A senior may split one claim across
    two turns. Do not make juniors ask again.
@@ -257,6 +261,8 @@ ACCURACY — fail if any:
   period / locked input / next period / source tab) when the card used it.
 - Lower-bound, upper-bound, and result locked inputs are collapsed into one
   ambiguous input.
+- First and second locked inputs or input blocks are collapsed, or a required
+  block row count or corresponding-value operation is omitted.
 - A modelling assertion that is not on any claim card.
 - An alternative named and left open.
 - Catalogue ids, or a numeric literal that looks like a graded target.

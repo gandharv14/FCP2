@@ -136,6 +136,31 @@ def is_locked(phrase: dict, evidence: str) -> bool:
     )
 
 
+def range_cardinality(phrase: dict) -> int:
+    if phrase.get("kind") != "range":
+        return 1
+    if phrase["col"] == phrase["end_col"]:
+        return abs(int(phrase["end_row"]) - int(phrase["row"])) + 1
+    if phrase["row"] == phrase["end_row"]:
+        return abs(col_to_num(phrase["end_col"]) - col_to_num(phrase["col"])) + 1
+    return 1
+
+
+def locked_ordinal(phrase: dict, phrases: list[dict], evidence: str) -> str:
+    peers = [
+        item
+        for item in phrases
+        if is_locked(item, evidence)
+        and item.get("sheet") == phrase.get("sheet")
+        and item.get("labels") == phrase.get("labels")
+    ]
+    if len(peers) < 2:
+        return ""
+    words = ("first", "second", "third", "fourth", "fifth")
+    index = next((i for i, item in enumerate(peers) if item is phrase), 0)
+    return words[index] if index < len(words) else f"number {index + 1}"
+
+
 def spoken_locator(phrase: dict, phrases: list[dict], representative: str, evidence: str) -> str:
     label = phrase["label"]
     label_cells = {
@@ -162,9 +187,17 @@ def spoken_locator(phrase: dict, phrases: list[dict], representative: str, evide
     if unique and not locked:
         return named + tab
     if locked:
+        ordinal = locked_ordinal(phrase, phrases, evidence)
+        prefix = f"{ordinal} " if ordinal else ""
+        cardinality = range_cardinality(phrase)
+        if cardinality > 1:
+            return (
+                f"the {prefix}locked {cardinality}-row input block on "
+                f"{named}{tab}"
+            )
         if label:
-            return f"the locked input on {named}{tab}"
-        return f"the locked input{tab}"
+            return f"the {prefix}locked input on {named}{tab}"
+        return f"the {prefix}locked input{tab}"
     if not rep_col:
         return named + tab
     period = period_word(phrase["col"], rep_col)
@@ -305,6 +338,11 @@ class _Parser:
             return {"op": "avg", "args": self.parse_and_list_after(first)}
         if self.eat("take the negative of "):
             return {"op": "neg", "args": [self.parse_operand()]}
+        if self.eat("sum the products of corresponding values in "):
+            first = self.parse_operand()
+            self.eat("and ")
+            second = self.parse_operand()
+            return {"op": "sumproduct", "args": [first, second]}
         if self.eat("multiply "):
             a = self.parse_operand()
             self.eat("by ")
@@ -415,7 +453,7 @@ def _locked_role(node: dict, role: str) -> str:
     if "locked input" not in text.lower():
         return text
     return re.sub(
-        r"\bthe locked input\b",
+        r"\bthe (?:(?:first|second|third|fourth|fifth|number \d+) )?locked input\b",
         f"the {role} locked input",
         text,
         count=1,
@@ -466,6 +504,13 @@ def _linearize(node: dict) -> tuple[str, list[str]]:
     if op == "avg":
         parts = [_plain(arg) for arg in args]
         return f"the average of {_join_and(parts)}", []
+    if op == "sumproduct":
+        parts = [_wrap(arg) for arg in args]
+        return (
+            "sum the products of corresponding values in "
+            f"{_join_and(parts)}",
+            [],
+        )
     if op == "mul":
         a, b = args[0], args[1]
         if _is_neg_one(b):

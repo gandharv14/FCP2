@@ -47,6 +47,9 @@ OPERATOR_ATOMS = (
     "lower bound",
     "upper bound",
     "result locked input",
+    "first locked input",
+    "second locked input",
+    "corresponding",
     "otherwise",
     "errors",
 )
@@ -114,6 +117,13 @@ def must_say_atoms(spoken: str, sheet: str = "", row_label: str = "") -> list[st
     for atom in OPERATOR_ATOMS:
         if atom in low:
             add(atom)
+    for cardinality in re.findall(r"\b\d+-row\b", low):
+        add(cardinality)
+    for ordinal in re.findall(
+        r"\b(first|second|third|fourth|fifth) locked \d+-row input block\b",
+        low,
+    ):
+        add(f"{ordinal} locked input block")
     return out
 
 

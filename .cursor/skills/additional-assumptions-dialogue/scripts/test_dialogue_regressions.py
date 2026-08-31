@@ -58,6 +58,17 @@ LOCKED_WINDOW_EVIDENCE = (
     "C$372<='Assumptions Matrix'!$G$63),"
     "'Assumptions Matrix'!$I$63,0)"
 )
+LOCKED_SUMPRODUCT_STEPS = (
+    "sum the products of corresponding values in "
+    '(fixed range DCF!N71:N75 on the rows labelled "Year 1", "Year 2", '
+    '"Year 3", "Year 4" and "Year 5") and '
+    '(fixed range DCF!O71:O75 on the rows labelled "Year 1", "Year 2", '
+    '"Year 3", "Year 4" and "Year 5")'
+)
+SAME_LABEL_FACTORS_STEPS = (
+    'multiply (fixed cell DCF!M71 on the row labelled "Discount Factor") by '
+    '(fixed cell DCF!P71 on the row labelled "Discount Factor")'
+)
 
 
 TASK = Path()
@@ -400,6 +411,43 @@ def test_same_label_locked_inputs_keep_distinct_roles() -> None:
     )
 
 
+def test_locked_ranges_preserve_cardinality_and_operand_identity() -> None:
+    spoken = speak_steps(
+        LOCKED_SUMPRODUCT_STEPS,
+        representative="DCF!Q80",
+        evidence="=SUMPRODUCT($N$71:$N$75,$O$71:$O$75)",
+        sheet="DCF",
+        row_label="Product value",
+    )
+    atoms = must_say_atoms(spoken + "\n" + LOCKED_SUMPRODUCT_STEPS, "DCF", "Product value")
+    blob = " ".join(atoms).lower()
+    _ok("sumproduct-first-block", "first locked 5-row input block" in spoken, spoken)
+    _ok("sumproduct-second-block", "second locked 5-row input block" in spoken, spoken)
+    _ok("sumproduct-corresponding", "corresponding" in spoken, spoken)
+    _ok("sumproduct-no-addresses", "N71" not in spoken and "O71" not in spoken, spoken)
+    _ok("sumproduct-requires-first", "first locked input block" in blob, str(atoms))
+    _ok("sumproduct-requires-second", "second locked input block" in blob, str(atoms))
+    _ok("sumproduct-requires-cardinality", "5-row" in blob, str(atoms))
+    _ok("sumproduct-requires-operation", "corresponding" in blob, str(atoms))
+
+
+def test_same_label_factors_remain_distinct() -> None:
+    spoken = speak_steps(
+        SAME_LABEL_FACTORS_STEPS,
+        representative="DCF!Q80",
+        evidence="=$M$71*$P$71",
+        sheet="DCF",
+        row_label="Product value",
+    )
+    atoms = must_say_atoms(spoken + "\n" + SAME_LABEL_FACTORS_STEPS, "DCF", "Product value")
+    blob = " ".join(atoms).lower()
+    _ok("factor-first-input", "first locked input" in spoken, spoken)
+    _ok("factor-second-input", "second locked input" in spoken, spoken)
+    _ok("factor-no-addresses", "M71" not in spoken and "P71" not in spoken, spoken)
+    _ok("factor-requires-first", "first locked input" in blob, str(atoms))
+    _ok("factor-requires-second", "second locked input" in blob, str(atoms))
+
+
 def test_pasted_spoken_fails() -> None:
     spoken = speak_steps(
         RCF_STEPS,
@@ -537,6 +585,8 @@ def main() -> int:
         test_bounded_window_preserves_both_conditions_and_branches()
         test_iferror_literal_is_not_a_row_label()
         test_same_label_locked_inputs_keep_distinct_roles()
+        test_locked_ranges_preserve_cardinality_and_operand_identity()
+        test_same_label_factors_remain_distinct()
         test_pasted_spoken_fails()
         test_sheet_only_when_unclear()
         test_paren_ast_draft_fails()

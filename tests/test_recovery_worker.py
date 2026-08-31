@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import replace
@@ -1297,6 +1298,63 @@ def test_fairness_verifier_is_read_only_and_returns_report_in_final(
     assert "Return the complete verification report in your" in prompt
     assert "the recovery controller will persist it" in prompt
     assert "restricted_pass" in prompt
+
+
+def test_fairness_verifier_uses_controller_technical_evidence(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    worker = RecoveryWorker(config)
+    evidence = config.state / "verification-inputs" / "technical.json"
+    prompt = worker._verifier_prompt(
+        rows[0],
+        _candidate(tmp_path),
+        tmp_path / "vm-code-diff.txt",
+        evidence,
+        "a" * 64,
+    )
+
+    assert str(evidence) in prompt
+    assert "authoritative result of deterministic" in prompt
+    assert re.search(r"Do not rerun those technical\s+checks", prompt)
+    assert "every source/segmentation/task/current-release binding" not in prompt
+    assert "every semantic check succeeds" in prompt
+
+
+def test_technical_evidence_is_hash_bound_to_candidate(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    worker = RecoveryWorker(config)
+    row = rows[0]
+    candidate = replace(
+        _candidate(tmp_path),
+        source_sha256=row.run_source_sha256,
+    )
+    vm_diff = config.state / "vm-code-diff.txt"
+    vm_diff.parent.mkdir(parents=True)
+    vm_diff.write_text("no shared changes\n", encoding="utf-8")
+
+    path, digest = worker._write_technical_evidence(
+        row,
+        candidate,
+        vm_diff,
+        {
+            "agent_declaration": "YES",
+            "has_amd": True,
+            "baseline_diff": {},
+            "changed_during_run": [],
+        },
+        {},
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == "recovery-technical-evidence/v1"
+    assert payload["candidate"]["bundle_sha256"] == candidate.bundle_sha256
+    assert payload["candidate"]["source_sha256"] == row.run_source_sha256
+    assert payload["inspect_attestation"]["passed"] is True
+    assert payload["evidence_sha256"] == digest
+    assert worker_module._technical_evidence_digest(payload) == digest
 
 
 def test_fairness_stdout_is_persisted_by_controller(tmp_path: Path) -> None:
@@ -2669,6 +2727,46 @@ def test_worktree_quarantine_preserves_internal_publication_symlinks(
     assert preserved.is_symlink()
     assert os.readlink(preserved) == f"generations/{generation.name}"
     assert not worktree.exists()
+
+
+def test_worktree_refresh_preserves_recovery_lineage(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    row = rows[0]
+    recovery = RecoveryWorker(config)
+    worktree = create_isolated_worktree(
+        config.baseline_repo, config.work_root, row.workbook_id
+    )
+    recovery._write_worktree_marker(row, worktree)
+    prior_attempt = {
+        "attempt_number": 7,
+        "status": "fairness_retry",
+        "error": "external relationship required sanitation",
+    }
+    recovery._save_checkpoint(
+        row,
+        worktree,
+        cumulative_attempt_count=7,
+        last_attempt=prior_attempt,
+        fairness_result={"passed": False, "report": "semantic defect"},
+        incident_reports=[{"category": "fairness"}],
+    )
+    marker_path = recovery._marker_path(worktree)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["baseline_hash"] = "0" * 64
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    replacement = recovery._acquire_worktree(row)
+    checkpoint = recovery._load_checkpoint(row)
+
+    assert replacement.is_dir()
+    assert checkpoint["cumulative_attempt_count"] == 7
+    assert checkpoint["last_attempt"] == prior_attempt
+    assert checkpoint["fairness_result"]["passed"] is False
+    assert checkpoint["incident_reports"] == [{"category": "fairness"}]
+    assert checkpoint["baseline_refresh_history"]
+    assert "binding mismatch" in checkpoint["baseline_refresh_history"][-1]["reason"]
 
 
 def test_worktree_quarantine_rejects_escaping_symlink(

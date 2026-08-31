@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -813,19 +814,103 @@ def _write_pointer(worktree: Path, workbook_id: str, release_id: str) -> Path:
     return path
 
 
+def _write_independent_release(
+    worktree: Path, row: QueueRow
+) -> tuple[str, str, Path]:
+    release_root = worktree / "release_out" / row.workbook_id
+    stage = worktree / "task-stage"
+    _bundle(stage, row.workbook_id)
+    artifacts = {}
+    for path in sorted(stage.rglob("*")):
+        if path.is_file():
+            relative = path.relative_to(stage).as_posix()
+            artifacts[relative] = {
+                "algorithm": "sha256",
+                "path": relative,
+                "sha256": worker_module.sha256_file(path),
+                "size_bytes": path.stat().st_size,
+            }
+    task_identity = {
+        "schema_version": "task-generation-identity/v2",
+        "workbook_id": row.workbook_id,
+        "bindings": {},
+        "artifacts": artifacts,
+    }
+    generation_id = worker_module._sha256_bytes(
+        worker_module._canonical_bytes(task_identity)
+    )
+    task = release_root / "task-generations" / generation_id
+    task.parent.mkdir(parents=True)
+    os.replace(stage, task)
+    task_manifest = {
+        "schema_version": "task-generation/v2",
+        "generation_id": generation_id,
+        "identity": task_identity,
+        "bindings": {},
+        "artifacts": artifacts,
+    }
+    task_manifest_path = task / "generation-manifest.json"
+    task_manifest_path.write_bytes(worker_module._canonical_bytes(task_manifest))
+    task_record = {
+        "generation_id": generation_id,
+        "generation_path": str(task.resolve()),
+        "manifest_path": str(task_manifest_path.resolve()),
+        "manifest_sha256": worker_module.sha256_file(task_manifest_path),
+        "task_generation_sha256": generation_id,
+    }
+    release_identity = {
+        "schema_version": "workbook-release-identity/v2",
+        "workbook_id": row.workbook_id,
+        "source_generation": {},
+        "segmentation_generation": {},
+        "task_generation": task_record,
+        "bindings": {"source_sha256": row.run_source_sha256},
+        "versions": {},
+        "prior_release_id": None,
+        "legacy_snapshot_hash": None,
+    }
+    release_id = worker_module._sha256_bytes(
+        worker_module._canonical_bytes(release_identity)
+    )
+    release = release_root / "releases" / release_id
+    release.mkdir(parents=True)
+    release_manifest = {
+        "schema_version": "workbook-release/v2",
+        "release_id": release_id,
+        "identity": release_identity,
+        **{
+            key: release_identity[key]
+            for key in (
+                "workbook_id",
+                "source_generation",
+                "segmentation_generation",
+                "task_generation",
+                "bindings",
+                "versions",
+                "prior_release_id",
+                "legacy_snapshot_hash",
+            )
+        },
+    }
+    release_manifest_path = release / "release-manifest.json"
+    release_manifest_path.write_bytes(
+        worker_module._canonical_bytes(release_manifest)
+    )
+    pointer = {
+        "schema_version": "workbook-current-release/v2",
+        "release_id": release_id,
+        "release_path": f"releases/{release_id}",
+        "manifest_sha256": worker_module.sha256_file(release_manifest_path),
+    }
+    (release_root / "current-release.json").write_bytes(
+        worker_module._canonical_bytes(pointer)
+    )
+    return release_id, generation_id, task
+
+
 def test_inspect_uses_worktree_modules_not_baseline(tmp_path: Path) -> None:
     worker, row, worktree = _inspect_worktree(tmp_path)
-    gen_id = "b" * 64
-    release_id = "a" * 64
-    task = (
-        worktree
-        / "release_out"
-        / row.workbook_id
-        / "task-generations"
-        / gen_id
-    )
-    _bundle(task, row.workbook_id)
-    _write_pointer(worktree, row.workbook_id, release_id)
+    release_id, gen_id, task = _write_independent_release(worktree, row)
     (worktree / "xl_release_publication.py").write_text(
         WORKTREE_PUBLISHER.format(sha=row.run_source_sha256, gen=gen_id, rid=release_id),
         encoding="utf-8",
@@ -1042,7 +1127,10 @@ def test_run_records_inspect_error_and_does_not_skip_ahead(
     assert "does not bind" in str(by_id["0001"]["inspect_error"])
     assert "does not bind" in str(evidence["inspect_error"])
     assert "does not bind" in str(summary["tasks"]["0001"]["inspect_error"])
-    assert (config.state / "failed-releases" / "0001" / "current-release.json").is_file()
+    current = json.loads(
+        (config.state / "failed-releases" / "0001" / "current.json").read_text()
+    )
+    assert (Path(current["snapshot_path"]) / "current-release.json").is_file()
     leftover = list((config.work_root).glob("task-*"))
     assert leftover == [config.work_root / "task-0001"]
 
@@ -1072,7 +1160,10 @@ def test_inspect_fail_preserves_release_after_recycle(
     result = worker.process(rows[0])
     assert result["status"] in RECOVERY_OK_AFTER_NO_RELEASE
     assert result["inspect_error"]
-    assert (config.state / "failed-releases" / "0001" / "note.txt").read_text(
+    current = json.loads(
+        (config.state / "failed-releases" / "0001" / "current.json").read_text()
+    )
+    assert (Path(current["snapshot_path"]) / "note.txt").read_text(
         encoding="utf-8"
     ) == "keep-me\n"
     assert list(config.work_root.glob("task-*")) == [
@@ -1179,7 +1270,7 @@ def test_fairness_report_file_used_when_final_txt_empty(
     )
 
     result = worker.process(row)
-    assert result["status"] == "generated"
+    assert result["status"] == "fairness_retry"
 
 
 def test_fairness_stdout_fail_wins_over_file_pass() -> None:
@@ -1227,7 +1318,10 @@ def test_fairness_retry_preserves_release(
     )
     assert result["status"] == "fairness_retry"
     assert evidence["verification_attempt"]
-    assert (config.state / "failed-releases" / "0001" / "kept.txt").read_text(
+    current = json.loads(
+        (config.state / "failed-releases" / "0001" / "current.json").read_text()
+    )
+    assert (Path(current["snapshot_path"]) / "kept.txt").read_text(
         encoding="utf-8"
     ) == "fairness-evidence\n"
 
@@ -1567,7 +1661,7 @@ def test_incident_investigator_deduplicates_failure_fingerprint(
     def launcher(**kwargs: object) -> dict[str, object]:
         launches.append(list(kwargs["command"]))  # type: ignore[arg-type]
         Path(str(kwargs["report_path"])).write_text("report\n", encoding="utf-8")
-        return {"status": "test"}
+        return {"status": "completed", "return_code": 0}
 
     recovery = RecoveryWorker(config, investigator_launcher=launcher)
     first = recovery._launch_incident(
@@ -1916,7 +2010,9 @@ def test_modified_candidate_is_reinspected_after_fairness(
     assert recovery.process(row)["status"] == "generated"
     assert inspections == 2
     incident_results = list(
-        (config.state / "incidents" / "0001").glob("*/result.json")
+        (config.state / "incidents" / "0001").glob(
+            "*/attempts/*/result.json"
+        )
     )
     categories = {
         json.loads(path.read_text(encoding="utf-8"))["category"]
@@ -1937,3 +2033,522 @@ def test_worker_lock_fails_closed(tmp_path: Path) -> None:
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+@pytest.mark.parametrize("field", ["work_root", "state", "output"])
+@pytest.mark.parametrize("direction", ["below_baseline", "contains_baseline"])
+def test_root_layout_rejects_pairwise_nesting_before_creation(
+    tmp_path: Path, field: str, direction: str
+) -> None:
+    config, _, _ = _config(tmp_path)
+    if direction == "below_baseline":
+        unsafe = config.baseline_repo / f"unsafe-{field}"
+        assert not unsafe.exists()
+    else:
+        unsafe = tmp_path
+    config = replace(config, **{field: unsafe})
+    with pytest.raises(worker_module.RecoveryError, match="pairwise non-nested"):
+        RecoveryWorker(config).run()
+    if direction == "below_baseline":
+        assert not unsafe.exists()
+
+
+@pytest.mark.parametrize(
+    "field", ["baseline_repo", "work_root", "state", "output"]
+)
+def test_root_layout_rejects_symlink_roots(
+    tmp_path: Path, field: str
+) -> None:
+    config, _, _ = _config(tmp_path)
+    original = getattr(config, field)
+    target = original
+    if field != "baseline_repo":
+        target.mkdir(parents=True, exist_ok=True)
+    link = tmp_path / f"{field}-link"
+    link.symlink_to(target, target_is_directory=True)
+    config = replace(config, **{field: link})
+    recovery = RecoveryWorker(config)
+    with pytest.raises(worker_module.RecoveryError, match="must not be a symlink"):
+        recovery.run()
+
+
+def test_unique_fairness_report_accepts_only_current_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, rows, records = _config(tmp_path)
+    row = rows[0]
+    recovery = RecoveryWorker(config)
+    _stub_ready(recovery, records, monkeypatch)
+    candidate = replace(_candidate(tmp_path), source_sha256=row.run_source_sha256)
+    seen_paths: list[Path] = []
+
+    def verifier(*args: object) -> dict[str, object]:
+        report_path = Path(args[-1])
+        seen_paths.append(report_path)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            "fresh review\nFAIRNESS_VERDICT: PASS\n", encoding="utf-8"
+        )
+        return _attempt(tmp_path, 90, "wrote fresh report\n")
+
+    monkeypatch.setattr(
+        recovery,
+        "_run_generation",
+        lambda *_args, **_kwargs: _attempt(
+            tmp_path, 1, "RECOVERY_USED: YES\n"
+        ),
+    )
+    monkeypatch.setattr(recovery, "_inspect_release", lambda _row: candidate)
+    monkeypatch.setattr(recovery, "_run_verifier", verifier)
+    monkeypatch.setattr(
+        worker_module, "_write_vm_diff", lambda *_args: config.state / "diff.txt"
+    )
+    assert recovery.process(row)["status"] == "generated"
+    assert len(seen_paths) == 1
+    assert candidate.bundle_sha256 in seen_paths[0].parts
+    assert seen_paths[0].name.startswith("fairness-")
+
+
+def test_failed_release_rejects_root_and_nested_symlinks(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    row = rows[0]
+    worktree = tmp_path / "failed-worktree"
+    release_root = worktree / "release_out"
+    release_root.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    root_link = release_root / row.workbook_id
+    root_link.symlink_to(external, target_is_directory=True)
+    with pytest.raises(worker_module.RecoveryError, match="safe directory"):
+        _preserve_failed_release(config.state, row, worktree, config)
+    root_link.unlink()
+    root_link.mkdir()
+    (root_link / "good.txt").write_text("good\n", encoding="utf-8")
+    (root_link / "nested").symlink_to(external, target_is_directory=True)
+    with pytest.raises(worker_module.RecoveryError, match="contains a symlink"):
+        _preserve_failed_release(config.state, row, worktree, config)
+    assert not (config.state / "failed-releases").exists()
+
+
+def test_failed_release_copy_failure_preserves_prior_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    row = rows[0]
+    worktree = tmp_path / "failed-worktree"
+    release = worktree / "release_out" / row.workbook_id
+    release.mkdir(parents=True)
+    (release / "note.txt").write_text("first\n", encoding="utf-8")
+    first = _preserve_failed_release(config.state, row, worktree, config)
+    assert first is not None
+    current_path = config.state / "failed-releases" / row.workbook_id / "current.json"
+    prior_pointer = current_path.read_bytes()
+    (release / "note.txt").write_text("second\n", encoding="utf-8")
+    monkeypatch.setattr(
+        worker_module.shutil,
+        "copytree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("copy failed")),
+    )
+    with pytest.raises(OSError, match="copy failed"):
+        _preserve_failed_release(config.state, row, worktree, config)
+    assert current_path.read_bytes() == prior_pointer
+    assert (first / "note.txt").read_text(encoding="utf-8") == "first\n"
+
+
+def test_interrupted_attempt_advances_before_restart_and_retains_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, rows, records = _config(tmp_path, attempt_count=1)
+    row = rows[0]
+    first = RecoveryWorker(config)
+    _stub_ready(first, records, monkeypatch)
+
+    def interrupted(
+        *_args: object, **_kwargs: object
+    ) -> dict[str, object]:
+        assert first.active_worktree is not None
+        (first.active_worktree / "xl_seg" / "emit.py").write_text(
+            "INTERRUPTED_CHANGE = True\n", encoding="utf-8"
+        )
+        evidence = first.active_worktree / "seg_out" / row.workbook_id
+        evidence.mkdir(parents=True)
+        (evidence / "partial.json").write_text("{}\n", encoding="utf-8")
+        raise RuntimeError("VM interrupted")
+
+    monkeypatch.setattr(first, "_run_generation", interrupted)
+    with pytest.raises(RuntimeError, match="VM interrupted"):
+        first.process(row)
+    checkpoint_path = config.state / "checkpoints" / "0001.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    assert checkpoint["cumulative_attempt_count"] == 1
+    assert checkpoint["attempt_in_progress"]["attempt_index"] == 0
+
+    second = RecoveryWorker(config)
+    _stub_ready(second, records, monkeypatch)
+    seen: list[int] = []
+
+    def resumed(
+        _row: QueueRow,
+        _record: ReadyRecord,
+        _inventory: Path,
+        _prior: object,
+        attempt_index: int,
+    ) -> dict[str, object]:
+        assert second.active_worktree is not None
+        assert "INTERRUPTED_CHANGE" in (
+            second.active_worktree / "xl_seg" / "emit.py"
+        ).read_text()
+        assert (
+            second.active_worktree / "seg_out" / "0001" / "partial.json"
+        ).is_file()
+        seen.append(attempt_index)
+        return _attempt(tmp_path, 2, "FULL_RERUN_BLOCKER: HARD\n")
+
+    monkeypatch.setattr(second, "_run_generation", resumed)
+    monkeypatch.setattr(
+        second,
+        "_inspect_release",
+        lambda _row: (_ for _ in ()).throw(worker_module.RecoveryError("no release")),
+    )
+    second.process(row)
+    assert seen == [1]
+    checkpoint = json.loads(checkpoint_path.read_text())
+    assert checkpoint["interrupted_attempts"][0]["attempt_index"] == 0
+
+
+def test_independent_release_rejects_pointer_and_manifest_tampering(
+    tmp_path: Path,
+) -> None:
+    recovery, row, worktree = _inspect_worktree(tmp_path)
+    release_id, generation_id, task = _write_independent_release(worktree, row)
+    resolver = {
+        "release_id": release_id,
+        "release_dir": str(
+            worktree / "release_out" / row.workbook_id / "releases" / release_id
+        ),
+        "task_dir": str(task),
+        "task_generation_id": generation_id,
+    }
+    candidate = worker_module._independent_release_candidate(
+        row, worktree, resolver
+    )
+    snapshot = recovery._snapshot_candidate(row, candidate)
+    snapshot_root = Path(snapshot["snapshot_path"]).parent
+    assert (snapshot_root / "current-release.json").is_file()
+    assert (snapshot_root / "release-manifest.json").is_file()
+    assert (snapshot_root / "task-generation-manifest.json").is_file()
+
+    pointer_path = worktree / "release_out" / row.workbook_id / "current-release.json"
+    pointer = json.loads(pointer_path.read_text())
+    pointer["release_path"] = f"../releases/{release_id}"
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+    with pytest.raises(worker_module.RecoveryError, match="path is not canonical"):
+        worker_module._independent_release_candidate(row, worktree, resolver)
+
+
+def test_independent_release_rejects_resolver_path_and_task_bytes(
+    tmp_path: Path,
+) -> None:
+    _recovery, row, worktree = _inspect_worktree(tmp_path)
+    release_id, generation_id, task = _write_independent_release(worktree, row)
+    release_dir = (
+        worktree / "release_out" / row.workbook_id / "releases" / release_id
+    )
+    resolver = {
+        "release_id": release_id,
+        "release_dir": str(release_dir),
+        "task_dir": str(task),
+        "task_generation_id": generation_id,
+    }
+    lying = {**resolver, "task_dir": str(tmp_path / "escaped")}
+    with pytest.raises(worker_module.RecoveryError, match="resolver output"):
+        worker_module._independent_release_candidate(row, worktree, lying)
+    (task / "instruction.md").write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(worker_module.RecoveryError, match="artifacts"):
+        worker_module._independent_release_candidate(row, worktree, resolver)
+
+
+def test_candidate_snapshots_are_keyed_by_release_identity(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    recovery = RecoveryWorker(config)
+    first = replace(
+        _candidate(tmp_path / "one"),
+        source_sha256=rows[0].run_source_sha256,
+        release_id="1" * 64,
+        task_generation_id="2" * 64,
+    )
+    second = replace(
+        first,
+        release_id="3" * 64,
+        task_generation_id="4" * 64,
+    )
+    one = recovery._snapshot_candidate(rows[0], first)
+    two = recovery._snapshot_candidate(rows[0], second)
+    assert one["bundle_sha256"] == two["bundle_sha256"]
+    assert Path(one["snapshot_path"]).parent != Path(two["snapshot_path"]).parent
+
+
+@pytest.mark.parametrize(
+    ("launch", "report"),
+    [
+        ({"status": "unavailable"}, "report\n"),
+        ({"status": "completed", "return_code": 2}, "report\n"),
+        ({"status": "launch_error"}, "report\n"),
+        ({"status": "timed_out", "return_code": -15}, "report\n"),
+        ({"status": "completed", "return_code": 0}, ""),
+    ],
+)
+def test_incomplete_incidents_remain_retryable(
+    tmp_path: Path,
+    launch: dict[str, object],
+    report: str,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    launches = 0
+
+    def launcher(**kwargs: object) -> dict[str, object]:
+        nonlocal launches
+        launches += 1
+        Path(str(kwargs["report_path"])).write_text(report, encoding="utf-8")
+        return launch
+
+    recovery = RecoveryWorker(config, investigator_launcher=launcher)
+    first = recovery._launch_incident(rows[0], "inspect", {"error": "same"})
+    second = recovery._launch_incident(rows[0], "inspect", {"error": "same"})
+    assert launches == 2
+    assert first["completed"] is False
+    assert second["deduplicated"] is False
+    fingerprint_root = (
+        config.state / "incidents" / "0001" / str(first["fingerprint"])
+    )
+    assert not (fingerprint_root / "completed.json").exists()
+    assert len(list(fingerprint_root.glob("attempts/*/result.json"))) == 2
+
+
+def test_malformed_incident_jsonl_keeps_raw_and_is_retryable(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    config.agent_binary.write_text(
+        "#!/bin/sh\nprintf 'not-json\\n'\n", encoding="utf-8"
+    )
+    recovery = RecoveryWorker(config)
+    incident = recovery._launch_incident(
+        rows[0], "unexpected", {"error": "malformed"}
+    )
+    result = json.loads(Path(incident["result_path"]).read_text())
+    assert incident["completed"] is False
+    assert result["launch"]["status"] == "empty_or_malformed"
+    assert Path(result["launch"]["stream_path"]).read_text() == "not-json\n"
+    assert not (
+        config.state
+        / "incidents"
+        / "0001"
+        / str(incident["fingerprint"])
+        / "completed.json"
+    ).exists()
+
+
+def test_concurrent_valid_delivery_is_not_quarantined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    row = rows[0]
+    candidate = replace(
+        _candidate(tmp_path, amd=False),
+        source_sha256=row.run_source_sha256,
+    )
+    original = worker_module._quarantine_partial_delivery
+    installed = False
+
+    def concurrent(config_arg: Config, row_arg: QueueRow) -> Path | None:
+        nonlocal installed
+        if not installed:
+            installed = True
+            batch = config.output / row.batch_id
+            bundle = batch / "0001-outputs"
+            batch.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(candidate.task_dir, bundle)
+            sidecar = {
+                "schema_version": worker_module.DELIVERY_SCHEMA,
+                "batch_id": row.batch_id,
+                "workbook_id": row.workbook_id,
+                "release_id": candidate.release_id,
+                "task_generation_id": candidate.task_generation_id,
+                "source_sha256": row.run_source_sha256,
+                "run_source_sha256": row.run_source_sha256,
+                "bundle_path": str(bundle.resolve()),
+                "bundle_sha256": tree_sha256(bundle),
+                "modified": False,
+                "fairness_verdict": "not_required",
+                "fairness_report_path": None,
+                "fairness_report_sha256": None,
+                "verification_attempt": None,
+                "guard_evidence": {},
+            }
+            (batch / "0001-outputs.verification.json").write_bytes(
+                worker_module._canonical_bytes(sidecar)
+            )
+        return original(config_arg, row_arg)
+
+    monkeypatch.setattr(
+        worker_module, "_quarantine_partial_delivery", concurrent
+    )
+    sidecar = deliver_bundle(
+        config,
+        row,
+        candidate,
+        modified=False,
+        verification_report=None,
+        verification_attempt=None,
+    )
+    assert sidecar["bundle_sha256"] == candidate.bundle_sha256
+    assert not (config.state / "delivery-quarantine").exists()
+
+
+def test_restart_rejects_self_consistent_noncanonical_grader(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    row = rows[0]
+    candidate = replace(
+        _candidate(tmp_path, amd=False),
+        source_sha256=row.run_source_sha256,
+    )
+    deliver_bundle(
+        config,
+        row,
+        candidate,
+        modified=False,
+        verification_report=None,
+        verification_attempt=None,
+    )
+    batch = config.output / row.batch_id
+    bundle = batch / "0001-outputs"
+    (bundle / "tests" / "run_grader.py").write_text(
+        "noncanonical\n", encoding="utf-8"
+    )
+    sidecar_path = batch / "0001-outputs.verification.json"
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["bundle_sha256"] = tree_sha256(bundle)
+    sidecar_path.write_bytes(worker_module._canonical_bytes(sidecar))
+    assert worker_module._read_valid_delivery(config, row) is None
+
+
+def test_restart_rejects_external_fairness_report(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    row = rows[0]
+    candidate = replace(
+        _candidate(tmp_path),
+        source_sha256=row.run_source_sha256,
+    )
+    report = "review\nFAIRNESS_VERDICT: PASS\n"
+    deliver_bundle(
+        config,
+        row,
+        candidate,
+        modified=True,
+        verification_report=report,
+        verification_attempt={"attempt": "test"},
+    )
+    batch = config.output / row.batch_id
+    expected = batch / "0001-outputs.fairness.md"
+    external = tmp_path / "external-fairness.md"
+    os.replace(expected, external)
+    sidecar_path = batch / "0001-outputs.verification.json"
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["fairness_report_path"] = str(external)
+    sidecar["fairness_report_sha256"] = worker_module.sha256_file(external)
+    sidecar_path.write_bytes(worker_module._canonical_bytes(sidecar))
+    assert worker_module._read_valid_delivery(config, row) is None
+
+
+def test_evidence_limits_leave_latest_usable_artifacts(
+    tmp_path: Path,
+) -> None:
+    config, rows, _ = _config(tmp_path)
+    row = rows[0]
+    tiny_item = replace(
+        config,
+        evidence_item_limit_bytes=10,
+        evidence_global_limit_bytes=1000,
+    )
+    recovery = RecoveryWorker(tiny_item)
+    worktree = create_isolated_worktree(
+        config.baseline_repo, config.work_root, row.workbook_id
+    )
+    with pytest.raises(worker_module.RecoveryError, match="configured limit"):
+        recovery._quarantine_worktree(row, worktree, "test")
+    assert worktree.is_dir()
+    candidate = replace(
+        _candidate(tmp_path),
+        source_sha256=row.run_source_sha256,
+    )
+    with pytest.raises(worker_module.RecoveryError, match="configured limit"):
+        recovery._snapshot_candidate(row, candidate)
+
+    bounded = replace(
+        config,
+        evidence_item_limit_bytes=700,
+        evidence_global_limit_bytes=900,
+    )
+    batch = bounded.output / row.batch_id
+    first = batch / "0001-outputs"
+    first.mkdir(parents=True)
+    (first / "partial.bin").write_bytes(b"x" * 400)
+    first_snapshot = worker_module._quarantine_partial_delivery(bounded, row)
+    assert first_snapshot is not None and first_snapshot.is_dir()
+    second = batch / "0001-outputs"
+    second.mkdir()
+    (second / "partial.bin").write_bytes(b"y" * 400)
+    with pytest.raises(worker_module.RecoveryError, match="evidence total"):
+        worker_module._quarantine_partial_delivery(bounded, row)
+    assert second.is_dir()
+    assert first_snapshot.is_dir()
+
+
+def test_queue_mutation_writes_full_ledger_and_current_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, rows, _ = _config(
+        tmp_path, workbook_ids=("0001", "0002"), attempt_count=1
+    )
+    recovery = RecoveryWorker(config)
+
+    def mutate(row: QueueRow) -> dict[str, object]:
+        config.queue.write_text("[]\n", encoding="utf-8")
+        return {
+            "workbook_id": row.workbook_id,
+            "status": "recovery_pending",
+            "queued": True,
+            "error": "still pending",
+        }
+
+    monkeypatch.setattr(recovery, "process", mutate)
+    with pytest.raises(worker_module.RecoveryError, match="must not rewrite"):
+        recovery.run()
+    ledger = json.loads(
+        (config.state / "recovery-ledger.json").read_text(encoding="utf-8")
+    )
+    assert ledger["expected_count"] == 2
+    assert len(ledger["records"]) == 2
+    assert ledger["records"][0]["status"] == "recovery_pending"
+    integrity = json.loads(
+        (
+            config.state
+            / "queue-integrity"
+            / "original-queue-ledger.json"
+        ).read_text()
+    )
+    assert integrity["expected_count"] == 2
+    assert len(integrity["original_rows"]) == 2
+    evidence = json.loads(
+        (config.state / "task-evidence" / "0001.json").read_text()
+    )
+    assert evidence["queue_integrity_failure"] is True

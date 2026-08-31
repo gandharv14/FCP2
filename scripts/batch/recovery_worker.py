@@ -8,6 +8,7 @@ HARD is not a terminal stop. Only a valid current-release plus fairness
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -120,6 +121,8 @@ DEFAULT_ATTEMPT_COUNT = 6
 INSPECT_TIMEOUT_SECONDS = 600
 INCIDENT_TIMEOUT_SECONDS = 1800
 GENERATION_LANE_COUNT = 3
+DEFAULT_EVIDENCE_ITEM_LIMIT_BYTES = 20 * 1024 * 1024 * 1024
+DEFAULT_EVIDENCE_GLOBAL_LIMIT_BYTES = 100 * 1024 * 1024 * 1024
 # Runs in a fresh interpreter whose PYTHONPATH is the task worktree, so
 # resolve_current_release uses the same modules the generation agent published
 # with. The long-lived worker process stays on baseline code.
@@ -312,6 +315,12 @@ class ReleaseCandidate:
     task_generation_id: str
     source_sha256: str
     bundle_sha256: str
+    pointer_path: Path | None = None
+    pointer_sha256: str | None = None
+    release_manifest_path: Path | None = None
+    release_manifest_sha256: str | None = None
+    task_manifest_path: Path | None = None
+    task_manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -333,6 +342,8 @@ class Config:
     large_workbooks: frozenset[str]
     measured_timeout_seconds: int
     large_timeout_seconds: int
+    evidence_item_limit_bytes: int = DEFAULT_EVIDENCE_ITEM_LIMIT_BYTES
+    evidence_global_limit_bytes: int = DEFAULT_EVIDENCE_GLOBAL_LIMIT_BYTES
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Config":
@@ -349,7 +360,7 @@ class Config:
             raw = first_text(*names)
             if not raw:
                 raise RecoveryError(f"{names[0]} is required")
-            return Path(raw).expanduser().resolve(strict=False)
+            return Path(os.path.abspath(Path(raw).expanduser()))
 
         baseline_repo = required_path(
             "RECOVERY_BASELINE_REPO", "FULL_RERUN_REPO"
@@ -387,6 +398,18 @@ class Config:
                 default="14400",
             )
         )
+        evidence_item_limit = int(
+            first_text(
+                "RECOVERY_EVIDENCE_ITEM_LIMIT_BYTES",
+                default=str(DEFAULT_EVIDENCE_ITEM_LIMIT_BYTES),
+            )
+        )
+        evidence_global_limit = int(
+            first_text(
+                "RECOVERY_EVIDENCE_GLOBAL_LIMIT_BYTES",
+                default=str(DEFAULT_EVIDENCE_GLOBAL_LIMIT_BYTES),
+            )
+        )
         if not (0 < timeout <= 86400):
             raise RecoveryError("TIMEOUT must be in (0, 86400]")
         if attempts < DEFAULT_ATTEMPT_COUNT:
@@ -396,6 +419,10 @@ class Config:
             )
         if task_limit < 0:
             raise RecoveryError("TASK_LIMIT cannot be negative")
+        if evidence_item_limit <= 0 or evidence_global_limit < evidence_item_limit:
+            raise RecoveryError(
+                "evidence limits must be positive and global must cover one item"
+            )
         approval_batch_raw = first_text(
             "RECOVERY_APPROVAL_BATCH_ID", "FULL_RERUN_APPROVAL_BATCH_ID"
         )
@@ -456,6 +483,8 @@ class Config:
             large_workbooks=large_ids,
             measured_timeout_seconds=measured,
             large_timeout_seconds=large,
+            evidence_item_limit_bytes=evidence_item_limit,
+            evidence_global_limit_bytes=evidence_global_limit,
         )
 
 
@@ -479,6 +508,113 @@ def _canonical_bytes(value: object) -> bytes:
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _validate_root_layout(config: Config) -> None:
+    roots = {
+        "baseline_repo": config.baseline_repo,
+        "work_root": config.work_root,
+        "state": config.state,
+        "output": config.output,
+    }
+    resolved: dict[str, Path] = {}
+    for name, path in roots.items():
+        if path.is_symlink():
+            raise RecoveryError(f"{name} root must not be a symlink")
+        try:
+            resolved[name] = path.resolve(strict=False)
+        except OSError as error:
+            raise RecoveryError(f"{name} root cannot be resolved: {error}") from error
+    for left_name, left in resolved.items():
+        for right_name, right in resolved.items():
+            if left_name >= right_name:
+                continue
+            if (
+                left == right
+                or left.is_relative_to(right)
+                or right.is_relative_to(left)
+            ):
+                raise RecoveryError(
+                    f"{left_name} and {right_name} roots must be distinct "
+                    "and pairwise non-nested"
+                )
+
+
+def _safe_tree_size(
+    root: Path,
+    *,
+    excluded_names: frozenset[str] = frozenset(),
+) -> int:
+    try:
+        root_mode = root.lstat().st_mode
+    except OSError as error:
+        raise RecoveryError(f"evidence root is unreadable: {root}") from error
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        raise RecoveryError(f"evidence root is not a safe directory: {root}")
+    total = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as error:
+            raise RecoveryError(f"evidence tree is unreadable: {directory}") from error
+        for entry in entries:
+            if entry.name in excluded_names or entry.name.endswith(".pyc"):
+                continue
+            mode = entry.stat(follow_symlinks=False).st_mode
+            relative = Path(entry.path).relative_to(root).as_posix()
+            if stat.S_ISLNK(mode):
+                raise RecoveryError(f"evidence tree contains a symlink: {relative}")
+            if stat.S_ISDIR(mode):
+                pending.append(Path(entry.path))
+            elif stat.S_ISREG(mode):
+                total += entry.stat(follow_symlinks=False).st_size
+            else:
+                raise RecoveryError(
+                    f"evidence tree contains a special file: {relative}"
+                )
+    return total
+
+
+def _evidence_usage(state: Path) -> int:
+    total = 0
+    for name in (
+        "failed-releases",
+        "worktree-quarantine",
+        "candidates",
+        "delivery-quarantine",
+    ):
+        root = state / name
+        if not root.exists() or root.is_symlink() or not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            try:
+                mode = path.lstat().st_mode
+            except OSError:
+                continue
+            if stat.S_ISREG(mode):
+                total += path.stat().st_size
+    return total
+
+
+def _check_evidence_capacity(
+    config: Config,
+    size_bytes: int,
+    *,
+    existing_bytes: int = 0,
+) -> None:
+    if size_bytes > config.evidence_item_limit_bytes:
+        raise RecoveryError(
+            f"evidence item is {size_bytes} bytes, above configured limit "
+            f"{config.evidence_item_limit_bytes}"
+        )
+    projected = _evidence_usage(config.state) - existing_bytes + size_bytes
+    if projected > config.evidence_global_limit_bytes:
+        raise RecoveryError(
+            f"evidence total would be {projected} bytes, above configured limit "
+            f"{config.evidence_global_limit_bytes}"
+        )
 
 
 def read_queue(path: Path) -> list[QueueRow]:
@@ -1271,21 +1407,67 @@ def _combine_fairness_reports(stdout_text: str, file_text: str) -> str:
 
 
 def _preserve_failed_release(
-    state: Path, row: QueueRow, worktree: Path
+    state: Path,
+    row: QueueRow,
+    worktree: Path,
+    config: Config | None = None,
 ) -> Path | None:
-    """Copy release_out before worktree recycle so inspect failures stay visible."""
+    """Atomically publish a safe, versioned failed-release snapshot."""
 
     release_src = worktree / "release_out" / row.workbook_id
-    preserved = state / "failed-releases" / row.workbook_id
-    if not release_src.is_dir():
-        return preserved if preserved.is_dir() else None
-    if preserved.exists() or preserved.is_symlink():
-        if preserved.is_dir() and not preserved.is_symlink():
-            shutil.rmtree(preserved)
-        else:
-            preserved.unlink(missing_ok=True)
-    shutil.copytree(release_src, preserved, symlinks=False)
-    return preserved
+    root = state / "failed-releases" / row.workbook_id
+    current_path = root / "current.json"
+    if not release_src.exists() and not release_src.is_symlink():
+        if current_path.is_file() and not current_path.is_symlink():
+            try:
+                current = json.loads(current_path.read_text(encoding="utf-8"))
+                path = Path(str(current.get("snapshot_path", "")))
+                return path if path.is_dir() and not path.is_symlink() else None
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return None
+        return None
+    size_bytes = _safe_tree_size(release_src)
+    if config is not None:
+        _check_evidence_capacity(config, size_bytes)
+    versions = root / "versions"
+    versions.mkdir(parents=True, exist_ok=True)
+    token = str(time.time_ns())
+    destination = versions / token
+    temporary = versions / f".{token}.snapshot"
+    try:
+        shutil.copytree(release_src, temporary, symlinks=False)
+        copied_size = _safe_tree_size(temporary)
+        if copied_size != size_bytes:
+            raise RecoveryError("failed-release snapshot size changed during copy")
+        atomic_write_json(
+            temporary / "snapshot.json",
+            {
+                "workbook_id": row.workbook_id,
+                "source_path": str(release_src),
+                "size_bytes": size_bytes,
+                "preserved_at": _timestamp(),
+            },
+        )
+        staged_size = _safe_tree_size(temporary)
+        if config is not None:
+            _check_evidence_capacity(
+                config, staged_size, existing_bytes=staged_size
+            )
+        os.replace(temporary, destination)
+        atomic_write_json(
+            current_path,
+            {
+                "workbook_id": row.workbook_id,
+                "snapshot_path": str(destination),
+                "size_bytes": size_bytes,
+                "updated_at": _timestamp(),
+            },
+        )
+        return destination
+    except BaseException:
+        if temporary.exists() and temporary.is_dir() and not temporary.is_symlink():
+            shutil.rmtree(temporary, ignore_errors=True)
+        raise
 
 
 def _assert_inspect_candidate(
@@ -1324,6 +1506,186 @@ def _assert_inspect_candidate(
             raise RecoveryError(f"inspect {label} escapes release_out")
 
 
+def _read_bound_json(path: Path, description: str) -> tuple[dict[str, object], bytes]:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise RecoveryError(f"{description} is missing: {error}") from error
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise RecoveryError(f"{description} is not a safe regular file")
+    try:
+        content = path.read_bytes()
+        value = json.loads(content)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RecoveryError(f"{description} is unreadable: {error}") from error
+    if not isinstance(value, dict):
+        raise RecoveryError(f"{description} must be a JSON object")
+    return value, content
+
+
+def _assert_canonical_directory(path: Path, parent: Path, description: str) -> None:
+    if parent.is_symlink() or path.is_symlink():
+        raise RecoveryError(f"{description} path contains a symlink")
+    if not parent.is_dir() or not path.is_dir():
+        raise RecoveryError(f"{description} directory is missing")
+    if path.resolve(strict=False).parent != parent.resolve(strict=False):
+        raise RecoveryError(f"{description} path is not canonical")
+
+
+def _validate_task_manifest_artifacts(
+    task_dir: Path, manifest: Mapping[str, object]
+) -> None:
+    expected = manifest.get("artifacts")
+    if not isinstance(expected, dict):
+        raise RecoveryError("task generation manifest has no artifact records")
+    actual: dict[str, dict[str, object]] = {}
+    for relative, digest in _tree_records(task_dir).items():
+        if relative == "generation-manifest.json":
+            continue
+        path = task_dir / relative
+        actual[relative] = {
+            "algorithm": "sha256",
+            "path": relative,
+            "sha256": digest,
+            "size_bytes": path.stat().st_size,
+        }
+    if actual != expected:
+        raise RecoveryError("task generation artifacts do not match manifest")
+
+
+def _independent_release_candidate(
+    row: QueueRow,
+    repo: Path,
+    resolver_data: Mapping[str, object],
+) -> ReleaseCandidate:
+    release_root = repo / "release_out" / row.workbook_id
+    if release_root.is_symlink() or not release_root.is_dir():
+        raise RecoveryError("release root is missing or unsafe")
+    pointer_path = release_root / "current-release.json"
+    pointer, pointer_bytes = _read_bound_json(
+        pointer_path, "current release pointer"
+    )
+    release_id = pointer.get("release_id")
+    if not isinstance(release_id, str) or not HASH_RE.fullmatch(release_id):
+        raise RecoveryError("current release pointer has an invalid release ID")
+    if pointer.get("schema_version") != "workbook-current-release/v2":
+        raise RecoveryError("current release pointer schema is unsupported")
+    if pointer.get("release_path") != f"releases/{release_id}":
+        raise RecoveryError("current release pointer path is not canonical")
+    pointer_manifest_hash = pointer.get("manifest_sha256")
+    if (
+        not isinstance(pointer_manifest_hash, str)
+        or not HASH_RE.fullmatch(pointer_manifest_hash)
+    ):
+        raise RecoveryError("current release pointer manifest hash is invalid")
+
+    releases = release_root / "releases"
+    release_dir = releases / release_id
+    _assert_canonical_directory(release_dir, releases, "release")
+    if set(path.name for path in release_dir.iterdir()) != {
+        "release-manifest.json"
+    }:
+        raise RecoveryError("release directory contains unbound artifacts")
+    release_manifest_path = release_dir / "release-manifest.json"
+    release_manifest, release_bytes = _read_bound_json(
+        release_manifest_path, "release manifest"
+    )
+    release_hash = _sha256_bytes(release_bytes)
+    if release_hash != pointer_manifest_hash:
+        raise RecoveryError("release manifest does not match pointer hash")
+    identity = release_manifest.get("identity")
+    if (
+        release_manifest.get("schema_version") != "workbook-release/v2"
+        or not isinstance(identity, dict)
+        or identity.get("schema_version") != "workbook-release-identity/v2"
+        or _sha256_bytes(_canonical_bytes(identity)) != release_id
+        or release_manifest.get("release_id") != release_id
+        or release_manifest.get("workbook_id") != row.workbook_id
+        or identity.get("workbook_id") != row.workbook_id
+    ):
+        raise RecoveryError("release manifest identity is invalid")
+    for key in (
+        "workbook_id",
+        "source_generation",
+        "segmentation_generation",
+        "task_generation",
+        "bindings",
+        "versions",
+        "prior_release_id",
+        "legacy_snapshot_hash",
+    ):
+        if release_manifest.get(key) != identity.get(key):
+            raise RecoveryError(f"release manifest identity field changed: {key}")
+    bindings = release_manifest.get("bindings")
+    if (
+        not isinstance(bindings, dict)
+        or bindings.get("source_sha256") != row.run_source_sha256
+    ):
+        raise RecoveryError("release manifest does not bind queue source")
+    task_record = release_manifest.get("task_generation")
+    if not isinstance(task_record, dict):
+        raise RecoveryError("release manifest has no task generation")
+    generation_id = task_record.get("generation_id")
+    if not isinstance(generation_id, str) or not HASH_RE.fullmatch(generation_id):
+        raise RecoveryError("release task generation ID is invalid")
+    task_generations = release_root / "task-generations"
+    task_dir = task_generations / generation_id
+    _assert_canonical_directory(task_dir, task_generations, "task generation")
+    task_manifest_path = task_dir / "generation-manifest.json"
+    task_manifest, task_bytes = _read_bound_json(
+        task_manifest_path, "task generation manifest"
+    )
+    task_hash = _sha256_bytes(task_bytes)
+    if (
+        task_record.get("generation_path")
+        != str(task_dir.resolve(strict=False))
+        or task_record.get("manifest_path")
+        != str(task_manifest_path.resolve(strict=False))
+        or task_record.get("manifest_sha256") != task_hash
+    ):
+        raise RecoveryError("release task manifest hash changed")
+    task_identity = task_manifest.get("identity")
+    if (
+        task_manifest.get("schema_version") != "task-generation/v2"
+        or not isinstance(task_identity, dict)
+        or task_identity.get("schema_version") != "task-generation-identity/v2"
+        or _sha256_bytes(_canonical_bytes(task_identity)) != generation_id
+        or task_manifest.get("generation_id") != generation_id
+        or task_identity.get("workbook_id") != row.workbook_id
+        or task_manifest.get("bindings") != task_identity.get("bindings")
+        or task_manifest.get("artifacts") != task_identity.get("artifacts")
+        or task_record.get("task_generation_sha256")
+        != _sha256_bytes(_canonical_bytes(task_identity))
+    ):
+        raise RecoveryError("task generation manifest identity is invalid")
+    _validate_task_manifest_artifacts(task_dir, task_manifest)
+    expected_release_dir = str(release_dir.resolve(strict=False))
+    expected_task_dir = str(task_dir.resolve(strict=False))
+    if (
+        str(Path(str(resolver_data.get("release_dir", ""))).resolve(strict=False))
+        != expected_release_dir
+        or str(Path(str(resolver_data.get("task_dir", ""))).resolve(strict=False))
+        != expected_task_dir
+        or str(resolver_data.get("release_id", "")) != release_id
+        or str(resolver_data.get("task_generation_id", "")) != generation_id
+    ):
+        raise RecoveryError("mutable resolver output disagrees with canonical release")
+    return ReleaseCandidate(
+        release_id=release_id,
+        release_dir=release_dir,
+        task_dir=task_dir,
+        task_generation_id=generation_id,
+        source_sha256=row.run_source_sha256,
+        bundle_sha256=tree_sha256(task_dir),
+        pointer_path=pointer_path,
+        pointer_sha256=_sha256_bytes(pointer_bytes),
+        release_manifest_path=release_manifest_path,
+        release_manifest_sha256=release_hash,
+        task_manifest_path=task_manifest_path,
+        task_manifest_sha256=task_hash,
+    )
+
+
 def _exclusive_write(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() or path.is_symlink():
@@ -1357,25 +1719,65 @@ def _read_valid_delivery(config: Config, row: QueueRow) -> dict[str, object] | N
     batch_root = config.output / row.batch_id
     bundle = batch_root / f"{row.workbook_id}-outputs"
     sidecar_path = batch_root / f"{row.workbook_id}-outputs.verification.json"
-    if bundle.is_symlink() or sidecar_path.is_symlink():
+    if (
+        batch_root.is_symlink()
+        or batch_root.resolve(strict=False).parent
+        != config.output.resolve(strict=False)
+        or bundle.is_symlink()
+        or sidecar_path.is_symlink()
+    ):
         return None
     if not bundle.is_dir() or not sidecar_path.is_file():
         return None
     try:
+        missing = [
+            relative
+            for relative in REQUIRED_BUNDLE_FILES
+            if not (bundle / relative).is_file()
+            or (bundle / relative).is_symlink()
+        ]
+        missing.extend(
+            relative
+            for relative in REQUIRED_BUNDLE_DIRECTORIES
+            if not (bundle / relative).is_dir()
+            or (bundle / relative).is_symlink()
+        )
+        input_workbook = bundle / "environment" / f"{row.workbook_id}-inputs.xlsx"
+        if (
+            missing
+            or not input_workbook.is_file()
+            or input_workbook.is_symlink()
+        ):
+            return None
+        _safe_tree_size(bundle)
+        baseline = read_code_baseline(
+            config.code_baseline, config.baseline_repo
+        )
+        _assert_frozen_protected_baseline(
+            _protected_snapshot(config.baseline_repo, baseline),
+            baseline,
+        )
+        assert_canonical_grader_provenance(config.baseline_repo, bundle)
         sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        expected_bundle = str(bundle.resolve(strict=False))
         if not isinstance(sidecar, dict) or (
             sidecar.get("schema_version") != DELIVERY_SCHEMA
             or sidecar.get("batch_id") != row.batch_id
             or sidecar.get("workbook_id") != row.workbook_id
             or sidecar.get("run_source_sha256") != row.run_source_sha256
+            or sidecar.get("source_sha256") != row.run_source_sha256
+            or sidecar.get("bundle_path") != expected_bundle
             or sidecar.get("bundle_sha256") != tree_sha256(bundle)
         ):
             return None
         if sidecar.get("modified"):
-            report = Path(str(sidecar.get("fairness_report_path", "")))
+            report = batch_root / f"{row.workbook_id}-outputs.fairness.md"
             amd = bundle / "a.md"
             if (
-                not report.is_file()
+                sidecar.get("fairness_verdict") != "PASS"
+                or sidecar.get("fairness_report_path")
+                != str(report.resolve(strict=False))
+                or not report.is_file()
                 or report.is_symlink()
                 or sha256_file(report) != sidecar.get("fairness_report_sha256")
                 or not fairness_passed(report.read_text(encoding="utf-8"))
@@ -1383,12 +1785,28 @@ def _read_valid_delivery(config: Config, row: QueueRow) -> dict[str, object] | N
                 or amd.is_symlink()
             ):
                 return None
+            validate_recovery_amd(bundle)
+        elif (
+            sidecar.get("fairness_verdict") != "not_required"
+            or sidecar.get("fairness_report_path") is not None
+            or sidecar.get("fairness_report_sha256") is not None
+        ):
+            return None
         return sidecar
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+        RecoveryError,
+        PolicyViolation,
+    ):
         return None
 
 
 def _quarantine_partial_delivery(config: Config, row: QueueRow) -> Path | None:
+    if _read_valid_delivery(config, row) is not None:
+        return None
     batch_root = config.output / row.batch_id
     names = (
         f"{row.workbook_id}-outputs",
@@ -1398,21 +1816,66 @@ def _quarantine_partial_delivery(config: Config, row: QueueRow) -> Path | None:
     existing = [batch_root / name for name in names if (batch_root / name).exists() or (batch_root / name).is_symlink()]
     if not existing:
         return None
-    token = f"{int(time.time_ns())}"
-    quarantine = config.state / "delivery-quarantine" / row.workbook_id / token
-    quarantine.mkdir(parents=True, exist_ok=False)
+    size_bytes = 0
     for source in existing:
-        os.replace(source, quarantine / source.name)
-    atomic_write_json(
-        quarantine / "quarantine.json",
-        {
-            "workbook_id": row.workbook_id,
-            "batch_id": row.batch_id,
-            "reason": "incomplete or invalid delivery sidecar",
-            "quarantined_at": _timestamp(),
-        },
-    )
-    return quarantine
+        mode = source.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            raise RecoveryError("partial delivery contains a symlink")
+        if stat.S_ISDIR(mode):
+            size_bytes += _safe_tree_size(source)
+        elif stat.S_ISREG(mode):
+            size_bytes += source.stat().st_size
+        else:
+            raise RecoveryError("partial delivery contains a special file")
+    _check_evidence_capacity(config, size_bytes)
+    parent = config.state / "delivery-quarantine" / row.workbook_id
+    parent.mkdir(parents=True, exist_ok=True)
+    token = str(time.time_ns())
+    quarantine = parent / token
+    temporary = parent / f".{token}.quarantine"
+    temporary.mkdir()
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for source in existing:
+            target = temporary / source.name
+            os.replace(source, target)
+            moved.append((source, target))
+        atomic_write_json(
+            temporary / "quarantine.json",
+            {
+                "workbook_id": row.workbook_id,
+                "batch_id": row.batch_id,
+                "reason": "incomplete or invalid delivery sidecar",
+                "size_bytes": size_bytes,
+                "quarantined_at": _timestamp(),
+            },
+        )
+        staged_size = _safe_tree_size(temporary)
+        _check_evidence_capacity(
+            config, staged_size, existing_bytes=staged_size
+        )
+        os.replace(temporary, quarantine)
+        return quarantine
+    except BaseException:
+        for source, target in reversed(moved):
+            if target.exists() and not source.exists():
+                os.replace(target, source)
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
+@contextlib.contextmanager
+def _output_delivery_lock(config: Config):
+    config.output.mkdir(parents=True, exist_ok=True)
+    lock_path = config.output / ".recovery-delivery.lock"
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def deliver_bundle(
@@ -1442,57 +1905,80 @@ def deliver_bundle(
                 f"refusing to overwrite complete verified bundle {destination}"
             )
         return existing_delivery
-    _quarantine_partial_delivery(config, row)
-    if not destination.exists() and not destination.is_symlink():
-        batch_root.mkdir(parents=True, exist_ok=True)
-        temporary = Path(
-            tempfile.mkdtemp(
-                prefix=f".{destination.name}.", suffix=".delivery", dir=batch_root
+    with _output_delivery_lock(config):
+        existing_delivery = _read_valid_delivery(config, row)
+        if existing_delivery is not None:
+            if existing_delivery.get("bundle_sha256") != expected_hash:
+                raise FileExistsError(
+                    f"refusing to overwrite complete verified bundle {destination}"
+                )
+            return existing_delivery
+        _quarantine_partial_delivery(config, row)
+        concurrent_delivery = _read_valid_delivery(config, row)
+        if concurrent_delivery is not None:
+            if concurrent_delivery.get("bundle_sha256") != expected_hash:
+                raise FileExistsError(
+                    f"refusing to overwrite complete verified bundle {destination}"
+                )
+            return concurrent_delivery
+        if not destination.exists() and not destination.is_symlink():
+            batch_root.mkdir(parents=True, exist_ok=True)
+            temporary = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{destination.name}.",
+                    suffix=".delivery",
+                    dir=batch_root,
+                )
             )
-        )
-        temporary.rmdir()
-        try:
-            shutil.copytree(candidate.task_dir, temporary, symlinks=False)
-            if tree_sha256(temporary) != expected_hash:
-                raise RecoveryError("atomic delivery staging hash mismatch")
-            os.rename(temporary, destination)
-            descriptor = os.open(batch_root, os.O_RDONLY)
             try:
-                os.fsync(descriptor)
+                temporary.rmdir()
+                shutil.copytree(candidate.task_dir, temporary, symlinks=False)
+                if tree_sha256(temporary) != expected_hash:
+                    raise RecoveryError("atomic delivery staging hash mismatch")
+                os.rename(temporary, destination)
+                descriptor = os.open(batch_root, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
             finally:
-                os.close(descriptor)
-        finally:
-            if temporary.exists():
-                shutil.rmtree(temporary, ignore_errors=True)
-    report_path: Path | None = None
-    report_hash: str | None = None
-    if modified:
-        report_path = batch_root / f"{row.workbook_id}-outputs.fairness.md"
-        report_bytes = verification_report.encode("utf-8")  # type: ignore[union-attr]
-        _exclusive_write(report_path, report_bytes)
-        report_hash = _sha256_bytes(report_bytes)
-    sidecar = {
-        "schema_version": DELIVERY_SCHEMA,
-        "batch_id": row.batch_id,
-        "workbook_id": row.workbook_id,
-        "release_id": candidate.release_id,
-        "task_generation_id": candidate.task_generation_id,
-        "source_sha256": candidate.source_sha256,
-        "run_source_sha256": row.run_source_sha256,
-        "bundle_path": str(destination),
-        "bundle_sha256": expected_hash,
-        "modified": modified,
-        "fairness_verdict": "PASS" if modified else "not_required",
-        "fairness_report_path": str(report_path) if report_path else None,
-        "fairness_report_sha256": report_hash,
-        "verification_attempt": (
-            dict(verification_attempt) if verification_attempt is not None else None
-        ),
-        "guard_evidence": dict(guard_evidence or {}),
-    }
-    sidecar_path = batch_root / f"{row.workbook_id}-outputs.verification.json"
-    _exclusive_write(sidecar_path, _canonical_bytes(sidecar))
-    return sidecar
+                if temporary.exists():
+                    shutil.rmtree(temporary, ignore_errors=True)
+        elif _read_valid_delivery(config, row) is None:
+            raise RecoveryError("delivery destination appeared without valid sidecar")
+        report_path: Path | None = None
+        report_hash: str | None = None
+        if modified:
+            report_path = batch_root / f"{row.workbook_id}-outputs.fairness.md"
+            report_bytes = verification_report.encode("utf-8")  # type: ignore[union-attr]
+            _exclusive_write(report_path, report_bytes)
+            report_hash = _sha256_bytes(report_bytes)
+        sidecar = {
+            "schema_version": DELIVERY_SCHEMA,
+            "batch_id": row.batch_id,
+            "workbook_id": row.workbook_id,
+            "release_id": candidate.release_id,
+            "task_generation_id": candidate.task_generation_id,
+            "source_sha256": candidate.source_sha256,
+            "run_source_sha256": row.run_source_sha256,
+            "bundle_path": str(destination.resolve(strict=False)),
+            "bundle_sha256": expected_hash,
+            "modified": modified,
+            "fairness_verdict": "PASS" if modified else "not_required",
+            "fairness_report_path": (
+                str(report_path.resolve(strict=False)) if report_path else None
+            ),
+            "fairness_report_sha256": report_hash,
+            "verification_attempt": (
+                dict(verification_attempt)
+                if verification_attempt is not None
+                else None
+            ),
+            "guard_evidence": dict(guard_evidence or {}),
+        }
+        sidecar_path = batch_root / f"{row.workbook_id}-outputs.verification.json"
+        _exclusive_write(sidecar_path, _canonical_bytes(sidecar))
+        return sidecar
 
 
 def _delivery_is_complete(config: Config, row: QueueRow) -> bool:
@@ -1659,43 +2145,56 @@ class RecoveryWorker:
     ) -> Path | None:
         if not worktree.exists() and not worktree.is_symlink():
             return None
-        quarantine = (
-            self.config.state
-            / "worktree-quarantine"
-            / row.workbook_id
-            / str(time.time_ns())
+        excluded = frozenset({".git", ".venv", ".env", "__pycache__"})
+        if worktree.is_symlink() or not worktree.is_dir():
+            raise RecoveryError("unsafe worktree cannot be copied to quarantine")
+        size_bytes = _safe_tree_size(worktree, excluded_names=excluded)
+        _check_evidence_capacity(self.config, size_bytes)
+        parent = (
+            self.config.state / "worktree-quarantine" / row.workbook_id
         )
-        quarantine.parent.mkdir(parents=True, exist_ok=True)
-        if worktree.is_dir() and not worktree.is_symlink():
-            def ignore(_directory: str, names: list[str]) -> list[str]:
-                return [
-                    name
-                    for name in names
-                    if name in {".git", ".venv", ".env", "__pycache__"}
-                    or name.endswith(".pyc")
-                ]
+        parent.mkdir(parents=True, exist_ok=True)
+        token = str(time.time_ns())
+        quarantine = parent / token
+        temporary = parent / f".{token}.quarantine"
 
+        def ignore(_directory: str, names: list[str]) -> list[str]:
+            return [
+                name
+                for name in names
+                if name in excluded or name.endswith(".pyc")
+            ]
+
+        try:
             shutil.copytree(
                 worktree,
-                quarantine,
-                symlinks=True,
+                temporary,
+                symlinks=False,
                 ignore=ignore,
             )
-        else:
-            quarantine.mkdir()
-            atomic_write_text(
-                quarantine / "unsafe-path.txt",
-                f"{worktree}: symlink_or_non_directory\n",
+            if _safe_tree_size(temporary) != size_bytes:
+                raise RecoveryError("worktree quarantine size changed during copy")
+            atomic_write_json(
+                temporary / "quarantine.json",
+                {
+                    "workbook_id": row.workbook_id,
+                    "run_source_sha256": row.run_source_sha256,
+                    "reason": reason,
+                    "size_bytes": size_bytes,
+                    "quarantined_at": _timestamp(),
+                },
             )
-        atomic_write_json(
-            quarantine / "quarantine.json",
-            {
-                "workbook_id": row.workbook_id,
-                "run_source_sha256": row.run_source_sha256,
-                "reason": reason,
-                "quarantined_at": _timestamp(),
-            },
-        )
+            staged_size = _safe_tree_size(temporary)
+            _check_evidence_capacity(
+                self.config,
+                staged_size,
+                existing_bytes=staged_size,
+            )
+            os.replace(temporary, quarantine)
+        except BaseException:
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
+            raise
         recycle_isolated_worktree(worktree, self.config.baseline_repo)
         return quarantine
 
@@ -1770,25 +2269,79 @@ class RecoveryWorker:
     def _snapshot_candidate(
         self, row: QueueRow, candidate: ReleaseCandidate
     ) -> dict[str, object]:
+        identity_key = (
+            f"{candidate.release_id}--{candidate.task_generation_id}"
+        )
         root = (
             self.config.state
             / "candidates"
             / row.workbook_id
-            / candidate.bundle_sha256
+            / identity_key
         )
         bundle = root / "task-bundle"
         if bundle.exists() or bundle.is_symlink():
             if bundle.is_symlink() or tree_sha256(bundle) != candidate.bundle_sha256:
                 raise PolicyViolation("candidate snapshot hash conflict")
         else:
-            root.mkdir(parents=True, exist_ok=True)
-            temporary = root / ".task-bundle.snapshot"
-            if temporary.exists():
-                shutil.rmtree(temporary)
-            shutil.copytree(candidate.task_dir, temporary, symlinks=False)
-            if tree_sha256(temporary) != candidate.bundle_sha256:
-                raise RecoveryError("candidate snapshot hash mismatch")
-            os.rename(temporary, bundle)
+            size_bytes = _safe_tree_size(candidate.task_dir)
+            _check_evidence_capacity(self.config, size_bytes)
+            root.parent.mkdir(parents=True, exist_ok=True)
+            temporary_root = root.parent / f".{identity_key}.{time.time_ns()}.snapshot"
+            try:
+                temporary_root.mkdir()
+                temporary = temporary_root / "task-bundle"
+                shutil.copytree(candidate.task_dir, temporary, symlinks=False)
+                if tree_sha256(temporary) != candidate.bundle_sha256:
+                    raise RecoveryError("candidate snapshot hash mismatch")
+                manifest_sources = (
+                    ("current-release.json", candidate.pointer_path, candidate.pointer_sha256),
+                    (
+                        "release-manifest.json",
+                        candidate.release_manifest_path,
+                        candidate.release_manifest_sha256,
+                    ),
+                    (
+                        "task-generation-manifest.json",
+                        candidate.task_manifest_path,
+                        candidate.task_manifest_sha256,
+                    ),
+                )
+                manifest_hashes: dict[str, str] = {}
+                for name, source, expected_hash in manifest_sources:
+                    if source is None:
+                        continue
+                    _value, content = _read_bound_json(source, name)
+                    actual_hash = _sha256_bytes(content)
+                    if actual_hash != expected_hash:
+                        raise PolicyViolation(
+                            f"candidate {name} changed before snapshot"
+                        )
+                    (temporary_root / name).write_bytes(content)
+                    manifest_hashes[name] = actual_hash
+                atomic_write_json(
+                    temporary_root / "snapshot-record.json",
+                    {
+                        "workbook_id": row.workbook_id,
+                        "release_id": candidate.release_id,
+                        "task_generation_id": candidate.task_generation_id,
+                        "bundle_sha256": candidate.bundle_sha256,
+                        "size_bytes": size_bytes,
+                        "manifest_sha256": manifest_hashes,
+                        "snapshotted_at": _timestamp(),
+                    },
+                )
+                staged_size = _safe_tree_size(temporary_root)
+                _check_evidence_capacity(
+                    self.config,
+                    staged_size,
+                    existing_bytes=staged_size,
+                )
+                os.replace(temporary_root, root)
+            except BaseException:
+                if temporary_root.exists():
+                    shutil.rmtree(temporary_root, ignore_errors=True)
+                raise
+        size_bytes = _safe_tree_size(bundle)
         metadata = {
             "workbook_id": row.workbook_id,
             "run_source_sha256": row.run_source_sha256,
@@ -1798,6 +2351,10 @@ class RecoveryWorker:
             "source_sha256": candidate.source_sha256,
             "bundle_sha256": candidate.bundle_sha256,
             "snapshot_path": str(bundle),
+            "size_bytes": size_bytes,
+            "pointer_sha256": candidate.pointer_sha256,
+            "release_manifest_sha256": candidate.release_manifest_sha256,
+            "task_manifest_sha256": candidate.task_manifest_sha256,
             "snapshotted_at": _timestamp(),
         }
         metadata_path = root / "candidate.json"
@@ -1891,12 +2448,20 @@ changed before this lane can safely continue.
                 continue
             if isinstance(event, dict) and isinstance(event.get("result"), str):
                 final_text = event["result"]
-        report = final_text or stream
+        report = final_text.strip()
         if report and not report.endswith("\n"):
             report += "\n"
         atomic_write_text(report_path, report)
+        if timed_out:
+            status = "timed_out"
+        elif process.returncode != 0:
+            status = "nonzero_exit"
+        elif not report.strip():
+            status = "empty_or_malformed"
+        else:
+            status = "completed"
         return {
-            "status": "timed_out" if timed_out else "completed",
+            "status": status,
             "pid": process.pid,
             "return_code": process.returncode,
             "report_sha256": (
@@ -1926,27 +2491,50 @@ changed before this lane can safely continue.
             _canonical_bytes({"category": category, "detail": stable_detail})
         )
         root = self.config.state / "incidents" / row.workbook_id / fingerprint
-        result_path = root / "result.json"
-        report_path = root / "report.md"
-        if result_path.is_file() and not result_path.is_symlink():
+        completed_path = root / "completed.json"
+        if completed_path.is_file() and not completed_path.is_symlink():
             worker_fix_needed = False
+            report_path = Path()
             try:
-                prior = json.loads(result_path.read_text(encoding="utf-8"))
+                prior = json.loads(completed_path.read_text(encoding="utf-8"))
+                report_path = Path(str(prior.get("report_path", "")))
+                launch = prior.get("launch")
                 worker_fix_needed = bool(
                     isinstance(prior, dict)
                     and prior.get("worker_fix_needed") is True
                 )
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                pass
-            return {
-                "category": category,
-                "fingerprint": fingerprint,
-                "result_path": str(result_path),
-                "report_path": str(report_path),
-                "worker_fix_needed": worker_fix_needed,
-                "deduplicated": True,
-            }
+                valid_completed = bool(
+                    isinstance(launch, dict)
+                    and launch.get("status") == "completed"
+                    and type(launch.get("return_code")) is int
+                    and launch.get("return_code") == 0
+                    and report_path.is_file()
+                    and not report_path.is_symlink()
+                    and report_path.read_text(encoding="utf-8").strip()
+                )
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                AttributeError,
+                TypeError,
+            ):
+                valid_completed = False
+            if valid_completed:
+                return {
+                    "category": category,
+                    "fingerprint": fingerprint,
+                    "result_path": str(completed_path),
+                    "report_path": str(report_path),
+                    "worker_fix_needed": worker_fix_needed,
+                    "completed": True,
+                    "deduplicated": True,
+                }
         root.mkdir(parents=True, exist_ok=True)
+        attempt_root = root / "attempts" / str(time.time_ns())
+        attempt_root.mkdir(parents=True)
+        result_path = attempt_root / "result.json"
+        report_path = attempt_root / "report.md"
         prompt = self._incident_prompt(row, category, detail, report_path)
         command = [
             str(self.config.agent_binary),
@@ -1980,7 +2568,13 @@ changed before this lane can safely continue.
                 report = report_path.read_text(encoding="utf-8")
             except OSError:
                 report = ""
-        worker_fix_needed = incident_worker_fix_needed(report)
+        completed = bool(
+            launch.get("status") == "completed"
+            and type(launch.get("return_code")) is int
+            and launch.get("return_code") == 0
+            and report.strip()
+        )
+        worker_fix_needed = completed and incident_worker_fix_needed(report)
         result = {
             "schema_version": INCIDENT_SCHEMA,
             "workbook_id": row.workbook_id,
@@ -1991,19 +2585,24 @@ changed before this lane can safely continue.
             "launched_at": _timestamp(),
             "launch": launch,
             "worker_fix_needed": worker_fix_needed,
+            "completed": completed,
         }
         atomic_write_json(result_path, result)
+        if completed:
+            atomic_write_json(completed_path, result)
         reference = {
             "category": category,
             "fingerprint": fingerprint,
-            "result_path": str(result_path),
+            "result_path": str(completed_path if completed else result_path),
             "report_path": str(report_path),
             "worker_fix_needed": worker_fix_needed,
+            "completed": completed,
+            "retryable": not completed,
             "deduplicated": False,
         }
         checkpoint = self._load_checkpoint(row)
         reports = list(checkpoint.get("incident_reports", []))
-        if not any(
+        if completed and not any(
             isinstance(item, dict) and item.get("fingerprint") == fingerprint
             for item in reports
         ):
@@ -2310,32 +2909,18 @@ The separate incident investigator is read-only and is not a generation lane.
             ) from error
         data = _parse_inspect_output(result.stdout, result.stderr, result.returncode)
         _assert_inspect_candidate(row, repo, data)
-        task_dir = Path(str(data["task_dir"]))
-        if not task_dir.is_dir():
-            raise RecoveryError("inspect returned a missing task directory")
-        return ReleaseCandidate(
-            release_id=str(data["release_id"]),
-            release_dir=Path(str(data["release_dir"])),
-            task_dir=task_dir,
-            task_generation_id=str(data["task_generation_id"]),
-            source_sha256=row.run_source_sha256,
-            bundle_sha256=tree_sha256(task_dir),
-        )
+        return _independent_release_candidate(row, repo, data)
 
     def _attempt_final(self, result: Mapping[str, object]) -> str:
         path = Path(str(result.get("attempt_path", ""))) / "final.txt"
         return path.read_text(encoding="utf-8") if path.is_file() else ""
 
     def _read_fairness_report(
-        self, row: QueueRow, verification_result: Mapping[str, object]
+        self,
+        verification_result: Mapping[str, object],
+        report_path: Path,
     ) -> str:
         stdout_text = self._attempt_final(verification_result)
-        report_path = (
-            self.config.state
-            / "verification-inputs"
-            / row.workbook_id
-            / "fairness-report.md"
-        )
         file_text = ""
         if report_path.is_file() and not report_path.is_symlink():
             try:
@@ -2414,13 +2999,8 @@ every check succeeds without uncertainty.
         record: ReadyRecord,
         candidate: ReleaseCandidate,
         vm_diff: Path,
+        report_path: Path,
     ) -> dict[str, object]:
-        report_path = (
-            self.config.state
-            / "verification-inputs"
-            / row.workbook_id
-            / "fairness-report.md"
-        )
         command = [
             str(self.config.agent_binary),
             "-p",
@@ -2476,8 +3056,28 @@ every check succeeds without uncertainty.
                 verifier_protected,
                 "protected files before verifier",
             )
-            verification_result = self._run_verifier(
-                row, record, candidate, vm_diff
+            report_path = (
+                self.config.state
+                / "verification-inputs"
+                / row.workbook_id
+                / candidate.bundle_sha256
+                / f"fairness-{time.time_ns()}.md"
+            )
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            if report_path.exists() or report_path.is_symlink():
+                raise RecoveryError("fresh fairness report path already exists")
+            verification_result = dict(
+                self._run_verifier(
+                    row,
+                    record,
+                    candidate,
+                    vm_diff,
+                    report_path,
+                )
+            )
+            verification_result["fairness_report_path"] = str(report_path)
+            verification_result["candidate_bundle_sha256"] = (
+                candidate.bundle_sha256
             )
             after_tree = repo_snapshot(
                 repo,
@@ -2493,7 +3093,7 @@ every check succeeds without uncertainty.
                 "protected files during read-only verifier",
             )
             verification_report = self._read_fairness_report(
-                row, verification_result
+                verification_result, report_path
             )
             if not fairness_passed(verification_report):
                 raise FairnessRetry(verification_report, verification_result)
@@ -2509,6 +3109,7 @@ every check succeeds without uncertainty.
                         verification_report.encode("utf-8")
                     ),
                     "attempt": verification_result,
+                    "report_path": str(report_path),
                 },
             )
         else:
@@ -2571,8 +3172,10 @@ every check succeeds without uncertainty.
         finally:
             if not delivered and not unsafe:
                 try:
-                    _preserve_failed_release(self.config.state, row, worktree)
-                except OSError as error:
+                    _preserve_failed_release(
+                        self.config.state, row, worktree, self.config
+                    )
+                except (OSError, RecoveryError) as error:
                     _write_task_evidence(
                         self.config.state,
                         row,
@@ -2627,6 +3230,24 @@ every check succeeds without uncertainty.
         code_before = _code_state(worktree, self.baseline, row.workbook_id)
         checkpoint = self._load_checkpoint(row)
         cumulative_attempts = int(checkpoint.get("cumulative_attempt_count", 0))
+        interrupted = checkpoint.get("attempt_in_progress")
+        if isinstance(interrupted, dict):
+            interrupted_attempts = list(
+                checkpoint.get("interrupted_attempts", [])
+            )
+            interrupted_attempts.append(
+                {
+                    **interrupted,
+                    "reconciled_at": _timestamp(),
+                    "retained_worktree": str(worktree),
+                }
+            )
+            checkpoint = self._save_checkpoint(
+                row,
+                worktree,
+                attempt_in_progress=None,
+                interrupted_attempts=interrupted_attempts,
+            )
         durable_last = checkpoint.get("last_attempt")
         last_result = (
             dict(durable_last) if isinstance(durable_last, dict) else None
@@ -2640,10 +3261,30 @@ every check succeeds without uncertainty.
             cumulative_attempts,
             cumulative_attempts + self.config.attempt_count,
         ):
+            cumulative_attempts = attempt_index + 1
+            self._save_checkpoint(
+                row,
+                worktree,
+                cumulative_attempt_count=cumulative_attempts,
+                attempt_in_progress={
+                    "attempt_index": attempt_index,
+                    "attempt_number": cumulative_attempts,
+                    "strategy": self._ladder_step(attempt_index),
+                    "started_at": _timestamp(),
+                },
+                strategy=self._ladder_step(attempt_index),
+            )
             last_result = self._run_generation(
                 row, record, inventory, last_result, attempt_index
             )
-            cumulative_attempts = attempt_index + 1
+            self._save_checkpoint(
+                row,
+                worktree,
+                cumulative_attempt_count=cumulative_attempts,
+                attempt_in_progress=None,
+                last_attempt=last_result,
+                strategy=self._ladder_step(attempt_index),
+            )
             final_text = self._attempt_final(last_result)
             if HARD_LINE.search(final_text):
                 saw_hard = True
@@ -2926,26 +3567,13 @@ every check succeeds without uncertainty.
 
     def run(self) -> dict[str, object]:
         config = self.config
+        _validate_root_layout(config)
         if not config.baseline_repo.is_dir() or not config.agent_binary.is_file():
             raise RecoveryError(
                 "RECOVERY_BASELINE_REPO or agent binary is unavailable"
             )
         if not config.model:
             raise RecoveryError("MODEL cannot be empty")
-        if (
-            config.baseline_repo.resolve(strict=False).is_relative_to(
-                config.state.resolve(strict=False)
-            )
-            or config.baseline_repo.resolve(strict=False).is_relative_to(
-                config.output.resolve(strict=False)
-            )
-            or config.state.resolve(strict=False)
-            == config.output.resolve(strict=False)
-        ):
-            raise RecoveryError(
-                "state/output roots must not contain the baseline repo "
-                "and must be distinct"
-            )
         config.state.mkdir(parents=True, exist_ok=True)
         config.work_root.mkdir(parents=True, exist_ok=True)
         lock_path = config.state / "worker.lock"
@@ -3093,9 +3721,12 @@ every check succeeds without uncertainty.
                     if self.active_worktree is not None:
                         try:
                             _preserve_failed_release(
-                                config.state, row, self.active_worktree
+                                config.state,
+                                row,
+                                self.active_worktree,
+                                config,
                             )
-                        except OSError:
+                        except (OSError, RecoveryError):
                             pass
                         self.active_worktree = None
                     incident = self._launch_incident(
@@ -3138,8 +3769,6 @@ every check succeeds without uncertainty.
                 )
                 if str(result["status"]) != "generated":
                     break
-            if config.queue.read_bytes() != original_queue:
-                raise RecoveryError("recovery worker must not rewrite the queue file")
             ledger = _recovery_ledger(
                 [row.workbook_id for row in rows],
                 [
@@ -3150,6 +3779,68 @@ every check succeeds without uncertainty.
             atomic_write_json(config.state / "recovery-ledger.json", ledger)
             self.current = None
             self._write_summary()
+            queue_read_error: str | None = None
+            try:
+                current_queue = config.queue.read_bytes()
+            except OSError as error:
+                current_queue = None
+                queue_read_error = repr(error)
+            if current_queue != original_queue:
+                integrity = {
+                    "schema_version": "recovery-queue-integrity/v1",
+                    "queue_path": str(config.queue),
+                    "original_sha256": _sha256_bytes(original_queue),
+                    "current_sha256": (
+                        _sha256_bytes(current_queue)
+                        if current_queue is not None
+                        else None
+                    ),
+                    "current_read_error": queue_read_error,
+                    "expected_count": len(rows),
+                    "original_rows": [
+                        {
+                            **asdict(row),
+                            "run_source_path": str(row.run_source_path),
+                        }
+                        for row in rows
+                    ],
+                    "ledger_path": str(
+                        config.state / "recovery-ledger.json"
+                    ),
+                    "detected_at": _timestamp(),
+                }
+                integrity_path = (
+                    config.state / "queue-integrity" / "original-queue-ledger.json"
+                )
+                atomic_write_json(integrity_path, integrity)
+                current_id = (
+                    str(results[-1]["workbook_id"]) if results else None
+                )
+                evidence_row = next(
+                    (
+                        row
+                        for row in rows
+                        if row.workbook_id == current_id
+                    ),
+                    rows[0] if rows else None,
+                )
+                if evidence_row is not None:
+                    _write_task_evidence(
+                        config.state,
+                        evidence_row,
+                        error="recovery queue changed during worker run",
+                        extra={
+                            "queue_integrity_failure": True,
+                            "queue_integrity_path": str(integrity_path),
+                            "expected_count": len(rows),
+                            "recovery_ledger_path": str(
+                                config.state / "recovery-ledger.json"
+                            ),
+                        },
+                    )
+                raise RecoveryError(
+                    "recovery worker must not rewrite the queue file"
+                )
             return ledger
         finally:
             try:

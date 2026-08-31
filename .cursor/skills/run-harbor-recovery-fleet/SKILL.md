@@ -73,8 +73,10 @@ The worker must stop on the first unfinished row. For each new fingerprint:
    - record every generation-agent PID and process group before the pause;
      workers launch agents in new sessions, so stopping tmux alone may leave
      detached agents alive;
-   - terminate only those recorded generation process groups, then verify
-     that no generation agent remains before deployment;
+   - after tmux has stopped, scan the process table again. Include any helper
+     generation agents spawned between the first snapshot and the pause;
+   - terminate every recorded or newly discovered recovery generation process
+     group. Rescan until zero remain before deployment;
    - reproduce and fix it in local FCP2 first;
    - add a recurrence test and run the full focused suite;
    - deploy the exact tested files to all VMs;
@@ -115,6 +117,6 @@ its state, restart only that lane, and continue the same row.
 ## Stop
 
 On a stop request, terminate the reporting loop and record active generation
-PIDs. Stop the six tmux sessions, preserve state, terminate any recorded
-detached generation process groups, verify no generation agents remain, then
-stop the three VMs.
+PIDs. Stop the six tmux sessions and preserve state. Rescan for helper agents
+spawned during shutdown, terminate every recovery generation process group,
+and require two consecutive zero-agent scans before stopping the three VMs.

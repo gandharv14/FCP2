@@ -1440,6 +1440,30 @@ def test_restart_reuses_worktree_and_cumulative_ladder(
     )
 
 
+def test_worker_prompts_enforce_two_generation_lanes(tmp_path: Path) -> None:
+    config, rows, _ = _config(tmp_path)
+    worker = RecoveryWorker(config)
+    row = rows[0]
+
+    generation_prompt = worker._generation_prompt(
+        row,
+        row.run_source_path,
+        config.inventory,
+        None,
+        0,
+    )
+    incident_prompt = worker._incident_prompt(
+        row,
+        "test",
+        {"error": "example"},
+        config.state / "incident.md",
+    )
+
+    assert "exactly 2 generation lanes" in " ".join(generation_prompt.split())
+    assert "exactly 2 generation lanes" in " ".join(incident_prompt.split())
+    assert "exactly 3 generation lanes" not in generation_prompt
+
+
 def test_mismatched_checkpoint_quarantines_tree_and_starts_fresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

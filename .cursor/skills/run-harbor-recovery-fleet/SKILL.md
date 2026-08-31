@@ -1,6 +1,6 @@
 ---
 name: run-harbor-recovery-fleet
-description: Deploys local FCP2 to the three Harbor recovery VMs, launches exactly two recovery agents per VM, investigates every failure or skip, and reports task-level progress every 20 minutes. Use when starting, resuming, or monitoring the Harbor workbook recovery fleet.
+description: Deploys one starting FCP2 baseline to three Harbor recovery VMs, launches exactly two isolated recovery agents per VM, keeps subsequent fixes local to each task or lane, investigates every failure or skip, and reports task-level progress every 20 minutes. Use when starting, resuming, or monitoring the Harbor workbook recovery fleet.
 ---
 
 # Run Harbor recovery fleet
@@ -56,6 +56,27 @@ Do not reset or delete prior lane state. Adopt a retained worktree only when its
 checkpoint, source hash, baseline hash, and marker all match. Otherwise
 quarantine it and keep the row active.
 
+## Isolation contract
+
+The initial clean deployment is the only automatic fleet-wide broadcast.
+After launch:
+
+- Every task and pipeline fix stays inside that workbook's retained worktree.
+- Never copy a worktree edit into another worktree, lane, VM, or the shared
+  startup baseline.
+- Never pause healthy sibling lanes for a task-local or pipeline failure.
+- Test only the active workbook and its failed gate. Do not regression-test a
+  task-local fix against other workbooks.
+- A repeated fingerprint on another lane is a separate incident. Diagnose and
+  fix it in that lane's worktree instead of distributing the earlier patch.
+- A controller-only worker defect may use a lane-local worker overlay copied
+  from the immutable startup baseline. Keep `RECOVERY_BASELINE_REPO` and
+  `RECOVERY_CODE_BASELINE` bound to the unchanged startup baseline, launch the
+  worker module from the overlay, and restart only that lane.
+- Never automatically promote an isolated fix into local FCP2 or redeploy it
+  fleet-wide. Promotion and fleet redeployment require an explicit user
+  request after the task has been delivered and its evidence preserved.
+
 ## Failure loop
 
 The worker must stop on the first unfinished row. For each new fingerprint:
@@ -63,27 +84,25 @@ The worker must stop on the first unfinished row. For each new fingerprint:
 1. Preserve the release, candidate, logs, checkpoint, code diff, and exact
    error.
 2. Launch a fresh read-only incident investigator.
-3. Decide whether the cause is task-local or shared.
-4. For a task-local cause, keep fixes inside that workbook's retained
-   worktree, rerun the failed gate, inspect again, and require fairness when
-   code or assumptions changed.
-5. For a shared worker or pipeline defect:
+3. Decide whether the defect is in task/pipeline code or in the controller
+   worker itself. This classification controls only where the isolated fix is
+   applied; it never authorizes broadcasting.
+4. For a task or pipeline cause, keep fixes inside that workbook's retained
+   worktree, rerun only its failed gate, inspect again, and require fairness
+   when code or assumptions changed.
+5. For a controller worker defect:
    - mark the row `worker_fix_needed`;
-   - pause all six tmux sessions before replacing the shared baseline;
-   - record every generation-agent PID and process group before the pause;
-     workers launch agents in new sessions, so stopping tmux alone may leave
-     detached agents alive;
-   - after tmux has stopped, scan the process table again. Include any helper
-     generation agents spawned between the first snapshot and the pause;
-   - terminate every recorded or newly discovered recovery generation process
-     group. Rescan until zero remain before deployment;
-   - reproduce and fix it in local FCP2 first;
-   - add a recurrence test and run the full focused suite;
-   - deploy the exact tested files to all VMs;
-   - verify hashes, then resume the same row;
-   - after relaunch, count processes directly and require exactly two current
-     generation agents on each VM. Remove any stale pre-deployment process
-     group before allowing the fleet to continue.
+   - pause only that lane and record its generation-agent process group;
+   - terminate and rescan only that lane's detached generation processes;
+   - create a fresh lane-local worker overlay from the immutable startup
+     baseline and apply the smallest controller fix there;
+   - add a recurrence test in the overlay and run the focused worker suite;
+   - keep the task worktree, checkpoint, source binding, startup baseline, and
+     code-baseline manifest unchanged;
+   - launch that lane's worker from the overlay while retaining the original
+     `RECOVERY_BASELINE_REPO` and `RECOVERY_CODE_BASELINE`;
+   - verify exactly one generation agent for the restarted lane and leave the
+     other five lanes untouched.
 6. Never advance because an agent exited, printed `HARD`, skipped a gate, or
    produced only a partial task.
 

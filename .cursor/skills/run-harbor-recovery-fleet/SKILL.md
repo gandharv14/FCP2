@@ -69,10 +69,19 @@ The worker must stop on the first unfinished row. For each new fingerprint:
    code or assumptions changed.
 5. For a shared worker or pipeline defect:
    - mark the row `worker_fix_needed`;
+   - pause all six tmux sessions before replacing the shared baseline;
+   - record every generation-agent PID and process group before the pause;
+     workers launch agents in new sessions, so stopping tmux alone may leave
+     detached agents alive;
+   - terminate only those recorded generation process groups, then verify
+     that no generation agent remains before deployment;
    - reproduce and fix it in local FCP2 first;
    - add a recurrence test and run the full focused suite;
    - deploy the exact tested files to all VMs;
-   - verify hashes, then resume the same row.
+   - verify hashes, then resume the same row;
+   - after relaunch, count processes directly and require exactly two current
+     generation agents on each VM. Remove any stale pre-deployment process
+     group before allowing the fleet to continue.
 6. Never advance because an agent exited, printed `HARD`, skipped a gate, or
    produced only a partial task.
 
@@ -105,5 +114,7 @@ its state, restart only that lane, and continue the same row.
 
 ## Stop
 
-On a stop request, terminate the reporting loop, stop the six tmux sessions,
-preserve state, verify no generation agents remain, then stop the three VMs.
+On a stop request, terminate the reporting loop and record active generation
+PIDs. Stop the six tmux sessions, preserve state, terminate any recorded
+detached generation process groups, verify no generation agents remain, then
+stop the three VMs.

@@ -13,10 +13,12 @@ from openpyxl import Workbook
 import gen_normalizer
 import xl_release_publication as release
 import xl_output_task
+import xl_inventory_approval
 import xl_source_publication as source_publication
 import xl_source_recalc as source_recalc
 from xl_source_health import inspect_workbook
 from xl_source_inventory import build_inventory_manifest
+from xl_inventory_approval import approval_claims, object_hash
 from xl_source_recalc import create_identity_documents
 from xl_seg import diagnostics as segmentation_diagnostics
 from xl_seg import model as segmentation_model
@@ -34,6 +36,8 @@ H = {
         "events": "5",
         "profile": "6",
         "cone": "7",
+        "approval": "8",
+        "signals": "9",
     }.items()
 }
 
@@ -157,6 +161,13 @@ def _fixture(
             "restriction_events_sha256": H["events"],
             "restriction_profile_sha256": H["profile"],
         })
+        if release.SOURCE_POLICY_VERSION != (
+            release.PREVIOUS_SOURCE_POLICY_VERSION
+        ):
+            source_bindings.update({
+                "inventory_approval_sha256": H["approval"],
+                "recalc_signals_sha256": H["signals"],
+            })
     source_manifest = {
         "schema_version": release.SOURCE_SCHEMA_VERSION,
         "generation_id": source_id,
@@ -203,6 +214,13 @@ def _fixture(
             "restriction_profile_sha256": H["profile"],
             "cone_certificate_sha256": H["cone"],
         })
+        if release.SOURCE_POLICY_VERSION != (
+            release.PREVIOUS_SOURCE_POLICY_VERSION
+        ):
+            policy.update({
+                "inventory_approval_sha256": H["approval"],
+                "recalc_signals_sha256": H["signals"],
+            })
         (segmentation_dir / "restriction-cone-certificate.json").write_text(
             json.dumps({
                 "schema_version": release.CONE_SCHEMA_VERSION,
@@ -247,6 +265,20 @@ def _fixture(
         ),
         "restriction_events_sha256": H["events"] if restricted else None,
         "restriction_profile_sha256": H["profile"] if restricted else None,
+        "inventory_approval_sha256": (
+            H["approval"]
+            if restricted
+            and release.SOURCE_POLICY_VERSION
+            != release.PREVIOUS_SOURCE_POLICY_VERSION
+            else None
+        ),
+        "recalc_signals_sha256": (
+            H["signals"]
+            if restricted
+            and release.SOURCE_POLICY_VERSION
+            != release.PREVIOUS_SOURCE_POLICY_VERSION
+            else None
+        ),
         "segmentation_generation_id": segmentation_id,
         "segmentation_manifest_sha256": release._sha256(
             segmentation_dir / "generation-manifest.json"
@@ -305,6 +337,87 @@ def test_full_binding_preservation_and_first_cas(tmp_path, monkeypatch):
     assert manifest["bindings"]["cone_certificate_sha256"] == H["cone"]
 
 
+def test_previous_v2_source_policy_release_remains_valid(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        release, "SOURCE_POLICY_VERSION", release.PREVIOUS_SOURCE_POLICY_VERSION
+    )
+    monkeypatch.setattr(
+        release,
+        "SOURCE_HEALTH_SCHEMA_VERSION",
+        release.PREVIOUS_SOURCE_HEALTH_SCHEMA_VERSION,
+    )
+    case = _fixture(tmp_path, monkeypatch)
+    manifest = release.build_release_manifest(
+        case["workbook"],
+        source_root=case["source_root"],
+        source_generation_id=case["source_id"],
+        segmentation_root=case["segmentation_root"],
+        segmentation_generation_id=case["segmentation_id"],
+        task_root=case["release_root"],
+        task_generation_id=case["task_id"],
+        prior_release_id=None,
+        legacy_snapshot_hash=case["legacy_snapshot_hash"],
+        source_policy_version=release.PREVIOUS_SOURCE_POLICY_VERSION,
+        source_health_schema_version=release.PREVIOUS_SOURCE_HEALTH_SCHEMA_VERSION,
+    )
+    directory = (
+        case["release_root"] / "releases" / manifest["release_id"]
+    )
+    directory.mkdir(parents=True)
+    (directory / "release-manifest.json").write_bytes(
+        release._canonical_bytes(manifest)
+    )
+    monkeypatch.setattr(release, "SOURCE_POLICY_VERSION", "source-recalc-policy/v3")
+    monkeypatch.setattr(
+        release, "SOURCE_HEALTH_SCHEMA_VERSION", "xlsx-source-health/v3"
+    )
+
+    validated = release.validate_release(
+        directory,
+        source_root=case["source_root"],
+        segmentation_root=case["segmentation_root"],
+        task_root=case["release_root"],
+    )
+
+    assert validated == manifest
+    assert manifest["versions"]["source_policy_version"] == (
+        release.PREVIOUS_SOURCE_POLICY_VERSION
+    )
+
+
+def test_current_restricted_release_requires_approval_and_signal_bindings(
+    tmp_path,
+    monkeypatch,
+):
+    case = _fixture(tmp_path, monkeypatch)
+    source_manifest_path = (
+        case["source_root"]
+        / "generations"
+        / case["source_id"]
+        / "generation-manifest.json"
+    )
+    source_manifest = json.loads(source_manifest_path.read_text())
+    source_manifest["bindings"].pop("inventory_approval_sha256")
+    source_manifest["bindings"].pop("recalc_signals_sha256")
+    source_manifest_path.write_text(json.dumps(source_manifest) + "\n")
+    monkeypatch.setattr(
+        "xl_source_publication.resolve_source_generation_by_id",
+        lambda _root, _generation_id: (
+            source_manifest_path.parent,
+            source_manifest,
+        ),
+    )
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="current restricted source bindings are incomplete",
+    ):
+        _publish(case)
+
+
 def test_first_cas_without_validated_legacy_snapshot_is_rejected(
     tmp_path, monkeypatch
 ):
@@ -317,6 +430,77 @@ def test_first_cas_without_validated_legacy_snapshot_is_rejected(
         _publish(case, legacy_snapshot_hash=None)
 
     assert not (case["release_root"] / "current-release.json").exists()
+
+
+def test_first_cas_accepts_hash_bound_absent_legacy_snapshot(
+    tmp_path, monkeypatch
+):
+    case = _fixture(tmp_path, monkeypatch, freeze_legacy=False)
+    _, snapshot = release.freeze_absent_legacy_snapshot(
+        case["release_root"],
+        case["workbook"],
+        source_root=case["source_root"],
+        segmentation_root=case["segmentation_root"],
+    )
+
+    directory, manifest = _publish(
+        case,
+        legacy_snapshot_hash=snapshot["snapshot_hash"],
+    )
+
+    assert directory.is_dir()
+    assert manifest["legacy_snapshot_hash"] == snapshot["snapshot_hash"]
+    assert (case["release_root"] / "current-release.json").is_file()
+
+
+def test_absent_legacy_snapshot_rejects_appearing_or_wrong_legacy_state(
+    tmp_path, monkeypatch
+):
+    case = _fixture(tmp_path, monkeypatch, freeze_legacy=False)
+    _, snapshot = release.freeze_absent_legacy_snapshot(
+        case["release_root"],
+        case["workbook"],
+        source_root=case["source_root"],
+        segmentation_root=case["segmentation_root"],
+    )
+    source_pointer = case["source_root"] / "current.json"
+    source_pointer.write_text(
+        '{"schema_version":"source-current/v1"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="legacy state appeared",
+    ):
+        _publish(
+            case,
+            legacy_snapshot_hash=snapshot["snapshot_hash"],
+        )
+
+    assert not (case["release_root"] / "current-release.json").exists()
+
+
+def test_absent_legacy_snapshot_rejects_partial_legacy_tuple(
+    tmp_path, monkeypatch
+):
+    case = _fixture(tmp_path, monkeypatch, freeze_legacy=False)
+    source_pointer = case["source_root"] / "current.json"
+    source_pointer.write_text(
+        '{"schema_version":"source-current/v1"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        release.ReleasePublicationError,
+        match="both legacy pointers absent",
+    ):
+        release.freeze_absent_legacy_snapshot(
+            case["release_root"],
+            case["workbook"],
+            source_root=case["source_root"],
+            segmentation_root=case["segmentation_root"],
+        )
 
 
 def test_end_to_end_release_uses_real_source_and_segmentation_resolvers(tmp_path):
@@ -510,15 +694,22 @@ def test_end_to_end_restricted_release_uses_real_validators_and_resolvers(
         cohort_root,
         workbook_ids=cohort_ids,
     )
-    frozen_inventory = tmp_path / "synthetic-restricted-inventory.json"
-    frozen_inventory.write_text(
-        json.dumps(inventory, sort_keys=True),
-        encoding="utf-8",
-    )
+    batch_id = "synthetic-restricted-batch"
+    approval = approval_claims(inventory, batch_id=batch_id)
+    registry_core = {
+        "schema_version": "source-inventory-approval-registry/v1",
+        "approvals": [approval],
+    }
+    registry = {
+        **registry_core,
+        "registry_sha256": object_hash(registry_core),
+    }
+    registry_path = tmp_path / "approved-source-inventories.json"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
     monkeypatch.setattr(
-        source_recalc,
-        "RESTRICTED_SOURCE_COHORT_MANIFEST",
-        frozen_inventory,
+        xl_inventory_approval,
+        "DEFAULT_REGISTRY",
+        registry_path,
     )
 
     health = inspect_workbook(source)
@@ -539,6 +730,7 @@ def test_end_to_end_restricted_release_uses_real_validators_and_resolvers(
         source_root,
         health=health,
         inventory=inventory,
+        inventory_batch_id=batch_id,
     )
     source_path = source_dir / source_manifest["layout"]["source_workbook"]
     ast_dir = source_dir / source_manifest["layout"]["ast_directory"]
@@ -689,6 +881,12 @@ def test_end_to_end_restricted_release_uses_real_validators_and_resolvers(
         ],
         "restriction_profile_sha256": source_bindings[
             "restriction_profile_sha256"
+        ],
+        "inventory_approval_sha256": source_bindings[
+            "inventory_approval_sha256"
+        ],
+        "recalc_signals_sha256": source_bindings[
+            "recalc_signals_sha256"
         ],
         "segmentation_generation_id": segmentation_manifest["generation_id"],
         "segmentation_manifest_sha256": release._sha256(

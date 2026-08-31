@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import posixpath
+import pwd
 import re
 import shutil
 import signal
@@ -28,6 +29,7 @@ from xml.etree import ElementTree
 from xl_source_health import (
     POLICY_VERSION,
     RESTRICTION_PROFILE,
+    SCHEMA_VERSION as HEALTH_SCHEMA_VERSION,
     _open_regular_nofollow,
     atomic_write_report,
     inspect_workbook,
@@ -42,12 +44,30 @@ RESULT_SCHEMA_VERSION = "source-recalc-result/v2"
 SNAPSHOT_SCHEMA_VERSION = "xlsx-semantic-snapshot/v1"
 RESTRICTION_REQUEST_SCHEMA_VERSION = "source-restriction-request/v2"
 RESTRICTION_RESULT_SCHEMA_VERSION = "source-restriction-result/v2"
+# Compatibility aliases for readers of historical v2 evidence. New
+# restriction decisions are authorized by the approval registry instead.
 RESTRICTED_SOURCE_COHORT_MANIFEST = (
     Path(__file__).resolve().parent
     / "verification_manifests"
     / "restricted_source_cohort_123.v2.json"
 )
 RESTRICTED_SOURCE_COHORT_SIZE = 123
+NETWORK_SANDBOX_PROFILE = (
+    "(version 1)\n"
+    "(allow default)\n"
+    "(deny network*)\n"
+)
+NETWORK_SANDBOX_PROFILE_SHA256 = hashlib.sha256(
+    NETWORK_SANDBOX_PROFILE.encode("utf-8")
+).hexdigest()
+PF_NETWORK_RULES = (
+    "pass quick on lo0 all\n"
+    "block drop in quick all\n"
+    "block drop out quick all\n"
+)
+PF_NETWORK_RULES_SHA256 = hashlib.sha256(
+    PF_NETWORK_RULES.encode("utf-8")
+).hexdigest()
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 OFFICE_REL_NS = (
@@ -103,6 +123,113 @@ def _trusted_public_key(
     return key
 
 
+_ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+_ED25519_Q = 2**255 - 19
+_ED25519_L = 2**252 + 27742317777372353535851937790883648493
+_ED25519_D = (-121665 * pow(121666, _ED25519_Q - 2, _ED25519_Q)) % _ED25519_Q
+_ED25519_I = pow(2, (_ED25519_Q - 1) // 4, _ED25519_Q)
+
+
+def _ed25519_public_bytes(path: Path) -> bytes | None:
+    """Return raw Ed25519 SPKI bytes, or None for another key type."""
+    try:
+        text = path.read_text(encoding="ascii")
+        encoded = "".join(
+            line.strip()
+            for line in text.splitlines()
+            if line and not line.startswith("-----")
+        )
+        der = base64.b64decode(encoded, validate=True)
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if len(der) != len(_ED25519_SPKI_PREFIX) + 32:
+        return None
+    if not der.startswith(_ED25519_SPKI_PREFIX):
+        return None
+    return der[len(_ED25519_SPKI_PREFIX):]
+
+
+def _ed25519_xrecover(y: int) -> int:
+    xx = (y * y - 1) * pow(_ED25519_D * y * y + 1, _ED25519_Q - 2, _ED25519_Q)
+    x = pow(xx, (_ED25519_Q + 3) // 8, _ED25519_Q)
+    if (x * x - xx) % _ED25519_Q:
+        x = (x * _ED25519_I) % _ED25519_Q
+    if x & 1:
+        x = _ED25519_Q - x
+    return x
+
+
+def _ed25519_add(
+    first: tuple[int, int],
+    second: tuple[int, int],
+) -> tuple[int, int]:
+    x1, y1 = first
+    x2, y2 = second
+    product = _ED25519_D * x1 * x2 * y1 * y2
+    x3 = (x1 * y2 + x2 * y1) * pow(1 + product, _ED25519_Q - 2, _ED25519_Q)
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - product, _ED25519_Q - 2, _ED25519_Q)
+    return x3 % _ED25519_Q, y3 % _ED25519_Q
+
+
+def _ed25519_scalarmult(point: tuple[int, int], scalar: int) -> tuple[int, int]:
+    result = (0, 1)
+    addend = point
+    while scalar:
+        if scalar & 1:
+            result = _ed25519_add(result, addend)
+        addend = _ed25519_add(addend, addend)
+        scalar >>= 1
+    return result
+
+
+def _ed25519_decodepoint(encoded: bytes) -> tuple[int, int]:
+    if len(encoded) != 32:
+        raise ValueError("invalid point length")
+    y = int.from_bytes(encoded, "little") & ((1 << 255) - 1)
+    if y >= _ED25519_Q:
+        raise ValueError("non-canonical point")
+    x = _ed25519_xrecover(y)
+    if (x & 1) != (encoded[31] >> 7):
+        x = _ED25519_Q - x
+    if (
+        (-x * x + y * y - 1 - _ED25519_D * x * x * y * y)
+        % _ED25519_Q
+    ):
+        raise ValueError("point is not on Ed25519")
+    point = (x, y)
+    if _ed25519_scalarmult(point, _ED25519_L) != (0, 1):
+        raise ValueError("point is not in the prime-order subgroup")
+    return point
+
+
+def _verify_ed25519(
+    public_key: bytes,
+    signature: bytes,
+    message: bytes,
+) -> bool:
+    """Verify RFC 8032 Ed25519 without a mutable third-party dependency."""
+    if len(signature) != 64:
+        return False
+    try:
+        public_point = _ed25519_decodepoint(public_key)
+        r_point = _ed25519_decodepoint(signature[:32])
+    except ValueError:
+        return False
+    scalar = int.from_bytes(signature[32:], "little")
+    if scalar >= _ED25519_L:
+        return False
+    base_y = 4 * pow(5, _ED25519_Q - 2, _ED25519_Q) % _ED25519_Q
+    base_point = (_ed25519_xrecover(base_y), base_y)
+    challenge = int.from_bytes(
+        hashlib.sha512(signature[:32] + public_key + message).digest(),
+        "little",
+    ) % _ED25519_L
+    return _ed25519_scalarmult(base_point, scalar) == _ed25519_add(
+        r_point,
+        _ed25519_scalarmult(public_point, challenge),
+    )
+
+
 def verify_signed_runner_receipt(
     receipt: dict,
     trusted_public_key: str | Path,
@@ -111,6 +238,8 @@ def verify_signed_runner_receipt(
     source_sha256: str,
     output_sha256: str,
     require_root_owner: bool = True,
+    request_created_at_ns: int | None = None,
+    request_expires_at_ns: int | None = None,
 ) -> dict:
     """Verify the trusted Excel runner's signature and bound claims."""
     if receipt.get("schema_version") != "excel-runner-receipt/v1":
@@ -126,6 +255,8 @@ def verify_signed_runner_receipt(
         "engine": "excel-macos",
         "calculation_complete": True,
         "isolation_enforced": True,
+        "network_isolation_mechanism": "macos-pf-anchor",
+        "network_isolation_rules_sha256": PF_NETWORK_RULES_SHA256,
     }
     if any(payload.get(key) != value for key, value in required.items()):
         raise RecalculationError("sandbox runner receipt claims do not match")
@@ -135,6 +266,15 @@ def verify_signed_runner_receipt(
         raise RecalculationError("sandbox runner receipt lacks engine version")
     if not isinstance(payload.get("completed_at_ns"), int):
         raise RecalculationError("sandbox runner receipt lacks completion time")
+    completed_at_ns = payload["completed_at_ns"]
+    if (
+        completed_at_ns > time.time_ns() + 60 * 1_000_000_000
+        or request_created_at_ns is not None
+        and completed_at_ns < request_created_at_ns
+        or request_expires_at_ns is not None
+        and completed_at_ns > request_expires_at_ns
+    ):
+        raise RecalculationError("sandbox runner receipt completion time is stale")
     try:
         signature = base64.b64decode(signature_text, validate=True)
     except (ValueError, TypeError) as exc:
@@ -143,27 +283,33 @@ def verify_signed_runner_receipt(
         trusted_public_key,
         require_root_owner=require_root_owner,
     )
-    with tempfile.TemporaryDirectory(prefix="excel-receipt-verify-") as temporary:
-        payload_path = Path(temporary) / "payload.json"
-        signature_path = Path(temporary) / "signature.bin"
-        payload_path.write_bytes(_canonical_bytes(payload))
-        signature_path.write_bytes(signature)
-        verified = subprocess.run(
-            [
-                "/usr/bin/openssl",
-                "dgst",
-                "-sha256",
-                "-verify",
-                str(key),
-                "-signature",
-                str(signature_path),
-                str(payload_path),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    if verified.returncode != 0:
+    message = _canonical_bytes(payload)
+    ed25519_key = _ed25519_public_bytes(key)
+    if ed25519_key is not None:
+        signature_valid = _verify_ed25519(ed25519_key, signature, message)
+    else:
+        with tempfile.TemporaryDirectory(prefix="excel-receipt-verify-") as temporary:
+            payload_path = Path(temporary) / "payload.json"
+            signature_path = Path(temporary) / "signature.bin"
+            payload_path.write_bytes(message)
+            signature_path.write_bytes(signature)
+            verified = subprocess.run(
+                [
+                    "/usr/bin/openssl",
+                    "dgst",
+                    "-sha256",
+                    "-verify",
+                    str(key),
+                    "-signature",
+                    str(signature_path),
+                    str(payload_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        signature_valid = verified.returncode == 0
+    if not signature_valid:
         raise RecalculationError("sandbox runner receipt signature verification failed")
     return payload
 
@@ -834,6 +980,40 @@ class MacOSExcelEngine:
             return False, "isolation_attestation_schema"
         if any(payload.get(key) is not True for key in required):
             return False, "isolation_controls_unconfirmed"
+        automation_user = payload.get("automation_user")
+        try:
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+        except (KeyError, OSError):
+            return False, "automation_user_unavailable"
+        if (
+            not isinstance(automation_user, str)
+            or automation_user != current_user
+        ):
+            return False, "automation_user_mismatch"
+        network_sandbox = Path(
+            str(payload.get("network_sandbox", ""))
+        )
+        if (
+            network_sandbox != Path("/usr/bin/sandbox-exec")
+            or not self._trusted_root_file(
+                network_sandbox,
+                executable=True,
+            )
+            or payload.get("network_sandbox_profile_sha256")
+            != NETWORK_SANDBOX_PROFILE_SHA256
+        ):
+            return False, "network_sandbox_not_trusted"
+        if (
+            payload.get("pf_anchor")
+            != "com.apple/fcp2-excel-runner"
+            or payload.get("pf_rules_sha256")
+            != PF_NETWORK_RULES_SHA256
+            or not self._trusted_root_file(
+                Path("/sbin/pfctl"),
+                executable=True,
+            )
+        ):
+            return False, "pf_isolation_not_trusted"
         if self.sandbox_runner is None:
             return False, "sandbox_runner_required"
         if not self._trusted_root_file(self.sandbox_runner, executable=True):
@@ -857,6 +1037,9 @@ class MacOSExcelEngine:
                 self.isolation_attestation
             ),
             "sandbox_runner_sha256": runner_hash,
+            "network_sandbox_profile_sha256":
+                NETWORK_SANDBOX_PROFILE_SHA256,
+            "pf_rules_sha256": PF_NETWORK_RULES_SHA256,
             "receipt_public_key_sha256": public_key_hash,
             "controls": {key: payload[key] for key in required},
         }
@@ -887,9 +1070,27 @@ class MacOSExcelEngine:
             capture_output=True,
             text=True,
         )
-        if version.returncode != 0 or not version.stdout.strip():
-            return False, "excel_version_unavailable"
-        self.version = version.stdout.strip()
+        observed_version = version.stdout.strip()
+        if (
+            version.returncode != 0
+            or not observed_version
+            or observed_version == "(null)"
+        ):
+            fallback = subprocess.run(
+                [
+                    "/usr/bin/defaults",
+                    "read",
+                    str(self.excel_app / "Contents" / "Info"),
+                    "CFBundleShortVersionString",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            observed_version = fallback.stdout.strip()
+            if fallback.returncode != 0 or not observed_version:
+                return False, "excel_version_unavailable"
+        self.version = observed_version
         return True, "available"
 
     def execute(self, source: Path, destination: Path, request: dict) -> Path:
@@ -956,6 +1157,8 @@ class MacOSExcelEngine:
             request_sha256=request["request_sha256"],
             source_sha256=request["source_sha256"],
             output_sha256=sha256_file(destination),
+            request_created_at_ns=request["created_at_ns"],
+            request_expires_at_ns=request["expires_at_ns"],
         )
         if signed_payload["engine_version"] != self.version:
             raise RecalculationError(
@@ -1189,38 +1392,33 @@ def _validated_restricted_inventory_selection(
     *,
     source_sha256: str,
     workbook_id: str,
+    batch_id: str,
+    inventory_approval_registry: str | Path | None = None,
     expected_cohort_sha256: str | None = None,
-) -> tuple[dict, str, str]:
+) -> tuple[dict, str, str, dict]:
+    from xl_inventory_approval import resolve_inventory_approval
     from xl_source_inventory import validate_inventory_manifest
 
     validate_inventory_manifest(inventory)
-    frozen_inventory = _read_json(RESTRICTED_SOURCE_COHORT_MANIFEST)
-    validate_inventory_manifest(frozen_inventory)
-    frozen_cohort = frozen_inventory.get("cohort")
-    supplied_cohort = inventory.get("cohort")
+    approval = resolve_inventory_approval(
+        inventory,
+        batch_id=batch_id,
+        registry_path=inventory_approval_registry,
+    )
+    cohort = inventory.get("cohort")
     if (
-        not isinstance(frozen_cohort, dict)
-        or frozen_cohort.get("size") != RESTRICTED_SOURCE_COHORT_SIZE
-        or not isinstance(frozen_cohort.get("workbook_ids"), list)
-        or len(frozen_cohort["workbook_ids"]) != RESTRICTED_SOURCE_COHORT_SIZE
+        not isinstance(cohort, dict)
+        or not isinstance(cohort.get("workbook_ids"), list)
+        or cohort.get("size") != len(cohort["workbook_ids"])
     ):
-        raise RecalculationError("frozen restricted cohort contract is invalid")
-    cohort_hash = frozen_cohort.get("cohort_sha256")
+        raise RecalculationError("approved restricted cohort contract is invalid")
+    cohort_hash = cohort.get("cohort_sha256")
     if (
         not isinstance(cohort_hash, str)
         or expected_cohort_sha256 is not None
         and expected_cohort_sha256 != cohort_hash
     ):
         raise RecalculationError("expected restricted cohort hash does not match")
-    if (
-        inventory != frozen_inventory
-        or supplied_cohort != frozen_cohort
-        or inventory.get("inventory_sha256")
-        != frozen_inventory.get("inventory_sha256")
-    ):
-        raise RecalculationError(
-            "restricted evidence requires the exact frozen 123-workbook inventory"
-        )
     selected = [
         item
         for item in inventory.get("workbooks", [])
@@ -1228,14 +1426,26 @@ def _validated_restricted_inventory_selection(
     ]
     if len(selected) != 1 or selected[0].get("sha256") != source_sha256:
         raise RecalculationError(
-            "source workbook ID/hash does not match the frozen inventory"
+            "source workbook ID/hash does not match the approved inventory"
         )
     classification = selected[0].get("classification")
     if classification not in {"native_source", "conversion_equivalent"}:
         raise RecalculationError(
             "restricted evidence rejects conversion_unverified source"
         )
-    return selected[0], cohort_hash, frozen_inventory["inventory_sha256"]
+    if selected[0].get("route") not in {
+        "restricted_pass",
+        "restricted_recalc_pass",
+    }:
+        raise RecalculationError(
+            "approved inventory record does not permit restricted evidence"
+        )
+    return (
+        selected[0],
+        cohort_hash,
+        inventory["inventory_sha256"],
+        approval,
+    )
 
 
 def create_restriction_documents(
@@ -1243,6 +1453,8 @@ def create_restriction_documents(
     health: dict,
     inventory: dict,
     *,
+    batch_id: str,
+    inventory_approval_registry: str | Path | None = None,
     workbook_id: str | None = None,
     expected_cohort_sha256: str | None = None,
 ) -> tuple[dict, dict]:
@@ -1253,17 +1465,22 @@ def create_restriction_documents(
     except ValueError as exc:
         raise RecalculationError(f"restricted evidence input is invalid: {exc}") from exc
     source_hash = sha256_file(source)
-    if health.get("route") != "restricted_pass":
-        raise RecalculationError("restricted evidence requires restricted_pass health")
+    if health.get("route") not in {
+        "restricted_pass",
+        "restricted_recalc_pass",
+    }:
+        raise RecalculationError("restricted evidence requires restricted health")
     if health.get("policy_version") != POLICY_VERSION:
         raise RecalculationError("restricted evidence requires the current policy")
     selected_workbook_id = workbook_id or source.stem
     try:
-        selected, cohort_hash, inventory_hash = (
+        selected, cohort_hash, inventory_hash, approval = (
             _validated_restricted_inventory_selection(
                 inventory,
                 source_sha256=source_hash,
                 workbook_id=selected_workbook_id,
+                batch_id=batch_id,
+                inventory_approval_registry=inventory_approval_registry,
                 expected_cohort_sha256=expected_cohort_sha256,
             )
         )
@@ -1271,6 +1488,20 @@ def create_restriction_documents(
         raise RecalculationError(
             f"restricted evidence input is invalid: {exc}"
         ) from exc
+    if (
+        selected.get("health_report") != health
+        or selected.get("health_report_sha256") != health.get("report_sha256")
+        or selected.get("route") != health.get("route")
+        or selected.get("restriction_events_sha256")
+        != health.get("restriction_events_sha256")
+        or (selected.get("health_report") or {}).get(
+            "recalc_signals_sha256"
+        )
+        != health.get("recalc_signals_sha256")
+    ):
+        raise RecalculationError(
+            "fresh source health does not exactly match the approved inventory record"
+        )
     classification = selected["classification"]
     events = health.get("restriction_events")
     if (
@@ -1286,15 +1517,21 @@ def create_restriction_documents(
     restriction = {
         "classification": classification,
         "cohort_sha256": cohort_hash,
-        "cohort_size": RESTRICTED_SOURCE_COHORT_SIZE,
+        "cohort_size": inventory["cohort"]["size"],
         "health_report_sha256": health["report_sha256"],
+        "inventory_approval_sha256": approval[
+            "inventory_approval_sha256"
+        ],
         "inventory_sha256": inventory_hash,
         "policy_version": POLICY_VERSION,
         "profile": RESTRICTION_PROFILE,
+        "recalc_signals": health.get("recalc_signals", []),
+        "recalc_signals_sha256": health.get("recalc_signals_sha256"),
         "reason_codes": health["reason_codes"],
         "restriction_events": events,
         "restriction_events_sha256": health["restriction_events_sha256"],
         "source_sha256": source_hash,
+        "source_route": health["route"],
         "workbook_id": selected_workbook_id,
     }
     request = {
@@ -1306,6 +1543,9 @@ def create_restriction_documents(
         "policy_version": POLICY_VERSION,
         "source_sha256": source_hash,
         "cohort_sha256": cohort_hash,
+        "inventory_approval_sha256": approval[
+            "inventory_approval_sha256"
+        ],
         "inventory_sha256": inventory_hash,
         "mode": "restricted_policy",
         "restriction": restriction,
@@ -1319,6 +1559,9 @@ def create_restriction_documents(
         "source_sha256": source_hash,
         "output_sha256": source_hash,
         "cohort_sha256": cohort_hash,
+        "inventory_approval_sha256": approval[
+            "inventory_approval_sha256"
+        ],
         "inventory_sha256": inventory_hash,
         "mode": "restricted",
         "restriction": restriction,
@@ -1363,6 +1606,8 @@ def prepare_source_generation(
     trusted_runner_public_key: str | Path | None = None,
     original_source_path: str | Path | None = None,
     inventory: dict | str | Path | None = None,
+    inventory_batch_id: str | None = None,
+    inventory_approval_registry: str | Path | None = None,
 ) -> tuple[Path, dict]:
     """Build a fresh production AST and publish an inactive immutable generation."""
     source = Path(source_path)
@@ -1378,21 +1623,25 @@ def prepare_source_generation(
     except ValueError as exc:
         raise RecalculationError(f"source-health report is invalid: {exc}") from exc
     if (
-        health_value.get("schema_version") != "xlsx-source-health/v2"
+        health_value.get("schema_version") != HEALTH_SCHEMA_VERSION
         or health_value.get("policy_version") != POLICY_VERSION
     ):
         raise RecalculationError(
-            "new source generations require current v2 source health"
+            "new source generations require current source health"
         )
     if health_value.get("route") not in {
         "pass",
         "restricted_pass",
+        "restricted_recalc_pass",
         "recalc_candidate",
     }:
         raise RecalculationError("source health does not permit AST generation")
-    inventory_value = _read_json(inventory) if isinstance(
-        inventory, (str, Path)
-    ) else inventory
+    if isinstance(inventory, (str, Path)):
+        from xl_inventory_approval import read_inventory_artifact
+
+        inventory_value = read_inventory_artifact(inventory)
+    else:
+        inventory_value = inventory
     if (request is None) != (result is None):
         raise RecalculationError("request and result must be supplied together")
     if request is None and health_value.get("route") == "recalc_candidate":
@@ -1403,15 +1652,20 @@ def prepare_source_generation(
         identity_request, identity_result = _identity_documents(source)
         request = identity_request
         result = identity_result
-    elif request is None and health_value.get("route") == "restricted_pass":
-        if inventory_value is None:
+    elif request is None and health_value.get("route") in {
+        "restricted_pass",
+        "restricted_recalc_pass",
+    }:
+        if inventory_value is None or not inventory_batch_id:
             raise RecalculationError(
-                "restricted pass requires a bound source inventory"
+                "restricted pass requires an approved batch inventory"
             )
         request, result = create_restriction_documents(
             source,
             health_value,
             inventory_value,
+            batch_id=inventory_batch_id,
+            inventory_approval_registry=inventory_approval_registry,
             workbook_id=workbook_id,
         )
     route_schemas = {
@@ -1420,6 +1674,12 @@ def prepare_source_generation(
             (REQUEST_SCHEMA_VERSION, RESULT_SCHEMA_VERSION),
         },
         "restricted_pass": {
+            (
+                RESTRICTION_REQUEST_SCHEMA_VERSION,
+                RESTRICTION_RESULT_SCHEMA_VERSION,
+            )
+        },
+        "restricted_recalc_pass": {
             (
                 RESTRICTION_REQUEST_SCHEMA_VERSION,
                 RESTRICTION_RESULT_SCHEMA_VERSION,
@@ -1483,6 +1743,8 @@ def prepare_source_generation(
             trusted_runner_public_key=trusted_runner_public_key,
             original_source_path=original_source_path,
             inventory=inventory_value,
+            inventory_batch_id=inventory_batch_id,
+            inventory_approval_registry=inventory_approval_registry,
         )
         return destination, manifest
     finally:
@@ -1521,6 +1783,8 @@ def main(argv: list[str] | None = None) -> int:
     prepare_command.add_argument("--trusted-runner-public-key")
     prepare_command.add_argument("--original-source")
     prepare_command.add_argument("--inventory")
+    prepare_command.add_argument("--inventory-batch-id")
+    prepare_command.add_argument("--inventory-approval-registry")
     observe_command = commands.add_parser("diff")
     observe_command.add_argument("before")
     observe_command.add_argument("after")
@@ -1575,6 +1839,8 @@ def main(argv: list[str] | None = None) -> int:
                 trusted_runner_public_key=args.trusted_runner_public_key,
                 original_source_path=args.original_source,
                 inventory=args.inventory,
+                inventory_batch_id=args.inventory_batch_id,
+                inventory_approval_registry=args.inventory_approval_registry,
             )
             print(json.dumps({
                 "generation_dir": str(destination),

@@ -18,8 +18,11 @@ from openpyxl import Workbook
 from openpyxl.workbook.defined_name import DefinedName
 
 import xl_source_publication as publication
+import xl_inventory_approval
+from xl_inventory_approval import approval_claims, object_hash
 from xl_source_health import inspect_workbook, sha256_file
 from xl_source_recalc import (
+    PF_NETWORK_RULES_SHA256,
     RESTRICTED_SOURCE_COHORT_MANIFEST,
     RecalculationError,
     MacOSExcelEngine,
@@ -34,6 +37,28 @@ from xl_source_recalc import (
     verify_signed_runner_receipt,
 )
 from xl_source_inventory import build_inventory_manifest
+
+
+def _approve_inventory(
+    tmp_path: Path,
+    monkeypatch,
+    inventory: dict,
+    *,
+    batch_id: str = "test-batch",
+) -> Path:
+    entry = approval_claims(inventory, batch_id=batch_id)
+    core = {
+        "schema_version": "source-inventory-approval-registry/v1",
+        "approvals": [entry],
+    }
+    registry = {
+        **core,
+        "registry_sha256": object_hash(core),
+    }
+    path = tmp_path / "approved-source-inventories.json"
+    path.write_text(json.dumps(registry), encoding="utf-8")
+    monkeypatch.setattr(xl_inventory_approval, "DEFAULT_REGISTRY", path)
+    return path
 
 
 def _workbook(
@@ -314,6 +339,9 @@ def test_signed_runner_receipt_rejects_forgery(tmp_path):
         "engine_version": "16.99",
         "calculation_complete": True,
         "isolation_enforced": True,
+        "network_isolation_mechanism": "macos-pf-anchor",
+        "network_isolation_rules_sha256":
+            PF_NETWORK_RULES_SHA256,
         "completed_at_ns": 123,
     }
     payload_path = tmp_path / "payload.json"
@@ -560,7 +588,7 @@ def test_recalc_candidate_cannot_publish_with_identity_evidence(tmp_path):
         )
 
 
-def test_restricted_prepare_rejects_non_frozen_inventory(
+def test_restricted_prepare_rejects_unapproved_inventory(
     tmp_path, monkeypatch
 ):
     source_root = tmp_path / "sources"
@@ -577,17 +605,101 @@ def test_restricted_prepare_rejects_non_frozen_inventory(
 
     monkeypatch.setattr("xl_ast_graph.main", fake_ast_main)
 
-    with pytest.raises(RecalculationError, match="exact frozen 123-workbook"):
+    with pytest.raises(RecalculationError, match="not approved"):
         prepare_source_generation(
             source,
             "0004",
             tmp_path / "published",
             health=health,
             inventory=inventory,
+            inventory_batch_id="unapproved-batch",
         )
 
 
-def test_restricted_publication_rejects_identity_and_non_frozen_inventory(tmp_path):
+def test_approved_mixed_restricted_source_binds_signals_and_approval(
+    tmp_path,
+    monkeypatch,
+):
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "0004.xlsx"
+    _workbook(source, formula="OFFSET(A1,0,0)", cache=None)
+    health = inspect_workbook(source)
+    inventory = build_inventory_manifest(source_root, workbook_ids=["0004"])
+    registry = _approve_inventory(
+        tmp_path,
+        monkeypatch,
+        inventory,
+        batch_id="batch-mixed",
+    )
+
+    def fake_ast_main(args):
+        output_root = Path(args[args.index("-o") + 1])
+        output_root.mkdir()
+        _ast(output_root / "0004", "mixed-restricted")
+
+    monkeypatch.setattr("xl_ast_graph.main", fake_ast_main)
+
+    generation, manifest = prepare_source_generation(
+        source,
+        "0004",
+        tmp_path / "published",
+        health=health,
+        inventory=inventory,
+        inventory_batch_id="batch-mixed",
+        inventory_approval_registry=registry,
+    )
+
+    assert health["route"] == "restricted_recalc_pass"
+    assert manifest["bindings"]["inventory_approval_sha256"]
+    assert manifest["bindings"]["recalc_signals_sha256"] == (
+        health["recalc_signals_sha256"]
+    )
+    assert generation.is_dir()
+    assert not (tmp_path / "published" / "current.json").exists()
+
+
+def test_restricted_evidence_rejects_inventory_health_route_drift(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "0004.xlsx"
+    _workbook(source, formula="OFFSET(A1,0,0)", cache=None)
+    health = inspect_workbook(source)
+    selected = {
+        "classification": "native_source",
+        "health_report": health,
+        "health_report_sha256": health["report_sha256"],
+        "restriction_events_sha256": health[
+            "restriction_events_sha256"
+        ],
+        "route": "restricted_pass",
+    }
+    monkeypatch.setattr(
+        "xl_source_recalc._validated_restricted_inventory_selection",
+        lambda *_args, **_kwargs: (
+            selected,
+            "1" * 64,
+            "2" * 64,
+            {"inventory_approval_sha256": "3" * 64},
+        ),
+    )
+
+    with pytest.raises(
+        RecalculationError,
+        match="does not exactly match",
+    ):
+        create_restriction_documents(
+            source,
+            health,
+            {"cohort": {"size": 1}},
+            batch_id="batch-mixed",
+        )
+
+
+def test_restricted_publication_rejects_identity_and_unapproved_inventory(
+    tmp_path,
+):
     source_root = tmp_path / "sources"
     source_root.mkdir()
     source = source_root / "0005.xlsx"
@@ -600,7 +712,7 @@ def test_restricted_publication_rejects_identity_and_non_frozen_inventory(tmp_pa
 
     with pytest.raises(
         publication.SourcePublicationError,
-        match="restriction evidence",
+        match="approved inventory",
     ):
         publication.publish_source_generation(
             source,
@@ -610,10 +722,16 @@ def test_restricted_publication_rejects_identity_and_non_frozen_inventory(tmp_pa
             result=identity_result,
             health=health,
             inventory=inventory,
+            inventory_batch_id="unapproved-batch",
         )
 
-    with pytest.raises(RecalculationError, match="exact frozen 123-workbook"):
-        create_restriction_documents(source, health, inventory)
+    with pytest.raises(RecalculationError, match="not approved"):
+        create_restriction_documents(
+            source,
+            health,
+            inventory,
+            batch_id="unapproved-batch",
+        )
 
 
 def test_frozen_inventory_classification_controls_restricted_evidence():
@@ -635,13 +753,15 @@ def test_frozen_inventory_classification_controls_restricted_evidence():
             inventory,
             source_sha256=records[unverified_id]["sha256"],
             workbook_id=unverified_id,
+            batch_id="batch-002-restricted-123-v2",
         )
 
-    selected, cohort_hash, inventory_hash = (
+    selected, cohort_hash, inventory_hash, approval = (
         _validated_restricted_inventory_selection(
             inventory,
             source_sha256=records[allowed_id]["sha256"],
             workbook_id=allowed_id,
+            batch_id="batch-002-restricted-123-v2",
             expected_cohort_sha256=inventory["cohort"]["cohort_sha256"],
         )
     )
@@ -651,6 +771,7 @@ def test_frozen_inventory_classification_controls_restricted_evidence():
     }
     assert cohort_hash == inventory["cohort"]["cohort_sha256"]
     assert inventory_hash == inventory["inventory_sha256"]
+    assert approval["inventory_approval_sha256"]
 
 
 def test_generation_identity_ignores_receipt_request_id(tmp_path):

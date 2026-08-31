@@ -565,7 +565,7 @@ def segment(wb: str, args) -> dict:
     cone_certificate = None
     if source_generation is not None:
         source_route = source_generation["health"].get("route")
-        if source_route == "restricted_pass":
+        if source_route in {"restricted_pass", "restricted_recalc_pass"}:
             if proof is None:
                 raise SystemExit(
                     f"{wb}: restricted segmentation requires strict verification"

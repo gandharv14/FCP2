@@ -313,6 +313,7 @@ def _make_manifest(
     health: dict,
     result: dict,
     inventory: dict | None,
+    inventory_approval: dict | None,
 ) -> dict:
     artifacts = {}
     for path in sorted(stage.rglob("*")):
@@ -323,7 +324,10 @@ def _make_manifest(
         if path.is_file() and path.name != "generation-manifest.json":
             relative = path.relative_to(stage).as_posix()
             artifacts[relative] = _file_record(path, relative)
-    restricted = health.get("route") == "restricted_pass"
+    restricted = health.get("route") in {
+        "restricted_pass",
+        "restricted_recalc_pass",
+    }
     policy_decision = {
         "health_report_sha256": health.get("report_sha256"),
         "policy_version": health.get("policy_version"),
@@ -332,10 +336,14 @@ def _make_manifest(
     if restricted:
         policy_decision.update({
             "inventory_sha256": inventory.get("inventory_sha256"),
+            "inventory_approval_sha256": inventory_approval.get(
+                "inventory_approval_sha256"
+            ),
             "restriction_evidence_sha256": result.get("result_sha256"),
             "restriction_events_sha256": health.get(
                 "restriction_events_sha256"
             ),
+            "recalc_signals_sha256": health.get("recalc_signals_sha256"),
             "restriction_profile": health.get("restriction_profile"),
             "restriction_profile_sha256": _binding_hash(
                 health.get("restriction_profile")
@@ -376,9 +384,16 @@ def _make_manifest(
     if restricted:
         bindings.update({
             "inventory_artifact_sha256": artifacts["inventory.json"]["sha256"],
+            "inventory_approval_artifact_sha256": artifacts[
+                "inventory-approval.json"
+            ]["sha256"],
+            "inventory_approval_sha256": inventory_approval[
+                "inventory_approval_sha256"
+            ],
             "inventory_sha256": inventory["inventory_sha256"],
             "restriction_evidence_sha256": result["result_sha256"],
             "restriction_events_sha256": health["restriction_events_sha256"],
+            "recalc_signals_sha256": health.get("recalc_signals_sha256"),
             "restriction_profile_sha256": _binding_hash(
                 health["restriction_profile"]
             ),
@@ -409,6 +424,8 @@ def publish_source_generation(
     trusted_runner_public_key: str | Path | None = None,
     original_source_path: str | Path | None = None,
     inventory: dict | str | Path | None = None,
+    inventory_batch_id: str | None = None,
+    inventory_approval_registry: str | Path | None = None,
     fault=None,
 ) -> tuple[Path, dict]:
     """Publish immutable bytes; activation is a separate proof-gated operation."""
@@ -433,9 +450,14 @@ def publish_source_generation(
     request_value = _json_value(request, "recalculation request")
     result_value = _json_value(result, "recalculation result")
     health_value = _json_value(health, "source-health report")
-    inventory_value = (
-        None if inventory is None else _json_value(inventory, "source inventory")
-    )
+    if inventory is None:
+        inventory_value = None
+    elif isinstance(inventory, (str, Path)):
+        from xl_inventory_approval import read_inventory_artifact
+
+        inventory_value = read_inventory_artifact(inventory)
+    else:
+        inventory_value = _json_value(inventory, "source inventory")
     provenance = (
         create_ast_provenance(
             source,
@@ -466,7 +488,12 @@ def publish_source_generation(
     if result_hash is not None and result_hash != source_hash:
         raise SourcePublicationError("result is not bound to source workbook")
     route = health_value.get("route")
-    if route not in {"pass", "restricted_pass", "recalc_candidate"}:
+    if route not in {
+        "pass",
+        "restricted_pass",
+        "restricted_recalc_pass",
+        "recalc_candidate",
+    }:
         raise SourcePublicationError(
             "source health does not permit generation publication"
         )
@@ -504,9 +531,11 @@ def publish_source_generation(
         raise SourcePublicationError(
             f"health report validation failed: {exc}"
         ) from exc
-    if health_value.get("schema_version") != "xlsx-source-health/v2":
+    from xl_source_health import SCHEMA_VERSION as HEALTH_SCHEMA_VERSION
+
+    if health_value.get("schema_version") != HEALTH_SCHEMA_VERSION:
         raise SourcePublicationError(
-            "new source generations require v2 source health"
+            "new source generations require current source health"
         )
     identity_pair = (
         request_value.get("schema_version") == "source-identity-request/v2"
@@ -636,18 +665,33 @@ def publish_source_generation(
         and request_value.get("mode") == "restricted_policy"
         and result_value.get("mode") == "restricted"
     )
-    if route == "restricted_pass":
-        if not restricted_pair or inventory_value is None:
+    inventory_approval_value = None
+    if route in {"restricted_pass", "restricted_recalc_pass"}:
+        if (
+            not restricted_pair
+            or inventory_value is None
+            or not inventory_batch_id
+        ):
             raise SourcePublicationError(
-                "restricted pass requires dedicated restriction evidence and inventory"
+                "restricted pass requires dedicated evidence and approved inventory"
             )
         try:
+            from xl_inventory_approval import resolve_inventory_approval
             from xl_source_inventory import validate_inventory_manifest
             from xl_source_recalc import create_restriction_documents
 
             validate_inventory_manifest(inventory_value)
+            inventory_approval_value = resolve_inventory_approval(
+                inventory_value,
+                batch_id=inventory_batch_id,
+                registry_path=inventory_approval_registry,
+            )
             expected_request, expected_result = create_restriction_documents(
-                source, health_value, inventory_value
+                source,
+                health_value,
+                inventory_value,
+                batch_id=inventory_batch_id,
+                inventory_approval_registry=inventory_approval_registry,
             )
             if (
                 request_value != expected_request
@@ -679,8 +723,9 @@ def publish_source_generation(
             "health.json": health_value,
             "ast-provenance.json": provenance,
         }
-        if route == "restricted_pass":
+        if route in {"restricted_pass", "restricted_recalc_pass"}:
             documents["inventory.json"] = inventory_value
+            documents["inventory-approval.json"] = inventory_approval_value
         for name, value in documents.items():
             (stage / name).write_bytes(_canonical_bytes(value))
         manifest = _make_manifest(
@@ -690,6 +735,7 @@ def publish_source_generation(
             health_value,
             result_value,
             inventory_value,
+            inventory_approval_value,
         )
         (stage / "generation-manifest.json").write_bytes(_canonical_bytes(manifest))
         validate_source_generation(stage)
@@ -829,7 +875,10 @@ def validate_source_generation(
         ),
     }
     if manifest_schema == MANIFEST_SCHEMA_VERSION:
+        current_restricted = False
         try:
+            from xl_source_health import POLICY_VERSION as HEALTH_POLICY_VERSION
+
             health_document = _read_json(
                 directory / "health.json", "source health"
             )
@@ -843,13 +892,34 @@ def validate_source_generation(
         expected_bindings["health_report_sha256"] = health_document.get(
             "report_sha256"
         )
-        if health_document.get("route") == "restricted_pass":
+        if health_document.get("route") in {
+            "restricted_pass",
+            "restricted_recalc_pass",
+        }:
+            current_restricted = (
+                health_document.get("policy_version")
+                == HEALTH_POLICY_VERSION
+            )
+            has_inventory_approval = (
+                "inventory-approval.json" in artifacts
+            )
+            if current_restricted and not has_inventory_approval:
+                failures.append("inventory_approval_required")
             try:
                 inventory_document = _read_json(
                     directory / "inventory.json", "source inventory"
                 )
+                inventory_approval_document = (
+                    _read_json(
+                        directory / "inventory-approval.json",
+                        "source inventory approval",
+                    )
+                    if has_inventory_approval
+                    else {}
+                )
             except SourcePublicationError:
                 inventory_document = {}
+                inventory_approval_document = {}
                 failures.append("inventory")
             expected_bindings.update({
                 "inventory_artifact_sha256": artifacts.get(
@@ -866,6 +936,32 @@ def validate_source_generation(
                     health_document.get("restriction_profile")
                 ),
             })
+            if has_inventory_approval:
+                expected_bindings.update({
+                    "inventory_approval_artifact_sha256": artifacts.get(
+                        "inventory-approval.json", {}
+                    ).get("sha256"),
+                    "inventory_approval_sha256":
+                        inventory_approval_document.get(
+                            "inventory_approval_sha256"
+                        ),
+                    "recalc_signals_sha256": health_document.get(
+                        "recalc_signals_sha256"
+                    ),
+                })
+            if current_restricted and (
+                not GENERATION_ID_RE.fullmatch(
+                    str(expected_bindings.get(
+                        "inventory_approval_sha256", ""
+                    ))
+                )
+                or not GENERATION_ID_RE.fullmatch(
+                    str(expected_bindings.get(
+                        "recalc_signals_sha256", ""
+                    ))
+                )
+            ):
+                failures.append("current_restricted_bindings")
     if bindings != expected_bindings:
         failures.append("bindings")
     if manifest_schema == MANIFEST_SCHEMA_VERSION and not failures:
@@ -874,7 +970,10 @@ def validate_source_generation(
             "policy_version": health_document.get("policy_version"),
             "route": health_document.get("route"),
         }
-        if health_document.get("route") == "restricted_pass":
+        if health_document.get("route") in {
+            "restricted_pass",
+            "restricted_recalc_pass",
+        }:
             policy_decision.update({
                 "inventory_sha256": inventory_document.get("inventory_sha256"),
                 "restriction_evidence_sha256": result_document.get(
@@ -890,6 +989,16 @@ def validate_source_generation(
                     health_document.get("restriction_profile")
                 ),
             })
+            if has_inventory_approval:
+                policy_decision.update({
+                    "inventory_approval_sha256":
+                        inventory_approval_document.get(
+                            "inventory_approval_sha256"
+                        ),
+                    "recalc_signals_sha256": health_document.get(
+                        "recalc_signals_sha256"
+                    ),
+                })
         expected_identity = {
             "schema_version": "source-generation-identity/v2",
             "source_sha256": artifacts[source_relative]["sha256"],
@@ -911,7 +1020,10 @@ def validate_source_generation(
 
             source_path = directory / source_relative
             validate_report(health_document, source_path)
-            if health_document != inspect_workbook(source_path):
+            if health_document != inspect_workbook(
+                source_path,
+                policy_version=health_document.get("policy_version"),
+            ):
                 raise ValueError("source health does not match fresh observation")
             request_document = _read_json(
                 directory / "request.json", "source evidence request"
@@ -935,6 +1047,12 @@ def validate_source_generation(
                         "source-restriction-result/v2",
                     )
                 },
+                "restricted_recalc_pass": {
+                    (
+                        "source-restriction-request/v2",
+                        "source-restriction-result/v2",
+                    )
+                },
             }
             if evidence_schemas not in accepted.get(route, set()):
                 raise ValueError("evidence schemas do not match route")
@@ -945,19 +1063,35 @@ def validate_source_generation(
                 not in {None, health_document.get("policy_version")}
             ):
                 raise ValueError("evidence policy does not match health policy")
-            if route == "restricted_pass":
+            if route in {"restricted_pass", "restricted_recalc_pass"}:
                 from xl_source_inventory import validate_inventory_manifest
-                from xl_source_recalc import create_restriction_documents
 
                 validate_inventory_manifest(inventory_document)
-                expected_request, expected_result = create_restriction_documents(
-                    source_path, health_document, inventory_document
-                )
-                if (
-                    request_document != expected_request
-                    or result_document != expected_result
-                ):
-                    raise ValueError("restriction evidence changed")
+                if has_inventory_approval:
+                    from xl_inventory_approval import (
+                        validate_inventory_approval,
+                    )
+                    from xl_source_recalc import create_restriction_documents
+
+                    validate_inventory_approval(
+                        inventory_approval_document,
+                        inventory_document,
+                    )
+                    expected_request, expected_result = (
+                        create_restriction_documents(
+                            source_path,
+                            health_document,
+                            inventory_document,
+                            batch_id=inventory_approval_document[
+                                "approval"
+                            ]["batch_id"],
+                        )
+                    )
+                    if (
+                        request_document != expected_request
+                        or result_document != expected_result
+                    ):
+                        raise ValueError("restriction evidence changed")
         except (OSError, ValueError, SourcePublicationError):
             failures.append("policy_validation")
     if not failures:
@@ -1016,7 +1150,7 @@ def activate_source_generation(
     )
     if (
         manifest.get("schema_version") == MANIFEST_SCHEMA_VERSION
-        and route == "restricted_pass"
+        and route in {"restricted_pass", "restricted_recalc_pass"}
     ):
         raise SourcePublicationError(
             "restricted v2 source generations stay inactive; promote the exact "

@@ -834,11 +834,15 @@ def audit_segmentation_binding(pipeline_context):
     if pipeline_context is None:
         return None
     bindings = pipeline_context["bindings"]
-    return {
+    binding = {
         "generation_id": bindings["segmentation_generation_id"],
         "manifest_sha256": bindings["segmentation_manifest_sha256"],
         "source_generation_id": bindings["source_generation_id"],
     }
+    for key in ("inventory_approval_sha256", "recalc_signals_sha256"):
+        if bindings.get(key) is not None:
+            binding[key] = bindings[key]
+    return binding
 
 
 def main(argv=None):

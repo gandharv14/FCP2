@@ -11,7 +11,10 @@ from . import diagnostics, evaluate, model
 
 
 SCHEMA_VERSION = "restriction-cone-certificate/v1"
-POLICY_PROFILE_SCHEMA = "source-restriction-profile/v2"
+POLICY_PROFILE_SCHEMAS = {
+    "source-restriction-profile/v2",
+    "source-restriction-profile/v3",
+}
 MAX_DYNAMIC_TARGET_CELLS = 10_000
 MAX_EXCEL_ROW = 1_048_576
 MAX_EXCEL_COLUMN = 16_384
@@ -19,6 +22,8 @@ SEGMENTATION_BINDING_KEYS = frozenset({
     "source_generation",
     "source_restriction_evidence",
     "source_restriction_profile",
+    "source_inventory_approval",
+    "source_recalc_signals",
     "restriction_cone_certificate",
 })
 _A1_TARGET_RE = re.compile(
@@ -629,8 +634,11 @@ def build_certificate(
         raise RestrictionConeError("restricted certificates require a v2 source generation")
     health = _read_json(source_dir / "health.json", "source health")
     result = _read_json(source_dir / "result.json", "restriction evidence")
-    if health.get("route") != "restricted_pass":
-        raise RestrictionConeError("source generation is not restricted_pass")
+    if health.get("route") not in {
+        "restricted_pass",
+        "restricted_recalc_pass",
+    }:
+        raise RestrictionConeError("source generation is not restricted")
     if not _strict_verification_passes(verification, proof):
         raise RestrictionConeError("strict segmentation verification is not fully passing")
     if graph.integrity_errors or any(
@@ -647,7 +655,7 @@ def build_certificate(
     profile = health.get("restriction_profile")
     if (
         not isinstance(profile, dict)
-        or profile.get("schema_version") != POLICY_PROFILE_SCHEMA
+        or profile.get("schema_version") not in POLICY_PROFILE_SCHEMAS
         or result.get("restriction", {}).get("profile") != profile
     ):
         raise RestrictionConeError("restriction policy profile is absent or mismatched")
@@ -858,11 +866,17 @@ def build_certificate(
             "source_sha256": source_bindings.get("source_sha256"),
             "health_artifact_sha256": source_bindings.get("health_sha256"),
             "health_report_sha256": source_bindings.get("health_report_sha256"),
+            "inventory_approval_sha256": source_bindings.get(
+                "inventory_approval_sha256"
+            ),
             "restriction_evidence_sha256": source_bindings.get(
                 "restriction_evidence_sha256"
             ),
             "restriction_events_sha256": source_bindings.get(
                 "restriction_events_sha256"
+            ),
+            "recalc_signals_sha256": source_bindings.get(
+                "recalc_signals_sha256"
             ),
             "policy_version": health.get("policy_version"),
             "restriction_profile": profile,

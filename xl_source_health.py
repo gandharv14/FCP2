@@ -22,8 +22,10 @@ from xl_seg import diagnostics
 from xl_seg.evaluate import workbook_calculation_metadata
 
 
-SCHEMA_VERSION = "xlsx-source-health/v2"
-POLICY_VERSION = "source-recalc-policy/v2"
+SCHEMA_VERSION = "xlsx-source-health/v3"
+POLICY_VERSION = "source-recalc-policy/v3"
+PREVIOUS_SCHEMA_VERSION = "xlsx-source-health/v2"
+PREVIOUS_POLICY_VERSION = "source-recalc-policy/v2"
 LEGACY_SCHEMA_VERSION = "xlsx-source-health/v1"
 LEGACY_POLICY_VERSION = "source-recalc-policy/v1"
 ENGINE_REQUIREMENTS = {
@@ -38,11 +40,13 @@ ENGINE_REQUIREMENTS = {
 ROUTES = frozenset({
     "pass",
     "restricted_pass",
+    "restricted_recalc_pass",
     "recalc_candidate",
     "unsupported",
     "insufficient_evidence",
 })
-LEGACY_ROUTES = ROUTES - {"restricted_pass"}
+PREVIOUS_ROUTES = ROUTES - {"restricted_recalc_pass"}
+LEGACY_ROUTES = PREVIOUS_ROUTES - {"restricted_pass"}
 SAMPLE_LIMIT = 20
 MAX_ZIP_MEMBERS = 50_000
 MAX_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
@@ -58,7 +62,7 @@ VOLATILE_FUNCTIONS = frozenset({
     "TODAY",
 })
 RESTRICTION_PROFILE = {
-    "schema_version": "source-restriction-profile/v2",
+    "schema_version": "source-restriction-profile/v3",
     "allowlist": [
         "confirmed_false_external_detection",
         "worksheet_cell_filename",
@@ -67,6 +71,10 @@ RESTRICTION_PROFILE = {
         "worksheet_offset",
         "worksheet_today",
     ],
+}
+PREVIOUS_RESTRICTION_PROFILE = {
+    **RESTRICTION_PROFILE,
+    "schema_version": "source-restriction-profile/v2",
 }
 _FUNCTION_RE = re.compile(
     r"(?i)(?<![A-Z0-9_.])(?:_xlfn\.)?("
@@ -536,8 +544,17 @@ def _diagnostics_record(route: str, reasons: list[str], formula_count: int) -> d
     }
 
 
-def inspect_workbook(path: str | Path) -> dict:
+def inspect_workbook(
+    path: str | Path,
+    *,
+    policy_version: str = POLICY_VERSION,
+) -> dict:
     """Return deterministic observations and conservative routing evidence."""
+    if policy_version not in {POLICY_VERSION, PREVIOUS_POLICY_VERSION}:
+        raise SourceHealthError(
+            f"unsupported observation policy: {policy_version}"
+        )
+    current_policy = policy_version == POLICY_VERSION
     source = Path(path)
     source_size = None
     source_hash = None
@@ -558,8 +575,10 @@ def inspect_workbook(path: str | Path) -> dict:
     except OSError:
         source_problem = "source_unreadable"
     base = {
-        "schema_version": SCHEMA_VERSION,
-        "policy_version": POLICY_VERSION,
+        "schema_version": (
+            SCHEMA_VERSION if current_policy else PREVIOUS_SCHEMA_VERSION
+        ),
+        "policy_version": policy_version,
         "engine_requirements": ENGINE_REQUIREMENTS,
         "source_sha256": source_hash,
         "source_size_bytes": source_size,
@@ -568,7 +587,11 @@ def inspect_workbook(path: str | Path) -> dict:
             "size_bytes": source_size,
             "sha256": source_hash,
         },
-        "restriction_profile": RESTRICTION_PROFILE,
+        "restriction_profile": (
+            RESTRICTION_PROFILE
+            if current_policy
+            else PREVIOUS_RESTRICTION_PROFILE
+        ),
     }
     if source_problem is not None:
         reasons = [source_problem]
@@ -586,6 +609,9 @@ def inspect_workbook(path: str | Path) -> dict:
                 "insufficient_evidence", reasons, 0
             ),
         }
+        if current_policy:
+            report["recalc_signals"] = []
+            report["recalc_signals_sha256"] = _object_hash([])
         report["report_sha256"] = _report_id(report)
         return report
 
@@ -1065,8 +1091,29 @@ def inspect_workbook(path: str | Path) -> dict:
     if formula_count and calculation.get("force_full_calc") is True:
         recalc.append("forced_full_calculation_requested")
 
-    mixed_restricted_recalc = bool(allowed_events and recalc)
-    if mixed_restricted_recalc:
+    recalc_signals = []
+    for signal in recalc:
+        record = {
+            "formula_cache_count": cache_present,
+            "formula_cache_missing_count": missing_cache,
+            "formula_count": formula_count,
+            "signal": signal,
+        }
+        if signal in {
+            "manual_calculation_mode",
+            "full_calculation_on_load_requested",
+            "forced_full_calculation_requested",
+        }:
+            record["calculation"] = calculation
+        recalc_signals.append(record)
+    recalc_signals = sorted(
+        recalc_signals,
+        key=lambda item: (
+            item["signal"],
+            item["formula_cache_missing_count"],
+        ),
+    )
+    if not current_policy and allowed_events and recalc:
         unsupported.append("mixed_restricted_recalc")
 
     if unsupported or disallowed_events:
@@ -1075,6 +1122,12 @@ def inspect_workbook(path: str | Path) -> dict:
     elif incomplete:
         route = "insufficient_evidence"
         reasons = incomplete
+    elif current_policy and allowed_events and recalc:
+        route = "restricted_recalc_pass"
+        reasons = sorted({
+            "mixed_restricted_recalc",
+            *[event["reason"] for event in allowed_events],
+        })
     elif recalc:
         route = "recalc_candidate"
         reasons = recalc
@@ -1111,6 +1164,9 @@ def inspect_workbook(path: str | Path) -> dict:
         "connection_count": connection_count,
         "diagnostics": _diagnostics_record(route, reasons, formula_count),
     }
+    if current_policy:
+        report["recalc_signals"] = recalc_signals
+        report["recalc_signals_sha256"] = _object_hash(recalc_signals)
     report["report_sha256"] = _report_id(report)
     return report
 
@@ -1128,15 +1184,25 @@ def validate_report(report: dict, source_path: str | Path | None = None) -> dict
         schema_version == LEGACY_SCHEMA_VERSION
         and policy_version == LEGACY_POLICY_VERSION
     )
+    previous = (
+        schema_version == PREVIOUS_SCHEMA_VERSION
+        and policy_version == PREVIOUS_POLICY_VERSION
+    )
     current = (
         schema_version == SCHEMA_VERSION
         and policy_version == POLICY_VERSION
     )
-    if not (legacy or current):
+    if not (legacy or previous or current):
         failures.append("schema_version")
-    if not (legacy or current):
+    if not (legacy or previous or current):
         failures.append("policy_version")
-    allowed_routes = LEGACY_ROUTES if legacy else ROUTES
+    allowed_routes = (
+        LEGACY_ROUTES
+        if legacy
+        else PREVIOUS_ROUTES
+        if previous
+        else ROUTES
+    )
     if report.get("route") not in allowed_routes:
         failures.append("route")
     if report.get("routing") != report.get("route"):
@@ -1145,24 +1211,42 @@ def validate_report(report: dict, source_path: str | Path | None = None) -> dict
         failures.append("reason_codes")
     if report.get("report_sha256") != _report_id(report):
         failures.append("report_sha256")
-    if current:
+    if current or previous:
         events = report.get("restriction_events")
         profile = report.get("restriction_profile")
         if not isinstance(events, list):
             failures.append("restriction_events")
         elif report.get("restriction_events_sha256") != _object_hash(events):
             failures.append("restriction_events_sha256")
-        if profile != RESTRICTION_PROFILE:
+        expected_profile = (
+            RESTRICTION_PROFILE if current else PREVIOUS_RESTRICTION_PROFILE
+        )
+        if profile != expected_profile:
             failures.append("restriction_profile")
-        if report.get("route") == "restricted_pass" and (
+        if report.get("route") in {
+            "restricted_pass",
+            "restricted_recalc_pass",
+        } and (
             not events
             or any(event.get("allowed") is not True for event in events)
             or any(
-                event.get("reason") not in RESTRICTION_PROFILE["allowlist"]
+                event.get("reason") not in expected_profile["allowlist"]
                 for event in events
             )
         ):
             failures.append("restricted_pass_events")
+        if current:
+            signals = report.get("recalc_signals")
+            if not isinstance(signals, list):
+                failures.append("recalc_signals")
+            elif report.get("recalc_signals_sha256") != _object_hash(signals):
+                failures.append("recalc_signals_sha256")
+            if report.get("route") == "restricted_recalc_pass" and (
+                not signals
+                or "mixed_restricted_recalc"
+                not in report.get("reason_codes", [])
+            ):
+                failures.append("restricted_recalc_signals")
     source = report.get("source")
     if not isinstance(source, dict):
         failures.append("source")

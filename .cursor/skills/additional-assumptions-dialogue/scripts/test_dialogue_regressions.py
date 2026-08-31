@@ -40,17 +40,46 @@ RCF_STEPS = (
     '(cell LBO!J151 on the row labelled "Revolving Credit Facility (L+4.50%)")'
 )
 RCF_EVIDENCE = "=-MAX(0,MIN(O138,N141-O146))*$J$151"
-
-
-# Self-contained fixture task dir: check_draft only needs tests/answer_key.json
-# (for the graded-target collision audit) and an environment/ directory.
-_FIXTURE = tempfile.TemporaryDirectory(prefix="aa-dialogue-fixture-")
-TASK = Path(_FIXTURE.name) / "0042-outputs"
-(TASK / "tests").mkdir(parents=True)
-(TASK / "environment").mkdir()
-(TASK / "tests" / "answer_key.json").write_text(
-    json.dumps({"targets": {}}), encoding="utf-8"
+BOUNDED_WINDOW_STEPS = (
+    'when ((cell Model!C10 on the row labelled "Date") is at least '
+    '(cell Model!C8 on the row labelled "Start Date") and '
+    '(cell Model!C10 on the row labelled "Date") is at most '
+    '(cell Model!C9 on the row labelled "End Date")) is true, use '
+    '(cell Model!C11 on the row labelled "Operating Cost"); otherwise use (0)'
 )
+IFERROR_STEPS = (
+    'use (cell Model!C20 on the row labelled "IRR"), or use ("N/A") '
+    "if that calculation errors"
+)
+LOCKED_WINDOW_STEPS = (
+    "when ((cell 'Monthly Build Projections'!C372 with its row fixed when copied) "
+    "is greater than (fixed cell 'Assumptions Matrix'!F63 on the row labelled "
+    '"MVP Development Phase Cost Total") and (cell '
+    "'Monthly Build Projections'!C372 with its row fixed when copied) is at most "
+    "(fixed cell 'Assumptions Matrix'!G63 on the row labelled "
+    '"MVP Development Phase Cost Total")) is true, use (fixed cell '
+    "'Assumptions Matrix'!I63 on the row labelled "
+    '"MVP Development Phase Cost Total"); otherwise use (0)'
+)
+LOCKED_WINDOW_EVIDENCE = (
+    "=IF(AND(C$372>'Assumptions Matrix'!$F$63,"
+    "C$372<='Assumptions Matrix'!$G$63),"
+    "'Assumptions Matrix'!$I$63,0)"
+)
+LOCKED_SUMPRODUCT_STEPS = (
+    "sum the products of corresponding values in "
+    '(fixed range DCF!N71:N75 on the rows labelled "Year 1", "Year 2", '
+    '"Year 3", "Year 4" and "Year 5") and '
+    '(fixed range DCF!O71:O75 on the rows labelled "Year 1", "Year 2", '
+    '"Year 3", "Year 4" and "Year 5")'
+)
+SAME_LABEL_FACTORS_STEPS = (
+    'multiply (fixed cell DCF!M71 on the row labelled "Discount Factor") by '
+    '(fixed cell DCF!P71 on the row labelled "Discount Factor")'
+)
+
+
+TASK = Path()
 
 CLAIMS = {
     "schema_version": "1.1",
@@ -270,6 +299,42 @@ def test_apply_blocks_missing_must_say(tmp: Path) -> None:
         _ok("round2-missing-must-say", "must_say" in str(exc).lower() or "accuracy" in str(exc).lower(), str(exc))
     else:
         _ok("round2-missing-must-say", False, "apply did not raise")
+
+    draft.write_text(
+        "<!-- claim:projection_rule::Operations::Fee -->\n"
+        "**Associate:** How should Fee work?\n"
+        "**VP:** On Operations, The row labelled \"Fee\" is worked out from "
+        "the row labelled \"Revenue\".\n",
+        encoding="utf-8",
+    )
+    review = {
+        "passed": False,
+        "accuracy": {
+            "verdict": "pass",
+            "claims": [
+                {
+                    "record_id": "projection_rule::Operations::Fee",
+                    "must_say": "entailed",
+                }
+            ],
+            "extras": [],
+            "cell_refs_in_senior_turns": [],
+        },
+        "naturalness": {"verdict": "fail", "findings": ["too repetitive"]},
+    }
+    try:
+        apply(
+            task,
+            draft,
+            CLAIMS,
+            review,
+            require_review_pass=False,
+            skip_smoke=True,
+        )
+    except DialogueError as exc:
+        _ok("round2-full-review-required", "full review" in str(exc).lower(), str(exc))
+    else:
+        _ok("round2-full-review-required", False, "apply accepted failed review")
 
 
 def test_apply_error_names_absent_must_say_field(tmp: Path) -> None:
@@ -500,6 +565,117 @@ def test_rcf_must_say_atoms() -> None:
     _ok("atoms-cash", "Total Cash for Discretionary Debt Paydown" in " ".join(atoms), atoms)
     _ok("atoms-rcf", "Revolving Credit Facility (L+4.50%)" in " ".join(atoms), atoms)
     _ok("atoms-no-copied", "copied across the forecast" not in blob, atoms)
+
+
+def test_bounded_window_preserves_both_conditions_and_branches() -> None:
+    spoken = speak_steps(
+        BOUNDED_WINDOW_STEPS,
+        representative="Model!C11",
+        evidence="=IF(AND(C10>=C8,C10<=C9),C11,0)",
+        sheet="Model",
+        row_label="Operating Cost",
+    )
+    atoms = must_say_atoms(
+        spoken + "\n" + BOUNDED_WINDOW_STEPS,
+        "Model",
+        "Operating Cost",
+    )
+    blob = " ".join(atoms).lower()
+    _ok("bounds-lower-preserved", "at least" in spoken, spoken)
+    _ok("bounds-upper-preserved", "at most" in spoken, spoken)
+    _ok("bounds-true-branch-preserved", "Operating Cost" in spoken, spoken)
+    _ok("bounds-false-branch-preserved", "otherwise 0" in spoken, spoken)
+    _ok("bounds-required-lower", "at least" in blob, str(atoms))
+    _ok("bounds-required-upper", "at most" in blob, str(atoms))
+    _ok("bounds-required-branch", "otherwise" in blob, str(atoms))
+
+
+def test_iferror_literal_is_not_a_row_label() -> None:
+    spoken = speak_steps(
+        IFERROR_STEPS,
+        representative="Model!C20",
+        evidence='=IFERROR(C20,"N/A")',
+        sheet="Model",
+        row_label="IRR",
+    )
+    atoms = must_say_atoms(
+        spoken + "\n" + IFERROR_STEPS,
+        "Model",
+        "IRR",
+    )
+    _ok("iferror-keeps-fallback", "N/A" in spoken, spoken)
+    _ok("iferror-no-literal-row", 'row labelled "N/A"' not in spoken, spoken)
+    _ok(
+        "iferror-no-literal-atom",
+        not any('row labelled "N/A"' in atom for atom in atoms),
+        str(atoms),
+    )
+    _ok("iferror-requires-errors", "errors" in " ".join(atoms).lower(), str(atoms))
+
+
+def test_same_label_locked_inputs_keep_distinct_roles() -> None:
+    spoken = speak_steps(
+        LOCKED_WINDOW_STEPS,
+        representative="'Monthly Build Projections'!C393",
+        evidence=LOCKED_WINDOW_EVIDENCE,
+        sheet="Monthly Build Projections",
+        row_label="MVP Development Phase Costs",
+    )
+    atoms = must_say_atoms(
+        spoken + "\n" + LOCKED_WINDOW_STEPS,
+        "Monthly Build Projections",
+        "MVP Development Phase Costs",
+    )
+    blob = " ".join(atoms).lower()
+    _ok("locked-window-lower-role", "lower bound locked input" in spoken, spoken)
+    _ok("locked-window-upper-role", "upper bound locked input" in spoken, spoken)
+    _ok("locked-window-result-role", "result locked input" in spoken, spoken)
+    _ok("locked-window-no-fixed-the", "fixed the locked input" not in spoken, spoken)
+    _ok("locked-window-requires-lower", "lower bound" in blob, str(atoms))
+    _ok("locked-window-requires-upper", "upper bound" in blob, str(atoms))
+    _ok("locked-window-requires-result", "result locked input" in blob, str(atoms))
+    _ok(
+        "locked-window-requires-source-tab",
+        "assumptions matrix tab" in blob,
+        str(atoms),
+    )
+
+
+def test_locked_ranges_preserve_cardinality_and_operand_identity() -> None:
+    spoken = speak_steps(
+        LOCKED_SUMPRODUCT_STEPS,
+        representative="DCF!Q80",
+        evidence="=SUMPRODUCT($N$71:$N$75,$O$71:$O$75)",
+        sheet="DCF",
+        row_label="Product value",
+    )
+    atoms = must_say_atoms(spoken + "\n" + LOCKED_SUMPRODUCT_STEPS, "DCF", "Product value")
+    blob = " ".join(atoms).lower()
+    _ok("sumproduct-first-block", "first locked 5-row input block" in spoken, spoken)
+    _ok("sumproduct-second-block", "second locked 5-row input block" in spoken, spoken)
+    _ok("sumproduct-corresponding", "corresponding" in spoken, spoken)
+    _ok("sumproduct-no-addresses", "N71" not in spoken and "O71" not in spoken, spoken)
+    _ok("sumproduct-requires-first", "first locked input block" in blob, str(atoms))
+    _ok("sumproduct-requires-second", "second locked input block" in blob, str(atoms))
+    _ok("sumproduct-requires-cardinality", "5-row" in blob, str(atoms))
+    _ok("sumproduct-requires-operation", "corresponding" in blob, str(atoms))
+
+
+def test_same_label_factors_remain_distinct() -> None:
+    spoken = speak_steps(
+        SAME_LABEL_FACTORS_STEPS,
+        representative="DCF!Q80",
+        evidence="=$M$71*$P$71",
+        sheet="DCF",
+        row_label="Product value",
+    )
+    atoms = must_say_atoms(spoken + "\n" + SAME_LABEL_FACTORS_STEPS, "DCF", "Product value")
+    blob = " ".join(atoms).lower()
+    _ok("factor-first-input", "first locked input" in spoken, spoken)
+    _ok("factor-second-input", "second locked input" in spoken, spoken)
+    _ok("factor-no-addresses", "M71" not in spoken and "P71" not in spoken, spoken)
+    _ok("factor-requires-first", "first locked input" in blob, str(atoms))
+    _ok("factor-requires-second", "second locked input" in blob, str(atoms))
 
 
 def test_pasted_spoken_fails() -> None:
@@ -977,35 +1153,48 @@ def test_senior_cell_refs() -> None:
 
 
 def main() -> int:
-    test_senior_kickoff_unclaimed()
-    test_associate_junior_and_ack()
-    test_unknown_and_legacy_titles()
-    test_colon_in_turn_prose_is_not_a_speaker_title()
-    test_marker_coverage()
-    test_review_coverage()
-    test_stale_pack()
-    test_review_missing_must_say_field()
-    test_review_boolean_must_say()
-    test_review_claim_coverage_shape()
-    test_review_ordered_claims_shape()
-    test_review_faults_empty_on_compliant()
-    test_draft_numbered_indented_turns()
-    test_draft_capitalized_claim_comment()
-    test_no_senior_turn_message_names_titles()
-    test_writer_pack_skeleton()
-    test_senior_cell_refs()
-    test_rebuild_frame_blocked()
-    test_existing_input_rebuild_anchor_survives_pointer_apply()
-    test_rcf_spoken_disambiguated()
-    test_rcf_must_say_atoms()
-    test_pasted_spoken_fails()
-    test_sheet_only_when_unclear()
-    test_paren_ast_draft_fails()
-    test_compose_draft_structure()
-    test_fill_check_valid_and_rejects()
-    test_whole_column_and_row_refs()
+    global TASK
     with tempfile.TemporaryDirectory() as raw:
         tmp_path = Path(raw)
+        TASK = tmp_path / "dialogue-check-outputs"
+        (TASK / "tests").mkdir(parents=True)
+        (TASK / "environment").mkdir()
+        (TASK / "tests" / "answer_key.json").write_text(
+            '{"targets": {}, "tolerance": {}}\n',
+            encoding="utf-8",
+        )
+        test_senior_kickoff_unclaimed()
+        test_associate_junior_and_ack()
+        test_unknown_and_legacy_titles()
+        test_colon_in_turn_prose_is_not_a_speaker_title()
+        test_marker_coverage()
+        test_review_coverage()
+        test_stale_pack()
+        test_review_missing_must_say_field()
+        test_review_boolean_must_say()
+        test_review_claim_coverage_shape()
+        test_review_ordered_claims_shape()
+        test_review_faults_empty_on_compliant()
+        test_draft_numbered_indented_turns()
+        test_draft_capitalized_claim_comment()
+        test_no_senior_turn_message_names_titles()
+        test_writer_pack_skeleton()
+        test_senior_cell_refs()
+        test_rebuild_frame_blocked()
+        test_existing_input_rebuild_anchor_survives_pointer_apply()
+        test_rcf_spoken_disambiguated()
+        test_rcf_must_say_atoms()
+        test_bounded_window_preserves_both_conditions_and_branches()
+        test_iferror_literal_is_not_a_row_label()
+        test_same_label_locked_inputs_keep_distinct_roles()
+        test_locked_ranges_preserve_cardinality_and_operand_identity()
+        test_same_label_factors_remain_distinct()
+        test_pasted_spoken_fails()
+        test_sheet_only_when_unclear()
+        test_paren_ast_draft_fails()
+        test_compose_draft_structure()
+        test_fill_check_valid_and_rejects()
+        test_whole_column_and_row_refs()
         test_formula_literal_target_collision_is_claim_scoped(tmp_path)
         test_apply_blocks_missing_must_say(tmp_path)
         test_apply_error_names_absent_must_say_field(tmp_path)

@@ -15,14 +15,19 @@ from pathlib import Path
 from xl_source_health import inspect_workbook, sha256_file, validate_report
 
 
-SCHEMA_VERSION = "source-inventory/v2"
+SCHEMA_VERSION = "source-inventory/v3"
+PREVIOUS_SCHEMA_VERSION = "source-inventory/v2"
 CONVERSION_CERTIFICATE_SCHEMA_VERSION = "source-conversion-equivalence/v1"
 ROUTES = (
     "insufficient_evidence",
     "pass",
     "recalc_candidate",
     "restricted_pass",
+    "restricted_recalc_pass",
     "unsupported",
+)
+PREVIOUS_ROUTES = tuple(
+    route for route in ROUTES if route != "restricted_recalc_pass"
 )
 
 
@@ -87,14 +92,19 @@ def _record(path: Path, root: Path, *, root_index: int | None = None) -> dict:
     return record
 
 
-def _validated_ids(values: list[str] | tuple[str, ...]) -> list[str]:
+def _validated_ids(values: list[object] | tuple[object, ...]) -> list[str]:
     if not values:
         raise SourceInventoryError("an explicit workbook cohort is required")
     normalized = []
     seen: set[str] = set()
     for value in values:
-        workbook_id = str(value).strip()
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", workbook_id):
+        if not isinstance(value, str) or value != value.strip():
+            raise SourceInventoryError(f"unsafe workbook ID: {value!r}")
+        workbook_id = value
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            workbook_id,
+        ):
             raise SourceInventoryError(f"unsafe workbook ID: {workbook_id!r}")
         if workbook_id in seen:
             raise SourceInventoryError(f"duplicate workbook ID: {workbook_id}")
@@ -114,7 +124,7 @@ def read_workbook_ids(path: str | Path) -> list[str]:
         value = json.loads(text)
     except json.JSONDecodeError:
         values = [
-            line.strip()
+            line
             for line in text.splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
@@ -350,6 +360,58 @@ def _derived_workbook_record(
     }
 
 
+def assemble_inventory_manifest(workbooks: list[dict]) -> dict:
+    """Assemble one current inventory from independently observed records."""
+    ordered = sorted(workbooks, key=lambda item: item.get("workbook_id", ""))
+    ids = _validated_ids([
+        item.get("workbook_id") for item in ordered
+        if isinstance(item, dict)
+    ])
+    if len(ids) != len(ordered):
+        raise SourceInventoryError("inventory records are incomplete or duplicated")
+    cohorts = {
+        route: [
+            item["workbook_id"] for item in ordered if item["route"] == route
+        ]
+        for route in ROUTES
+    }
+    classifications = dict(sorted(Counter(
+        item["classification"] for item in ordered
+    ).items()))
+    classification_cohorts = {
+        classification: [
+            item["workbook_id"]
+            for item in ordered
+            if item["classification"] == classification
+        ]
+        for classification in (
+            "conversion_equivalent",
+            "conversion_unverified",
+            "native_source",
+        )
+    }
+    cohort = {
+        "workbook_ids": ids,
+        "size": len(ids),
+    }
+    cohort["cohort_sha256"] = _object_hash(cohort["workbook_ids"])
+    core = {
+        "schema_version": SCHEMA_VERSION,
+        "cohort": cohort,
+        "cohorts": cohorts,
+        "classifications": classifications,
+        "classification_cohorts": classification_cohorts,
+        "mixed_recalc_cohort": [
+            item["workbook_id"]
+            for item in ordered
+            if item["mixed_recalc_tags"]
+        ],
+        "workbooks": ordered,
+    }
+    manifest = {**core, "inventory_sha256": _object_hash(core)}
+    return validate_inventory_manifest(manifest, expected_workbook_ids=ids)
+
+
 def build_inventory_manifest(
     source_root: str | Path,
     *,
@@ -395,46 +457,7 @@ def build_inventory_manifest(
                 conversion,
             )
         )
-    cohorts = {
-        route: [
-            item["workbook_id"] for item in workbooks if item["route"] == route
-        ]
-        for route in ROUTES
-    }
-    classifications = dict(sorted(Counter(
-        item["classification"] for item in workbooks
-    ).items()))
-    classification_cohorts = {
-        classification: [
-            item["workbook_id"]
-            for item in workbooks
-            if item["classification"] == classification
-        ]
-        for classification in (
-            "conversion_equivalent",
-            "conversion_unverified",
-            "native_source",
-        )
-    }
-    cohort = {
-        "workbook_ids": ids,
-        "size": len(ids),
-    }
-    cohort["cohort_sha256"] = _object_hash(cohort["workbook_ids"])
-    core = {
-        "schema_version": SCHEMA_VERSION,
-        "cohort": cohort,
-        "cohorts": cohorts,
-        "classifications": classifications,
-        "classification_cohorts": classification_cohorts,
-        "mixed_recalc_cohort": [
-            item["workbook_id"]
-            for item in workbooks
-            if item["mixed_recalc_tags"]
-        ],
-        "workbooks": workbooks,
-    }
-    manifest = {**core, "inventory_sha256": _object_hash(core)}
+    manifest = assemble_inventory_manifest(workbooks)
     return validate_inventory_manifest(
         manifest,
         source_root=source_directory,
@@ -467,7 +490,8 @@ def validate_inventory_manifest(
     unsigned = dict(manifest)
     claimed = unsigned.pop("inventory_sha256", None)
     failures = []
-    if unsigned.get("schema_version") != SCHEMA_VERSION:
+    schema_version = unsigned.get("schema_version")
+    if schema_version not in {SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION}:
         failures.append("schema_version")
     if claimed != _object_hash(unsigned):
         failures.append("inventory_sha256")
@@ -500,7 +524,8 @@ def validate_inventory_manifest(
             failures.append("expected_cohort")
 
     root = Path(source_root).resolve() if source_root is not None else None
-    derived_cohorts = {route: [] for route in ROUTES}
+    routes = PREVIOUS_ROUTES if schema_version == PREVIOUS_SCHEMA_VERSION else ROUTES
+    derived_cohorts = {route: [] for route in routes}
     derived_classifications = Counter()
     derived_classification_cohorts = {
         "conversion_equivalent": [],

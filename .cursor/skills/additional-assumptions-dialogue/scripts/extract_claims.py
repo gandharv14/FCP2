@@ -23,6 +23,10 @@ from spoken_formula import needs_spoken, speak_record
 
 
 LABEL_RE = re.compile(r'"([^"]+)"')
+SOURCE_TAB_RE = re.compile(
+    r"\bon the ([A-Za-z0-9][A-Za-z0-9 _&.'()/-]*?) tab\b",
+    re.I,
+)
 LOCATOR_ATOMS = (
     "last period",
     "this period",
@@ -32,13 +36,24 @@ LOCATOR_ATOMS = (
 OPERATOR_ATOMS = (
     "smaller",
     "greater",
+    "at least",
+    "at most",
     "floor",
     "flip",
     "minus",
     "plus",
     "average",
     "held flat",
+    "lower bound",
+    "upper bound",
+    "result locked input",
+    "first locked input",
+    "second locked input",
+    "corresponding",
+    "otherwise",
+    "errors",
 )
+NON_LABEL_LITERALS = frozenset({"", "N/A", "#N/A", "NA"})
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -90,13 +105,25 @@ def must_say_atoms(spoken: str, sheet: str = "", row_label: str = "") -> list[st
     if row_label:
         add(f'the row labelled "{row_label}"')
     for label in LABEL_RE.findall(blob):
+        if label.strip() in NON_LABEL_LITERALS:
+            continue
         add(f'the row labelled "{label}"')
+    for tab in SOURCE_TAB_RE.findall(blob):
+        if tab.strip().casefold() != sheet.strip().casefold():
+            add(f"the {tab.strip()} tab")
     for atom in LOCATOR_ATOMS:
         if atom in low:
             add(atom)
     for atom in OPERATOR_ATOMS:
         if atom in low:
             add(atom)
+    for cardinality in re.findall(r"\b\d+-row\b", low):
+        add(cardinality)
+    for ordinal in re.findall(
+        r"\b(first|second|third|fourth|fifth) locked \d+-row input block\b",
+        low,
+    ):
+        add(f"{ordinal} locked input block")
     return out
 
 
@@ -113,7 +140,11 @@ def build_claim(record: dict, index: int) -> dict:
         if not spoken:
             spoken = strip_cell_refs(rendered)
             spoken = re.sub(r"\bFor\s+on the row\b", "On the row", spoken)
-        must_say = must_say_atoms(spoken, sheet, row_label)
+        must_say = must_say_atoms(
+            spoken + "\n" + raw_steps,
+            sheet,
+            row_label,
+        )
     else:
         spoken = strip_cell_refs(rendered)
         spoken = re.sub(r"\bFor\s+on the row\b", "On the row", spoken)

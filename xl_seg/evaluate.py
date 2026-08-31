@@ -15,12 +15,14 @@ import math
 import os
 import re
 import stat
+import time
 import zipfile
 from calendar import monthrange
 from collections import defaultdict
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta
 from functools import lru_cache
+from heapq import heappop, heappush
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -60,6 +62,38 @@ EXCEL_DEFAULT_CHANGE = 0.001
 MAX_WORKBOOK_ITERATIONS = 10_000
 MAX_ITERATION_DELTA = 1.0
 CONVERGENCE = 1e-12
+
+# Only operations whose active source walk is a pure union of their argument
+# sources belong here. Unknown and newly implemented operations deliberately
+# default to uncacheable. Dynamic selectors and references (IF/IFS/CHOOSE,
+# IFERROR, SUMIF/SUMIFS, lookups, OFFSET, INDIRECT) are intentionally absent.
+SOURCE_WALK_PURE_OPS = frozenset({
+    "+", "-", "*", "/", "^", "&", "=", "<>", ">", "<", ">=", "<=",
+    "u-", "u+", "%", "isect", " ",
+    "ABS", "AND", "AVERAGE", "AVERAGEIF", "AVERAGEIFS", "CONCAT",
+    "CONCATENATE", "COUNT", "COUNTA", "COUNTBLANK", "COUNTIF", "COUNTIFS",
+    "CUMIPMT", "CUMPRINC", "DATE", "DATEDIF", "DAY", "DAYS", "DAYS360",
+    "EDATE", "EOMONTH", "EXP", "FIXED", "FV", "GCD", "INT", "IPMT",
+    "IRR", "ISBLANK", "ISERR", "ISERROR", "ISNA", "ISNUMBER", "LARGE",
+    "LEFT", "LEN", "LN", "LOWER", "MAX", "MAXA", "MAXIFS", "MEDIAN",
+    "MID", "MIN", "MINA", "MINIFS", "MIRR", "MOD", "MONTH", "MROUND",
+    "N", "NETWORKDAYS", "NORM.DIST", "NORM.INV", "NORM.S.DIST",
+    "NORM.S.INV", "NOW", "NPER", "NPV", "NUMBERVALUE",
+    "PMT", "POWER", "PPMT", "PRODUCT", "PROPER", "PV", "QUARTILE",
+    "RANK", "RANK.EQ", "RATE", "RIGHT", "ROUNDDOWN", "ROUNDUP", "ROUND",
+    "ROWS", "RRI", "RSQ", "SEARCH", "SLOPE", "SMALL", "SUBSTITUTE",
+    "SUBTOTAL", "SUM", "SUMPRODUCT", "TEXT", "TEXTJOIN", "TODAY", "TRANSPOSE",
+    "TRIM", "UPPER", "VSTACK", "WEEKDAY", "WORKDAY", "XIRR", "XNPV",
+    "YEAR", "YEARFRAC",
+})
+
+
+def _bare_operation(operation: str) -> str:
+    bare = str(operation).upper()
+    for prefix in ("_XLFN.", "_XLWS."):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+    return bare
 
 
 class Unresolved:
@@ -777,6 +811,9 @@ class EvalResult:
     cycle_groups: dict = dataclass_field(default_factory=dict)
     endpoint_equation_checker: object = None
     strict_proof: bool = False
+    # Process-local performance data. It is returned to the caller but is not
+    # part of proof, coverage, verification, or published generation identity.
+    benchmark: dict = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -828,6 +865,8 @@ class Evaluator:
         proof_outputs=None,
         run_probes: bool = True,
         proof_scope=None,
+        optimize: bool = True,
+        clock=None,
     ):
         self.graph = graph
         self.cg = cg
@@ -837,6 +876,8 @@ class Evaluator:
         self.proof_outputs = set(proof_outputs) if proof_outputs is not None else None
         self.run_probes = run_probes
         self.proof_scope = set(proof_scope) if proof_scope is not None else None
+        self.optimize = bool(optimize)
+        self.clock = clock if clock is not None else datetime.now
         self.values: dict = {}
         self.unresolved: dict = {}
         self.unknown_ops: dict = defaultdict(int)
@@ -855,6 +896,28 @@ class Evaluator:
         self._proof_active_radj: dict = {}
         self._proof_resolved_targets: dict = {}
         self._proof_resolved_operation_targets: dict = {}
+        self._static_source_cache: dict[str, frozenset[str]] = {}
+        self._source_walk_purity_cache: dict[str, bool] = {}
+        self._component_plan_cache: dict[tuple, tuple] = {}
+        self._benchmark = {
+            "active_graph": {
+                "calls": 0,
+                "seconds": 0.0,
+                "cells_scanned": 0,
+                "reused_initial_graphs": 0,
+                "static_source_cache_hits": 0,
+                "static_source_cache_misses": 0,
+            },
+            "component_plan": {
+                "calls": 0,
+                "seconds": 0.0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+            },
+            "acyclic_evaluation": {"calls": 0, "seconds": 0.0},
+            "run_seconds": 0.0,
+            "optimized": self.optimize,
+        }
 
     # -- AST walking ------------------------------------------------------
     def _arg_specs(self, node):
@@ -1520,7 +1583,7 @@ class Evaluator:
     _fn__xlfn_days = _fn_days
 
     def _fn_today(self, args):
-        return float(math.floor(_datetime_to_serial(datetime.today())))
+        return float(math.floor(_datetime_to_serial(self.clock())))
 
     def _fn_choose(self, args):
         idx = int(num(args[0]))
@@ -2182,7 +2245,7 @@ class Evaluator:
         return 0.0
 
     def _fn_now(self, args):
-        return _datetime_to_serial(datetime.now())
+        return _datetime_to_serial(self.clock())
 
     def _fn_workday(self, args):
         serial = int(num(args[0]))
@@ -2716,7 +2779,15 @@ class Evaluator:
 
     def _active_node_sources(self, node_id, seen=None):
         """Cell precedents actually evaluated under the current selector values."""
-        seen = set() if seen is None else seen
+        root_call = seen is None
+        if root_call and self.optimize and self._source_walk_is_pure(node_id):
+            cached = self._static_source_cache.get(node_id)
+            if cached is not None:
+                self._benchmark["active_graph"]["static_source_cache_hits"] += 1
+                return set(cached)
+            self._benchmark["active_graph"]["static_source_cache_misses"] += 1
+
+        seen = set() if root_call else seen
         if node_id in seen:
             return set()
         seen.add(node_id)
@@ -2805,22 +2876,67 @@ class Evaluator:
             if isinstance(targets, list):
                 sources.update(targets)
                 self._record_resolved_targets(node, targets)
+        if (
+            root_call
+            and self.optimize
+            and self._source_walk_purity_cache.get(node_id) is True
+        ):
+            self._static_source_cache[node_id] = frozenset(sources)
         return sources
+
+    def _source_walk_is_pure(self, node_id, visiting=None):
+        """Prove that an AST subtree's active sources cannot depend on values."""
+        cached = self._source_walk_purity_cache.get(node_id)
+        if cached is not None:
+            return cached
+        visiting = set() if visiting is None else visiting
+        if node_id in visiting:
+            self._source_walk_purity_cache[node_id] = False
+            return False
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            self._source_walk_purity_cache[node_id] = False
+            return False
+        if node.is_cell or node.kind in {"const", "range"}:
+            self._source_walk_purity_cache[node_id] = True
+            return True
+        if (
+            node.kind != "op"
+            or _bare_operation(node.op) not in SOURCE_WALK_PURE_OPS
+        ):
+            self._source_walk_purity_cache[node_id] = False
+            return False
+        branch = visiting | {node_id}
+        pure = all(
+            self._source_walk_is_pure(edge.source, branch)
+            for edge in self.graph.in_edges.get(node_id, ())
+        )
+        self._source_walk_purity_cache[node_id] = pure
+        return pure
 
     def _active_graph(self, cells):
         """Build source-to-consumer edges after pruning inactive formula branches."""
+        started = time.perf_counter()
+        cell_count = 0
         adj: dict[str, set] = {}
         radj: dict[str, set] = {}
-        for target in cells:
-            root = self.graph.root_of(target)
-            if root is None:
-                continue
-            radj[target] = set()
-            self._current_cell = target
-            for source in self._active_node_sources(root):
-                adj.setdefault(source, set()).add(target)
-                radj.setdefault(target, set()).add(source)
-        return adj, radj
+        try:
+            for target in cells:
+                cell_count += 1
+                root = self.graph.root_of(target)
+                if root is None:
+                    continue
+                radj[target] = set()
+                self._current_cell = target
+                for source in self._active_node_sources(root):
+                    adj.setdefault(source, set()).add(target)
+                    radj.setdefault(target, set()).add(source)
+            return adj, radj
+        finally:
+            metric = self._benchmark["active_graph"]
+            metric["calls"] += 1
+            metric["cells_scanned"] += cell_count
+            metric["seconds"] += time.perf_counter() - started
 
     @staticmethod
     def _cell_key(cell):
@@ -2829,7 +2945,19 @@ class Evaluator:
 
     def _component_plan(self, cells, active_adj):
         """Return deterministic SCC and topological metadata for an active graph."""
-        ordered_cells = sorted(cells, key=self._cell_key)
+        started = time.perf_counter()
+        metric = self._benchmark["component_plan"]
+        metric["calls"] += 1
+        ordered_cells = tuple(sorted(cells, key=self._cell_key))
+        cache_key = None
+        if self.optimize:
+            cache_key = (ordered_cells, self._graph_signature(active_adj))
+            cached = self._component_plan_cache.get(cache_key)
+            if cached is not None:
+                metric["cache_hits"] += 1
+                metric["seconds"] += time.perf_counter() - started
+                return cached
+            metric["cache_misses"] += 1
         ordered_adj = {
             source: tuple(sorted(targets, key=self._cell_key))
             for source, targets in active_adj.items()
@@ -2855,13 +2983,13 @@ class Evaluator:
                     continue
                 comp_adj[source_comp].add(target_comp)
                 indegree[target_comp] += 1
-        ready = sorted(
-            (index for index, count in indegree.items() if count == 0),
-            key=lambda index: self._cell_key(groups[index][0]),
-        )
+        ready = []
+        for index, count in indegree.items():
+            if count == 0:
+                heappush(ready, (self._cell_key(groups[index][0]), index))
         topo = []
         while ready:
-            index = ready.pop(0)
+            _, index = heappop(ready)
             topo.append(index)
             for target in sorted(
                 comp_adj[index],
@@ -2869,23 +2997,35 @@ class Evaluator:
             ):
                 indegree[target] -= 1
                 if indegree[target] == 0:
-                    ready.append(target)
-                    ready.sort(key=lambda item: self._cell_key(groups[item][0]))
+                    heappush(
+                        ready,
+                        (self._cell_key(groups[target][0]), target),
+                    )
         cyclic = {
             index
             for index, group in enumerate(groups)
             if len(group) > 1
             or any(cell in active_adj.get(cell, ()) for cell in group)
         }
-        return groups, topo, cyclic
+        result = (groups, topo, cyclic)
+        if cache_key is not None:
+            self._component_plan_cache[cache_key] = result
+        metric["seconds"] += time.perf_counter() - started
+        return result
 
     def _evaluate_acyclic(self, groups, topo, cyclic, evaluable, seeded):
-        for index in topo:
-            if index in cyclic:
-                continue
-            for cell in groups[index]:
-                if cell in evaluable and cell not in seeded:
-                    self.values[cell] = self._eval_cell(cell)
+        started = time.perf_counter()
+        try:
+            for index in topo:
+                if index in cyclic:
+                    continue
+                for cell in groups[index]:
+                    if cell in evaluable and cell not in seeded:
+                        self.values[cell] = self._eval_cell(cell)
+        finally:
+            metric = self._benchmark["acyclic_evaluation"]
+            metric["calls"] += 1
+            metric["seconds"] += time.perf_counter() - started
 
     @staticmethod
     def _graph_signature(active_adj):
@@ -3478,6 +3618,7 @@ class Evaluator:
     # -- driver -----------------------------------------------------------
     def run(self, inputs: set) -> EvalResult:
         """Seed primitive graph values, rebuild formulas, and report the gaps."""
+        run_started = time.perf_counter()
         cells = [
             cell for cell in self.cg.info
             if self.proof_scope is None or cell in self.proof_scope
@@ -3576,10 +3717,16 @@ class Evaluator:
         groups, topo, cyclic = [], [], set()
         for graph_pass in range(1, MAX_ACTIVE_PASSES + 1):
             graph_passes = graph_pass
-            self._resolved_targets = {}
-            self._resolved_operation_targets = {}
-            self.runtime_address_radj = {}
-            active_adj, active_radj = self._active_graph(cells)
+            if graph_pass == 1 or not self.optimize:
+                self._resolved_targets = {}
+                self._resolved_operation_targets = {}
+                self.runtime_address_radj = {}
+                active_adj, active_radj = self._active_graph(cells)
+            else:
+                # The previous pass's post-evaluation graph was built from the
+                # exact values present here. No value, scope, or target-ledger
+                # mutation occurs between these points.
+                self._benchmark["active_graph"]["reused_initial_graphs"] += 1
             groups, topo, cyclic = self._component_plan(cells, active_adj)
             self._evaluate_acyclic(groups, topo, cyclic, evaluable, seeded)
 
@@ -4116,6 +4263,11 @@ class Evaluator:
             target: set(sources)
             for target, sources in self.runtime_address_radj.items()
         }
+        self._benchmark["run_seconds"] = time.perf_counter() - run_started
+        benchmark = {
+            name: dict(value) if isinstance(value, dict) else value
+            for name, value in self._benchmark.items()
+        }
         return EvalResult(
             self.values, self.unresolved, iterated, coverage,
             runtime_radj=runtime_radj,
@@ -4153,6 +4305,7 @@ class Evaluator:
             cycle_groups=cycle_groups,
             endpoint_equation_checker=self._endpoint_equation_check,
             strict_proof=self.strict_proof,
+            benchmark=benchmark,
         )
 
     @staticmethod

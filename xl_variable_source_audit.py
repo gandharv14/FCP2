@@ -695,9 +695,15 @@ def resolve_segmentation_directory(
     )
     return generation_dir, {
         "generation_id": generation_manifest["generation_id"],
+        "inventory_approval_sha256": (
+            source_manifest.get("bindings") or {}
+        ).get("inventory_approval_sha256"),
         "manifest_sha256": hashlib.sha256(
             (generation_dir / "generation-manifest.json").read_bytes()
         ).hexdigest(),
+        "recalc_signals_sha256": (
+            source_manifest.get("bindings") or {}
+        ).get("recalc_signals_sha256"),
         "source_generation_id": source_manifest["generation_id"],
     }
 

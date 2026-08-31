@@ -257,7 +257,7 @@ def review_accuracy_passed(review: dict | None, claims_payload: dict) -> bool:
 
 
 def review_faults(review: dict | None, claims_payload: dict) -> list[str]:
-    """Diagnose the full round-1 gate. Empty list == review_passed."""
+    """Diagnose the full review gate. Empty list == review_passed."""
     if not review:
         return [
             "no review JSON was loaded; expected: %s" % REVIEW_SCHEMA_TEMPLATE
@@ -899,18 +899,19 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
           require_review_pass: bool, skip_smoke: bool) -> dict:
     if claims_payload.get("empty") or not claims_payload.get("claims"):
         raise DialogueError("empty agent_records: do not apply")
-    if require_review_pass:
-        round_faults = review_faults(review, claims_payload)
-        if round_faults:
-            raise DialogueError(
-                "review did not pass; not applying after round 1: "
-                + "; ".join(round_faults[:6])
-            )
+    # Kept for CLI/API compatibility; no round may weaken the full review gate.
+    _ = require_review_pass
     accuracy_gate_faults = review_accuracy_faults(review, claims_payload)
-    if accuracy_gate_faults:
+    round_faults = review_faults(review, claims_payload)
+    if round_faults:
+        gate = (
+            "reviewer accuracy did not pass"
+            if accuracy_gate_faults
+            else "full review did not pass"
+        )
         raise DialogueError(
-            "reviewer accuracy did not pass; not applying: "
-            + "; ".join(accuracy_gate_faults[:6])
+            f"{gate}; full review is required in every round; not applying: "
+            + "; ".join(round_faults[:6])
         )
     if DOCKER_IMAGE_RE.search((task_dir / "task.toml").read_text(encoding="utf-8")):
         raise DialogueError("refuse apply: bare docker_image task")
@@ -926,7 +927,7 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
     raw_dialogue = draft.read_text(encoding="utf-8")
     draft_report = check_draft(raw_dialogue, claims_payload, task_dir)
     # Cell-address leaks in senior turns must not replace working bullets,
-    # even after the two-round force-ship. Reviewer naturalness can fail.
+    # even after the second round. The full review gate above must also pass.
     if draft_report.get("senior_cell_refs"):
         raise DialogueError(
             "refuse apply: senior turns still contain cell refs: %s"
@@ -939,9 +940,7 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
     toml = update_instruction_hash(original_toml, sha256_text(instruction))
 
     faults = list(draft_report["faults"])
-    blocking = []
-    blocking.extend(draft_report.get("accuracy_faults") or [])
-    blocking.extend(draft_report.get("cast_faults") or [])
+    blocking = list(faults)
     blocking.extend(instruction_faults(instruction, claims_payload, task_dir))
     blocking.extend(identity_faults(original_instruction, instruction))
     try:

@@ -35,8 +35,30 @@ def test_packaging_uses_same_pinned_audit_binding():
         "generation_id": "segmentation-id",
         "manifest_sha256": "a" * 64,
         "source_generation_id": "source-id",
+        "inventory_approval_sha256": None,
+        "recalc_signals_sha256": None,
     }
     assert xl_output_task.audit_segmentation_binding(None) is None
+
+
+def test_packaging_preserves_non_null_audit_bindings():
+    context = {
+        "bindings": {
+            "source_generation_id": "source-id",
+            "segmentation_generation_id": "segmentation-id",
+            "segmentation_manifest_sha256": "a" * 64,
+            "inventory_approval_sha256": "b" * 64,
+            "recalc_signals_sha256": "c" * 64,
+        }
+    }
+
+    assert xl_output_task.audit_segmentation_binding(context) == {
+        "generation_id": "segmentation-id",
+        "manifest_sha256": "a" * 64,
+        "source_generation_id": "source-id",
+        "inventory_approval_sha256": "b" * 64,
+        "recalc_signals_sha256": "c" * 64,
+    }
 
 
 def _case(tmp_path: Path, name="case", *, status="pass"):

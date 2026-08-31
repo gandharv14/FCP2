@@ -498,7 +498,7 @@ INPUT_SECTION_PLAIN = """\
 The workbook `%s` is in your working directory. Every input the model needs is
 present - assumptions, drivers, historicals and labels - and every cell the
 model is meant to work out is blank. The artifact has been checked to contain
-no formulas or derived numbers and to preserve the identified input cells.
+no formulas and to preserve identified inputs, labels, and sheet structure.
 You may install Python packages (for example `openpyxl`) to read it.
 """
 
@@ -508,8 +508,9 @@ to work out is blank, and a set of externally-sourced input assumptions has
 additionally been removed from the sheets. Those removed inputs are only
 retrievable through the research data service described in the next section;
 every other input - drivers, historicals and labels - is present. The artifact
-has been checked to contain no formulas or derived numbers. You may install
-Python packages (for example `openpyxl`) to read it.
+has been checked to contain no formulas and to preserve identified inputs,
+labels, and sheet structure. You may install Python packages (for example
+`openpyxl`) to read it.
 """
 
 RESEARCH_SECTION = """\
@@ -908,11 +909,16 @@ def audit_segmentation_binding(pipeline_context):
     if pipeline_context is None:
         return None
     bindings = pipeline_context["bindings"]
-    return {
+    binding = {
         "generation_id": bindings["segmentation_generation_id"],
         "manifest_sha256": bindings["segmentation_manifest_sha256"],
         "source_generation_id": bindings["source_generation_id"],
+        "inventory_approval_sha256": bindings.get(
+            "inventory_approval_sha256"
+        ),
+        "recalc_signals_sha256": bindings.get("recalc_signals_sha256"),
     }
+    return binding
 
 
 def main(argv=None):

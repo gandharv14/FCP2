@@ -28,11 +28,16 @@ LEGACY_SNAPSHOT_SCHEMA_VERSION = "workbook-legacy-snapshot/v1"
 LEGACY_POINTER_SCHEMA_VERSION = "workbook-legacy-snapshot-pointer/v1"
 SOURCE_SCHEMA_VERSION = "source-generation/v2"
 SEGMENTATION_SCHEMA_VERSION = "segmentation-generation/v2"
-SOURCE_POLICY_VERSION = "source-recalc-policy/v2"
-SOURCE_HEALTH_SCHEMA_VERSION = "xlsx-source-health/v2"
+SOURCE_POLICY_VERSION = "source-recalc-policy/v3"
+SOURCE_HEALTH_SCHEMA_VERSION = "xlsx-source-health/v3"
+PREVIOUS_SOURCE_POLICY_VERSION = "source-recalc-policy/v2"
+PREVIOUS_SOURCE_HEALTH_SCHEMA_VERSION = "xlsx-source-health/v2"
 SEGMENTATION_VERIFICATION_SCHEMA_VERSION = "segmentation-verification/v2"
 CONE_SCHEMA_VERSION = "restriction-cone-certificate/v1"
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+RECOVERY_RESTRICTED_MODES = frozenset({
+    "data_tables_outside_output_cone",
+})
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TRUE_EXTERNAL_XLSX_PARTS = (
     "xl/externalLinks/",
@@ -195,7 +200,38 @@ def _workbook_lock(root: Path):
         os.close(descriptor)
 
 
+def _validate_dialogue_application(task_dir: Path) -> None:
+    marker_path = task_dir / "tests" / "dialogue-applied.json"
+    if not marker_path.exists() and not marker_path.is_symlink():
+        return
+    if marker_path.is_symlink() or not marker_path.is_file():
+        raise ReleasePublicationError("dialogue application marker is unsafe")
+    marker = _read_json(marker_path, "dialogue application marker")
+    if (
+        marker.get("applied") is not True
+        or marker.get("review_passed") is not True
+        or marker.get("draft_passed") is not True
+    ):
+        raise ReleasePublicationError(
+            "dialogue application did not pass draft and independent review"
+        )
+    notes = task_dir / "environment" / "additional-assumptions.md"
+    dockerfile = task_dir / "environment" / "Dockerfile"
+    if (
+        notes.is_symlink()
+        or not notes.is_file()
+        or dockerfile.is_symlink()
+        or not dockerfile.is_file()
+        or "COPY additional-assumptions.md /app/additional-assumptions.md"
+        not in dockerfile.read_text(encoding="utf-8")
+    ):
+        raise ReleasePublicationError(
+            "passing dialogue application is not bound into the task image"
+        )
+
+
 def _reject_external_package_artifacts(task_dir: Path) -> None:
+    _validate_dialogue_application(task_dir)
     environment = task_dir / "environment"
     if not environment.is_dir() or environment.is_symlink():
         raise ReleasePublicationError("task environment is missing or unsafe")
@@ -400,6 +436,9 @@ def _release_components(
     segmentation_generation_id: str,
     task_root: Path,
     task_generation_id: str,
+    *,
+    source_policy_version: str = SOURCE_POLICY_VERSION,
+    source_health_schema_version: str = SOURCE_HEALTH_SCHEMA_VERSION,
 ) -> tuple[dict, dict, dict, Path, Path, Path]:
     from xl_source_publication import resolve_source_generation_by_id
     from xl_seg.publication import resolve_generation_by_id
@@ -413,12 +452,12 @@ def _release_components(
     if layout.get("workbook_id") != workbook_id:
         raise ReleasePublicationError("source generation workbook ID mismatch")
     source_identity = source_manifest.get("identity") or {}
-    if source_identity.get("policy_version") != SOURCE_POLICY_VERSION:
+    if source_identity.get("policy_version") != source_policy_version:
         raise ReleasePublicationError("unsupported or downgraded source policy")
     health = _read_json(source_dir / "health.json", "source health")
     if (
-        health.get("schema_version") != SOURCE_HEALTH_SCHEMA_VERSION
-        or health.get("policy_version") != SOURCE_POLICY_VERSION
+        health.get("schema_version") != source_health_schema_version
+        or health.get("policy_version") != source_policy_version
     ):
         raise ReleasePublicationError("unsupported source health policy/schema")
     segmentation_dir, segmentation_manifest = resolve_generation_by_id(
@@ -443,14 +482,53 @@ def _release_components(
         or source_binding.get("source_sha256") != source_bindings.get("source_sha256")
         or source_binding.get("health_report_sha256")
         != source_bindings.get("health_report_sha256")
-        or source_binding.get("policy_version") != SOURCE_POLICY_VERSION
+        or source_binding.get("policy_version") != source_policy_version
     ):
         raise ReleasePublicationError(
             "segmentation does not bind the exact source generation"
         )
-    restricted = source_binding.get("route") == "restricted_pass"
+    restricted = source_binding.get("route") in {
+        "restricted_pass",
+        "restricted_recalc_pass",
+    }
+    policy_decision = source_identity.get("policy_decision") or {}
+    recovery_mode = policy_decision.get("recovery_mode")
+    recovery_restricted = recovery_mode in RECOVERY_RESTRICTED_MODES
+    if recovery_mode is not None and not recovery_restricted:
+        raise ReleasePublicationError("unsupported restricted recovery mode")
+    if recovery_restricted and (
+        source_policy_version == PREVIOUS_SOURCE_POLICY_VERSION
+        or not restricted
+        or policy_decision.get("route") != source_binding.get("route")
+    ):
+        raise ReleasePublicationError(
+            "restricted recovery mode is not bound to the source route"
+        )
     policy_bindings = segmentation_manifest.get("source_policy_bindings") or {}
     if restricted:
+        required_source_bindings = (
+            "restriction_evidence_sha256",
+            "restriction_events_sha256",
+            "restriction_profile_sha256",
+            "recalc_signals_sha256",
+        )
+        if not recovery_restricted:
+            required_source_bindings += ("inventory_approval_sha256",)
+        if source_policy_version != PREVIOUS_SOURCE_POLICY_VERSION and any(
+            not isinstance(source_bindings.get(key), str)
+            or HASH_RE.fullmatch(source_bindings[key]) is None
+            for key in required_source_bindings
+        ):
+            raise ReleasePublicationError(
+                "current restricted source bindings are incomplete"
+            )
+        if recovery_restricted and (
+            source_bindings.get("inventory_approval_sha256") is not None
+            or policy_bindings.get("inventory_approval_sha256") is not None
+        ):
+            raise ReleasePublicationError(
+                "restricted recovery mode must omit inventory approval"
+            )
         if (
             policy_bindings.get("restriction_evidence_sha256")
             != source_bindings.get("restriction_evidence_sha256")
@@ -458,20 +536,34 @@ def _release_components(
             != source_bindings.get("restriction_events_sha256")
             or policy_bindings.get("restriction_profile_sha256")
             != source_bindings.get("restriction_profile_sha256")
+            or policy_bindings.get("inventory_approval_sha256")
+            != source_bindings.get("inventory_approval_sha256")
+            or policy_bindings.get("recalc_signals_sha256")
+            != source_bindings.get("recalc_signals_sha256")
         ):
             raise ReleasePublicationError("restriction evidence bindings changed")
         certificate = _read_json(
             segmentation_dir / "restriction-cone-certificate.json",
             "restriction cone certificate",
         )
-        if certificate.get("schema_version") != CONE_SCHEMA_VERSION:
-            raise ReleasePublicationError("unsupported restriction cone schema")
+        certificate_hash = policy_bindings.get("cone_certificate_sha256")
+        if (
+            certificate.get("schema_version") != CONE_SCHEMA_VERSION
+            or not isinstance(certificate_hash, str)
+            or HASH_RE.fullmatch(certificate_hash) is None
+            or certificate.get("certificate_sha256") != certificate_hash
+        ):
+            raise ReleasePublicationError(
+                "restriction cone certificate is incomplete or changed"
+            )
     elif any(
         policy_bindings.get(key) is not None
         for key in (
             "restriction_evidence_sha256",
             "restriction_events_sha256",
             "restriction_profile_sha256",
+            "inventory_approval_sha256",
+            "recalc_signals_sha256",
             "cone_certificate_sha256",
         )
     ):
@@ -495,6 +587,12 @@ def _release_components(
         ),
         "restriction_profile_sha256": source_bindings.get(
             "restriction_profile_sha256"
+        ),
+        "inventory_approval_sha256": source_bindings.get(
+            "inventory_approval_sha256"
+        ),
+        "recalc_signals_sha256": source_bindings.get(
+            "recalc_signals_sha256"
         ),
         "segmentation_generation_id": segmentation_generation_id,
         "segmentation_manifest_sha256": _sha256(
@@ -528,6 +626,8 @@ def build_release_manifest(
     task_generation_id: str,
     prior_release_id: str | None,
     legacy_snapshot_hash: str | None,
+    source_policy_version: str = SOURCE_POLICY_VERSION,
+    source_health_schema_version: str = SOURCE_HEALTH_SCHEMA_VERSION,
 ) -> dict:
     """Validate all immutable inputs and derive the canonical release identity."""
     if not SAFE_ID_RE.fullmatch(str(workbook_id)):
@@ -551,6 +651,8 @@ def build_release_manifest(
         segmentation_generation_id,
         Path(task_root),
         task_generation_id,
+        source_policy_version=source_policy_version,
+        source_health_schema_version=source_health_schema_version,
     )
     source_bindings = source_manifest["bindings"]
     policy_bindings = segmentation_manifest.get("source_policy_bindings") or {}
@@ -573,6 +675,12 @@ def build_release_manifest(
         "restriction_profile_sha256": source_bindings.get(
             "restriction_profile_sha256"
         ),
+        "inventory_approval_sha256": source_bindings.get(
+            "inventory_approval_sha256"
+        ),
+        "recalc_signals_sha256": source_bindings.get(
+            "recalc_signals_sha256"
+        ),
         "cone_certificate_sha256": policy_bindings.get(
             "cone_certificate_sha256"
         ),
@@ -581,8 +689,8 @@ def build_release_manifest(
         "release_schema_version": RELEASE_SCHEMA_VERSION,
         "release_policy_version": RELEASE_POLICY_VERSION,
         "source_schema_version": SOURCE_SCHEMA_VERSION,
-        "source_health_schema_version": SOURCE_HEALTH_SCHEMA_VERSION,
-        "source_policy_version": SOURCE_POLICY_VERSION,
+        "source_health_schema_version": source_health_schema_version,
+        "source_policy_version": source_policy_version,
         "segmentation_schema_version": SEGMENTATION_SCHEMA_VERSION,
         "segmentation_verification_schema_version":
             SEGMENTATION_VERIFICATION_SCHEMA_VERSION,
@@ -694,6 +802,23 @@ def publish_release(
                 raise ReleasePublicationError(
                     "first v2 release does not bind the validated legacy snapshot"
                 )
+            if snapshot_identity.get("mode") == "absent":
+                expected_source_pointer = str(
+                    (Path(source_root) / "current.json").resolve()
+                )
+                expected_segmentation_pointer = str(
+                    (Path(segmentation_root) / "current.json").resolve()
+                )
+                if (
+                    snapshot_identity.get("source_pointer_path")
+                    != expected_source_pointer
+                    or snapshot_identity.get("segmentation_pointer_path")
+                    != expected_segmentation_pointer
+                ):
+                    raise ReleasePublicationError(
+                        "first v2 release does not bind the validated absent "
+                        "legacy paths"
+                    )
         else:
             prior_release_id = observed
             if legacy_snapshot_hash is not None:
@@ -820,24 +945,34 @@ def validate_release(
     if copied != {key: identity.get(key) for key in copied}:
         raise ReleasePublicationError("release manifest identity fields disagree")
     versions = identity.get("versions")
-    expected_versions = {
-        "release_schema_version": RELEASE_SCHEMA_VERSION,
-        "release_policy_version": RELEASE_POLICY_VERSION,
-        "source_schema_version": SOURCE_SCHEMA_VERSION,
-        "source_health_schema_version": SOURCE_HEALTH_SCHEMA_VERSION,
-        "source_policy_version": SOURCE_POLICY_VERSION,
-        "segmentation_schema_version": SEGMENTATION_SCHEMA_VERSION,
-        "segmentation_verification_schema_version":
-            SEGMENTATION_VERIFICATION_SCHEMA_VERSION,
-        "cone_schema_version": (
-            CONE_SCHEMA_VERSION
-            if (identity.get("bindings") or {}).get("cone_certificate_sha256")
-            is not None
-            else None
+    def version_bundle(health_schema: str, source_policy: str) -> dict:
+        return {
+            "release_schema_version": RELEASE_SCHEMA_VERSION,
+            "release_policy_version": RELEASE_POLICY_VERSION,
+            "source_schema_version": SOURCE_SCHEMA_VERSION,
+            "source_health_schema_version": health_schema,
+            "source_policy_version": source_policy,
+            "segmentation_schema_version": SEGMENTATION_SCHEMA_VERSION,
+            "segmentation_verification_schema_version":
+                SEGMENTATION_VERIFICATION_SCHEMA_VERSION,
+            "cone_schema_version": (
+                CONE_SCHEMA_VERSION
+                if (identity.get("bindings") or {}).get(
+                    "cone_certificate_sha256"
+                ) is not None
+                else None
+            ),
+            "task_schema_version": TASK_SCHEMA_VERSION,
+        }
+
+    known_versions = (
+        version_bundle(SOURCE_HEALTH_SCHEMA_VERSION, SOURCE_POLICY_VERSION),
+        version_bundle(
+            PREVIOUS_SOURCE_HEALTH_SCHEMA_VERSION,
+            PREVIOUS_SOURCE_POLICY_VERSION,
         ),
-        "task_schema_version": TASK_SCHEMA_VERSION,
-    }
-    if versions != expected_versions:
+    )
+    if versions not in known_versions:
         raise ReleasePublicationError("unknown, mixed, or downgraded release versions")
     rebuilt = build_release_manifest(
         identity["workbook_id"],
@@ -849,6 +984,10 @@ def validate_release(
         task_generation_id=identity["task_generation"]["generation_id"],
         prior_release_id=identity.get("prior_release_id"),
         legacy_snapshot_hash=identity.get("legacy_snapshot_hash"),
+        source_policy_version=versions["source_policy_version"],
+        source_health_schema_version=versions[
+            "source_health_schema_version"
+        ],
     )
     if rebuilt != manifest:
         raise ReleasePublicationError("release component bytes or bindings changed")
@@ -979,17 +1118,78 @@ def freeze_legacy_snapshot(
         return directory, validate_legacy_snapshot(directory)
 
 
+def freeze_absent_legacy_snapshot(
+    publication_root: str | Path,
+    workbook_id: str,
+    *,
+    source_root: str | Path,
+    segmentation_root: str | Path,
+) -> tuple[Path, dict]:
+    """Freeze proof that no pre-cutover source or segmentation pointer exists."""
+    root = Path(publication_root)
+    with _workbook_lock(root):
+        if (root / "current-release.json").exists():
+            raise ReleasePublicationError("cannot freeze legacy state after v2 cutover")
+        source_pointer = Path(source_root) / "current.json"
+        segmentation_pointer = Path(segmentation_root) / "current.json"
+        for pointer in (source_pointer, segmentation_pointer):
+            if pointer.is_symlink() or pointer.exists():
+                raise ReleasePublicationError(
+                    "absent legacy snapshot requires both legacy pointers absent"
+                )
+        identity = {
+            "schema_version": LEGACY_SNAPSHOT_SCHEMA_VERSION,
+            "mode": "absent",
+            "workbook_id": workbook_id,
+            "source_pointer_path": str(source_pointer.resolve()),
+            "segmentation_pointer_path": str(segmentation_pointer.resolve()),
+        }
+        snapshot_hash = canonical_hash(identity)
+        snapshot = {
+            "schema_version": LEGACY_SNAPSHOT_SCHEMA_VERSION,
+            "snapshot_hash": snapshot_hash,
+            "identity": identity,
+        }
+        pointer_path = root / "legacy-snapshot.json"
+        if pointer_path.exists():
+            pointer = _read_json(pointer_path, "legacy snapshot pointer")
+            if (
+                pointer.get("schema_version") != LEGACY_POINTER_SCHEMA_VERSION
+                or pointer.get("snapshot_hash") != snapshot_hash
+            ):
+                raise ReleasePublicationError(
+                    "legacy snapshot is immutable and live legacy state changed"
+                )
+            directory = root / pointer.get("snapshot_path", "")
+            return directory, validate_legacy_snapshot(directory)
+        snapshots = root / "legacy-snapshots"
+        snapshots.mkdir(parents=True, exist_ok=True)
+        directory = snapshots / snapshot_hash
+        temporary = Path(tempfile.mkdtemp(prefix=".legacy-stage-", dir=str(root)))
+        try:
+            (temporary / "legacy-snapshot.json").write_bytes(
+                _canonical_bytes(snapshot)
+            )
+            os.replace(temporary, directory)
+            _fsync_directory(snapshots)
+        except BaseException:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            raise
+        pointer = {
+            "schema_version": LEGACY_POINTER_SCHEMA_VERSION,
+            "snapshot_hash": snapshot_hash,
+            "snapshot_path": f"legacy-snapshots/{snapshot_hash}",
+            "manifest_sha256": _sha256(directory / "legacy-snapshot.json"),
+        }
+        _atomic_write(pointer_path, _canonical_bytes(pointer), exclusive=True)
+        return directory, validate_legacy_snapshot(directory)
+
+
 def validate_legacy_snapshot(snapshot_dir: str | Path) -> dict:
     directory = Path(snapshot_dir)
     if directory.is_symlink() or not directory.is_dir():
         raise ReleasePublicationError("legacy snapshot is missing or unsafe")
-    expected = {
-        "legacy-snapshot.json",
-        "source-current.json",
-        "segmentation-current.json",
-    }
-    if {path.name for path in directory.iterdir()} != expected:
-        raise ReleasePublicationError("legacy snapshot file set changed")
     snapshot = _read_json(directory / "legacy-snapshot.json", "legacy snapshot")
     if snapshot.get("schema_version") != LEGACY_SNAPSHOT_SCHEMA_VERSION:
         raise ReleasePublicationError("unsupported legacy snapshot schema")
@@ -998,6 +1198,28 @@ def validate_legacy_snapshot(snapshot_dir: str | Path) -> dict:
         canonical_hash(identity)
     ):
         raise ReleasePublicationError("legacy snapshot identity hash mismatch")
+    if identity.get("mode") == "absent":
+        if {path.name for path in directory.iterdir()} != {"legacy-snapshot.json"}:
+            raise ReleasePublicationError("absent legacy snapshot file set changed")
+        for key in ("source_pointer_path", "segmentation_pointer_path"):
+            value = identity.get(key)
+            if not isinstance(value, str) or not Path(value).is_absolute():
+                raise ReleasePublicationError(
+                    "absent legacy snapshot path is invalid"
+                )
+            path = Path(value)
+            if path.is_symlink() or path.exists():
+                raise ReleasePublicationError(
+                    "legacy state appeared after its absence was frozen"
+                )
+        return snapshot
+    expected = {
+        "legacy-snapshot.json",
+        "source-current.json",
+        "segmentation-current.json",
+    }
+    if {path.name for path in directory.iterdir()} != expected:
+        raise ReleasePublicationError("legacy snapshot file set changed")
     if hashlib.sha256((directory / "source-current.json").read_bytes()).hexdigest() != (
         identity.get("source_pointer_sha256")
     ):
@@ -1145,6 +1367,10 @@ def resolve_build_context(
             source_bindings.get("restriction_events_sha256"),
         "restriction_profile_sha256":
             source_bindings.get("restriction_profile_sha256"),
+        "inventory_approval_sha256":
+            source_bindings.get("inventory_approval_sha256"),
+        "recalc_signals_sha256":
+            source_bindings.get("recalc_signals_sha256"),
         "segmentation_generation_id": segmentation_generation_id,
         "segmentation_manifest_sha256":
             _sha256(segmentation_dir / "generation-manifest.json"),
@@ -1218,6 +1444,11 @@ def main(argv: list[str] | None = None) -> int:
     freeze.add_argument("--source-root", required=True)
     freeze.add_argument("--segmentation-root", required=True)
     freeze.add_argument("--task-dir", required=True)
+    freeze_absent = commands.add_parser("freeze-absent-legacy")
+    freeze_absent.add_argument("release_root")
+    freeze_absent.add_argument("workbook_id")
+    freeze_absent.add_argument("--source-root", required=True)
+    freeze_absent.add_argument("--segmentation-root", required=True)
     resolve = commands.add_parser("resolve")
     resolve.add_argument("release_root")
     resolve.add_argument("workbook_id")
@@ -1257,6 +1488,14 @@ def main(argv: list[str] | None = None) -> int:
                 source_root=args.source_root,
                 segmentation_root=args.segmentation_root,
                 task_dir=args.task_dir,
+            )
+            result = {"snapshot_dir": str(directory), **value}
+        elif args.command == "freeze-absent-legacy":
+            directory, value = freeze_absent_legacy_snapshot(
+                args.release_root,
+                args.workbook_id,
+                source_root=args.source_root,
+                segmentation_root=args.segmentation_root,
             )
             result = {"snapshot_dir": str(directory), **value}
         elif args.command == "resolve":

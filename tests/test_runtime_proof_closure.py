@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -337,6 +338,166 @@ def test_unresolved_selectors_conservatively_discover_all_dynamic_branches():
     assert radj[ifs_output.id] == {
         condition.id, choices[0].id, choices[1].id, choices[2].id
     }
+
+
+def test_optimized_static_source_walk_matches_reference_and_reuses_work():
+    left = _cell("Sheet!A1", "input", 2)
+    right = _cell("Sheet!B1", "input", 3)
+    output = _cell("Sheet!C1", "formula", 5, "=SUM(A1,B1)")
+    operation = _ast(
+        "Sheet!C1#SUM", output.id, "op", op="SUM", arity=2
+    )
+    graph, cg = _graph(
+        [left, right, output, operation],
+        [
+            _edge(left.id, operation.id, 0, op="SUM"),
+            _edge(right.id, operation.id, 1, op="SUM"),
+            _edge(operation.id, output.id, role="result", op="SUM"),
+        ],
+    )
+
+    reference = Evaluator(
+        graph, cg, strict_proof=True, calculation=CALC, optimize=False
+    ).run({left.id, right.id})
+    optimized = Evaluator(
+        graph, cg, strict_proof=True, calculation=CALC, optimize=True
+    ).run({left.id, right.id})
+
+    assert optimized.values == reference.values
+    assert optimized.runtime_radj == reference.runtime_radj
+    assert optimized.resolved_targets == reference.resolved_targets
+    assert optimized.resolved_operation_targets == reference.resolved_operation_targets
+    assert optimized.runtime_address_radj == reference.runtime_address_radj
+    assert optimized.read_attempts == reference.read_attempts
+    assert optimized.coverage == reference.coverage
+    active = optimized.benchmark["active_graph"]
+    assert active["static_source_cache_misses"] == 1
+    assert active["static_source_cache_hits"] >= 1
+    assert active["reused_initial_graphs"] >= 1
+    assert active["calls"] < reference.benchmark["active_graph"]["calls"]
+
+
+def test_nested_dynamic_selector_is_not_static_cached():
+    condition = _cell("Sheet!A1", "input", 1)
+    selected = _cell("Sheet!B1", "input", 10)
+    unselected = _cell("Sheet!B2", "input", 20)
+    output = _cell("Sheet!C1", "formula", 10, "=SUM(IF(A1,B1,B2))")
+    selector = _ast("Sheet!C1#IF", output.id, "op", op="IF", arity=3)
+    wrapper = _ast("Sheet!C1#SUM", output.id, "op", op="SUM", arity=1)
+    graph, cg = _graph(
+        [condition, selected, unselected, output, selector, wrapper],
+        [
+            _edge(condition.id, selector.id, 0, op="IF"),
+            _edge(selected.id, selector.id, 1, op="IF"),
+            _edge(unselected.id, selector.id, 2, op="IF"),
+            _edge(selector.id, wrapper.id, 0, op="SUM"),
+            _edge(wrapper.id, output.id, role="result", op="SUM"),
+        ],
+    )
+
+    evaluator = Evaluator(
+        graph, cg, strict_proof=True, calculation=CALC, optimize=True
+    )
+    result = evaluator.run({condition.id, selected.id, unselected.id})
+
+    assert result.values[output.id] == 10
+    assert result.runtime_radj[output.id] == {condition.id, selected.id}
+    assert unselected.id not in result.runtime_radj[output.id]
+    assert evaluator._source_walk_is_pure(wrapper.id) is False
+    assert result.benchmark["active_graph"]["static_source_cache_hits"] == 0
+
+
+def test_source_walk_allowlist_normalizes_prefixes_and_rejects_unknown_ops():
+    source = _cell("Sheet!A1", "input", 1)
+    output = _cell("Sheet!B1", "formula", 1, "=_xlfn.SUM(A1)")
+    prefixed = _ast(
+        "Sheet!B1#SUM", output.id, "op", op="_XLFN.SUM", arity=1
+    )
+    unknown = _ast(
+        "Sheet!B1#FUTURE", output.id, "op", op="FUTURE.OP", arity=1
+    )
+    graph, cg = _graph(
+        [source, output, prefixed, unknown],
+        [
+            _edge(source.id, prefixed.id, 0, op="_XLFN.SUM"),
+            _edge(source.id, unknown.id, 0, op="FUTURE.OP"),
+        ],
+    )
+    evaluator = Evaluator(graph, cg)
+
+    assert evaluator._source_walk_is_pure(prefixed.id) is True
+    assert evaluator._source_walk_is_pure(unknown.id) is False
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "IF",
+        "IFS",
+        "_XLFN.IFS",
+        "CHOOSE",
+        "IFERROR",
+        "SUMIF",
+        "SUMIFS",
+        "VLOOKUP",
+        "HLOOKUP",
+        "XLOOKUP",
+        "_XLFN.XLOOKUP",
+        "LOOKUP",
+        "MATCH",
+        "INDEX",
+        "OFFSET",
+        "INDIRECT",
+    ],
+)
+def test_dynamic_source_walk_operations_default_to_uncacheable(operation):
+    output = _cell("Sheet!B1", "formula", 1, f"={operation}()")
+    dynamic = _ast(
+        f"Sheet!B1#{operation}", output.id, "op", op=operation, arity=0
+    )
+    graph, cg = _graph([output, dynamic], [])
+
+    assert Evaluator(graph, cg)._source_walk_is_pure(dynamic.id) is False
+
+
+def test_static_subtotal_is_cacheable_but_name_nodes_are_not():
+    source = _cell("Sheet!A1", "input", 1)
+    output = _cell("Sheet!B1", "formula", 1, "=SUBTOTAL(9,A1)")
+    subtotal = _ast(
+        "Sheet!B1#SUBTOTAL", output.id, "op", op="SUBTOTAL", arity=1
+    )
+    name = _ast("Sheet!B1#NAME", output.id, "name")
+    graph, cg = _graph(
+        [source, output, subtotal, name],
+        [_edge(source.id, subtotal.id, 0, op="SUBTOTAL")],
+    )
+    evaluator = Evaluator(graph, cg)
+
+    assert evaluator._source_walk_is_pure(subtotal.id) is True
+    assert evaluator._source_walk_is_pure(name.id) is False
+
+
+def test_component_plan_cache_keys_isolated_cell_universe():
+    evaluator = Evaluator(graph=None, cg=None, optimize=True)
+
+    first = evaluator._component_plan(["Sheet!A1"], {})
+    second = evaluator._component_plan(["Sheet!B1"], {})
+    repeated = evaluator._component_plan(["Sheet!A1"], {})
+
+    assert first[0] == [("Sheet!A1",)]
+    assert second[0] == [("Sheet!B1",)]
+    assert repeated == first
+    assert evaluator._benchmark["component_plan"]["cache_hits"] == 1
+
+
+def test_clock_is_injected_for_volatile_date_functions():
+    fixed = datetime(2026, 8, 31, 6, 30, 15)
+    evaluator = Evaluator(graph=None, cg=None, clock=lambda: fixed)
+
+    assert evaluator._fn_today([]) == float(
+        int(evaluator._fn_now([]))
+    )
+    assert evaluator._fn_now([]) > evaluator._fn_today([])
 
 
 class _AlternatingEvaluator:

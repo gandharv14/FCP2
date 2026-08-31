@@ -1245,13 +1245,11 @@ class AstGraph:
                     src.update({"sheet": sheet, "row": bounds[1], "col": bounds[0],
                                 "coordinate": ref, "value": n,
                                 "range_truncated": (sheet, ref) in self._truncated_ranges,
-                                "label": "%s (%d cells)" % (ref, n)})
-                    if preserve_range:
-                        # A top-level CSE range is an expression root shared by
-                        # projected members. Give the range a valid formula
-                        # owner (the array anchor encountered first) while each
-                        # member retains exactly one incoming root edge.
-                        src["owner"] = ctx["cell"]
+                                "label": "%s (%d cells)" % (ref, n),
+                                # A collapsed range is an AST expression node.
+                                # Bind it to the first formula that creates it;
+                                # later consumers remain represented by edges.
+                                "owner": ctx["cell"]})
             elif item[0] == "name":
                 node_id = "name:%s" % item[1]
                 src = self.nodes.get(node_id) or self._blank_node(node_id, "name")

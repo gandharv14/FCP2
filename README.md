@@ -2063,11 +2063,12 @@ python3 .cursor/skills/custom-formula-gate/scripts/validate_gate_outputs.py \
 | `PASS` | Every domain method is `standard` or `standard_variant`; documented `definitional` and `structural` rows do not fail the gate. |
 
 Before packaging,
-`scripts/validate_gate_outputs.py` rechecks the exact Terra model, prompt/context/
-catalog hashes, complete key-variable coverage, closed classes and catalog IDs,
-all-period agreement evidence, verdict/count consistency, hint coverage, and
-formula/answer leakage. The package receives only `hints.json` and its prose;
-golden formulas and cached values stay under `runs/`.
+`.cursor/skills/custom-formula-gate/scripts/validate_gate_outputs.py` rechecks
+the exact Terra model, prompt/context/catalog hashes, complete key-variable
+coverage, closed classes and catalog IDs, all-period agreement evidence,
+verdict/count consistency, hint coverage, and formula/answer leakage. The
+package receives only `hints.json` and its prose; golden formulas and cached
+values stay under `runs/`.
 
 ---
 
@@ -2116,10 +2117,11 @@ python3 xl_variable_mcp.py import \
     runs/0233-variable-sources/0233-inputs-variable-sources.md \
     runs/0233-variable-sources/draft.json
 
-# 2. Normalize by hand/agent into atomic variables (one per entity, metric,
-#    period, scenario, basis, unit, status tuple), with workbook cell refs.
-#    For 0233 the authoring script is runs/0233-variable-sources/normalize_0233.py
-#    and exclusions are documented in exclusions.json.
+# 2. Normalize into atomic variables (one per entity, metric, period, scenario,
+#    basis, unit, status tuple), with workbook cell refs. gen_normalizer.py
+#    writes the authoring script to runs/0233-variable-sources/normalize_0233.py;
+#    running that script emits normalized.json. Exclusions are documented in
+#    exclusions.json.
 
 # 3. Profile deduplicated public source URLs with /profile-mcp-sources.
 #    GPT 5.6 Sol receives only a redacted URL/name/kind worklist. Each source

@@ -1,6 +1,16 @@
 # Stage 0 parses .xlsx with openpyxl; the evaluator reads cached values back
-# through it as well. Everything else in the pipeline is standard library.
+# through it as well.
 openpyxl>=3.1.5
+
+# Template-driven task building reads task_templates.yaml. xl_task_build.py is
+# imported by xl_output_task.py, so packaging fails without this.
+pyyaml>=6.0
+
+# Optional, not installed here:
+#   tomli    - only on Python < 3.11; xl_output_task.py, xl_harbor_prep.py and
+#              xl_eval_run.py fall back to stdlib tomllib on 3.11+.
+#   fastmcp  - generated-server smoke and oracle checks only; normally supplied
+#              ephemerally with `uv run --with fastmcp`.
 
 # LLM stages use stdlib urllib against the configured HTTP endpoints, so no SDK
 # is required. `xl_variable_source_audit.py` calls GPT 5.6 Sol through Labelbox

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -181,3 +182,37 @@ def test_compensation_type_markers_are_not_row_names() -> None:
     assert not book.is_row_name("Cost Assumptions Matrix", 5, "Salary Only")
     assert not book.is_row_name("Cost Assumptions Matrix", 5, "Hourly Only")
     assert book.is_row_name("Cost Assumptions Matrix", 2, "District Managers")
+
+
+def test_ungraded_row_label_year_is_licensed_from_target_collision(
+    tmp_path: Path,
+) -> None:
+    disclose = _load_disclose()
+    task = tmp_path / "0167-outputs"
+    (task / "tests").mkdir(parents=True)
+    (task / "tests" / "answer_key.json").write_text(
+        json.dumps({"targets": {"Overview!L12": 2013}}),
+        encoding="utf-8",
+    )
+    record = {
+        "entry": "source_selection",
+        "family": "source_selection",
+        "value": "source",
+        "disposition": "disclosed",
+        "source": "convention_detector",
+        "cell_keys": ["Overview!F55"],
+        "fields": {
+            "label": '"Adjusted EBITDA (FY 2013)"',
+            "ingredient": 'cell LBO!X20 on the row labelled "Adjusted EBITDA"',
+        },
+        "leak_flag": False,
+    }
+
+    allowed = disclose.trusted_row_label_literal_counts([record], task)
+
+    assert allowed[2013.0] == 1
+    assert disclose.audit_text(
+        disclose.render_sentence(record),
+        task,
+        records=[record],
+    ) == []

@@ -628,6 +628,7 @@ def inspect_workbook(
             cache_present = 0
             cache_populated = 0
             cache_empty = 0
+            cache_blank_string = 0
             missing_cache = 0
             data_tables = 0
             shared_formula_followers_expanded = 0
@@ -701,7 +702,14 @@ def inspect_workbook(
                     else:
                         cache_present += 1
                         if value.text in (None, ""):
-                            cache_empty += 1
+                            # A string-typed empty cache is the calculated
+                            # result of formulas such as IF(...,"ERROR","").
+                            # It is complete evidence, not a stale cache.
+                            if cell.attrib.get("t") == "str":
+                                cache_blank_string += 1
+                                cache_populated += 1
+                            else:
+                                cache_empty += 1
                         else:
                             cache_populated += 1
                     text = formula.text or ""
@@ -1017,6 +1025,7 @@ def inspect_workbook(
         "formula_caches_present": cache_present,
         "formula_caches_populated": cache_populated,
         "formula_caches_empty": cache_empty,
+        "formula_caches_blank_string": cache_blank_string,
         "formula_caches_missing": missing_cache,
         "external_links": len(external_link_parts),
         "external_link_relationships": external_link_relations,

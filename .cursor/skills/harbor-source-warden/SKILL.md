@@ -82,6 +82,14 @@ the recorded hash to match every existing immutable file or manifest before use:
 WB="<tracker.workbook_id>"
 DEPENDENCY_PREFLIGHT="<tracker.bindings.dependency_preflight.path>"
 DEPENDENCY_PREFLIGHT_SHA256="<tracker.bindings.dependency_preflight.sha256>"
+ORIGINAL_RAW_SOURCE="<tracker.bindings.original_raw_source.path-or-empty>"
+ORIGINAL_RAW_SOURCE_SHA256="<tracker.bindings.original_raw_source.sha256-or-empty>"
+SOURCE_HEALTH_BEFORE="<tracker.bindings.source_health_before.path-or-empty>"
+SOURCE_HEALTH_BEFORE_SHA256="<tracker.bindings.source_health_before.sha256-or-empty>"
+SOURCE_REMEDIATION_PLAN="<tracker.bindings.source_remediation_plan.path-or-empty>"
+SOURCE_REMEDIATION_PLAN_SHA256="<tracker.bindings.source_remediation_plan.sha256-or-empty>"
+SOURCE_REMEDIATION_MANIFEST="<tracker.bindings.source_remediation_manifest.path-or-empty>"
+SOURCE_REMEDIATION_MANIFEST_SHA256="<tracker.bindings.source_remediation_manifest.sha256-or-empty>"
 RAW_SOURCE_FILE="<tracker.bindings.raw_source.path>"
 RAW_SOURCE_SHA256="<tracker.bindings.raw_source.sha256>"
 SOURCE_RUN="<tracker.bindings.source_publication_root.path>"
@@ -105,6 +113,26 @@ Only `.xlsx` is eligible. Never read or print `.env`.
 
 ```bash
 test -f "$RAW_SOURCE_FILE"
+if [ -n "$SOURCE_REMEDIATION_MANIFEST" ]; then
+  test -f "$ORIGINAL_RAW_SOURCE"
+  test -f "$SOURCE_HEALTH_BEFORE"
+  test -f "$SOURCE_REMEDIATION_PLAN"
+  test "$(shasum -a 256 "$ORIGINAL_RAW_SOURCE" | awk '{print $1}')" = \
+    "$ORIGINAL_RAW_SOURCE_SHA256"
+  test "$(shasum -a 256 "$SOURCE_HEALTH_BEFORE" | awk '{print $1}')" = \
+    "$SOURCE_HEALTH_BEFORE_SHA256"
+  test "$(shasum -a 256 "$SOURCE_REMEDIATION_PLAN" | awk '{print $1}')" = \
+    "$SOURCE_REMEDIATION_PLAN_SHA256"
+  test "$(shasum -a 256 "$SOURCE_REMEDIATION_MANIFEST" | awk '{print $1}')" = \
+    "$SOURCE_REMEDIATION_MANIFEST_SHA256"
+  python3 xl_volatile_formula_remediation.py verify \
+    "$ORIGINAL_RAW_SOURCE" "$RAW_SOURCE_FILE" \
+    --plan "$SOURCE_REMEDIATION_PLAN" \
+    --manifest "$SOURCE_REMEDIATION_MANIFEST"
+elif [ -n "$ORIGINAL_RAW_SOURCE$SOURCE_HEALTH_BEFORE$SOURCE_REMEDIATION_PLAN" ]; then
+  echo "partial volatile-remediation bindings" >&2
+  exit 1
+fi
 python3 xl_source_health.py observe "$RAW_SOURCE_FILE" -o "$SOURCE_HEALTH"
 SOURCE_ROUTE=$(python3 -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["route"])' \
@@ -114,7 +142,9 @@ SOURCE_ROUTE=$(python3 -c \
 Hash `"$RAW_SOURCE_FILE"` and `"$SOURCE_HEALTH"`. `unsupported` and
 `insufficient_evidence` are terminal source-lane outcomes. External
 links/connections, macros, OLE, volatile formulas, data tables, and unknown
-iteration semantics are not recalculation candidates.
+iteration semantics are not recalculation candidates. Remediation is never
+attempted here because tracker `raw_source` is already immutable; unresolved
+volatility must return to a fresh orchestrator intake.
 
 ## Gate 2: Bind recalculation when required
 

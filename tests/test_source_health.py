@@ -266,6 +266,26 @@ def test_restricted_plus_missing_cache_has_bound_restricted_route(tmp_path):
     assert "recalc_signals" not in previous
 
 
+def test_calculated_blank_string_cache_is_complete(tmp_path):
+    source = tmp_path / "blank-string.xlsx"
+    sheet = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        'spreadsheetml/2006/main"><sheetData><row r="1">'
+        '<c r="A1"><v>1</v></c><c r="B1" t="str">'
+        '<f>IF(A1=1,"","ERROR")</f><v></v></c>'
+        "</row></sheetData></worksheet>"
+    )
+    _workbook(source, sheet_xml=sheet)
+
+    report = inspect_workbook(source)
+
+    assert report["route"] == "pass"
+    assert report["counts"]["formula_caches_empty"] == 0
+    assert report["counts"]["formula_caches_blank_string"] == 1
+    assert report["counts"]["formula_caches_populated"] == 1
+    assert "formula_cache_empty" not in report["reason_codes"]
+
+
 def test_mixed_restricted_route_never_overrides_hard_external_reason(tmp_path):
     source = tmp_path / "mixed-external.xlsx"
     sheet = (

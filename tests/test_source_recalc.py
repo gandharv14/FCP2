@@ -112,7 +112,10 @@ def test_semantic_diff_separates_cache_changes_from_model_changes(tmp_path):
     assert cache_diff["cache_only"] is True
     assert cache_diff["proven_stale_cache"] is True
     assert input_diff["equivalent_semantics"] is False
-    assert input_diff["semantic_changes"] == ["inputs", "package_parts"]
+    # Worksheet values are modeled by the dedicated inputs snapshot; the
+    # generic package snapshot deliberately avoids reporting the same change
+    # a second time.
+    assert input_diff["semantic_changes"] == ["inputs"]
     assert input_diff["proven_stale_cache"] is False
 
 
@@ -172,6 +175,46 @@ def test_bound_request_and_injected_engine_preserve_original(tmp_path):
             FakeEngine(),
             allowed_root=tmp_path / "out",
         )
+
+
+def test_execute_accepts_policy_approved_restricted_semantics(tmp_path):
+    source = tmp_path / "source.xlsx"
+    destination = tmp_path / "out" / "recalculated.xlsx"
+    _workbook(source, formula='CELL("filename",A1)', cache="1")
+    request = create_recalc_request(
+        source,
+        destination,
+        request_id="request-restricted",
+        allowed_root=tmp_path / "out",
+        engine_constraints={
+            "allowed_engines": ["fake-engine"],
+            "permitted_versions": ["test-v1"],
+        },
+    )
+
+    class FakeEngine:
+        name = "fake-engine"
+        version = "test-v1"
+        authoritative = True
+
+        def capability(self):
+            return True, "test"
+
+        def execute(self, _source, _candidate, _request):
+            return None
+
+    result = execute_recalc(
+        request,
+        FakeEngine(),
+        allowed_root=tmp_path / "out",
+    )
+
+    assert result["semantic_diff"]["equivalent_semantics"] is True
+    assert result["semantic_diff"]["supported_equivalent_semantics"] is True
+    assert (
+        result["semantic_diff"]["snapshot_supported_equivalent_semantics"]
+        is False
+    )
 
 
 def test_request_tamper_and_out_of_root_fail_closed(tmp_path):

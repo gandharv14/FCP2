@@ -232,6 +232,101 @@ def _runner_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path, dict]:
     return original, candidate, excel_app, request_path, config
 
 
+def test_excel_automation_targets_configured_app_path(tmp_path, monkeypatch):
+    workbook = tmp_path / "candidate.xlsx"
+    _xlsx(workbook)
+    excel_app = tmp_path / "trusted" / "Microsoft Excel.app"
+    excel_app.mkdir(parents=True)
+    staging_root = tmp_path / "excel-container"
+    staging_root.mkdir()
+    captured = {}
+
+    class Process:
+        pid = 123
+        returncode = 0
+
+        def communicate(self, timeout):
+            captured["timeout"] = timeout
+            return "", ""
+
+    def popen(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return Process()
+
+    monkeypatch.setattr(excel_runner.os, "geteuid", lambda: 501)
+    monkeypatch.setattr(excel_runner, "_excel_running", lambda: False)
+    monkeypatch.setattr(excel_runner.subprocess, "Popen", popen)
+    monkeypatch.setattr(excel_runner, "excel_version", lambda app: "16.99")
+    monkeypatch.setattr(
+        excel_runner,
+        "_excel_container_staging_root",
+        lambda _account: staging_root,
+    )
+
+    assert excel_runner.run_excel_automation(excel_app, workbook, 30) == "16.99"
+    staged_workbook = Path(captured["args"][-2])
+    assert staged_workbook.name == workbook.name
+    assert staged_workbook.parent.parent == staging_root
+    assert captured["args"][-1] == str(excel_app)
+    assert captured["args"][0] == "/usr/bin/osascript"
+    assert str(excel_runner.NETWORK_SANDBOX) not in captured["args"]
+    assert "tell application excelAppPath" in excel_runner._AUTOMATION_SCRIPT
+    assert (
+        "set enabledAddIns to every add in whose installed is true"
+        in excel_runner._AUTOMATION_SCRIPT
+    )
+    assert "count of enabledAddIns" in excel_runner._AUTOMATION_SCRIPT
+    assert "set previousCalculation to calculation" in excel_runner._AUTOMATION_SCRIPT
+    assert "set calculation to calculation automatic" in (
+        excel_runner._AUTOMATION_SCRIPT
+    )
+    assert "set calculation to previousCalculation" in (
+        excel_runner._AUTOMATION_SCRIPT
+    )
+
+
+def test_cache_graft_preserves_noncalculation_package_parts(tmp_path):
+    candidate = tmp_path / "candidate.xlsx"
+    calculated = tmp_path / "calculated.xlsx"
+    worksheet = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        'spreadsheetml/2006/main"><sheetData><row r="1">'
+        '<c r="A1"><v>1</v></c><c r="B1"><f>A1+1</f><v>{cache}</v></c>'
+        "</row></sheetData></worksheet>"
+    )
+
+    def write(path, cache, drawing, *, include_person):
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types/>")
+            archive.writestr("xl/workbook.xml", "<workbook/>")
+            archive.writestr(
+                "xl/worksheets/sheet1.xml",
+                worksheet.format(cache=cache),
+            )
+            archive.writestr("xl/drawings/drawing1.xml", drawing)
+            if include_person:
+                archive.writestr("xl/persons/person.xml", "<person original='1'/>")
+
+    write(candidate, "2", "<drawing original='1'/>", include_person=True)
+    write(calculated, "3", "<drawing excel='rewritten'/>", include_person=False)
+
+    excel_runner._replace_candidate_from_staging(calculated, candidate)
+
+    with zipfile.ZipFile(candidate) as archive:
+        assert "xl/persons/person.xml" in archive.namelist()
+        assert archive.read("xl/drawings/drawing1.xml") == b"<drawing original='1'/>"
+        root = excel_runner.ElementTree.fromstring(
+            archive.read("xl/worksheets/sheet1.xml")
+        )
+        cell = next(
+            item for item in root.findall(".//{*}c")
+            if item.attrib.get("r") == "B1"
+        )
+        assert cell.find("{*}f").text == "A1+1"
+        assert cell.find("{*}v").text == "3"
+
+
 def test_timeout_and_partial_save_never_emit_receipt(tmp_path, monkeypatch):
     monkeypatch.setattr(excel_runner.platform, "system", lambda: "Darwin")
     _, candidate, excel_app, request_path, config = _runner_inputs(tmp_path)

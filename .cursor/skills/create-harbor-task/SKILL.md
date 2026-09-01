@@ -25,6 +25,8 @@ pipeline repository root and set:
 ```bash
 WB=0256
 RAW_SOURCE_FILE="4-10 100/$WB.xlsx"
+ORIGINAL_RAW_SOURCE_FILE="$RAW_SOURCE_FILE"
+SOURCE_REMEDIATION_RUN="runs/$WB-volatile-remediation"
 SOURCE_RUN="source_out/$WB"
 RELEASE_ROOT="release_out/$WB"
 SOURCE_HEALTH="runs/$WB-source-health.json"
@@ -66,6 +68,8 @@ GOLDEN=$(PYTHONPATH=synthetic-data-pipeline python3 -c \
 
 Expected artifacts:
 
+- optional `runs/<id>-volatile-remediation/{source-health-before,plan,
+  manifest,source-health-after}.json` and `<id>.xlsx` candidate
 - `runs/preflight/$WB.json`: source-health verdict (must be `healthy`)
 - `release_out/$WB/current-release.json`, immutable
   `releases/<release_id>/release-manifest.json`, and immutable
@@ -137,16 +141,44 @@ Stage all requested workbooks before promoting any of them.
 ### 1. Preflight and AST
 
 Do not read or print `.env`; the pipeline reads required credentials itself.
-Only `.xlsx` is eligible for the authoritative-source path.
+Only `.xlsx` is eligible for the authoritative-source path. Before binding the
+source hash, source health may route an unsupported source to the deterministic
+volatile-formula intake fixer. Never overwrite the discovered source:
 
 ```bash
 python3 -m pip install -r requirements.txt
 test -f "$RAW_SOURCE_FILE"
+mkdir -p "$SOURCE_REMEDIATION_RUN"
+python3 xl_source_health.py observe "$ORIGINAL_RAW_SOURCE_FILE" \
+  -o "$SOURCE_REMEDIATION_RUN/source-health-before.json"
+INITIAL_ROUTE=$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["route"])' \
+  "$SOURCE_REMEDIATION_RUN/source-health-before.json")
+if [ "$INITIAL_ROUTE" = unsupported ]; then
+  python3 xl_volatile_formula_remediation.py plan "$ORIGINAL_RAW_SOURCE_FILE" \
+    -o "$SOURCE_REMEDIATION_RUN/plan.json"
+  python3 xl_volatile_formula_remediation.py apply "$ORIGINAL_RAW_SOURCE_FILE" \
+    --plan "$SOURCE_REMEDIATION_RUN/plan.json" \
+    --output "$SOURCE_REMEDIATION_RUN/$WB.xlsx" \
+    --manifest "$SOURCE_REMEDIATION_RUN/manifest.json"
+  python3 xl_volatile_formula_remediation.py verify \
+    "$ORIGINAL_RAW_SOURCE_FILE" "$SOURCE_REMEDIATION_RUN/$WB.xlsx" \
+    --plan "$SOURCE_REMEDIATION_RUN/plan.json" \
+    --manifest "$SOURCE_REMEDIATION_RUN/manifest.json"
+  RAW_SOURCE_FILE="$SOURCE_REMEDIATION_RUN/$WB.xlsx"
+fi
 python3 xl_source_health.py observe "$RAW_SOURCE_FILE" -o "$SOURCE_HEALTH"
 SOURCE_ROUTE=$(python3 -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["route"])' \
   "$SOURCE_HEALTH")
 ```
+
+The plan must be `eligible` with zero unresolved actions. Require identical
+cached-value ledgers, identical untouched OOXML members, matching
+plan/manifest/source hashes, and a fresh post-remediation route other than
+`unsupported` or `insufficient_evidence`. If any proof fails, stop; do not
+hand-edit formulas or weaken source health. Record the discovered and candidate
+hashes in the completion report.
 
 Read `"$SOURCE_HEALTH"`. Stop on `unsupported` or `insufficient_evidence`.
 External links/connections, macros, OLE, volatile formulas, data tables, and

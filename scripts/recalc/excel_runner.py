@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import contextlib
 import hashlib
 import json
 import os
 import platform
 import pwd
+import shutil
 import signal
 import stat
 import subprocess
@@ -24,6 +26,7 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Callable, Mapping
+from xml.etree import ElementTree
 
 
 REQUEST_SCHEMA = "source-recalc-request/v2"
@@ -324,21 +327,31 @@ def validate_xlsx(path: Path) -> None:
 _AUTOMATION_SCRIPT = r'''
 on run argv
     set workbookPath to item 1 of argv
-    tell application "Microsoft Excel"
-        if (count of workbooks) is not 0 then error "Excel session is not dedicated"
-        set display alerts to false
-        set ask to update links to false
-        set enable events to false
-        set automation security to msoAutomationSecurityForceDisable
-        if (count of (every add in whose installed is true)) is not 0 then error "Excel add-ins are enabled"
-        set calculate before save to true
-        set calculation to calculation manual
-        set targetBook to open workbook workbook file name workbookPath update links do not update links read only false editable true notify false
-        calculate full rebuild
-        save workbook as targetBook filename workbookPath
-        close targetBook saving no
-        quit
-    end tell
+    set excelAppPath to item 2 of argv
+    using terms from application "Microsoft Excel"
+        tell application excelAppPath
+            if (count of workbooks) is not 0 then error "Excel session is not dedicated"
+            set display alerts to false
+            set ask to update links to false
+            set enable events to false
+            set automation security to msoAutomationSecurityForceDisable
+            -- Excel returns `missing value` for the inline filtered-count
+            -- expression even when no add-ins are enabled. Materializing the
+            -- filtered list first makes `count` return the actual integer.
+            set enabledAddIns to every add in whose installed is true
+            if (count of enabledAddIns) is not 0 then error "Excel add-ins are enabled"
+            set calculate before save to true
+            set previousCalculation to calculation
+            set calculation to calculation manual
+            set targetBook to open workbook workbook file name workbookPath update links do not update links read only false editable true notify false
+            set calculation to calculation automatic
+            calculate full rebuild
+            save workbook as targetBook filename workbookPath
+            close targetBook saving no
+            set calculation to previousCalculation
+            quit
+        end tell
+    end using terms from
 end run
 '''
 
@@ -385,6 +398,153 @@ def excel_version(excel_app: Path) -> str:
     return value
 
 
+def _excel_container_staging_root(account: pwd.struct_passwd) -> Path:
+    """Return a protected user-owned staging root accessible to sandboxed Excel."""
+    documents = (
+        Path(account.pw_dir)
+        / "Library"
+        / "Containers"
+        / "com.microsoft.Excel"
+        / "Data"
+        / "Documents"
+    )
+    if (
+        documents.is_symlink()
+        or not documents.is_dir()
+        or documents.stat().st_uid != account.pw_uid
+        or documents.stat().st_mode & 0o022
+    ):
+        raise RunnerError("Excel container Documents directory is unavailable or unsafe")
+    root = documents / "FCP2-Recalc"
+    try:
+        root.mkdir(mode=0o700)
+        if os.geteuid() == 0:
+            os.chown(root, account.pw_uid, account.pw_gid)
+    except FileExistsError:
+        pass
+    if (
+        root.is_symlink()
+        or not root.is_dir()
+        or root.stat().st_uid != account.pw_uid
+        or root.stat().st_mode & 0o077
+    ):
+        raise RunnerError("Excel container staging root is unavailable or unsafe")
+    return root
+
+
+def _formula_cells(root: ElementTree.Element) -> dict[str, ElementTree.Element]:
+    cells = {}
+    for cell in root.findall(".//{*}c"):
+        if cell.find("{*}f") is None:
+            continue
+        coordinate = cell.attrib.get("r")
+        if not coordinate or coordinate in cells:
+            raise RunnerError("worksheet has ambiguous formula coordinates")
+        cells[coordinate] = cell
+    return cells
+
+
+def _replace_candidate_from_staging(staged: Path, candidate: Path) -> None:
+    """Atomically graft Excel's formula caches into the original package.
+
+    A normal Excel save reserializes drawings, relationships, comments/person
+    metadata, styles, themes, and calculation settings. Replacing the complete
+    package would therefore lose or rewrite content unrelated to recalculation.
+    Preserve every original member and transplant only formula result types and
+    ``<v>`` cache nodes from Excel's private calculated copy.
+    """
+    validate_xlsx(staged)
+    metadata = _regular_nofollow(candidate)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{candidate.name}.",
+        suffix=".excel-output.xlsx",
+        dir=str(candidate.parent),
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.close(descriptor)
+        replacements: dict[str, bytes] = {}
+        try:
+            with (
+                zipfile.ZipFile(candidate) as original,
+                zipfile.ZipFile(staged) as calculated,
+            ):
+                original_sheets = {
+                    name for name in original.namelist()
+                    if name.startswith("xl/worksheets/")
+                    and name.endswith(".xml")
+                    and "/_rels/" not in name
+                }
+                calculated_sheets = {
+                    name for name in calculated.namelist()
+                    if name.startswith("xl/worksheets/")
+                    and name.endswith(".xml")
+                    and "/_rels/" not in name
+                }
+                if original_sheets != calculated_sheets:
+                    raise RunnerError("Excel changed the worksheet package layout")
+                for name in sorted(original_sheets):
+                    original_root = ElementTree.fromstring(original.read(name))
+                    calculated_root = ElementTree.fromstring(calculated.read(name))
+                    original_cells = _formula_cells(original_root)
+                    calculated_cells = _formula_cells(calculated_root)
+                    if set(original_cells) != set(calculated_cells):
+                        raise RunnerError("Excel changed the formula cell set")
+                    for coordinate, original_cell in original_cells.items():
+                        calculated_cell = calculated_cells[coordinate]
+                        original_formula = original_cell.find("{*}f")
+                        calculated_formula = calculated_cell.find("{*}f")
+                        if (
+                            original_formula is None
+                            or calculated_formula is None
+                            or (original_formula.text or "")
+                            != (calculated_formula.text or "")
+                            or original_formula.attrib != calculated_formula.attrib
+                        ):
+                            raise RunnerError(
+                                f"Excel changed formula encoding at {coordinate}"
+                            )
+                        if "t" in calculated_cell.attrib:
+                            original_cell.attrib["t"] = calculated_cell.attrib["t"]
+                        else:
+                            original_cell.attrib.pop("t", None)
+                        for child in list(original_cell):
+                            if child.tag.rsplit("}", 1)[-1] == "v":
+                                original_cell.remove(child)
+                        calculated_value = calculated_cell.find("{*}v")
+                        if calculated_value is not None:
+                            formula_index = list(original_cell).index(original_formula)
+                            original_cell.insert(
+                                formula_index + 1,
+                                copy.deepcopy(calculated_value),
+                            )
+                    replacements[name] = ElementTree.tostring(
+                        original_root,
+                        encoding="utf-8",
+                        xml_declaration=True,
+                    )
+                with zipfile.ZipFile(temporary, "w") as output:
+                    for info in original.infolist():
+                        output.writestr(
+                            info,
+                            replacements.get(info.filename, original.read(info)),
+                        )
+        except (KeyError, OSError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+            raise RunnerError(f"cannot graft Excel formula caches: {exc}") from exc
+        validate_xlsx(temporary)
+        os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
+        if os.geteuid() == 0:
+            os.chown(temporary, metadata.st_uid, metadata.st_gid)
+        os.replace(temporary, candidate)
+        directory = os.open(candidate.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def run_excel_automation(
     excel_app: Path,
     workbook: Path,
@@ -404,11 +564,27 @@ def run_excel_automation(
         if account.pw_uid == 0:
             raise RunnerError("Excel automation cannot run as root")
         command_prefix = ["/usr/bin/sudo", "-n", "-u", invoking_user, "--"]
-    command_prefix.extend([
-        str(NETWORK_SANDBOX),
-        "-p",
-        NETWORK_SANDBOX_PROFILE,
-    ])
+    else:
+        account = pwd.getpwuid(os.geteuid())
+    # Do not wrap osascript in sandbox-exec. A sandboxed process cannot send
+    # Apple Events without a code-signing entitlement, and /usr/bin/osascript
+    # consequently fails with errAEPrivilegeError (-10004) even under an
+    # allow-default profile. Network isolation is already fail-closed here:
+    # process_recalculation first requires loopback to be the only active
+    # interface and invokes this function inside enforce_pf_network_isolation.
+    staging_root = _excel_container_staging_root(account)
+    staging_dir = Path(tempfile.mkdtemp(prefix="run-", dir=staging_root))
+    staged_workbook = staging_dir / workbook.name
+    try:
+        shutil.copyfile(workbook, staged_workbook)
+        os.chmod(staging_dir, 0o700)
+        os.chmod(staged_workbook, 0o600)
+        if os.geteuid() == 0:
+            os.chown(staging_dir, account.pw_uid, account.pw_gid)
+            os.chown(staged_workbook, account.pw_uid, account.pw_gid)
+    except BaseException:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".applescript", encoding="utf-8", delete=False
     ) as handle:
@@ -419,7 +595,12 @@ def run_excel_automation(
     try:
         process = subprocess.Popen(
             command_prefix
-            + ["/usr/bin/osascript", str(script_path), str(workbook)],
+            + [
+                "/usr/bin/osascript",
+                str(script_path),
+                str(staged_workbook),
+                str(excel_app),
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -439,6 +620,7 @@ def run_excel_automation(
             raise RunnerError(
                 "Excel automation failed: " + (stderr.strip() or "osascript failed")
             )
+        _replace_candidate_from_staging(staged_workbook, workbook)
     finally:
         script_path.unlink(missing_ok=True)
         if _excel_running():
@@ -454,6 +636,7 @@ def run_excel_automation(
                 stderr=subprocess.DEVNULL,
                 timeout=15,
             )
+        shutil.rmtree(staging_dir, ignore_errors=True)
     if _excel_running():
         raise RunnerError("Microsoft Excel did not exit its isolated session")
     return excel_version(excel_app)

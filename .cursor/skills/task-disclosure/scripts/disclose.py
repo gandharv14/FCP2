@@ -4829,6 +4829,43 @@ def trusted_formula_literal_counts(records: list[dict], task_dir: Path) -> Count
     return allowed
 
 
+def trusted_row_label_literal_counts(
+    records: list[dict], task_dir: Path
+) -> Counter:
+    """License numeric text in verified row labels on ungraded cells.
+
+    Faithcheck independently re-resolves every claimed label from the golden
+    workbook. This budget only prevents a legitimate label such as
+    ``Adjusted EBITDA (FY 2013)`` from being mistaken for an unrelated graded
+    numeric value that happens to equal the year.
+    """
+    targets, _ = load_key(task_dir)
+    target_cells = {
+        parse_ref(ref, "")
+        for ref in targets
+        if "!" in ref
+    }
+    allowed: Counter = Counter()
+    for rec in records:
+        cells = set(rec.get("cell_keys") or [])
+        label = _unquote_label((rec.get("fields") or {}).get("label"))
+        if (
+            rec.get("disposition") != "disclosed"
+            or rec.get("leak_flag")
+            or not cells
+            or cells & target_cells
+            or not label
+            or label not in render_sentence(rec)
+        ):
+            continue
+        for raw in NUMBER_RE.findall(label):
+            try:
+                allowed[float(raw.replace(",", ""))] += 1
+            except ValueError:
+                continue
+    return allowed
+
+
 def significant_digits(raw: str) -> int:
     """Digits a rendered numeric literal carries, leading zeros excluded."""
     mantissa = re.split(r"[eE]", raw)[0]
@@ -4847,6 +4884,7 @@ def audit_text(section: str, task_dir: Path, records: list[dict] | None = None,
         faults.append(f"internal taxonomy token(s) in agent text: {leaked[:5]}")
     targets = numeric_targets(task_dir)
     allowed = trusted_formula_literal_counts(records or [], task_dir)
+    allowed.update(trusted_row_label_literal_counts(records or [], task_dir))
     # Numeric-collision policy (0469). Two tiers:
     #
     # (a) Provenance. A literal rendered from a record that reaches the

@@ -387,10 +387,15 @@ def _sheet_parts(
             raise RecalculationError(
                 f"worksheet relationship {rel_id!r} is missing"
             )
+        attributes = dict(sheet.attrib)
+        # Excel omits the default visible state when it reserializes a file.
+        # Treat an explicit default and an omitted default as equivalent.
+        if attributes.get("state") == "visible":
+            attributes.pop("state")
         parts.append((
             sheet.attrib.get("name", ""),
             _resolve_part("xl/workbook.xml", target),
-            dict(sorted(sheet.attrib.items())),
+            dict(sorted(attributes.items())),
         ))
     return workbook, parts
 
@@ -436,14 +441,30 @@ def _relationship_snapshot(archive: zipfile.ZipFile) -> list:
         item for item in archive.namelist() if item.endswith(".rels")
     ):
         root = _xml_root(archive, name)
+        if "/_rels/" in name:
+            prefix, filename = name.rsplit("/_rels/", 1)
+            owner_part = f"{prefix}/{filename[:-5]}"
+        elif name == "_rels/.rels":
+            owner_part = ""
+        else:
+            owner_part = name
         relations = sorted(
             [
-                relation.attrib.get("Id"),
                 relation.attrib.get("Type"),
-                relation.attrib.get("Target"),
+                (
+                    relation.attrib.get("Target")
+                    if relation.attrib.get("TargetMode") == "External"
+                    else _resolve_part(
+                        owner_part or "/",
+                        relation.attrib.get("Target", ""),
+                    )
+                ),
                 relation.attrib.get("TargetMode"),
             ]
             for relation in root.findall(f"{{{REL_NS}}}Relationship")
+            # A calculation chain is derived cache metadata. Excel is free to
+            # add, remove, or rebuild it during a full recalculation.
+            if not relation.attrib.get("Type", "").endswith("/calcChain")
         )
         result.append([name, relations])
     return result
@@ -453,10 +474,34 @@ def _package_snapshot(
     archive: zipfile.ZipFile,
     worksheet_parts: set[str],
 ) -> dict:
-    """Canonicalize every package part, excluding only formula cached values."""
+    """Canonicalize package parts not modeled by dedicated semantic snapshots.
+
+    Excel routinely reserializes the parts below during a save. Their relevant
+    calculation semantics are compared separately (formulas, inputs, defined
+    names, sheets, tables, merges, relationships, and calculation settings).
+    Unknown/custom package parts remain byte- or XML-exact and therefore still
+    fail closed when changed.
+    """
     result = {}
     for name in sorted(archive.namelist()):
         if name.endswith("/"):
+            continue
+        excel_managed = (
+            name in worksheet_parts
+            or name in {
+                "[Content_Types].xml",
+                "_rels/.rels",
+                "docProps/app.xml",
+                "docProps/core.xml",
+                "xl/_rels/workbook.xml.rels",
+                "xl/calcChain.xml",
+                "xl/sharedStrings.xml",
+                "xl/styles.xml",
+                "xl/workbook.xml",
+            }
+            or name.startswith("xl/theme/")
+        )
+        if excel_managed:
             continue
         raw = archive.read(name)
         is_xml = (
@@ -476,14 +521,6 @@ def _package_snapshot(
             raise RecalculationError(
                 f"cannot canonicalize OOXML part {name}: {exc}"
             ) from exc
-        if name in worksheet_parts:
-            root = copy.deepcopy(root)
-            for cell in root.findall(".//{*}c"):
-                if cell.find("{*}f") is None:
-                    continue
-                for child in list(cell):
-                    if child.tag.rsplit("}", 1)[-1] == "v":
-                        cell.remove(child)
         result[name] = {
             "kind": "xml",
             "content": _normalized_xml(root),
@@ -554,11 +591,25 @@ def semantic_workbook_snapshot(path: str | Path) -> dict:
                 for name in workbook.findall(".//{*}definedName")
             )
             calc = workbook.find("{*}calcPr")
-            calc_settings = (
-                None
-                if calc is None
-                else [sorted(calc.attrib.items()), calc.text or ""]
-            )
+            calc_attributes = {} if calc is None else dict(calc.attrib)
+            # These fields describe cache freshness and the Excel build that
+            # last calculated the workbook. They are expected to change during
+            # authoritative recalculation and do not alter formula semantics.
+            for attribute in (
+                "calcCompleted",
+                "calcId",
+                "calcOnSave",
+                "forceFullCalc",
+                "fullCalcOnLoad",
+            ):
+                calc_attributes.pop(attribute, None)
+            # Normalize omitted OOXML defaults without weakening iteration,
+            # precision, or reference-mode checks.
+            calc_attributes.setdefault("calcMode", "auto")
+            calc_attributes.setdefault("iterate", "0")
+            calc_attributes.setdefault("fullPrecision", "1")
+            calc_attributes.setdefault("refMode", "A1")
+            calc_settings = sorted(calc_attributes.items())
             table_parts = {
                 name: _normalized_xml(_xml_root(archive, name))
                 for name in sorted(names)
@@ -687,6 +738,53 @@ def semantic_workbook_diff(
         )
         if before_semantics.get(name) != after_semantics.get(name)
     ]
+    change_details = {}
+    for category in ("formulas", "inputs"):
+        first_by_sheet = before_semantics.get(category) or {}
+        second_by_sheet = after_semantics.get(category) or {}
+        changed_cells = []
+        for sheet in sorted(set(first_by_sheet) | set(second_by_sheet)):
+            first = first_by_sheet.get(sheet) or {}
+            second = second_by_sheet.get(sheet) or {}
+            changed_cells.extend(
+                f"{sheet}!{cell}"
+                for cell in sorted(set(first) | set(second))
+                if first.get(cell) != second.get(cell)
+            )
+        if changed_cells:
+            change_details[f"{category}_changed_cells"] = changed_cells
+    for category in ("tables", "merges", "package_parts"):
+        first = before_semantics.get(category) or {}
+        second = after_semantics.get(category) or {}
+        if first != second:
+            change_details[f"{category}_added"] = sorted(set(second) - set(first))
+            change_details[f"{category}_removed"] = sorted(set(first) - set(second))
+            change_details[f"{category}_changed"] = sorted(
+                key for key in set(first) & set(second)
+                if first.get(key) != second.get(key)
+            )
+    first_relationships = dict(before_semantics.get("relationships") or [])
+    second_relationships = dict(after_semantics.get("relationships") or [])
+    if first_relationships != second_relationships:
+        change_details["relationship_parts_changed"] = sorted(
+            key for key in set(first_relationships) | set(second_relationships)
+            if first_relationships.get(key) != second_relationships.get(key)
+        )
+    if before_semantics.get("calculation_settings") != (
+        after_semantics.get("calculation_settings")
+    ):
+        change_details["calculation_settings_before"] = before_semantics.get(
+            "calculation_settings"
+        )
+        change_details["calculation_settings_after"] = after_semantics.get(
+            "calculation_settings"
+        )
+    for category in ("defined_names", "sheets"):
+        first = before_semantics.get(category) or []
+        second = after_semantics.get(category) or []
+        if first != second:
+            change_details[f"{category}_before_count"] = len(first)
+            change_details[f"{category}_after_count"] = len(second)
     before_caches = before_snapshot.get("formula_caches") or {}
     after_caches = after_snapshot.get("formula_caches") or {}
     cache_changes = []
@@ -722,6 +820,7 @@ def semantic_workbook_diff(
         "equivalent_semantics": equivalent,
         "supported_equivalent_semantics": supported,
         "semantic_changes": categories,
+        "semantic_change_details": change_details,
         "cache_only": equivalent and bool(cache_changes),
         "formula_cache_changes": len(cache_changes),
         "formula_cache_change_cells": cache_changes,
@@ -1048,7 +1147,10 @@ class MacOSExcelEngine:
     def capability(self) -> tuple[bool, str]:
         if platform.system() != "Darwin":
             return False, "platform_not_macos"
+        # The hardened installer pins a root-protected Excel copy; probe it
+        # first so the runner's configured-path check can succeed.
         candidates = (
+            Path("/opt/harbor/apps/Microsoft Excel.app"),
             Path("/Applications/Microsoft Excel.app"),
             Path.home() / "Applications/Microsoft Excel.app",
         )
@@ -1268,16 +1370,42 @@ def _execute_recalc_unlocked(
             raise RecalculationError("engine modified the original workbook")
         after = semantic_workbook_snapshot(candidate)
         difference = semantic_workbook_diff(before, after)
-        if not difference["supported_equivalent_semantics"]:
-            raise RecalculationError(
-                "recalculation changed or used unsupported workbook semantics: "
-                + ", ".join(difference["semantic_changes"])
-            )
         after_health = inspect_workbook(candidate)
+        journal.mkdir(parents=True, exist_ok=True)
+        atomic_write_report(
+            journal / f"{request.get('request_id', 'invalid')}.source-health-after.json",
+            after_health,
+        )
         if after_health["route"] in {"unsupported", "insufficient_evidence"}:
             raise RecalculationError(
                 "recalculated workbook failed source health: "
                 + ", ".join(after_health["reason_codes"])
+            )
+        # inspect_workbook is the policy authority for context-sensitive
+        # restrictions such as approved CELL("filename") usage. The generic
+        # semantic snapshot intentionally flags every volatile formula because
+        # it lacks that context. Once both policy checks accept the source,
+        # require semantic equivalence without re-rejecting approved features.
+        difference["snapshot_supported_equivalent_semantics"] = difference[
+            "supported_equivalent_semantics"
+        ]
+        difference["supported_equivalent_semantics"] = difference[
+            "equivalent_semantics"
+        ]
+        if not difference["supported_equivalent_semantics"]:
+            atomic_write_report(
+                journal / f"{request.get('request_id', 'invalid')}.semantic-diff.json",
+                {
+                    "schema_version": "source-recalc-semantic-diagnostic/v1",
+                    "request_id": request.get("request_id"),
+                    "source_sha256": source_hash,
+                    "candidate_sha256": sha256_file(candidate),
+                    "semantic_diff": difference,
+                },
+            )
+            raise RecalculationError(
+                "recalculation changed workbook semantics: "
+                + ", ".join(difference["semantic_changes"])
             )
         uncleared_cache_reasons = {
             "formula_cache_incomplete",
@@ -1683,7 +1811,12 @@ def prepare_source_generation(
             (
                 RESTRICTION_REQUEST_SCHEMA_VERSION,
                 RESTRICTION_RESULT_SCHEMA_VERSION,
-            )
+            ),
+            # A restricted source that also required cache refresh carries the
+            # signed authoritative recalculation pair. The inventory and its
+            # approval are still independently required and bound by
+            # publish_source_generation below.
+            (REQUEST_SCHEMA_VERSION, RESULT_SCHEMA_VERSION),
         },
         "recalc_candidate": {(REQUEST_SCHEMA_VERSION, RESULT_SCHEMA_VERSION)},
     }

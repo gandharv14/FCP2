@@ -620,6 +620,18 @@ def publish_source_generation(
                         original_snapshot,
                         source,
                     )
+                # The generic snapshot has no restriction-profile context and
+                # conservatively flags all volatile formulas. The bound,
+                # freshly validated health report is the policy authority for
+                # approved restricted constructs such as CELL("filename").
+                # Reproduce the same policy-aware projection recorded by the
+                # recalculation executor before comparing the evidence.
+                observed_diff[
+                    "snapshot_supported_equivalent_semantics"
+                ] = observed_diff["supported_equivalent_semantics"]
+                observed_diff["supported_equivalent_semantics"] = (
+                    observed_diff["equivalent_semantics"]
+                )
                 if (
                     observed_diff.get("supported_equivalent_semantics") is not True
                     or observed_diff != result_value.get("semantic_diff")
@@ -667,8 +679,13 @@ def publish_source_generation(
     )
     inventory_approval_value = None
     if route in {"restricted_pass", "restricted_recalc_pass"}:
+        expected_route_evidence = (
+            restricted_pair
+            if route == "restricted_pass"
+            else (restricted_pair or recalc_pair)
+        )
         if (
-            not restricted_pair
+            not expected_route_evidence
             or inventory_value is None
             or not inventory_batch_id
         ):
@@ -687,18 +704,29 @@ def publish_source_generation(
                 registry_path=inventory_approval_registry,
             )
             expected_request, expected_result = create_restriction_documents(
-                source,
-                health_value,
+                source if restricted_pair else Path(original_source_path),
+                (
+                    health_value
+                    if restricted_pair
+                    else inspect_workbook(Path(original_source_path))
+                ),
                 inventory_value,
                 batch_id=inventory_batch_id,
                 inventory_approval_registry=inventory_approval_registry,
             )
-            if (
-                request_value != expected_request
-                or result_value != expected_result
+            if restricted_pair and (
+                request_value != expected_request or result_value != expected_result
             ):
                 raise ValueError(
                     "restriction evidence does not match independent observation"
+                )
+            if not restricted_pair and (
+                request_value.get("source_sha256")
+                != expected_request.get("source_sha256")
+                or expected_request.get("route") != "restricted_recalc_pass"
+            ):
+                raise ValueError(
+                    "recalculation evidence does not match approved restricted source"
                 )
         except ValueError as exc:
             raise SourcePublicationError(
@@ -1051,7 +1079,8 @@ def validate_source_generation(
                     (
                         "source-restriction-request/v2",
                         "source-restriction-result/v2",
-                    )
+                    ),
+                    ("source-recalc-request/v2", "source-recalc-result/v2"),
                 },
             }
             if evidence_schemas not in accepted.get(route, set()):
@@ -1088,10 +1117,35 @@ def validate_source_generation(
                         )
                     )
                     if (
-                        request_document != expected_request
-                        or result_document != expected_result
+                        evidence_schemas
+                        == (
+                            "source-restriction-request/v2",
+                            "source-restriction-result/v2",
+                        )
                     ):
-                        raise ValueError("restriction evidence changed")
+                        if (
+                            request_document != expected_request
+                            or result_document != expected_result
+                        ):
+                            raise ValueError("restriction evidence changed")
+                    else:
+                        selected = [
+                            item
+                            for item in inventory_document.get("workbooks", [])
+                            if isinstance(item, dict)
+                            and item.get("workbook_id")
+                            == manifest.get("layout", {}).get("workbook_id")
+                        ]
+                        if (
+                            len(selected) != 1
+                            or selected[0].get("sha256")
+                            != request_document.get("source_sha256")
+                            or selected[0].get("route")
+                            != "restricted_recalc_pass"
+                        ):
+                            raise ValueError(
+                                "recalculation source is not in approved restricted cohort"
+                            )
         except (OSError, ValueError, SourcePublicationError):
             failures.append("policy_validation")
     if not failures:

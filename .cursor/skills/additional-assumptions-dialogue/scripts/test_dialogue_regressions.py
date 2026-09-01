@@ -20,6 +20,7 @@ from validate_dialogue import (
     check_draft,
     fill_faults,
     instruction_faults,
+    licensed_row_label_literals,
     map_turns_to_claims,
     review_accuracy_faults,
     review_accuracy_passed,
@@ -244,6 +245,14 @@ def test_formula_literal_target_collision_is_claim_scoped(tmp_path: Path) -> Non
         faults == ["numeric literal 365 matches target 365.0"],
         str(faults),
     )
+
+
+def test_year_in_required_row_label_receives_one_literal_budget() -> None:
+    budget = licensed_row_label_literals({
+        "row_label": "Adjusted EBITDA (FY 2013)",
+    })
+
+    _ok("row-label-year-budget", budget == {2013.0: 1}, str(budget))
 
 
 def test_stale_pack() -> None:
@@ -1195,6 +1204,7 @@ def main() -> int:
         test_compose_draft_structure()
         test_fill_check_valid_and_rejects()
         test_whole_column_and_row_refs()
+        test_year_in_required_row_label_receives_one_literal_budget()
         test_formula_literal_target_collision_is_claim_scoped(tmp_path)
         test_apply_blocks_missing_must_say(tmp_path)
         test_apply_error_names_absent_must_say_field(tmp_path)

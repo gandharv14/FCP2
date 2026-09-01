@@ -16,6 +16,7 @@ from xl_mcp_oracle import (
     check_rendered_profile_excerpts,
     check_workbook,
     load_allowlist,
+    normalized_ref,
     query_all,
     validate_task_rows,
     value_matches_target,
@@ -242,6 +243,16 @@ class PaginationAndMcpTests(unittest.TestCase):
 
 
 class WorkbookLeakTests(unittest.TestCase):
+    def test_reference_normalization_preserves_sheet_edge_spaces(self):
+        self.assertEqual(
+            normalized_ref("Model Inputs !a1"),
+            "Model Inputs !A1",
+        )
+        self.assertEqual(
+            normalized_ref("'Model Inputs '!a1"),
+            "Model Inputs !A1",
+        )
+
     def setUp(self):
         try:
             import openpyxl

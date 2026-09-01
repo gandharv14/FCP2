@@ -22,9 +22,11 @@ a workbook-local stop.
 ## Inputs and dependency preflight
 
 Require `batch`, a non-empty de-duplicated `requested_workbook_ids` list, each
-workbook's immutable raw-source path and hash, optional `max_parallel_tasks`
-(default `4`), and optional `max_model_heavy_tasks` (default `2`). Reject
-unknown IDs rather than substituting one.
+workbook's immutable discovered-source path and hash, optional
+`max_parallel_tasks` (default `4`), and optional `max_model_heavy_tasks`
+(default `2`). Reject unknown IDs rather than substituting one. A verified
+intake remediation candidate may become tracker `raw_source`; retain the
+discovered file as immutable `original_raw_source`.
 
 Observe CPU, memory, free disk, container capacity, and queue health. Clamp both
 caps downward to safe values and never make the model-heavy cap exceed the task
@@ -40,6 +42,29 @@ Hash-bind it into every tracker; lanes never provision dependencies. A failed
 preflight may use the bounded `harbor-infra-fixer` route. If it remains failed,
 the orchestrator records a `preflight` promotion failure and notes for every ID,
 then stops the batch because no task can run.
+
+### Deterministic volatile-formula intake
+
+Before creating a tracker or leasing a task-agent, run source health once for
+each discovered source. If it is unsupported solely because of volatile
+formula/name or formula-level external-reference events, invoke
+`harbor-volatile-formula-fixer` once. It runs
+`xl_volatile_formula_remediation.py plan/apply/verify` into:
+
+`runs/harbor-fleet/<batch>/source-remediation/<id>/`
+
+Never overwrite the discovered source. Require an eligible zero-unresolved
+plan, identical cached-value ledger, identical untouched-member bytes, valid
+manifest, and fresh non-unsupported source health. Then bind the candidate and
+its hash as tracker `raw_source`, while hash-binding the discovered source,
+before-health, plan, and manifest separately. Formula text and workbook values
+must not enter tracker notes.
+
+If remediation is ineligible or proof fails, create the tracker against the
+discovered source and record terminal
+`source_policy/volatile_formula_remediation_unresolved` or
+`source_integrity/volatile_formula_remediation_proof_failed`. Never weaken
+source health or send an unresolved source to a task-agent.
 
 ## Per-workbook tracker
 
@@ -121,7 +146,8 @@ cross-workbook verdict.
 `bindings` is closed to:
 
 ```text
-dependency_preflight, raw_source, source_health, recalc_run,
+dependency_preflight, original_raw_source, raw_source, source_health_before,
+source_remediation_plan, source_remediation_manifest, source_health, recalc_run,
 restriction_inventory, trusted_runner_public_key, excel_isolation_attestation,
 excel_sandbox_runner, excel_engine_version, source_publication_root,
 source_generation_root, source_generation, source_root, source_file, ast_root,
@@ -288,9 +314,11 @@ agent-notes file. Include no sensitive or task-answer material.
 
 Route eligible artifact repair only to harbor-spec-fixer, generation retry only
 to harbor-prose-fixer, and infrastructure/configuration repair only to
-harbor-infra-fixer. Consume only this workbook's bounded budget, re-enter at the
-earliest invalidated lane, and rerun dependent gates. Never edit content or
-bypass a gate. Smoke is mandatory.
+harbor-infra-fixer. Volatile-formula remediation belongs only to the
+pre-tracker intake fixer and must never mutate a leased tracker source. Consume
+only this workbook's bounded budget, re-enter at the earliest invalidated lane,
+and rerun dependent gates. Never edit content or bypass a gate. Smoke is
+mandatory.
 
 Do not release the task-agent lease after a failure until the orchestrator
 confirms matching tracker promotion_failure and agent-notes signature/evidence
@@ -323,6 +351,11 @@ Per signature, `harbor-spec-fixer` gets one reviewed-artifact repair,
 `harbor-infra-fixer` gets one distinguishable infra/config repair. Record scope,
 hashes, budget, verification, confidence impact, and reentry. Failed/repeated
 fixers, absent slots, exhausted budgets, or terminal gates stop only that ID.
+
+`harbor-volatile-formula-fixer` is different: it gets one deterministic attempt
+before tracker creation, no model token, at most 100,000 actions, and never
+modifies the discovered source. Once `raw_source` is hash-frozen in a tracker,
+volatile remediation is no longer an eligible route for that run.
 
 A common signature in at least two workbooks may lower future concurrency or
 pause new launches while one representative infra/config fix is proved.

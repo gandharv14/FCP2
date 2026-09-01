@@ -128,7 +128,9 @@ def normalized_ref(ref: str) -> str:
     sheet, separator, coordinate = str(ref).rpartition("!")
     if not separator or not sheet or not coordinate:
         raise OracleInputError("invalid workbook reference: %r" % ref)
-    return "%s!%s" % (sheet.strip().strip("'"), coordinate.upper())
+    if len(sheet) >= 2 and sheet.startswith("'") and sheet.endswith("'"):
+        sheet = sheet[1:-1].replace("''", "'")
+    return "%s!%s" % (sheet, coordinate.upper())
 
 
 def display_ref(ref: str) -> str:

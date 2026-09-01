@@ -375,6 +375,17 @@ def licensed_formula_literals(claim: dict, task_dir: Path) -> Counter:
     return allowed
 
 
+def licensed_row_label_literals(claim: dict) -> Counter:
+    """License numeric text that the claim requires as an exact row label."""
+    allowed: Counter = Counter()
+    for raw in disclose.NUMBER_RE.findall(str(claim.get("row_label") or "")):
+        try:
+            allowed[float(raw.replace(",", ""))] += 1
+        except ValueError:
+            continue
+    return allowed
+
+
 def numeric_faults_with_budget(
     text: str, task_dir: Path, allowed: Counter | None = None
 ) -> list[str]:
@@ -446,9 +457,11 @@ def audit_dialogue(
         ]
         assigned_senior_turns.update(id(turn) for turn in senior_turns)
         text = "\n".join(turn["text"] for turn in senior_turns)
+        allowed = licensed_formula_literals(claim, task_dir)
+        allowed.update(licensed_row_label_literals(claim))
         faults.extend(
             numeric_faults_with_budget(
-                text, task_dir, licensed_formula_literals(claim, task_dir)
+                text, task_dir, allowed
             )
         )
     # Juniors, kickoff turns, and any unmapped senior prose receive no budget.

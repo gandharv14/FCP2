@@ -1902,6 +1902,16 @@ workbook takes its slot. Model-heavy work uses a separate fleet semaphore, and
 publication uses a singleton queue so release compare-and-swap operations
 remain serial.
 
+Before tracker creation, source health may route volatile-only failures through
+`/harbor-volatile-formula-fixer`. Its deterministic OOXML tool can remove
+provably dead volatile defined-name graphs, freeze an unreferenced `TODAY()`
+display to its cached as-of date, resolve static internal `INDIRECT` targets,
+and replace scalar blank-column `OFFSET` calls with `INDEX`. It writes a
+candidate under the batch run rather than overwriting the discovered source.
+Every cached cell value and untouched OOXML member must remain byte-identical,
+all plan/manifest hashes must verify, and fresh source health must pass. Any
+unresolved construct remains terminal; no source-policy gate is weakened.
+
 ### Per-workbook specialist lane
 
 Every task agent invokes the specialist skills in this order:

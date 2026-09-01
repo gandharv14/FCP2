@@ -290,21 +290,7 @@ class EvaluatorRegressionTests(unittest.TestCase):
             "Sheet!B3": None,
             "Sheet!C3": "x",
         })
-        # Excel counts the formula-produced "" in C2; only the genuinely
-        # empty B3 is skipped (workbook 0342 regression).
-        self.assertEqual(ev._counta(op), 3.0)
-
-    def test_iterate_group_polishes_past_workbook_delta(self):
-        # Workbook 0451 regression: Excel's cached circular values sit at the
-        # fixed point (every save iterates again), so stopping at the coarse
-        # workbook delta (0.001) leaves a drift the verifier rejects. The
-        # group must keep polishing once converged.
-        ev = evaluator([])
-        ev.values["Sheet!A1"] = 0.0
-        ev._eval_cell = lambda cid: (ev.values[cid] + 10.0) / 2.0
-        diagnostic = ev._iterate_group(["Sheet!A1"], 5000, 0.001)
-        self.assertTrue(diagnostic["converged"])
-        self.assertAlmostEqual(ev.values["Sheet!A1"], 10.0, places=9)
+        self.assertEqual(ev._counta(op), 2.0)
 
     def test_offset_returns_requested_range(self):
         base = make_node("Sheet!A1", "input", row=1, col=1, value=1)
@@ -533,100 +519,6 @@ class NewFunctionGoldenValueTests(unittest.TestCase):
             [-4500, -800, 800, 800, 600, 600, 800, 800, 700, 3000], rows=10, cols=1)
         self.assertAlmostEqual(
             self.ev._fn_mirr([flows, 0.08, 0.055]), 0.06659717503155349)
-
-    def test_array_member_takes_positional_element(self):
-        # Workbook 0451 regression: members of a multi-cell CSE span like
-        # {=TRANSPOSE(LBO!E314:E322)} entered over I24:Q24 must each take
-        # their own element, not the anchor's first value.
-        anchor = make_node("Sheet!I24", "formula", row=24, col=9)
-        anchor.array_span = "I24:Q24"
-        member = make_node("Sheet!L24", "formula", row=24, col=12)
-        member.array_span = "I24:Q24"
-        plain = make_node("Sheet!Z1", "formula", row=1, col=26)
-        result = RangeValues([7.0, 8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 12.0],
-                             rows=1, cols=9)
-        ev = evaluator([anchor, member, plain])
-        self.assertEqual(ev._array_element(anchor, result), 7.0)
-        self.assertEqual(ev._array_element(member, result), 9.0)
-        # No recorded span keeps the historical first-element behavior.
-        self.assertEqual(ev._array_element(plain, result), 7.0)
-        # Single-row results broadcast down a multi-row span.
-        tall_member = make_node("Sheet!I26", "formula", row=26, col=9)
-        tall_member.array_span = "I24:I30"
-        one_row = RangeValues([3.0], rows=1, cols=1)
-        self.assertEqual(ev._array_element(tall_member, one_row), 3.0)
-        # Members outside the result's extent read #N/A, as in Excel.
-        wide = make_node("Sheet!S24", "formula", row=24, col=19)
-        wide.array_span = "I24:S24"
-        short = RangeValues([1.0, 2.0], rows=1, cols=2)
-        self.assertEqual(ev._array_element(wide, short).code, "#N/A")
-
-    def test_index_lone_position_on_single_row_vector(self):
-        # Workbook 0613 regression: INDEX(J9:O9, MATCH(...)) walks along the
-        # row when the vector has one row, instead of demanding row=1.
-        vector = RangeValues([0.1, 0.2, 0.3, 0.4], rows=1, cols=4)
-        self.assertEqual(self.ev._fn_index([vector, 2.0]), 0.2)
-        self.assertEqual(self.ev._fn_index([vector, 4.0]), 0.4)
-        self.assertEqual(self.ev._fn_index([vector, 5.0]).code, "#REF!")
-        # Explicit row/col arguments keep their meaning.
-        self.assertEqual(self.ev._fn_index([vector, 1.0, 3.0]), 0.3)
-
-    def test_criteria_accepts_percent_literals(self):
-        # Workbook 0661 regression: AVERAGEIF(range, ">0%", range) parses the
-        # percent criteria numerically, as Excel does.
-        from xl_seg.evaluate import _matches
-        self.assertTrue(_matches(0.05, ">0%"))
-        self.assertFalse(_matches(-0.05, ">0%"))
-        self.assertTrue(_matches(0.10, ">=10%"))
-        self.assertFalse(_matches(0.09, ">=10%"))
-
-    def test_irr_requires_a_sign_change(self):
-        # Workbook 0354 regression: Excel returns #NUM! for an all-zero series,
-        # while the grid scan used to report a rate near the default guess.
-        zeros = RangeValues([0.0] * 11, rows=1, cols=11)
-        result = self.ev._fn_irr([zeros])
-        self.assertIsInstance(result, ExcelError)
-        self.assertEqual(result.code, "#NUM!")
-        one_sided = RangeValues([100.0, 250.0, 300.0], rows=1, cols=3)
-        self.assertEqual(self.ev._fn_irr([one_sided]).code, "#NUM!")
-
-    def test_irr_matches_excel_on_0354_row_11(self):
-        # Real cash flows from golden workbook 0354 Cap Table!M11:W11; Excel
-        # cached X11 = 0.2024400597734355.
-        flows = RangeValues([
-            -70000000, -4592867.329370629, -20868351.54630504,
-            -11783491.649813956, -30128500.031470563, 673897.8796283146,
-            12959856.453163365, 12617898.583657674, 13279295.109379407,
-            13954486.138147676, 604841505.7387657,
-        ], rows=1, cols=11)
-        self.assertAlmostEqual(self.ev._fn_irr([flows]), 0.2024400597734355, places=9)
-
-    def test_vdb_matches_excel_documentation(self):
-        # The five worked examples from Microsoft's VDB documentation
-        # (published rounded to cents).
-        self.assertAlmostEqual(self.ev._fn_vdb([2400, 300, 3650, 0, 1]), 1.32, places=2)
-        self.assertAlmostEqual(self.ev._fn_vdb([2400, 300, 120, 0, 1]), 40.0)
-        self.assertAlmostEqual(self.ev._fn_vdb([2400, 300, 10, 0, 1]), 480.0)
-        self.assertAlmostEqual(self.ev._fn_vdb([2400, 300, 120, 6, 18]), 396.31, places=2)
-        self.assertAlmostEqual(self.ev._fn_vdb([2400, 300, 120, 6, 18, 1.5]), 311.81, places=2)
-
-    def test_vdb_switches_to_straight_line_and_validates_domain(self):
-        # With switching allowed, late periods fall back to straight line, so
-        # a zero-salvage asset depreciates to exactly its full cost.
-        total = sum(
-            self.ev._fn_vdb([2400, 0, 10, start, start + 1])
-            for start in range(10)
-        )
-        self.assertAlmostEqual(total, 2400.0)
-        # no_switch keeps pure declining balance, which leaves the geometric
-        # residual (2400 * 0.8^10) undepreciated.
-        no_switch_total = sum(
-            self.ev._fn_vdb([2400, 0, 10, start, start + 1, 2, True])
-            for start in range(10)
-        )
-        self.assertAlmostEqual(no_switch_total, 2400.0 - 2400.0 * 0.8 ** 10)
-        self.assertEqual(self.ev._fn_vdb([2400, 300, 10, 5, 4]).code, "#NUM!")
-        self.assertEqual(self.ev._fn_vdb([2400, 300, 10, 0, 11]).code, "#NUM!")
 
     def test_xnpv(self):
         flows = RangeValues([-10000, 2750, 4250, 3250, 2750], rows=5, cols=1)

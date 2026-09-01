@@ -226,13 +226,8 @@ def build_cell(ref, style, kind, inner):
     return out + b"/>"
 
 
-def rewrite_sheet(xml, levels, cutoff, tally, final=False):
-    """Freeze formulas at or below `cutoff` to their value and empty the rest.
-
-    `final` marks the complete (deepest-cutoff) snapshot: cells whose formula
-    could not be parsed (UNKNOWN_LEVEL) are frozen there instead of emptied,
-    so the last snapshot really contains every cached value as documented.
-    """
+def rewrite_sheet(xml, levels, cutoff, tally):
+    """Freeze formulas at or below `cutoff` to their value and empty the rest."""
     def fix(match):
         cell = match.group(0)
         if FORMULA_RE.search(cell) is None:
@@ -250,8 +245,7 @@ def rewrite_sheet(xml, levels, cutoff, tally, final=False):
         row, col = coordinate_to_tuple(ref.decode("ascii"))
         level = levels.get((row, col), UNKNOWN_LEVEL)
 
-        if (level == UNKNOWN_LEVEL and not final) or \
-                (level != UNKNOWN_LEVEL and level > cutoff):
+        if level == UNKNOWN_LEVEL or level > cutoff:
             tally["emptied"] += 1
             return build_cell(ref, style, None, b"")
 
@@ -295,15 +289,14 @@ def sheet_parts(zf):
     return out
 
 
-def write_snapshot(src, out_path, part_levels, cutoff, tally, final=False):
+def write_snapshot(src, out_path, part_levels, cutoff, tally):
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as out:
         for item in src.infolist():
             if item.filename == CALC_CHAIN:
                 continue
             data = src.read(item.filename)
             if item.filename in part_levels:
-                data = rewrite_sheet(data, part_levels[item.filename], cutoff,
-                                     tally, final=final)
+                data = rewrite_sheet(data, part_levels[item.filename], cutoff, tally)
             elif is_chart_part(item.filename):
                 data, hits = scrub_chart_caches(item.filename, data)
                 tally["chart_caches"] += hits
@@ -366,8 +359,7 @@ def process(path, args):
             # a macro-enabled package has to keep its extension or Excel refuses it
             name = "L%s%s" % (str(cutoff).zfill(width), path.suffix.lower())
             tally = defaultdict(int)
-            write_snapshot(src, out_dir / name, part_levels, cutoff, tally,
-                           final=(cutoff == deepest))
+            write_snapshot(src, out_dir / name, part_levels, cutoff, tally)
             rows.append({
                 "file": name,
                 "levels": "0-%d" % cutoff,

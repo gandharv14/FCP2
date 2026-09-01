@@ -27,7 +27,7 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 from .condense import strongly_connected, topo_order
-from .model import A1_RE, Graph, a1, col_number, range_members, split_ref
+from .model import Graph, a1, range_members, split_ref
 from .project import CellGraph
 
 
@@ -242,12 +242,7 @@ def _matches(value, criteria) -> bool:
     text = str(criteria)
     op, operand = CRITERIA_RE.match(text).groups()
     try:
-        stripped = operand.strip()
-        if stripped.endswith("%"):
-            # Excel parses criteria like ">0%" numerically.
-            target = float(stripped[:-1]) / 100.0
-        else:
-            target = float(operand)
+        target = float(operand)
         left = num(value, math.nan)
     except ValueError:
         target = operand.strip().lower()
@@ -363,11 +358,7 @@ def _solve_rate(exponents, values, guess=0.1, scan=True):
 
 
 def _irr(values, guess=0.1):
-    # Excel documents that IRR needs at least one positive and one negative
-    # flow. Without a sign change the NPV curve never crosses zero -- and on an
-    # all-zero series it is identically zero, which the grid scan would happily
-    # "solve" at whatever point sits nearest the guess.
-    if not values or not any(v > 0 for v in values) or not any(v < 0 for v in values):
+    if not values:
         return ExcelError("#NUM!")
     return _solve_rate(list(range(len(values))), values, guess)
 
@@ -375,90 +366,12 @@ def _irr(values, guess=0.1):
 def _xirr(values, dates, guess=0.1):
     if len(values) != len(dates) or not values:
         return ExcelError("#NUM!")
-    if not any(v > 0 for v in values) or not any(v < 0 for v in values):
-        return ExcelError("#NUM!")
     start = dates[0]
     return _solve_rate([(d - start) / 365.0 for d in dates], values, guess)
 
 
 def _div(a, b):
     return ExcelError("#DIV/0!") if b == 0 else a / b
-
-
-def _ddb_amount(cost, salvage, life, period, factor):
-    """Double-declining depreciation for one whole ``period`` (1-based).
-
-    Mirrors the reference implementation Excel-compatible engines share
-    (LibreOffice ``ScGetDDB``): book value declines geometrically at
-    ``factor/life`` capped at 100%, and the period's charge never takes the
-    book value below salvage or itself goes negative.
-    """
-    rate = factor / life
-    if rate >= 1.0:
-        rate = 1.0
-        old = cost if period == 1 else 0.0
-    else:
-        old = cost * (1.0 - rate) ** (period - 1.0)
-    new = cost * (1.0 - rate) ** period
-    return max(old - (salvage if new < salvage else new), 0.0)
-
-
-def _inter_vdb(cost, salvage, life, life1, period, factor):
-    """VDB core with straight-line switching (LibreOffice ``ScInterVDB``)."""
-    vdb = 0.0
-    loop_end = int(math.ceil(period - 1e-12))
-    remaining = cost - salvage
-    switched = False
-    linear = 0.0
-    for i in range(1, loop_end + 1):
-        if not switched:
-            ddb = _ddb_amount(cost, salvage, life, float(i), factor)
-            denominator = life1 - float(i - 1)
-            linear = remaining / denominator if denominator != 0 else math.inf
-            if linear > ddb:
-                term = linear
-                switched = True
-            else:
-                term = ddb
-                remaining -= ddb
-        else:
-            term = linear
-        if i == loop_end:
-            term *= period + 1.0 - loop_end
-        vdb += term
-    return vdb
-
-
-def _vdb_value(cost, salvage, life, start, end, factor, no_switch):
-    if (start < 0.0 or end < start or end > life or cost < 0.0
-            or salvage > cost or factor <= 0.0 or life <= 0.0):
-        return ExcelError("#NUM!")
-    int_start = math.floor(start + 1e-12)
-    int_end = math.ceil(end - 1e-12)
-    if no_switch:
-        vdb = 0.0
-        for i in range(int(int_start) + 1, int(int_end) + 1):
-            term = _ddb_amount(cost, salvage, life, float(i), factor)
-            if i == int_start + 1:
-                term *= min(end, int_start + 1.0) - start
-            elif i == int_end:
-                term *= end + 1.0 - int_end
-            vdb += term
-        return vdb
-    life1 = life
-    fractional = abs(start - int_start) > 1e-12 or abs(end - int_end) > 1e-12
-    if fractional and factor > 1 and start >= life / 2.0 - 1e-12:
-        # Excel's documented quirk: fractional spans starting in the second
-        # half of the asset's life re-anchor at midlife.
-        part = start - life / 2.0
-        start = life / 2.0
-        end -= part
-        life1 += 1.0
-    # Depreciation accumulated before `start` always comes off the cost first;
-    # the requested span then runs on the reduced book value over the
-    # remaining life.
-    cost -= _inter_vdb(cost, salvage, life, life1, start, factor)
-    return _inter_vdb(cost, salvage, life, life - start, end - start, factor)
 
 
 def _fv_value(rate, nper, pmt, pv, ptype):
@@ -509,33 +422,6 @@ def _rate_value(nper, pmt, pv, fv, ptype, guess):
     key = (nper, pmt, pv, fv, ptype, guess)
     if key in _RATE_CACHE:
         return _RATE_CACHE[key]
-    # With no periodic payment the equation has a closed-form solution.
-    # Newton from Excel's default guess can miss roots extremely close to -1,
-    # while the broad fallback scan intentionally stops at -0.9999.
-    if pmt == 0 and pv != 0:
-        ratio = -fv / pv
-        if ratio > 0:
-            result = ratio ** (1.0 / nper) - 1.0
-            _RATE_CACHE[key] = result
-            return result
-        if fv == 0:
-            # Excel's Newton solver returns a near--1 approximation even
-            # though the zero-future-value equation has no finite root.
-            rate = guess
-            for _ in range(100):
-                growth = (1.0 + rate) ** nper
-                derivative = nper * (1.0 + rate) ** (nper - 1.0)
-                if derivative == 0:
-                    break
-                nxt = rate - growth / derivative
-                if nxt <= -1.0:
-                    nxt = (rate - 1.0) / 2.0
-                if abs(nxt - rate) < 1e-7:
-                    rate = nxt
-                    break
-                rate = nxt
-            _RATE_CACHE[key] = rate
-            return rate
     periods = int(nper)
     if periods == nper:
         shift = 1.0 if ptype else 0.0
@@ -1697,14 +1583,6 @@ class Evaluator:
 
     _fn__xlfn_rri = _fn_rri
 
-    def _fn_vdb(self, args):
-        if len(args) < 5:
-            return ExcelError("#VALUE!")
-        cost, salvage, life, start, end = (num(a) for a in args[:5])
-        factor = num(args[5]) if len(args) > 5 and args[5] is not None else 2.0
-        no_switch = truthy(args[6]) if len(args) > 6 and args[6] is not None else False
-        return _vdb_value(cost, salvage, life, start, end, factor, no_switch)
-
     def _fn_sumproduct(self, args):
         arrays = [list(flatten([arg])) for arg in args]
         if not arrays:
@@ -2562,9 +2440,7 @@ class Evaluator:
         bad = next((value for value in values if isinstance(value, Unresolved)), None)
         if bad is not None:
             return bad
-        # Excel's COUNTA counts every non-empty cell, including formulas that
-        # display as "" -- only genuinely empty cells (None here) are skipped.
-        return float(sum(value is not None for value in values))
+        return float(sum(value is not None and value != "" for value in values))
 
     def _offset(self, node):
         """Resolve a dynamic reference, including optional range dimensions."""
@@ -3404,18 +3280,6 @@ class Evaluator:
                     total = combine(total, arg)
                 if node.op == "AVERAGE" and args:
                     total = scale(total, 1.0 / len(args))
-                return total
-            if node.op == "PRODUCT":
-                total = constant(1.0)
-                for arg in args:
-                    total_constant = is_constant(total)
-                    arg_constant = is_constant(arg)
-                    if not total_constant and not arg_constant:
-                        return reject(node_id, "bilinear_product")
-                    if total_constant:
-                        total = scale(arg, total[1])
-                    else:
-                        total = scale(total, arg[1])
                 return total
             if node.op in ("MIN", "MAX") and args:
                 endpoint = [
@@ -4337,37 +4201,6 @@ class Evaluator:
             if not changed:
                 break
 
-    def _iterate_group(self, pending, iteration_limit, iteration_delta):
-        max_change = math.inf
-        refine_delta = min(iteration_delta, 1e-11)
-        converged_step = None
-        step = -1
-        for step in range(iteration_limit):
-            max_change = 0.0
-            for cell in pending:
-                before = self.values[cell]
-                after = self._eval_cell(cell)
-                self.values[cell] = after
-                max_change = max(max_change, self._value_change(before, after))
-            if max_change <= iteration_delta and converged_step is None:
-                converged_step = step
-            # Excel stops at the workbook's delta, but every subsequent
-            # recalculation of a saved file iterates again from the converged
-            # state, so cached values sit essentially at the fixed point.
-            # Keep polishing (bounded) until the change is negligible, not
-            # merely below the workbook threshold.
-            if max_change <= refine_delta:
-                break
-            if converged_step is not None and step - converged_step >= 200:
-                break
-        return {
-            "iterations": (converged_step if converged_step is not None else step) + 1,
-            "converged": max_change <= iteration_delta,
-            "max_change": None if math.isinf(max_change) else max_change,
-            "errors": sum(isinstance(self.values[cell], ExcelError) for cell in pending),
-            "unresolved": sum(isinstance(self.values[cell], Unresolved) for cell in pending),
-        }
-
     def _eval_cell(self, cid: str):
         self._current_cell = cid
         info = self.cg.info[cid]
@@ -4391,43 +4224,11 @@ class Evaluator:
                 # Legacy graphs did not persist array-member coordinates. Keep
                 # their historical anchor behavior while new graphs project
                 # every CSE/spill member through the metadata above.
-                if getattr(node, "array_span", ""):
-                    return self._array_element(node, value)
                 return value[0] if value else None
             return value
         if info.empty_ref:
             return 0.0
         return Unresolved("no-ast-root")
-
-    def _array_element(self, node, value):
-        """Pick this cell's element from a multi-cell array-formula result.
-
-        Excel's CSE semantics: the member at offset (dr, dc) inside the
-        entered span reads result[dr][dc], with single-row/single-column
-        results broadcast across the span and out-of-range members #N/A.
-        Cells without a recorded span keep the anchor's first element.
-        """
-        if not value:
-            return None
-        span = getattr(node, "array_span", "")
-        if not span or node.row is None or node.col is None:
-            return value[0]
-        start = span.split(":", 1)[0].replace("$", "")
-        matched = A1_RE.match(start)
-        if not matched:
-            return value[0]
-        offset_row = node.row - int(matched.group(2))
-        offset_col = node.col - col_number(matched.group(1))
-        row = offset_row if value.rows > 1 else 0
-        col = offset_col if value.cols > 1 else 0
-        if row < 0 or col < 0 or row >= value.rows or col >= value.cols:
-            return ExcelError("#N/A")
-        index = row * value.cols + col
-        if index >= len(value):
-            return ExcelError("#N/A")
-        element = value[index]
-        # An empty source cell inside an array result renders as 0 in Excel.
-        return 0.0 if element is None else element
 
 
 def _xml_bool(value):

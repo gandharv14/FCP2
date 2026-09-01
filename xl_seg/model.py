@@ -116,10 +116,6 @@ class Node:
     parse_error: str = ""
     value_type: str = ""
     range_truncated: bool = False
-    # A1 span of the multi-cell array formula this cell belongs to, empty for
-    # ordinary cells. Lets the evaluator hand each member its own positional
-    # element instead of the anchor's first value.
-    array_span: str = ""
 
     @property
     def is_cell(self) -> bool:
@@ -226,7 +222,6 @@ def load(ast_dir: Path, wb: str) -> Graph:
                 parse_error=_text(row, "parse_error"),
                 value_type=_text(row, "value_type"),
                 range_truncated=_bool(row, "range_truncated"),
-                array_span=_text(row, "array_span") or _text(row, "array_ref"),
             )
 
     edges: list[Edge] = []
@@ -276,12 +271,7 @@ def load(ast_dir: Path, wb: str) -> Graph:
                 "missing": missing[:2],
             })
     for node in nodes.values():
-        # Range nodes are shared dependency sources when expansion would be
-        # excessive, so they intentionally have no single formula owner. A
-        # top-level array/CSE range may still carry an owner and must validate.
-        requires_owner = node.kind in {"op", "const"}
-        validates_owner = requires_owner or bool(node.owner)
-        if validates_owner and node.kind in AST_KINDS and (
+        if node.kind in AST_KINDS and (
             not node.owner
             or node.owner not in nodes
             or nodes[node.owner].kind != "formula"

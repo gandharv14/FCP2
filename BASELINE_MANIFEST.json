@@ -1,0 +1,7 @@
+{
+  "schema_version": "fcp-recursive-baseline/v1",
+  "source_commit": "ce6bf2e81ecf3f81efac2f2c77a3799598574095",
+  "file_count": 138,
+  "tree_sha256": "46744efb9f85a2ea0ff1fe57cfc221dbd56fb47c91960db9eb566c1d371a2673",
+  "tree_hash_definition": "SHA-256 of compact, key-sorted JSON mapping each relative regular-file path to its SHA-256; BASELINE_MANIFEST.json excluded"
+}

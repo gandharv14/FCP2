@@ -651,9 +651,7 @@ class AstGraph:
                         # otherwise be classified as hand-typed inputs -- a
                         # computed value handed to the rebuild as a given.
                         # Register every member as owning the same formula so
-                        # it is a formula cell with real precedent edges, and
-                        # record the span so the evaluator can hand each
-                        # member its own positional element of the result.
+                        # it is a formula cell with real precedent edges.
                         ref = str(getattr(value, "ref", "") or cell.coordinate)
                         try:
                             min_col, min_row, max_col, max_row = range_boundaries(
@@ -915,7 +913,6 @@ class AstGraph:
             "expr": "", "label": "", "formula": "", "value": None,
             "array_formula": False, "array_anchor": "", "array_ref": "",
             "array_row": None, "array_col": None,
-            "array_span": "",
             "ast_schema_version": AST_SCHEMA_VERSION,
             "parse_status": "not_applicable", "parse_error": "",
             "value_type": "",
@@ -947,7 +944,6 @@ class AstGraph:
             "array_ref": entry["array_ref"] if entry else "",
             "array_row": entry["array_row"] if entry else None,
             "array_col": entry["array_col"] if entry else None,
-            "array_span": (entry["array_ref"] if entry else "") or "",
             "value": jsonable(value),
             "value_type": type(value).__name__ if value is not None else "blank",
             "parse_status": "pending" if entry else "not_applicable",
@@ -1105,12 +1101,6 @@ class AstGraph:
         """Render a cached value the way Excel's ``&`` would."""
         if isinstance(value, bool):
             return "TRUE" if value else "FALSE"
-        if isinstance(value, _dt.datetime):
-            # Excel concatenates a date as its serial number, e.g.
-            # INDIRECT(T2&":"&T3) building a "46023:46053" row span.
-            delta = value - _dt.datetime(1899, 12, 30)
-            serial = delta.days + delta.seconds / 86400.0
-            return str(int(serial)) if float(serial).is_integer() else str(serial)
         if isinstance(value, float) and value.is_integer():
             return str(int(value))
         return str(value)
@@ -1219,16 +1209,7 @@ class AstGraph:
                     )]
         if items is None:
             items = self.resolve(token, ctx["sheet"])
-        # A span-like token must keep its via_range even when only one member
-        # cell is populated: the evaluator rebuilds the full span (empty
-        # members included) from this text, and losing it hands positional
-        # functions like INDEX/COUNTA a bare scalar instead of the range.
-        spanlike = ":" in token.rpartition("!")[2]
-        multi = (
-            len(items) > 1
-            or (bool(items) and items[0][0] == "range")
-            or (bool(items) and spanlike)
-        )
+        multi = len(items) > 1 or (bool(items) and items[0][0] == "range")
         via = token if multi else ""
         out = []
         for item in items:
@@ -1438,9 +1419,8 @@ class AstGraph:
 NODE_FIELDS = ["id", "kind", "sheet", "coordinate", "row", "col", "owner", "op",
                "op_kind", "arity", "expr", "label", "formula", "value",
                "array_formula", "array_anchor", "array_ref", "array_row",
-               "array_col", "array_span", "ast_schema_version", "parse_status",
-               "parse_error", "value_type", "range_truncated", "in_degree",
-               "out_degree", "in_cycle"]
+               "array_col", "ast_schema_version", "parse_status", "parse_error",
+               "value_type", "range_truncated", "in_degree", "out_degree", "in_cycle"]
 EDGE_FIELDS = ["source", "target", "role", "arg_index", "op", "cell", "ref",
                "via_range", "cross_sheet", "in_cycle"]
 
@@ -1470,7 +1450,6 @@ _GRAPHML_NODE_TYPES = {
     "arity": "int", "expr": "string", "label": "string", "formula": "string",
     "value": "string", "array_formula": "boolean", "array_anchor": "string",
     "array_ref": "string", "array_row": "int", "array_col": "int",
-    "array_span": "string",
     "ast_schema_version": "string", "parse_status": "string",
     "parse_error": "string", "value_type": "string",
     "range_truncated": "boolean",

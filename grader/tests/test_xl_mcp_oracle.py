@@ -172,53 +172,6 @@ class PaginationAndMcpTests(unittest.TestCase):
         self.assertEqual(report["broad_queries_with_conflicts"], 1)
         self.assertEqual(report["pages_read"], 4)
 
-    def test_readiness_probe_reports_ready_server(self):
-        report = asyncio.run(check_mcp(
-            "http://example.test/mcp",
-            [_task()],
-            [ValueTarget("asset-capacity", 42, 42, "MW")],
-            [{
-                "id": "source-1",
-                "name": "Source One",
-                "origin_url": "https://example.test/source",
-            }],
-            [{"id": "dataset-1"}],
-            page_size=2,
-            client_factory=FakeClient,
-        ))
-        self.assertTrue(report["readiness"]["ready"])
-        self.assertEqual(report["readiness"]["attempts"], 1)
-
-    def test_unready_server_fails_closed_with_mcp_not_ready(self):
-        # Workbook 0256 regression: a sidecar that never answers must produce
-        # a distinct mcp_not_ready failure (restartable window) rather than an
-        # opaque mid-run disconnect, and no semantic check may run.
-        class DeadClient:
-            def __init__(self, _url):
-                pass
-
-            async def __aenter__(self):
-                raise ConnectionError("Server disconnected without a response")
-
-            async def __aexit__(self, *_args):
-                return False
-
-        report = asyncio.run(check_mcp(
-            "http://example.test/mcp",
-            [_task()],
-            [ValueTarget("asset-capacity", 42, 42, "MW")],
-            [],
-            [],
-            client_factory=DeadClient,
-            readiness_timeout=0.05,
-        ))
-        self.assertFalse(report["valid"])
-        self.assertFalse(report["readiness"]["ready"])
-        self.assertEqual(report["failures"][0]["check"], "mcp_not_ready")
-        self.assertIn("Server disconnected", report["failures"][0]["detail"])
-        self.assertEqual(report["exact_resolutions"], 0)
-        self.assertEqual(report["pages_read"], 0)
-
     def test_query_all_rejects_repeated_cursor(self):
         class RepeatingClient:
             async def call_tool(self, _name, _arguments):

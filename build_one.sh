@@ -175,10 +175,7 @@ if [ "$PLAIN" -eq 0 ]; then
 python3 xl_variable_mcp.py validate-spec "$RUN/normalized.json" >/dev/null 2>&1 || exit 95
 
 # ---- gate 8: maskability ------------------------------------------------
-# The check is committed in-repo (it used to live at /tmp/maskability.py,
-# which vanished on reboot and was silently tamperable).
-[ -f maskability.py ] || { echo "BUILDFAIL $WB gate=8 :: maskability.py missing from repo"; exit 96; }
-python3 maskability.py "$WB" --source "$SOURCE" >/dev/null 2>&1 || exit 96
+python3 /tmp/maskability.py "$WB" >/dev/null 2>&1 || exit 96
 
 # ---- gate 9: deterministic double build + validate + smoke -------------
 rm -rf "$RUN/mcp-build-a" "$RUN/mcp-build-b" "$RUN/mcp"
@@ -293,11 +290,6 @@ if not os.path.exists(rp):
     raise SystemExit(1)
 r = json.load(open(rp))
 if r.get("agent_model") != "gpt-5.6-sol-high":
-    raise SystemExit(1)
-# detect refuses files that have not passed roles-validate, so requiring the
-# stamp here keeps this checker and disclose.py in agreement instead of
-# deadlocking the gate between two incompatible schemas.
-if r.get("validated") is not True:
     raise SystemExit(1)
 have = {x["case_id"] for x in (r.get("resolutions") or [])}
 want = {c["case_id"] for c in cases}

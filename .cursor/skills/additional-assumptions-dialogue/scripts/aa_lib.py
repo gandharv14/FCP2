@@ -58,7 +58,7 @@ BARE_A1_RE = re.compile(
     r"(?<![A-Za-z0-9])(\$?[A-Z]{1,3}\$?\d{1,7})(?::(\$?[A-Z]{1,3}\$?\d{1,7}))?(?![A-Za-z0-9])"
 )
 SPEAKER_PREFIX_RE = re.compile(
-    r"^\*\*([A-Za-z][A-Za-z0-9 .&/-]{0,40}):\*\*\s*(.*)$"
+    r"^\*{0,2}([A-Za-z][A-Za-z0-9 .&/-]{0,40})\*{0,2}:\s*(.*)$"
 )
 SKIP_PREFIXES = frozenset({"http", "https", "ftp", "mailto"})
 CLAIM_COMMENT_RE = re.compile(r"<!--\s*claim:([^>]+?)\s*-->")

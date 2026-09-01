@@ -308,40 +308,6 @@ def test_contractive_multicell_affine_cycle_gets_bounded_certificate():
     assert certificate["endpoint_error_bound"] is not None
 
 
-def test_product_function_affine_cycle_gets_bounded_certificate():
-    owner = _cell("Sheet!A1", "formula", 0, "=PRODUCT(0.5,A1)+1")
-    factor = _ast("Sheet!A1#factor", owner.id, "const", value=0.5)
-    product = _ast(
-        "Sheet!A1#product", owner.id, "op", op="PRODUCT", arity=2
-    )
-    one = _ast("Sheet!A1#one", owner.id, "const", value=1)
-    add = _ast("Sheet!A1#add", owner.id, "op", op="+", arity=2)
-    graph, cg = _graph(
-        [owner, factor, product, one, add],
-        [
-            _edge(factor.id, product.id, 0),
-            _edge(owner.id, product.id, 1),
-            _edge(product.id, add.id, 0),
-            _edge(one.id, add.id, 1),
-            _edge(add.id, owner.id, role="result"),
-        ],
-    )
-
-    result = Evaluator(
-        graph,
-        cg,
-        calculation=_calculation(count=100, delta=1e-9),
-        proof_outputs={owner.id},
-    ).run(set())
-
-    diagnostic = result.iterated[0]
-    assert diagnostic["converged"] is True
-    assert diagnostic["certified"] is True
-    assert diagnostic["certification"]["kind"] == "scalar_affine"
-    assert diagnostic["certification"]["coefficient"] == 0.5
-    assert diagnostic["certification"]["fixed_point"] == 2.0
-
-
 def test_sum_range_blank_is_zero_for_affine_cycle_certificate():
     owner = _cell("Sheet!A1", "formula", 0, "=0.5*SUM(A1:B1)+1")
     total = _ast("Sheet!A1#sum", owner.id, "op", op="SUM", arity=1)

@@ -5,14 +5,6 @@ The deterministic half of this stage extracts compact input-band summaries from
 ``seg_out/<workbook>/segments.json`` and the corresponding inputs-only workbook.
 GPT 5.6 Sol then selects externally sourced candidates and proposes plausible
 source classes through Labelbox's LiteLLM endpoint.
-
-The model never writes workbook cell references or values itself: every
-inventory row carries a stable ``row_id`` and the model cites those ids only.
-Deterministic code resolves each cited row_id back to the inventory's
-qualified reference and raw values before emitting the final Markdown table,
-so invented references are impossible by construction. The final table keeps
-the historical ``| Variable | Workbook cells and values | Plausible external
-source(s) |`` column set consumed by ``xl_variable_mcp.py import``.
 """
 
 from __future__ import annotations
@@ -33,27 +25,18 @@ from pathlib import Path
 import openpyxl
 from openpyxl.utils import range_boundaries
 
-from xl_artifact_paths import resolve_workbook_artifact
 from xl_task_build import DEFAULT_PROJECT_ID, PROD_ENDPOINT, read_env_key
 
 
 GENERATOR_VERSION = "1.0.0"
-PROMPT_VERSION = "variable-source-audit-v2"
+PROMPT_VERSION = "variable-source-audit-v1"
 DEFAULT_MODEL = "openai/gpt-5.6-sol"
 MAX_CHUNK_CHARS = 100_000
-
-MODEL_TABLE_HEADER = (
-    "| Variable | Inventory row IDs | Plausible external source(s) |"
-)
-FINAL_TABLE_HEADER = (
-    "| Variable | Workbook cells and values | Plausible external source(s) |"
-)
 
 SYSTEM_PROMPT = """\
 You are GPT 5.6 Sol producing a review artifact for a financial-spreadsheet
 pipeline. The user message contains workbook metadata and deterministic NDJSON
-inventory rows extracted from an inputs-only workbook. Every inventory row
-carries a stable identifier in its "row_id" field (for example "R0001").
+inventory rows extracted from an inputs-only workbook.
 
 Identify inputs that are plausibly externally sourced: market and macro data,
 tax or regulatory rates, contractual and financing terms, asset facts,
@@ -63,17 +46,13 @@ providers. Exclude labels, blank cells, calculations, and purely internal model
 choices unless a contract, filing, or external study is a plausible source.
 
 Return exactly one Markdown table with these columns:
-| Variable | Inventory row IDs | Plausible external source(s) |
+| Variable | Workbook cells and values | Plausible external source(s) |
 
 Rules:
-1. Cite inventory rows only by their supplied row_id. The "Inventory row IDs"
-   column must contain nothing but row_ids separated by commas. Never write
-   workbook cell references or workbook values anywhere in the table; the
-   pipeline deterministically resolves each cited row_id back to its exact
-   cells and values.
-2. Group related period series or repeated assumptions by citing several
-   row_ids on one row when that improves auditability. Cite each row_id at
-   most once in the whole table, and cite only row_ids from the current batch.
+1. Use only cell ranges and values present in the supplied inventory. Never
+   alter, infer, or invent a workbook value.
+2. Group related period series or repeated assumptions when that improves
+   auditability, but preserve the supplied ranges and compact value summaries.
 3. Sources are candidates, not proof. Say when exact-value provenance is
    unverified or likely private/internal.
 4. Prefer authoritative organizations, filings, contracts, and official data
@@ -81,7 +60,7 @@ Rules:
    otherwise name the source without fabricating a link.
 5. Do not include a preamble, headings, commentary, or fenced code block.
 If the batch has no externally sourced candidates, return the table header and
-exactly one row: | No externally sourced candidates identified | — | — |"""
+one row stating that no candidates were identified."""
 
 
 def _json_value(value):
@@ -129,11 +108,7 @@ def _cell_value(book, ref):
 
 
 def build_inventory(workbook, artifact, seg_dir, *, segmentation=None):
-    """Return a compact, deterministic inventory of relevant input bands.
-
-    Every row carries a stable ``row_id`` ("R0001", ...) assigned in sorted
-    inventory order; the model cites these ids instead of writing references.
-    """
+    """Return a compact, deterministic inventory of relevant input bands."""
     segments = json.loads(
         (Path(seg_dir) / "segments.json").read_text(encoding="utf-8")
     )
@@ -167,10 +142,6 @@ def build_inventory(workbook, artifact, seg_dir, *, segmentation=None):
             str(row["label"]).casefold(), str(row["sheet"]).casefold(),
             str(row["band"]),
         ))
-        rows = [
-            {"row_id": "R%04d" % index, **row}
-            for index, row in enumerate(rows, 1)
-        ]
         props = book.properties
         metadata = {
             "workbook": workbook,
@@ -224,181 +195,19 @@ def _call_model(endpoint, api_key, model, project_id, messages):
     return choice["message"]["content"].strip(), choice.get("finish_reason", "")
 
 
-def _request_config_fingerprint(endpoint, model, project_id):
-    """Hash non-secret routing configuration without prompt or workbook data."""
-    return _canonical_hash({
-        "endpoint": endpoint.rstrip("/"),
-        "model": model,
-        "project_id": project_id,
-        "prompt_version": PROMPT_VERSION,
-    })
-
-
-def _http_error_details(exc):
-    """Return bounded gateway diagnostics without retaining request content."""
-    details = {
-        "status": getattr(exc, "code", None),
-        "reason": str(getattr(exc, "reason", "") or ""),
-    }
-    try:
-        raw = exc.read(4096)
-    except (AttributeError, OSError):
-        raw = b""
-    if not raw:
-        return details
-    details["response_sha256"] = hashlib.sha256(raw).hexdigest()
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return details
-    error = payload.get("error") if isinstance(payload, dict) else None
-    if not isinstance(error, dict):
-        return details
-    safe = {
-        key: value
-        for key in ("type", "param", "code")
-        if isinstance((value := error.get(key)), (str, int, float, bool))
-    }
-    message = error.get("message")
-    if (
-        isinstance(message, str)
-        and len(message) <= 512
-        and "\n" not in message
-        and not re.search(r"\bR\d{4}\b|Workbook metadata:|![A-Z]{1,3}\d+", message)
-    ):
-        safe["message"] = re.sub(
-            r"(?i)\b(bearer|api[_-]?key)\s*[:=]?\s*\S+",
-            r"\1 [REDACTED]",
-            message,
-        )
-    if safe:
-        details["response_error"] = safe
-    return details
-
-
 def _clean_table(text):
     text = text.strip()
     if text.startswith("```") and text.endswith("```"):
         lines = text.splitlines()
         text = "\n".join(lines[1:-1]).strip()
     match = re.search(
-        r"(?im)^\|\s*Variable\s*\|\s*Inventory row IDs\s*\|"
+        r"(?im)^\|\s*Variable\s*\|\s*Workbook cells and values\s*\|"
         r"\s*Plausible external source\(s\)\s*\|",
         text,
     )
     if not match:
         raise ValueError("model response did not contain the required table")
     return text[match.start():].strip()
-
-
-ROW_ID_RE = re.compile(r"\bR\d{4,}\b")
-# Text allowed in the row-id column once every cited row_id is removed.
-_ROW_ID_FILLER_RE = re.compile(r"^[\s,;`*—–-]*$")
-
-
-def _table_data_rows(table):
-    """Return [variable, ids/cells, source] triples for each data row."""
-    rows = []
-    for line in table.splitlines()[1:]:
-        stripped = line.strip()
-        if not stripped.startswith("|"):
-            continue
-        columns = [column.strip() for column in stripped.strip("|").split("|")]
-        if len(columns) < 3:
-            continue
-        if all(set(column) <= set("-: ") for column in columns):
-            continue
-        rows.append(columns[:3])
-    return rows
-
-
-def validate_row_ids(table, batch_row_ids, inventory_row_ids):
-    """Return violations for row_id citations in the raw model table.
-
-    The model must cite inventory rows only by row_id: unknown, duplicate, and
-    out-of-batch ids fail, as does any other text (such as a hand-written cell
-    reference) in the row-id column.
-    """
-    data_rows = _table_data_rows(table)
-    if not data_rows:
-        return ["table contains no data rows"]
-    violations = []
-    cited = set()
-    rows_with_ids = 0
-    for variable, id_column, _ in data_rows:
-        row_ids = ROW_ID_RE.findall(id_column)
-        if row_ids:
-            rows_with_ids += 1
-        leftover = ROW_ID_RE.sub("", id_column)
-        if not _ROW_ID_FILLER_RE.match(leftover):
-            violations.append(
-                "row_id column may cite only supplied row_ids, found %r "
-                "(row %s)" % (leftover.strip(" \t,;`*"), variable))
-        for row_id in row_ids:
-            if row_id in cited:
-                violations.append("duplicate row_id citation: %s" % row_id)
-            cited.add(row_id)
-            if row_id not in inventory_row_ids:
-                violations.append(
-                    "unknown row_id: %s (row %s)" % (row_id, variable))
-            elif row_id not in batch_row_ids:
-                violations.append(
-                    "row_id not in this batch: %s (row %s)"
-                    % (row_id, variable))
-    # A table with no citations at all is only valid as the single
-    # "no candidates" sentinel row.
-    if not (len(data_rows) == 1 and rows_with_ids == 0):
-        for variable, id_column, _ in data_rows:
-            if not ROW_ID_RE.search(id_column):
-                violations.append("row cites no row_id: %s" % variable)
-    return list(dict.fromkeys(violations))
-
-
-def _summary_text(summary):
-    """Render a value_summary using only tokens present in the NDJSON row."""
-    count = summary.get("count", 0)
-    if not count:
-        return "(no supplied value)"
-    if "value" in summary:
-        text = "`%s`" % json.dumps(summary["value"], ensure_ascii=False)
-        return text if count == 1 else "%s (×%d)" % (text, count)
-    if "values" in summary:
-        return "`%s`" % json.dumps(summary["values"], ensure_ascii=False)
-    parts = ["%d values" % count]
-    if "minimum" in summary:
-        parts.append("min %s, max %s" % (
-            json.dumps(summary["minimum"]), json.dumps(summary["maximum"])))
-    return "`%s` … `%s` (%s)" % (
-        json.dumps(summary.get("first", []), ensure_ascii=False),
-        json.dumps(summary.get("last", []), ensure_ascii=False),
-        "; ".join(parts),
-    )
-
-
-def _resolved_cells_text(row):
-    text = "`%s`" % row["band"]
-    label = str(row.get("label") or "").strip()
-    if label:
-        text += " %s" % label
-    return ("%s: %s" % (text, _summary_text(row["value_summary"]))
-            ).replace("|", "\\|")
-
-
-def resolve_table(model_table, rows_by_id):
-    """Deterministically rewrite cited row_ids into the downstream table.
-
-    The model only picks row_ids; this function writes every qualified
-    reference and raw value from the inventory, emitting the historical
-    ``| Variable | Workbook cells and values | ... |`` column set.
-    """
-    lines = [FINAL_TABLE_HEADER, "|---|---|---|"]
-    for variable, id_column, source in _table_data_rows(model_table):
-        row_ids = ROW_ID_RE.findall(id_column)
-        resolved = "<br>".join(
-            _resolved_cells_text(rows_by_id[row_id]) for row_id in row_ids
-        ) or "—"
-        lines.append("| %s | %s | %s |" % (variable, resolved, source))
-    return "\n".join(lines)
 
 
 VALUE_NUMBER_RE = re.compile(
@@ -414,12 +223,7 @@ def _normalized_number(token):
 
 
 def validate_table(table, encoded_rows, workbook_metadata):
-    """Return hallucination violations for refs and values in an audit table.
-
-    Applied to the FINAL resolved table: since deterministic code now writes
-    every reference and value from the inventory, these checks serve as
-    invariants that the row_id resolution cannot drift from the inventory.
-    """
+    """Return hallucination violations for refs and values in a GPT table."""
     rows = [json.loads(row) for row in encoded_rows]
     allowed_cells = set()
     for row in rows:
@@ -537,15 +341,10 @@ def generate_audit(
         )
 
     chunks = _split_chunks(inventory)
-    all_row_ids = {row["row_id"] for row in inventory["variables"]}
     generated_at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     tables, finishes = [], []
     try:
         for index, (header, rows) in enumerate(chunks, 1):
-            rows_by_id = {
-                decoded["row_id"]: decoded
-                for decoded in (json.loads(row) for row in rows)
-            }
             user = (
                 "Workbook metadata:\n%s\n\nInventory batch %d of %d (NDJSON):\n%s"
                 % (header, index, len(chunks), "\n".join(rows))
@@ -559,15 +358,10 @@ def generate_audit(
                     endpoint, api_key, model, project_id, messages
                 )
                 finishes.append(finish)
-                model_table = _clean_table(text)
-                violations = validate_row_ids(
-                    model_table, set(rows_by_id), all_row_ids
+                table = _clean_table(text)
+                violations = validate_table(
+                    table, rows, inventory["metadata"]
                 )
-                if not violations:
-                    table = resolve_table(model_table, rows_by_id)
-                    violations = validate_table(
-                        table, rows, inventory["metadata"]
-                    )
                 if not violations:
                     tables.append(table)
                     break
@@ -578,9 +372,8 @@ def generate_audit(
                 messages.extend([
                     {"role": "assistant", "content": text},
                     {"role": "user", "content":
-                     "Correct the table. Cite inventory rows only by their "
-                     "supplied row_id and fix these problems:\n- "
-                     + "\n- ".join(violations[:20])},
+                     "Correct the table. These items were not present in the "
+                     "inventory:\n- " + "\n- ".join(violations[:20])},
                 ])
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, KeyError,
             json.JSONDecodeError, ValueError) as exc:
@@ -588,21 +381,14 @@ def generate_audit(
             "schema_version": 1,
             "generator_version": GENERATOR_VERSION,
             "prompt_version": PROMPT_VERSION,
-            "row_id_resolution": True,
             "status": "failed",
             "workbook": workbook,
             "model": model,
             "endpoint": endpoint,
-            "project_id": project_id,
-            "request_config_sha256": _request_config_fingerprint(
-                endpoint, model, project_id
-            ),
             "inventory_sha256": inventory_hash,
             "error": str(exc),
             "generated_at": generated_at,
         }
-        if isinstance(exc, urllib.error.HTTPError):
-            failure["http_error"] = _http_error_details(exc)
         metadata_path.write_text(
             json.dumps(failure, indent=2) + "\n", encoding="utf-8"
         )
@@ -635,7 +421,6 @@ def generate_audit(
         "schema_version": 1,
         "generator_version": GENERATOR_VERSION,
         "prompt_version": PROMPT_VERSION,
-        "row_id_resolution": True,
         "status": "complete",
         "workbook": workbook,
         "artifact": str(artifact),
@@ -649,8 +434,7 @@ def generate_audit(
         "finish_reasons": finishes,
         "validation": {
             "status": "passed",
-            "checks": ["row_id_citations", "qualified_cell_refs",
-                       "workbook_value_numbers"],
+            "checks": ["qualified_cell_refs", "workbook_value_numbers"],
         },
         "markdown": str(markdown_path),
         "inventory": str(inventory_path),
@@ -736,8 +520,7 @@ def main(argv=None):
     api_key = "" if args.inventory_only else read_env_key(args.env_file)
     results = []
     for workbook in args.workbooks:
-        artifact = resolve_workbook_artifact(
-            args.inputs_root, workbook, "%s-inputs")
+        artifact = Path(args.inputs_root) / ("%s-inputs.xlsx" % workbook)
         output_dir = Path(args.audit_root) / ("%s-variable-sources" % workbook)
         try:
             seg_dir, segmentation = resolve_segmentation_directory(

@@ -26,7 +26,7 @@ from instruction_spans import (  # noqa: E402
 )
 
 
-PROMPT_VERSION = "finance-instruction-naturalizer-v3"
+PROMPT_VERSION = "finance-instruction-naturalizer-v1"
 MODEL = "gpt-5.6-sol-high"
 
 HEADING_RE = re.compile(r"(?m)^(#{1,6}\s+.+)$")
@@ -42,21 +42,8 @@ NUMBER_RE = re.compile(
     r"(?:[eE][-+]?\d+)?%?"
     r"(?![A-Za-z0-9_])"
 )
-FENCE_RE = re.compile(r"(?ms)^```[^\n]*\n.*?^```\s*$")
 TABLE_RE = re.compile(r"(?m)(?:^\|.*\|\s*\n?){2,}")
 LIST_RE = re.compile(r"(?m)^(?:[-*+]|\d+\.)\s+.+$")
-
-# freeze_protected_spans.py derives frozen token spans from this same table.
-EXACT_TOKEN_CHECKS = (
-    ("fenced code blocks", FENCE_RE),
-    ("Markdown tables", TABLE_RE),
-    ("list items", LIST_RE),
-    ("inline-code spans", INLINE_CODE_RE),
-    ("URLs", URL_RE),
-    ("cell references", CELL_RE),
-    ("numbers", NUMBER_RE),
-)
-FROZEN_TOKEN_LABELS = ("inline-code spans", "URLs", "cell references", "numbers")
 
 SOURCE_CATEGORIES = (
     "market rates",
@@ -65,25 +52,6 @@ SOURCE_CATEGORIES = (
     "contractual terms",
     "opening balances",
 )
-
-SEMANTIC_ANCHORS = (
-    ("rebuild", ("rebuild",)),
-    ("working directory", ("working directory",)),
-    ("blank", ("blank", "cleared")),
-    ("no formulas", ("no formulas",)),
-    ("derived", ("derived",)),
-    ("install", ("install",)),
-    ("packages", ("packages",)),
-    ("research data service", ("research data service",)),
-)
-REMOVED_TERMS = ("removed", "stripped out")
-REMOVED_ACCEPTED = ("removed", "stripped out", "cleared", "blanked")
-INPUT_AVAILABILITY_ACCEPTED = ("present", "remain", "retained")
-REGION_LABELS = {
-    "preamble": "opening prose (text before the first heading)",
-    "input": "## Input section",
-    "mutable": "opening prose or ## Input section",
-}
 
 
 class RewriteValidationError(ValueError):
@@ -172,132 +140,10 @@ def require(
     message: str,
     checks: list[str],
     reason_code: str = "validation_constraint_failed",
-    expected: str | None = None,
-    found: str | None = None,
 ) -> None:
-    """Record a passing check, or fail with a reason code plus expected/found."""
     if not condition:
-        detail = message
-        if expected is not None:
-            detail += " | expected: %s" % expected
-        if found is not None:
-            detail += " | found: %s" % found
-        raise RewriteValidationError(detail, reason_code)
+        raise RewriteValidationError(message, reason_code)
     checks.append(message)
-
-
-def first_diff(source_body: str, candidate_body: str) -> str:
-    source_lines = source_body.splitlines()
-    candidate_lines = candidate_body.splitlines()
-    for index, (old, new) in enumerate(zip(source_lines, candidate_lines)):
-        if old != new:
-            return "line %d differs | source: %r | candidate: %r" % (
-                index + 1,
-                old[:160],
-                new[:160],
-            )
-    return "line counts differ: source has %d lines, candidate has %d" % (
-        len(source_lines),
-        len(candidate_lines),
-    )
-
-
-def model_type_phrase(source_preamble: str) -> str | None:
-    matches = re.findall(
-        r"(?=\b(?:an?|the)\s+([A-Za-z][^.\n]{0,120}?\bmodel)\b)",
-        source_preamble,
-        re.IGNORECASE,
-    )
-    return min(matches, key=len) if matches else None
-
-
-def named_outputs_phrase(source_preamble: str) -> str | None:
-    match = re.search(
-        r"(?:including|such as)\s+(.+?)(?=\.\s+(?:The full list|Every required)|$)",
-        source_preamble,
-        re.IGNORECASE | re.DOTALL,
-    )
-    return " ".join(match.group(1).split()) if match else None
-
-
-def protected_anchor_specs(source: str) -> list[dict]:
-    """Anchor list validate() enforces; freeze_protected_spans.py uses this too."""
-    preamble, sections = split_sections(source)
-    input_body = input_section(sections)
-    mutable_lower = (preamble + input_body).lower()
-    input_lower = input_body.lower()
-    specs: list[dict] = []
-
-    phrase = model_type_phrase(preamble)
-    if phrase:
-        specs.append({
-            "check": "financial model type preserved: %s" % phrase,
-            "phrase": phrase,
-            "accepted": (phrase.lower(),),
-            "region": "preamble",
-            "normalize_ws": False,
-        })
-    phrase = named_outputs_phrase(preamble)
-    if phrase:
-        specs.append({
-            "check": "named example outputs preserved",
-            "phrase": phrase,
-            "accepted": (phrase.lower(),),
-            "region": "preamble",
-            "normalize_ws": True,
-        })
-    for category in SOURCE_CATEGORIES:
-        if category in mutable_lower:
-            specs.append({
-                "check": "source category preserved: %s" % category,
-                "phrase": category,
-                "accepted": (category,),
-                "region": "mutable",
-                "normalize_ws": False,
-            })
-    for anchor, accepted in SEMANTIC_ANCHORS:
-        if anchor in mutable_lower:
-            specs.append({
-                "check": "semantic anchor preserved: %s" % anchor,
-                "phrase": anchor,
-                "accepted": accepted,
-                "region": "mutable",
-                "normalize_ws": False,
-            })
-    if "only" in input_lower:
-        specs.append({
-            "check": "Input exclusivity preserved",
-            "phrase": "only",
-            "accepted": ("only",),
-            "region": "input",
-            "normalize_ws": False,
-        })
-    if "may " in input_lower:
-        specs.append({
-            "check": "Input permission modality preserved",
-            "phrase": "may ",
-            "accepted": ("may ",),
-            "region": "input",
-            "normalize_ws": False,
-        })
-    if "present" in input_lower:
-        specs.append({
-            "check": "Input availability preserved",
-            "phrase": "present",
-            "accepted": INPUT_AVAILABILITY_ACCEPTED,
-            "region": "input",
-            "normalize_ws": False,
-        })
-    removed = next((term for term in REMOVED_TERMS if term in mutable_lower), None)
-    if removed:
-        specs.append({
-            "check": "removed-content scope preserved",
-            "phrase": removed,
-            "accepted": REMOVED_ACCEPTED,
-            "region": "mutable",
-            "normalize_ws": False,
-        })
-    return specs
 
 
 def _numeric_occurrences(text: str, value: int | float) -> int:
@@ -391,12 +237,8 @@ def validate(
             str(exc), exc.reason_code, **exc.details
         ) from exc
     if candidate_bytes != expected_candidate:
-        expected_text = expected_candidate.decode("utf-8-sig", "replace")
-        candidate_text = candidate_bytes.decode("utf-8-sig", "replace")
         raise RewriteValidationError(
-            "protected section preserved byte-for-byte"
-            " | expected: %s | found: candidate protected bytes differ"
-            % first_diff(expected_text, candidate_text),
+            "protected section preserved byte-for-byte",
             "protected_section_changed",
         )
 
@@ -454,8 +296,6 @@ def validate(
         "headings and section order preserved",
         checks,
         "heading_structure_changed",
-        expected="the source headings in order: %r" % source_headings,
-        found="%r" % candidate_headings,
     )
 
     for (heading, source_body), (_, candidate_body) in zip(
@@ -468,12 +308,6 @@ def validate(
             "protected section preserved byte-for-byte: %s" % heading,
             checks,
             "protected_section_changed",
-            expected="a byte-identical copy of the source section",
-            found=(
-                None
-                if candidate_body == source_body
-                else first_diff(source_body, candidate_body)
-            ),
         )
 
     if answer_key:
@@ -481,35 +315,25 @@ def validate(
         for value in targets.values():
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 continue
-            source_hits = _numeric_occurrences(source_text, value)
-            candidate_hits = _numeric_occurrences(candidate_text, value)
             require(
-                candidate_hits <= source_hits,
+                _numeric_occurrences(candidate_text, value)
+                <= _numeric_occurrences(source_text, value),
                 "no new answer-value occurrence: %s" % value,
                 checks,
                 "answer_value_leak",
-                expected="at most %d occurrence(s), matching the source" % source_hits,
-                found="%d occurrence(s) in the candidate" % candidate_hits,
             )
 
-    for label, pattern in EXACT_TOKEN_CHECKS:
-        source_counts = counter(pattern, source_text)
-        candidate_counts = counter(pattern, candidate_text)
-        found = None
-        if candidate_counts != source_counts:
-            missing = dict((source_counts - candidate_counts).most_common(8))
-            added = dict((candidate_counts - source_counts).most_common(8))
-            found = "missing from candidate: %r; new in candidate: %r" % (
-                missing,
-                added,
-            )
+    for label, pattern in (
+        ("inline-code spans", INLINE_CODE_RE),
+        ("URLs", URL_RE),
+        ("cell references", CELL_RE),
+        ("numbers", NUMBER_RE),
+    ):
         require(
-            candidate_counts == source_counts,
+            counter(pattern, candidate_text) == counter(pattern, source_text),
             "%s preserved exactly" % label,
             checks,
             "token_mismatch",
-            expected="the same %s tokens with the same counts as the source" % label,
-            found=found,
         )
 
     source_mutable = mutable_text(source_text)
@@ -545,8 +369,6 @@ def validate(
             "named example outputs preserved",
             checks,
             "named_outputs_changed",
-            expected=repr(phrase.lower()),
-            found=repr(" ".join(candidate_preamble.split()).lower()),
         )
 
     for category in SOURCE_CATEGORIES:
@@ -575,8 +397,6 @@ def validate(
                 "semantic anchor preserved: %s" % source_anchor,
                 checks,
                 "semantic_anchor_lost",
-                expected=repr(source_anchor),
-                found=repr(candidate_mutable_lower),
             )
 
     if "only" in source_input:
@@ -592,8 +412,6 @@ def validate(
             "Input permission modality preserved",
             checks,
             "input_modality_lost",
-            expected=repr("may "),
-            found=repr(candidate_input),
         )
     if "present" in source_input:
         require(
@@ -618,8 +436,6 @@ def validate(
         "no unresolved template placeholders",
         checks,
         "template_placeholder",
-        expected="no '{{' or '}}' anywhere in the candidate",
-        found="unresolved '{{'/'}}' placeholder text",
     )
     require(
         candidate_bytes.endswith((b"\n", b"\r"))
@@ -627,8 +443,6 @@ def validate(
         "candidate final-newline state preserved",
         checks,
         "final_newline_changed",
-        expected="candidate final-newline state matching the source",
-        found="candidate ends with %r" % candidate_text[-8:],
     )
 
     return {

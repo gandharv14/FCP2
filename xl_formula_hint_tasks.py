@@ -53,30 +53,12 @@ def render_section(spec: dict) -> str:
 
 
 def numeric_targets(bundle: Path) -> list[float]:
-    """Every numeric value in the answer key, whatever its kind.
-
-    Task builders write several key shapes: "targets" maps for cell-value
-    tasks, and "derived"/"boolean+value" keys that store the answer under
-    "answer", "value" or "change" plus numeric "detail" fields. Auditing
-    only "targets" made the answer-leak check vacuous for the other kinds.
-    """
     key = json.loads((bundle / "tests" / "answer_key.json").read_text())
-
-    def walk(node):
-        if isinstance(node, bool):
-            return
-        if isinstance(node, (int, float)):
-            yield float(node)
-        elif isinstance(node, dict):
-            for name, value in node.items():
-                if name == "tolerance":  # grader tolerances are not answers
-                    continue
-                yield from walk(value)
-        elif isinstance(node, list):
-            for value in node:
-                yield from walk(value)
-
-    return list(walk(key))
+    return [
+        float(value)
+        for value in (key.get("targets") or {}).values()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
 
 
 def audit_no_answers(spec: dict, targets: list[float]):

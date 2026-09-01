@@ -268,47 +268,6 @@ def value_matches_target(value: Any, target: ValueTarget) -> bool:
     return isinstance(value, str) and normalized_text(value) in string_candidates
 
 
-RENDERING_KINDS = (
-    "raw_number",
-    "formatted_text",
-    "percent_rendering",
-    "date_rendering",
-    "other",
-)
-
-
-def classify_rendering(value: Any, target: ValueTarget) -> str:
-    """How a duplicated masked value appears in a leaking cell (closed enum).
-
-    One of ``RENDERING_KINDS``: "raw_number" for a typed numeric cell equal to
-    the raw value, "percent_rendering" for percent-scaled numerics or "12.5%"
-    style text, "date_rendering" for typed dates or date strings,
-    "formatted_text" for the value embedded in a text rendering ("42 MW",
-    concatenated labels, exact string duplicates), and "other" for anything
-    else (booleans, unclassifiable representations).
-    """
-    if isinstance(value, bool):
-        return "other"
-    if isinstance(value, (dt.date, dt.datetime)):
-        return "date_rendering"
-    number = _as_decimal(value)
-    if number is not None:
-        raw = _as_decimal(target.raw)
-        if raw is not None and _decimals_equal(number, raw):
-            return "raw_number"
-        if target.unit.strip().casefold() == "percent":
-            return "percent_rendering"
-        return "other"
-    if isinstance(value, str):
-        if _as_date(value) is not None:
-            return "date_rendering"
-        parsed = _numeric_string(value)
-        if parsed is not None and parsed[1]:
-            return "percent_rendering"
-        return "formatted_text"
-    return "other"
-
-
 def text_leaks_target(text: str, target: ValueTarget) -> bool:
     """Whether free text contains a masked value representation."""
     for candidate in (target.raw, target.mcp):
@@ -581,9 +540,6 @@ def check_workbook(
                                 "cell": display_ref(ref),
                                 "variable_id": target.variable_id,
                                 "value": repr(cell.value),
-                                "rendering": classify_rendering(
-                                    cell.value, target
-                                ),
                             }
 
         found_keys = set(found)
@@ -615,44 +571,6 @@ def check_workbook(
         }
     finally:
         book.close()
-
-
-def scan_value_leaks(
-    workbook: Path,
-    mask_refs: list[str],
-    audit: list[dict[str, Any]],
-    allowlist_path: Path | None = None,
-    *,
-    require_blank_mask: bool = True,
-) -> dict[str, Any]:
-    """Offline masked-value duplicate/leak scan of one workbook.
-
-    This is the exact detector the HTTP oracle applies to the delivered
-    workbook: the masked-cell blanking check, the duplicate representation
-    scan (typed values plus text/date/percent renderings), and explicit
-    allowlist handling.  It needs no live MCP server and no docker, so it can
-    run at maskability-review time against the golden or baseline inputs
-    workbook.  Pass ``require_blank_mask=False`` for such pre-masking scans:
-    masked cells are then expected to still hold their raw values and only
-    duplicate representations outside the mask (and allowlist hygiene) decide
-    validity.
-    """
-    targets = value_targets(audit)
-    allowlist, allowlist_errors = load_allowlist(
-        allowlist_path, {target.variable_id for target in targets}
-    )
-    report = check_workbook(workbook, mask_refs, audit, allowlist)
-    if not require_blank_mask:
-        report["masked_cells_not_blank"] = []
-        report["valid"] = not (
-            report["manifest_errors"]
-            or report["unapproved_value_leaks"]
-            or report["unused_allowlist_entries"]
-        )
-    report["allowlist_errors"] = allowlist_errors
-    if allowlist_errors:
-        report["valid"] = False
-    return report
 
 
 def profile_excerpt_items(source: dict[str, Any]) -> list[tuple[str, Any]]:
@@ -1083,38 +1001,6 @@ async def validate_documents(
     )
 
 
-async def wait_until_ready(
-    url: str,
-    client_factory: Callable[[str], Any],
-    *,
-    timeout: float = 60.0,
-    interval: float = 2.0,
-) -> dict[str, Any]:
-    """Poll the sidecar until it answers a trivial tool call, or time out.
-
-    A container that is still importing (or crash-looping) otherwise surfaces
-    as one opaque ``mcp_connection`` failure mid-run (workbook 0256). Probing
-    first separates "never became ready" from "broke mid-run": only the former
-    justifies the single pre-semantic container restart the skill permits.
-    """
-    import time
-
-    deadline = time.monotonic() + timeout
-    attempts = 0
-    last_error = ""
-    while True:
-        attempts += 1
-        try:
-            async with client_factory(url) as client:
-                await client.call_tool("list_sources", {"limit": 1})
-            return {"ready": True, "attempts": attempts, "last_error": ""}
-        except Exception as exc:  # noqa: BLE001 - any failure means not ready yet
-            last_error = str(exc)
-        if time.monotonic() >= deadline:
-            return {"ready": False, "attempts": attempts, "last_error": last_error}
-        await asyncio.sleep(interval)
-
-
 async def check_mcp(
     url: str,
     tasks: list[dict[str, Any]],
@@ -1125,7 +1011,6 @@ async def check_mcp(
     page_size: int = 2,
     max_pages: int = 1000,
     client_factory: Callable[[str], Any] | None = None,
-    readiness_timeout: float = 60.0,
 ) -> dict[str, Any]:
     if client_factory is None:
         try:
@@ -1143,30 +1028,6 @@ async def check_mcp(
     pages_read = 0
     profile_report = {"valid": True, "count": 0, "violations": []}
     broad_cache: dict[tuple[str, str, str], tuple[list[dict[str, Any]], int]] = {}
-
-    readiness = await wait_until_ready(
-        url, client_factory, timeout=readiness_timeout
-    )
-    if not readiness["ready"]:
-        return {
-            "valid": False,
-            "url": url,
-            "tasks": len(tasks),
-            "exact_resolutions": 0,
-            "provenance_chains": 0,
-            "broad_queries_with_conflicts": 0,
-            "pages_read": 0,
-            "profile_excerpts": profile_report,
-            "readiness": readiness,
-            "failures": [{
-                "check": "mcp_not_ready",
-                "detail": "server did not become ready within %.0fs after %d "
-                          "attempt(s); last error: %s. Capture container logs "
-                          "and restart once before any semantic check."
-                          % (readiness_timeout, readiness["attempts"],
-                             readiness["last_error"]),
-            }],
-        }
 
     try:
         async with client_factory(url) as client:
@@ -1309,7 +1170,6 @@ async def check_mcp(
         "valid": not failures,
         "url": url,
         "tasks": len(tasks),
-        "readiness": readiness,
         "exact_resolutions": resolution_passed,
         "provenance_chains": chains_passed,
         "broad_queries_with_conflicts": broad_passed,
@@ -1361,7 +1221,6 @@ async def run_oracle(
     page_size: int = 2,
     max_pages: int = 1000,
     client_factory: Callable[[str], Any] | None = None,
-    readiness_timeout: float = 60.0,
 ) -> dict[str, Any]:
     bundle = bundle.resolve()
     mcp = mcp.resolve()
@@ -1389,11 +1248,17 @@ async def run_oracle(
         raise OracleInputError("eval/tasks.jsonl contains no tasks")
 
     targets = value_targets(audit)
+    allowlist, allowlist_errors = load_allowlist(
+        allowlist_path, {target.variable_id for target in targets}
+    )
     shipped_workbook = resolve_workbook(bundle, workbook)
     isolation = check_environment(bundle, shipped_workbook)
-    workbook_report = scan_value_leaks(
-        shipped_workbook, mask_refs, audit, allowlist_path
+    workbook_report = check_workbook(
+        shipped_workbook, mask_refs, audit, allowlist
     )
+    workbook_report["allowlist_errors"] = allowlist_errors
+    if allowlist_errors:
+        workbook_report["valid"] = False
     manifest_errors = validate_manifests(tasks, audit)
 
     runtime = bundle / "environment" / "mcp-server" / "runtime"
@@ -1420,7 +1285,6 @@ async def run_oracle(
         page_size=page_size,
         max_pages=max_pages,
         client_factory=client_factory,
-        readiness_timeout=readiness_timeout,
     )
 
     valid = (

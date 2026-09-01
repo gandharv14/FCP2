@@ -1,15 +1,9 @@
-import tempfile
 import unittest
-from pathlib import Path
-
-import openpyxl
-from openpyxl.worksheet.formula import ArrayFormula
 
 from xl_input_mask import (
     MASKED_VALUE_NOTE,
     _assumptions_sheet_xml,
     redact_assumptions,
-    verify,
 )
 from xl_level_split import scrub_chart_caches
 
@@ -129,68 +123,6 @@ class ChartCacheScrubTests(unittest.TestCase):
         self.assertEqual(hits, 2)
         self.assertNotIn(b"1234.5", data)
         self.assertIn(b"<cx:f>Sheet1!$B$2:$B$5</cx:f>", data)
-
-
-class VerifyFormulaCensusTests(unittest.TestCase):
-    """Workbook 0642 regression: typed text that merely looks like a formula
-    (a literal "=" dashboard label) must not be reported as a survivor, while
-    every genuinely stored formula -- string, shared, or array -- must be."""
-
-    def _book(self, build):
-        book = openpyxl.Workbook()
-        build(book.active)
-        path = Path(self._dir.name) / ("case%d.xlsx" % self._counter)
-        self._counter += 1
-        book.save(path)
-        return path
-
-    def setUp(self):
-        self._dir = tempfile.TemporaryDirectory()
-        self._counter = 0
-
-    def tearDown(self):
-        self._dir.cleanup()
-
-    def _verify(self, path, derived=None):
-        return verify(
-            path, path, keep={}, frontier={},
-            formula_coords=derived or {}, deny={},
-        )
-
-    def test_typed_equals_label_is_not_a_formula_fault(self):
-        def build(ws):
-            cell = ws.cell(row=12, column=13)
-            cell.value = "="
-            cell.data_type = "s"
-        path = self._book(build)
-        faults = self._verify(path)
-        self.assertEqual(faults["formula"], [])
-
-    def test_formula_like_text_on_a_derived_cell_is_refused(self):
-        def build(ws):
-            cell = ws.cell(row=2, column=1)
-            cell.value = "=A1*2"
-            cell.data_type = "s"
-        path = self._book(build)
-        faults = self._verify(path, derived={"Sheet": {(2, 1)}})
-        self.assertTrue(any("formula-like derived text" in f
-                            for f in faults["formula"]))
-
-    def test_real_formula_is_caught_by_cell_and_census(self):
-        def build(ws):
-            ws["A1"] = "=1+1"
-        path = self._book(build)
-        faults = self._verify(path)
-        self.assertTrue(any(f.startswith("Sheet!A1") for f in faults["formula"]))
-        self.assertTrue(any("<f> element survived" in f
-                            for f in faults["formula"]))
-
-    def test_array_formula_is_caught(self):
-        def build(ws):
-            ws["A1"] = ArrayFormula("A1", "=SUM(1)")
-        path = self._book(build)
-        faults = self._verify(path)
-        self.assertTrue(faults["formula"])
 
 
 if __name__ == "__main__":

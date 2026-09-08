@@ -95,7 +95,7 @@ round, rescale or convert percentages.
 ````markdown
 You are an Analyst on the project finance team of an infrastructure advisory firm. The team advises operators of regional transport concessions on how they fund vehicle fleets and depots, and you support the Director on each mandate with the financing schedules and the dashboards that go to the client. Work is assigned to you by the Director.
 
-The Director wants to know how much term debt the concession vehicle will draw in total to fund its asset company, which the dashboard reports as Term Loan to CALIF (Total). The working file, `0243-inputs.xlsx`, is in your working directory. It carries the concession's traffic, revenue, operating cost, capex and financing assumptions across the `Hyp_Traffic`, `Hyp_Revenues`, `Hyp_Capex`, `Hyp_Fin` and `Hyp_Others` tabs, with the `Operations`, `Capex`, `Financing` and `Annual FS` schedules feeding the `Dashboard`. The drivers, historicals and layout are in place; the calculations across those schedules have not been carried out yet. You may install Python packages (for example `openpyxl`) to read it.
+The Director wants to know how much term debt the concession vehicle will draw in total to fund its asset company, which the dashboard reports as Term Loan to CALIF (Total). The working file, `0243-inputs.xlsx`, is in your working directory; the figure is reported on the `Dashboard` tab. The concession's traffic, revenue, cost, capex and financing drivers, the historicals and the layout are in place; the calculations across the schedules have not been carried out yet. You may install Python packages (for example `openpyxl`) to read it.
 
 The market rates, tax rates, macro assumptions, contractual terms and opening balances the model needs are not in the sheets; they are only available from the firm's research service, an MCP server at `http://mcp-server:8000/mcp` (streamable HTTP transport). Records come in releases; use the latest release of each one. Convert each value into the units and scale of the sheet it feeds: rates come back in percent while the sheets may store decimal fractions, and monetary amounts state their unit on the record. Complete the necessary analysis from the inputs that are there plus what you retrieve, and report the 1 headline figure the Director is waiting on.
 
@@ -139,7 +139,7 @@ Give the figure as the model produces it, in the units and scale of the sheet it
 
 ## What changed
 
-- Persona from sheet names (`Hyp_Traffic`, `Financing`, `FS A_CALIF`): a project-finance Analyst on a transport-concession mandate. No dates, no client names.
+- Persona from sheet names (`Hyp_Traffic`, `Financing`, `FS A_CALIF`): a project-finance Analyst on a transport-concession mandate. No dates, no client names. The sheet names ground the setting; the prose does not list them. Only the answer tab, `Dashboard`, is named (the validator allows at most three sheet names beyond the answer tabs).
 - The question is asked as the Director would ask it and names the first curated output, Term Loan to CALIF (Total).
 - Template framing: the drivers and layout are in place and the calculations have not been carried out yet. "stripped out", "Rebuild", "removed", "blank", "no formulas", "remaining", "mock", "delivered file", "artifact" are all gone.
 - Research service: URL, transport, only-source, "latest release", units/scale warning, both code blocks. The tool list, "five tools", paging, "at least two filter dimensions" and the `superseded_by` mechanics are dropped; the server documents them itself.

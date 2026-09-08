@@ -3,7 +3,7 @@
   "source_commit": "unversioned",
   "derived_from_commit": "ce6bf2e81ecf3f81efac2f2c77a3799598574095",
   "file_count": 183,
-  "tree_sha256": "ea8a02979d72a4f375c38e20790b883f4c623d51386c138eaf3d3e423a1fdb61",
+  "tree_sha256": "81778bd1f6caddb3c25b853f197c0cbbd2823ce1d2f2151216eae50d456806df",
   "tree_hash_definition": "SHA-256 of compact, key-sorted JSON mapping each relative regular-file path to its SHA-256. Excluded: BASELINE_MANIFEST.json itself, any path under __pycache__/ or .pytest_cache/, any *.pyc file, and the .venv, .env, and .git trees.",
   "changelog": {
     "2026-09-02": "OOM immunity leak fix: hardened_runner resets oom_score_adj on every child and probes OOMPolicy; recovery_worker adds the startup self-test, the disk floor, and the disk reaper; harbor_host_protections installs the log-cap timer and reports freegib/logcap/childoom; new scripts/batch/disk_reaper.py.",
@@ -27,6 +27,7 @@
     "2026-09-06T10:54:16Z": "Verification pass: quarantine names include recovery-evidence.json; _read_valid_delivery binds evidence hash; mechanical controller class parks the row; failure records resolve on delivery; verifier status checked + all three read-only assertions on rerun; last-line rule for FAIL; lane_fix hashes baseline/code-baseline/worktrees/checkpoints, per-host flock, scope stop, model default, skips output trees; report demotes worker-count alert under supervisor state, distinct-classes note, remedy line; report_remote uses summary.current; Port 6 subclass->gate map + stage recipes; prose_<reason>/mode_mismatch subclasses; verifier prompt states mode; commands_source; prior evidence in retry prompt; post-delivery controller verdict informational; cap bound uses _row_attempts.",
     "2026-09-06T11:00:12Z": "Verification pass 2: _record_row_close returns the recorded result so run() sees a mechanical controller park; resolve_failure_record on both delivered-complete short-circuits; test for controller class after a real attempt.",
     "2026-09-07T11:20:55Z": "2026-09-07 redeploy: gdpval-prose-instruction skill + recovery_worker edits of 09-07 03:24-03:32 (prose retrofit prep); fleet rerun of remaining 5-2/5-5/Licensing rows on vm1-18",
-    "2026-09-08T12:20:59Z": "Manifest refresh before pushing the tree to FCP2 branch Pipeline_combined: covers 09-07/09-08 edits to gdpval-prose-instruction (SKILL.md, extract_critical_facts.py, validate_prose_rewrite.py), additional-assumptions-dialogue/validate_dialogue.py, tests/test_gdpval_prose_instruction.py."
+    "2026-09-08T12:20:59Z": "Manifest refresh before pushing the tree to FCP2 branch Pipeline_combined: covers 09-07/09-08 edits to gdpval-prose-instruction (SKILL.md, extract_critical_facts.py, validate_prose_rewrite.py), additional-assumptions-dialogue/validate_dialogue.py, tests/test_gdpval_prose_instruction.py.",
+    "2026-09-08T19:21:12Z": "gdpval-prose-instruction: sheet_list_dump cap (at most three sheet names beyond the answer tabs), brief no longer hands the writer the tab list, optional_group_partial and sheet_list_dump retryable, examples.md 0243 without the tab recital; validate_dialogue leaves a valid prose pointer in place."
   }
 }

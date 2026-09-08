@@ -450,6 +450,68 @@ class ValidatorTests(TaskFixture):
         reordered = CANDIDATE.replace(lead_in, " It exposes these tools:\n\n" + swapped)
         self.assertEqual(self.reason(reordered), "optional_group_partial")
 
+    def test_sheet_names_are_grounding_not_a_tab_list(self):
+        # The fixture has no workbook, so inject the sheet list the extractor
+        # would have read. Returns holds the graded cells; the rest are extras.
+        sheets = ["Returns", "Inputs", "Debt", "Tax", "Opex", "Capex", "Summary"]
+        facts = FACTS.extract_facts(SOURCE.encode("utf-8"), self.task)
+        facts["workbook_sheets"] = sheets
+        facts["allowed_extra_inline_code"] = sorted(
+            set(facts["allowed_extra_inline_code"]) | {"`%s`" % s for s in sheets}
+        )
+
+        def run(candidate):
+            return VALIDATOR.validate(SOURCE, candidate, ANSWER_KEY, facts=facts)
+
+        def reason(candidate):
+            with self.assertRaises(VALIDATOR.ProseValidationError) as ctx:
+                run(candidate)
+            return ctx.exception.reason_codes[0]
+
+        anchor = "The working file, `0001-inputs.xlsx`, is in your working directory."
+        self.assertIn(anchor, CANDIDATE)
+        self.assertTrue(run(CANDIDATE)["valid"])
+        # Answer tab plus three extras: fine.
+        three = CANDIDATE.replace(
+            anchor,
+            anchor + " The returns sit on `Returns`, fed by `Inputs`, `Debt` and `Tax`.",
+        )
+        self.assertTrue(run(three)["valid"])
+        # Four extras beyond the answer tab: a recital.
+        four = CANDIDATE.replace(
+            anchor,
+            anchor + " It holds the tabs `Returns`, `Inputs`, `Debt`, `Tax`, and `Opex`.",
+        )
+        self.assertEqual(reason(four), "sheet_list_dump")
+        # Repeating a sheet name does not count twice.
+        repeated = CANDIDATE.replace(
+            anchor,
+            anchor + " `Inputs` feeds `Debt`, `Debt` feeds `Tax`, and `Tax` feeds `Inputs`.",
+        )
+        self.assertTrue(run(repeated)["valid"])
+        # A sheet name the source already quotes in prose is not new.
+        source_names = SOURCE.replace(
+            "The workbook `0001-inputs.xlsx` is in your working directory.",
+            "The workbook `0001-inputs.xlsx` is in your working directory; start on `Summary`.",
+        )
+        facts_named = FACTS.extract_facts(source_names.encode("utf-8"), self.task)
+        facts_named["workbook_sheets"] = sheets
+        facts_named["allowed_extra_inline_code"] = facts["allowed_extra_inline_code"]
+        named = CANDIDATE.replace(
+            anchor, anchor + " Start on `Summary`; `Inputs`, `Debt` and `Tax` feed it."
+        )
+        self.assertTrue(
+            VALIDATOR.validate(source_names, named, ANSWER_KEY, facts=facts_named)["valid"]
+        )
+        # The reason code lets the run continue to attempt two.
+        self.assertIn("sheet_list_dump", RECOVERY.RETRYABLE_REASON_CODES)
+        self.assertIn("optional_group_partial", RECOVERY.RETRYABLE_REASON_CODES)
+        # Brief no longer hands the writer the sheet list as permission.
+        brief = FACTS.writer_brief(facts)
+        self.assertIn("grounding only", brief)
+        self.assertIn("Do not list the workbook's tabs", brief)
+        self.assertNotIn("New inline code only for: `", brief)
+
     def test_rejects_dropped_or_reordered_protected_blocks(self):
         self.assertEqual(self.reason(CANDIDATE.replace(TASK_ITEM, "")), "protected_block_missing")
         self.assertEqual(

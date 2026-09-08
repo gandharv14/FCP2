@@ -547,7 +547,8 @@ def writer_brief(facts: dict[str, Any]) -> str:
         "Deliverable path (use exactly this): %s"
         % facts.get("deliverable_path", DEFAULT_DELIVERABLE_PATH),
         "Model family: %s" % facts["family_phrase"],
-        "Sheet names: %s"
+        "Sheet names (grounding only: pick the setting from them, do not list"
+        " them; quote at most the answer tab): %s"
         % (", ".join(facts["workbook_sheets"]) if facts["workbook_sheets"] else "(unknown)"),
         "Curated output names, in order: %s" % ", ".join(facts["output_names"]),
         "Number of graded cells: %d" % facts["n_cells"],
@@ -584,6 +585,9 @@ def writer_brief(facts: dict[str, Any]) -> str:
         "    blank cells, removed, no formulas, remaining inputs, mock, masked.",
         "  - Ask the question the way the senior colleague would ask it; do not",
         "    write 'The business question is'.",
+        "  - Do not list the workbook's tabs. Name at most the tab the graded cells",
+        "    sit on; when they sit on several tabs, point to the table. The validator",
+        "    rejects more than three sheet names beyond the answer tabs.",
     ]
     if facts.get("count_required"):
         lines += [
@@ -643,9 +647,10 @@ def writer_brief(facts: dict[str, Any]) -> str:
             else:
                 rule = "required exactly %d" % count
             lines.append("  - %s: %s" % (token, rule))
-    lines.append("  - Add no other numbers. New inline code only for: %s" % ", ".join(
-        facts["allowed_extra_inline_code"]
-    ))
+    lines.append(
+        "  - Add no other numbers. New inline code only for: the sheet names above"
+        " (grounding only; at most the answer tab), `%s`, `openpyxl`" % NOTES_NAME
+    )
 
     if facts["has_research_service"]:
         url = next(iter(facts["prose_tokens"].get("urls", {})), "http://mcp-server:8000/mcp")

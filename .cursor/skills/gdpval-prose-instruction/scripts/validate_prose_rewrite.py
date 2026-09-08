@@ -48,6 +48,10 @@ from extract_critical_facts import (  # noqa: E402
 # optional; the deliverable rule is phrased naturally. Applied v1 tasks fail
 # verify-metadata after this bump and need a re-run (only the two demo copies
 # existed at the time of the change).
+# The sheet_list_dump cap (at most three sheet names beyond the answer tabs)
+# was added without a bump: no applied prose task existed outside the demo,
+# and verify-applied / verify-metadata compare hashes and versions only, so
+# applied tasks cannot start failing.
 PROMPT_VERSION = "gdpval-prose-instruction-v2"
 MODEL = "gpt-5.6-sol-high"
 
@@ -479,6 +483,21 @@ def validate(
             checks,
             "unsupported_inline_code",
         )
+    # Sheet names are permitted so the writer can ground the setting, not so
+    # it can recite the workbook's tabs. Tabs the graded cells sit on are
+    # already in the table and do not count; a few more may frame the work.
+    answer_sheets = {ref.split("!")[0].strip("'") for ref in facts["cell_refs"]}
+    sheet_spans = {
+        "`%s`" % s for s in (facts.get("workbook_sheets") or []) if s not in answer_sheets
+    }
+    new_sheets = sorted((sheet_spans & set(candidate_code)) - set(source_code))
+    require(
+        len(new_sheets) <= 3,
+        "at most three sheet names beyond the answer tabs"
+        + (" (have %d: %s)" % (len(new_sheets), ", ".join(new_sheets[:5])) if len(new_sheets) > 3 else ""),
+        checks,
+        "sheet_list_dump",
+    )
     candidate_numbers = Counter(
         m.group(0) for m in NUMBER_RE.finditer(INLINE_CODE_RE.sub(" ", candidate_prose))
     )

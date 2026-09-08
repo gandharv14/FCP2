@@ -60,16 +60,20 @@ style of a GDPval task prompt. The reader is an Analyst or Associate.
 VOICE
 - Open with "You are an Analyst..." or "You are an Associate..." and say what
   the team does and who assigns the work. Ground the firm and the work in the
-  sheet names and output names in the brief. If they do not support a specific
-  setting, say "a finance team" and stop there. Never invent deadlines,
-  committee dates, client names, or numbers.
+  sheet names and output names in the brief: use them to pick the setting,
+  not to recite. If they do not support a specific setting, say "a finance
+  team" and stop there. Never invent deadlines, committee dates, client
+  names, or numbers.
 - Second paragraph: the question, asked the way the senior colleague would
   ask it and named by the first curated output ("the Director wants to know
   what return the deal makes", "how much term debt the vehicle draws"). Do
-  not write "The business question is". Then the workbook: its file name,
-  the tabs it holds, that the inputs, historicals and layout are in place and
-  the calculations have not been carried out yet, and that Python packages
-  such as openpyxl may be installed to read it.
+  not write "The business question is". Then the workbook: its file name
+  and, if it helps, the tab the graded figures sit on; when they sit on
+  several tabs, point to the table instead of naming them. Never list the
+  workbook's tabs; the reader opens the file and sees them. Then that the
+  inputs, historicals and layout are in place and the calculations have not
+  been carried out yet, and that Python packages such as openpyxl may be
+  installed to read it.
 - The workbook is a template to complete, not a file that was emptied. Never
   write: removed, stripped, blank cells / cells are blank, cleared, no
   formulas, remaining drivers/inputs, identified inputs, sheet structure,
@@ -130,7 +134,8 @@ HARD RULES (a validator rejects the file otherwise)
    and inline-code spans keep their counts too, except tokens the brief marks
    "may be dropped" (they live only in droppable sentences). Add no new
    numbers. New inline code only for sheet names from the brief,
-   additional-assumptions.md, and openpyxl.
+   additional-assumptions.md, and openpyxl; at most three sheet names beyond
+   the ones the graded cells sit on (`sheet_list_dump`).
 4. Do not add facts, hints, formulas, assumptions, or answer values.
 5. Keep "working directory", "only" for the research-service inputs,
    "install", "key", "units", "scale", "percentage", a no-rounding word

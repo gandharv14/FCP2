@@ -338,14 +338,23 @@ def check_rollout_performance(report, baseline) -> dict:
     baseline_runtime = reference.get("verifier_runtime_p95_s")
     current_peak = current.get("peak_memory_bytes")
     baseline_peak = reference.get("peak_memory_bytes")
+    required = {
+        "current.verifier_runtime_p95_s": current_runtime,
+        "baseline.verifier_runtime_p95_s": baseline_runtime,
+    }
+    # Peak memory is opt-in (see FCP_TRACE_MEMORY in xl_segment). When neither
+    # side measured it, the memory budget is skipped rather than failed --
+    # comparing an unmeasured run against an unmeasured baseline proves
+    # nothing. One side missing is still a mismatch worth reporting.
+    memory_measured = isinstance(current_peak, (int, float)) or isinstance(
+        baseline_peak, (int, float)
+    )
+    if memory_measured:
+        required["current.peak_memory_bytes"] = current_peak
+        required["baseline.peak_memory_bytes"] = baseline_peak
     missing = [
         name
-        for name, value in {
-            "current.verifier_runtime_p95_s": current_runtime,
-            "baseline.verifier_runtime_p95_s": baseline_runtime,
-            "current.peak_memory_bytes": current_peak,
-            "baseline.peak_memory_bytes": baseline_peak,
-        }.items()
+        for name, value in required.items()
         if not isinstance(value, (int, float))
     ]
     if missing:
@@ -356,11 +365,21 @@ def check_rollout_performance(report, baseline) -> dict:
             "peak_memory_limit_ratio": 1.20,
         }
     runtime_ratio = current_runtime / baseline_runtime if baseline_runtime else math.inf
+    if not memory_measured:
+        return {
+            "passed": runtime_ratio <= 1.25,
+            "runtime_ratio": runtime_ratio,
+            "peak_memory_ratio": None,
+            "peak_memory_measured": False,
+            "runtime_limit_ratio": 1.25,
+            "peak_memory_limit_ratio": 1.20,
+        }
     memory_ratio = current_peak / baseline_peak if baseline_peak else math.inf
     return {
         "passed": runtime_ratio <= 1.25 and memory_ratio <= 1.20,
         "runtime_ratio": runtime_ratio,
         "peak_memory_ratio": memory_ratio,
+        "peak_memory_measured": True,
         "runtime_limit_ratio": 1.25,
         "peak_memory_limit_ratio": 1.20,
     }

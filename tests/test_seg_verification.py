@@ -47,7 +47,6 @@ def _node(node_id, kind, value):
         label=node_id,
         formula=(f"={value}" if kind == "formula" else ""),
         value=str(value),
-        in_cycle=False,
     )
 
 
@@ -60,11 +59,7 @@ def _verification_fixture(output_count=1):
             target=output.id,
             role="identity",
             arg_index=0,
-            op="",
-            cell=output.id,
-            ref=source.id,
             via_range="",
-            cross_sheet=False,
         )
         for output in outputs
     ]

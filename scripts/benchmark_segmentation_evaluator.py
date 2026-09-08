@@ -114,7 +114,7 @@ def _worker(arguments: argparse.Namespace) -> dict[str, object]:
             active_adj, active_radj = evaluator._active_graph(cells)
         elapsed = time.perf_counter() - started
         signature = {
-            "edges": evaluator._graph_signature(active_adj),
+            "edges": evaluator._graph_signature(active_adj).to_tuple(),
             "reverse_edges": tuple(
                 (target, tuple(sorted(sources)))
                 for target, sources in sorted(active_radj.items())

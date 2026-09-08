@@ -52,7 +52,10 @@ def _restricted_topo(cone: set, adj: dict, radj: dict) -> list:
                 if indeg[succ] == 0:
                     queue.append(succ)
     # Anything left sits in a cycle the caller already contracted; append it.
-    order.extend(sorted(n for n in cone if n not in set(order)))
+    # One set, built once: rebuilding ``set(order)`` inside the generator made
+    # this O(N^2) on the cone size (hours on a 100k-cell cone).
+    ordered = set(order)
+    order.extend(sorted(n for n in cone if n not in ordered))
     return order
 
 
@@ -113,7 +116,6 @@ def cell_trace(
     radj=None,
 ) -> dict:
     """Exact cell-by-cell derivation of one output value."""
-    adj = cg.adj if adj is None else adj
     radj = cg.radj if radj is None else radj
     cone = {cell_id}
     stack = [cell_id]
@@ -126,10 +128,23 @@ def cell_trace(
                 cone.add(pred)
                 stack.append(pred)
 
+    # Forward edges inside the cone, derived from the same radj the cone was
+    # traversed with; identical to filtering a full forward graph to the cone,
+    # without ever building one. ``adj`` is accepted for callers that still
+    # pass it and used only as a fallback when no radj is available.
+    successors: dict = {}
+    if radj is not None:
+        for target in cone:
+            for source in radj.get(target, ()):
+                if source in cone:
+                    successors.setdefault(source, set()).add(target)
+    elif adj is not None:
+        for node in cone:
+            successors[node] = {s for s in adj.get(node, ()) if s in cone}
     # Canonicalize both Tarjan roots and successors.  The proof graphs store
     # adjacency in sets, whose iteration order changes with PYTHONHASHSEED.
     restricted_adj = {
-        node: tuple(sorted(succ for succ in adj.get(node, ()) if succ in cone))
+        node: tuple(sorted(successors.get(node, ())))
         for node in sorted(cone)
     }
     groups = strongly_connected(sorted(cone), restricted_adj)
@@ -140,9 +155,7 @@ def cell_trace(
             comp_of[cell] = group[0]
     cadj, cradj = {}, {}
     for node in cone:
-        for succ in adj.get(node, ()):
-            if succ not in cone:
-                continue
+        for succ in successors.get(node, ()):
             a, b = comp_of[node], comp_of[succ]
             if a != b:
                 cadj.setdefault(a, set()).add(b)
@@ -195,23 +208,46 @@ def _plain(value):
 
 
 def _proof_graphs(bg, cd, proof_radj):
-    cell_radj = {
-        target: set(sources) for target, sources in proof_radj.items()
-    }
-    cell_adj = {}
-    comp_adj, comp_radj = {}, {}
-    for target, sources in cell_radj.items():
-        target_band = bg.of_cell.get(target)
-        target_comp = cd.comp_of.get(target_band)
-        for source in sources:
-            cell_adj.setdefault(source, set()).add(target)
-            source_band = bg.of_cell.get(source)
-            source_comp = cd.comp_of.get(source_band)
-            if source_comp is None or target_comp is None or source_comp == target_comp:
+    """Component-level graph of the proof, plus the cell radj for traces.
+
+    The cell-level forward graph is no longer materialized: ``cell_trace``
+    derives the forward edges it needs inside each cone from ``radj``. The
+    component graph is built band by band; a proof radj that can name source
+    bands directly (``band_sources``) avoids expanding range references to
+    cells, which on the largest workbook is hundreds of millions of pairs.
+    """
+    of_cell, comp_of = bg.of_cell, cd.comp_of
+    comp_adj: dict = {}
+    comp_radj: dict = {}
+
+    def link(source_band, target_comp):
+        source_comp = comp_of.get(source_band)
+        if source_comp is None or source_comp == target_comp:
+            return
+        comp_adj.setdefault(source_comp, set()).add(target_comp)
+        comp_radj.setdefault(target_comp, set()).add(source_comp)
+
+    band_sources = getattr(proof_radj, "band_sources", None)
+    if band_sources is not None:
+        range_bands = getattr(bg, "range_bands", None)
+        if range_bands is None:
+            range_bands = {}
+        for target in proof_radj:
+            target_comp = comp_of.get(of_cell.get(target))
+            if target_comp is None:
                 continue
-            comp_adj.setdefault(source_comp, set()).add(target_comp)
-            comp_radj.setdefault(target_comp, set()).add(source_comp)
-    return cell_adj, cell_radj, comp_adj, comp_radj
+            for source_band in band_sources(target, of_cell, range_bands):
+                link(source_band, target_comp)
+    else:
+        for target, sources in proof_radj.items():
+            target_comp = comp_of.get(of_cell.get(target))
+            if target_comp is None:
+                continue
+            for source in sources:
+                source_band = of_cell.get(source)
+                if source_band is not None:
+                    link(source_band, target_comp)
+    return None, proof_radj, comp_adj, comp_radj
 
 
 def build(
@@ -227,7 +263,9 @@ def build(
     proof_radj=None,
 ) -> list:
     if proof_radj is None:
-        cell_adj, cell_radj = cg.adj, cg.radj
+        # Forward edges are derived per trace from radj; never touch cg.adj
+        # (materializing it costs the full cell-level expansion).
+        cell_adj, cell_radj = None, cg.radj
         comp_adj, comp_radj = cd.comp_adj, cd.comp_radj
     else:
         cell_adj, cell_radj, comp_adj, comp_radj = _proof_graphs(

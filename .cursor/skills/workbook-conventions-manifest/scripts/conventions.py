@@ -32,6 +32,30 @@ except ImportError:
     sys.exit("openpyxl required: pip install openpyxl")
 
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *([".."] * 4)))
+
+
+def _populated_cells(ws):
+    """Every populated cell of a worksheet, full or read-only.
+
+    The AST builder's streamer reproduces full-mode semantics on a read-only
+    sheet (ignores a wrong <dimension>, keeps out-of-order rows, blanks merged
+    members). Reuse it when the repo is importable; otherwise fall back to
+    iter_rows() with the declared dimension cleared.
+    """
+    try:
+        if _REPO_ROOT not in sys.path:
+            sys.path.insert(0, _REPO_ROOT)
+        from xl_ast_graph import iter_cells  # type: ignore
+
+        return iter_cells(ws)
+    except Exception:
+        reset = getattr(ws, "reset_dimensions", None)
+        if reset is not None:
+            reset()
+        return [cell for row in ws.iter_rows() for cell in row]
+
+
 # --------------------------------------------------------------------- refs
 
 # A cell or range reference, with an optional sheet qualifier.
@@ -145,13 +169,15 @@ class Book:
         self.formula = {}
         self.value = {}
         self.sheets = []
-        wbf = openpyxl.load_workbook(path, data_only=False)
+        # The formula pass only iterates, so it streams; the value pass is
+        # indexed per formula cell and stays a full load.
+        wbf = openpyxl.load_workbook(path, data_only=False, read_only=True)
         wbv = openpyxl.load_workbook(path, data_only=True)
-        for ws in wbf.worksheets:
-            self.sheets.append(ws.title)
-            vs = wbv[ws.title]
-            for row in ws.iter_rows():
-                for c in row:
+        try:
+            for ws in wbf.worksheets:
+                self.sheets.append(ws.title)
+                vs = wbv[ws.title]
+                for c in _populated_cells(ws):
                     if c.value is None:
                         continue
                     k = key(ws.title, c.coordinate)
@@ -160,6 +186,9 @@ class Book:
                         self.value[k] = vs[c.coordinate].value
                     else:
                         self.value[k] = c.value
+        finally:
+            wbf.close()
+            wbv.close()
         self._labels = {}
 
     def has(self, k: str) -> bool:

@@ -514,24 +514,22 @@ def check_workbook(
             for ref in sorted(audit_refs - expanded_mask):
                 manifest_errors.append("audit ref absent from mask: %s" % display_ref(ref))
 
-        not_blank: list[dict[str, Any]] = []
-        for ref in sorted(expanded_mask):
-            sheet, _, coordinate = ref.rpartition("!")
-            if sheet not in book.sheetnames:
-                not_blank.append({"cell": display_ref(ref), "value": "<unknown sheet>"})
-                continue
-            value = book[sheet][coordinate].value
-            if value is not None:
-                not_blank.append({"cell": display_ref(ref), "value": repr(value)})
-
+        # One streaming pass over every sheet serves both checks. Indexing
+        # book[sheet][coordinate] on a read-only workbook re-parses the sheet
+        # XML from the top per call, which made the blank check quadratic.
+        populated: dict[str, Any] = {}
         found: dict[tuple[str, str], dict[str, Any]] = {}
         for sheet in book.worksheets:
+            reset = getattr(sheet, "reset_dimensions", None)
+            if reset is not None:
+                reset()
             for row in sheet.iter_rows():
                 for cell in row:
                     if cell.value is None:
                         continue
                     ref = "%s!%s" % (sheet.title, cell.coordinate)
                     if ref in expanded_mask:
+                        populated[ref] = cell.value
                         continue
                     for target in targets:
                         if value_matches_target(cell.value, target):
@@ -541,6 +539,15 @@ def check_workbook(
                                 "variable_id": target.variable_id,
                                 "value": repr(cell.value),
                             }
+
+        not_blank: list[dict[str, Any]] = []
+        for ref in sorted(expanded_mask):
+            sheet, _, _coordinate = ref.rpartition("!")
+            if sheet not in book.sheetnames:
+                not_blank.append({"cell": display_ref(ref), "value": "<unknown sheet>"})
+                continue
+            if ref in populated:
+                not_blank.append({"cell": display_ref(ref), "value": repr(populated[ref])})
 
         found_keys = set(found)
         approved_keys = found_keys & set(allowlist)

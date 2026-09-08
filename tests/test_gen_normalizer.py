@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -257,3 +260,110 @@ class PlainEligibilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NormalizerOutputRedirectionTests(unittest.TestCase):
+    """Gate 6 runs the generated normalizer twice to prove byte-stability.
+
+    Redirecting only the outputs lets the two runs overlap instead of racing on
+    a shared normalized.json. Inputs must keep coming from the script's own
+    directory, or a redirected run would silently read nothing.
+    """
+
+    VAR_DEFS = [
+        {
+            "id": "v1",
+            "name": "Revenue",
+            "value": 100,
+            "unit": "USD",
+            "period": "FY24",
+            "basis": "actual",
+            "question": "What is revenue?",
+            "cells": ["Sheet1!B4"],
+        }
+    ]
+
+    def _render(self, run):
+        (run / "draft.json").write_text(
+            json.dumps({"rows": [{"draft_id": "d1"}]}), encoding="utf-8"
+        )
+        script = run / "normalize_0001.py"
+        script.write_text(
+            gn.TEMPLATE.format(
+                wb="0001",
+                seed=1,
+                variables=repr(self.VAR_DEFS),
+                included=repr({"d1": ["v1"]}),
+                excluded=repr({}),
+                reasons=repr({}),
+                codes=repr({}),
+                first_atomic=1,
+                forced=repr([]),
+                pipeline_bindings=repr(None),
+            ),
+            encoding="utf-8",
+        )
+        return script
+
+    def _run(self, script, out_dir=None):
+        env = dict(os.environ)
+        if out_dir is not None:
+            env["NORMALIZE_OUT_DIR"] = str(out_dir)
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_default_writes_beside_the_script(self):
+        run = Path(tempfile.mkdtemp())
+        script = self._render(run)
+
+        self._run(script)
+
+        for name in ("normalized.json", "exclusions.json", "normalization_report.json"):
+            self.assertTrue((run / name).is_file(), name)
+
+    def test_redirected_outputs_are_byte_identical(self):
+        run = Path(tempfile.mkdtemp())
+        script = self._render(run)
+        other = run / "b"
+
+        self._run(script)
+        self._run(script, other)
+
+        for name in ("normalized.json", "exclusions.json", "normalization_report.json"):
+            self.assertEqual(
+                (run / name).read_bytes(), (other / name).read_bytes(), name
+            )
+
+    def test_an_empty_override_falls_back_to_the_script_dir(self):
+        # Gate 6 clears NORMALIZE_OUT_DIR for its first run so an inherited
+        # value cannot redirect it, leaving a stale normalized.json for the
+        # byte-stability cmp to compare against and pass. That relies on an
+        # empty string falling back to RUN rather than resolving to ".".
+        run = Path(tempfile.mkdtemp())
+        script = self._render(run)
+        (run / "normalized.json").write_text("stale\n", encoding="utf-8")
+
+        self._run(script, out_dir="")
+
+        self.assertNotEqual(
+            (run / "normalized.json").read_text(encoding="utf-8"), "stale\n"
+        )
+
+    def test_inputs_are_read_from_the_script_dir_not_the_output_dir(self):
+        run = Path(tempfile.mkdtemp())
+        script = self._render(run)
+        (run / "source_profiles.json").write_text(
+            json.dumps({"profiles": [{"profile_id": "p1"}]}), encoding="utf-8"
+        )
+        other = run / "b"
+
+        self._run(script, other)
+
+        spec = json.loads((other / "normalized.json").read_text(encoding="utf-8"))
+        self.assertEqual(spec.get("source_profiles"), [{"profile_id": "p1"}])
+        self.assertFalse((other / "draft.json").exists())

@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
+
+try:
+    import xl_hash_cache
+except ImportError:  # pragma: no cover - package imported without repo root
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import xl_hash_cache
 
 
 SCHEMA_VERSION = "segmentation-verification/v2"
@@ -333,18 +340,19 @@ def fingerprint_file(path, *, logical_path=None) -> dict:
         "available": path.is_file(),
     }
     if record["available"]:
-        digest = hashlib.sha256()
-        size = 0
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-                size += len(chunk)
+        digest, size = xl_hash_cache.sha256_and_size(path)
         record.update({
             "algorithm": "sha256",
-            "sha256": digest.hexdigest(),
+            "sha256": digest,
             "size_bytes": size,
         })
     return record
+
+
+def sha256_file(path) -> str:
+    """Hex SHA-256 of a file, memoised in-process by inode and change stamps."""
+
+    return xl_hash_cache.sha256_file(path)
 
 
 def fingerprint_values(values) -> dict:

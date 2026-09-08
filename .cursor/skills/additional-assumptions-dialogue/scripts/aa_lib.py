@@ -18,8 +18,14 @@ DO_NOT_RERUN = (
     "xl_harbor_prep.py",
     "xl_output_task.py",
     "create-harbor-task steps 11-15",
+    "gdpval-prose-instruction",
 )
 DISCLOSURE_HEADING = "## Workbook disclosure"
+# Heading-free instructions (gdpval-prose-instruction) hold the disclosure
+# bullets between these markers instead of under DISCLOSURE_HEADING.
+NOTES_MARKER_START = "<!-- workbook-notes:start -->"
+NOTES_MARKER_END = "<!-- workbook-notes:end -->"
+FENCE_RE = re.compile(r"(?ms)^ {0,3}(`{3,}|~{3,})[^\n]*\n.*?^ {0,3}\1[ \t]*$")
 ASSUMPTIONS_HEADING = "## Additional assumptions"
 OUTPUT_HEADING = "## Output"
 INPUT_HEADING = "## Input"
@@ -284,9 +290,34 @@ def strip_claim_comments(text: str) -> str:
 
 
 def disclosure_body(instruction: str) -> str:
-    if DISCLOSURE_HEADING not in instruction:
-        return ""
-    return DISCLOSURE_HEADING + instruction.split(DISCLOSURE_HEADING, 1)[1].split("\n## ", 1)[0]
+    if DISCLOSURE_HEADING in instruction:
+        return DISCLOSURE_HEADING + instruction.split(DISCLOSURE_HEADING, 1)[1].split("\n## ", 1)[0]
+    block = notes_marker_block(instruction)
+    return block or ""
+
+
+def strip_fences(text: str) -> str:
+    return FENCE_RE.sub("", text or "")
+
+
+def is_heading_free(instruction: str) -> bool:
+    """True when the instruction has no Markdown heading outside code fences."""
+    return not HEADING_RE.search(strip_fences(instruction))
+
+
+def notes_marker_block(instruction: str) -> str | None:
+    """The exact `<!-- workbook-notes:start -->` ... `<!-- workbook-notes:end -->` span."""
+    start = instruction.find(NOTES_MARKER_START)
+    if start < 0:
+        return None
+    end = instruction.find(NOTES_MARKER_END, start)
+    if end < 0:
+        return None
+    return instruction[start : end + len(NOTES_MARKER_END)]
+
+
+def paragraphs_with(text: str, needle: str) -> list[str]:
+    return [p for p in re.split(r"\n\s*\n", text) if needle in p]
 
 
 def artifact_name(task_dir: Path) -> str:

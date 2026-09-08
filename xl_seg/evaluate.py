@@ -58,6 +58,9 @@ MAX_ITERATIONS = 5000
 MAX_SWEEPS = 12
 MAX_ACTIVE_PASSES = 12
 EXCEL_DEFAULT_ITERATIONS = 100
+# Functions whose value can change between two evaluations with identical
+# inputs. Dirty-set sweeps must never skip a cell that contains one.
+VOLATILE_OPS = frozenset({"NOW", "TODAY", "RAND", "RANDBETWEEN", "_XLFN.RANDARRAY"})
 EXCEL_DEFAULT_CHANGE = 0.001
 MAX_WORKBOOK_ITERATIONS = 10_000
 MAX_ITERATION_DELTA = 1.0
@@ -695,6 +698,10 @@ class EvalResult:
     # diagnostics carry bounded member samples while this complete mapping lets
     # the post-proof verifier reason about every member without truncation.
     cycle_groups: dict = dataclass_field(default_factory=dict)
+    # formula cell -> sorted operations it applied that have no handler. The
+    # coverage payload only counts unknown operations; output-cone pruning
+    # needs the cells so a failure can be traced to the outputs it feeds.
+    unknown_op_cells: dict = dataclass_field(default_factory=dict)
     endpoint_equation_checker: object = None
     strict_proof: bool = False
     # Process-local performance data. It is returned to the caller but is not
@@ -739,6 +746,99 @@ class CalculationMetadata:
         return self.force_full_calc
 
 
+class _Span(list):
+    """Range member ids with their grid shape, computed once per argument slot.
+
+    ``_arg_value`` used to regex-split every member id on every evaluation to
+    count rows and columns; the shape is a property of the span, not of the
+    values, so it is fixed when the spec is built. A list subclass keeps every
+    consumer that iterates the payload or passes it as ``refs`` unchanged.
+    """
+
+    __slots__ = ("rows", "cols")
+
+    def __init__(self, members):
+        super().__init__(members)
+        coordinates = [_split(cid) for cid in members]
+        self.rows = len({row for _, row, _ in coordinates})
+        self.cols = len({col for _, _, col in coordinates})
+
+
+class GraphIndex:
+    """Graph-derived caches that do not depend on cell values.
+
+    Argument specs, range shapes, const literals, subtree purity, static source
+    sets, SUBTOTAL provenance and cell sort keys are functions of the AST alone.
+    One instance can be shared by every ``Evaluator`` built over the same
+    ``graph``/``cg`` (the proof closure builds up to 13), so the work is done
+    once per segmentation run instead of once per evaluator. Value state
+    (``values``, ledgers, resolved targets) never lives here.
+    """
+
+    __slots__ = (
+        "arg_cache", "subtotal_provenance", "static_source_cache",
+        "source_walk_purity_cache", "cell_key_cache", "range_cache",
+        "const_cache",
+    )
+
+    def __init__(self):
+        self.arg_cache: dict = {}
+        self.subtotal_provenance: dict[str, bool] = {}
+        self.static_source_cache: dict[str, frozenset[str]] = {}
+        self.source_walk_purity_cache: dict[str, bool] = {}
+        self.cell_key_cache: dict[str, tuple] = {}
+        self.range_cache: dict[str, object] = {}
+        self.const_cache: dict[str, object] = {}
+
+
+class _GraphSignature:
+    """Exact, order-independent identity of an active dependency graph.
+
+    Equality is a dict-of-frozenset comparison (O(E), no sort), ``len`` is the
+    edge count the topology history records, and the hash is computed once
+    when the object is used as a component-plan cache key. The old sorted
+    tuple of (source, target) pairs cost an O(E log E) sort per call, seven
+    times per run, and kept every pair alive as a cache key.
+    """
+
+    __slots__ = ("_adj", "_count", "_hash")
+
+    def __init__(self, active_adj):
+        self._adj = {
+            source: frozenset(targets)
+            for source, targets in active_adj.items()
+            if targets
+        }
+        self._count = sum(len(targets) for targets in self._adj.values())
+        self._hash = None
+
+    def __len__(self):
+        return self._count
+
+    def __eq__(self, other):
+        if not isinstance(other, _GraphSignature):
+            return NotImplemented
+        return self._count == other._count and self._adj == other._adj
+
+    def __hash__(self):
+        if self._hash is None:
+            self._hash = hash(frozenset(self._adj.items()))
+        return self._hash
+
+    def to_tuple(self):
+        """The historical sorted-pairs form, for tools that serialize it."""
+        return tuple(sorted(
+            (source, target)
+            for source, targets in self._adj.items()
+            for target in targets
+        ))
+
+
+# ``_fn_*`` handler lookup per (class, op): the string building and getattr
+# ran once per function evaluation before.
+_HANDLER_CACHE: dict = {}
+
+
 class Evaluator:
     def __init__(
         self,
@@ -753,6 +853,7 @@ class Evaluator:
         proof_scope=None,
         optimize: bool = True,
         clock=None,
+        index: GraphIndex | None = None,
     ):
         self.graph = graph
         self.cg = cg
@@ -766,9 +867,17 @@ class Evaluator:
         self.clock = clock if clock is not None else datetime.now
         self.values: dict = {}
         self.unresolved: dict = {}
+        # Counted once per (cell, op) per run: the number is a coverage fact
+        # about the workbook, not about how many sweeps happened to run.
         self.unknown_ops: dict = defaultdict(int)
-        self._arg_cache: dict = {}
-        self._subtotal_provenance: dict[str, bool] = {}
+        self._unknown_seen: set = set()
+        self.index = index if index is not None else GraphIndex()
+        self._arg_cache = self.index.arg_cache
+        self._subtotal_provenance = self.index.subtotal_provenance
+        # Dirty-sweep state: values at the end of the previous acyclic sweep
+        # under the same active graph, or None when the next sweep must be
+        # full (first sweep, or the graph changed).
+        self._sweep_snapshot: dict | None = None
         self.oracle_reads: dict = {}
         self.oracle_accesses: dict = {}
         self.read_attempts: dict = {}
@@ -782,8 +891,8 @@ class Evaluator:
         self._proof_active_radj: dict = {}
         self._proof_resolved_targets: dict = {}
         self._proof_resolved_operation_targets: dict = {}
-        self._static_source_cache: dict[str, frozenset[str]] = {}
-        self._source_walk_purity_cache: dict[str, bool] = {}
+        self._static_source_cache = self.index.static_source_cache
+        self._source_walk_purity_cache = self.index.source_walk_purity_cache
         self._component_plan_cache: dict[tuple, tuple] = {}
         self._benchmark = {
             "active_graph": {
@@ -831,10 +940,14 @@ class Evaluator:
         if kind == "scalar":
             return self._eval_node(payload)
         if kind == "span":
-            values = [self._read(cid) for cid in payload]
-            coordinates = [_split(cid) for cid in payload]
-            rows = len({row for _, row, _ in coordinates})
-            cols = len({col for _, _, col in coordinates})
+            read = self._read
+            values = [read(cid) for cid in payload]
+            if isinstance(payload, _Span):
+                rows, cols = payload.rows, payload.cols
+            else:
+                coordinates = [_split(cid) for cid in payload]
+                rows = len({row for _, row, _ in coordinates})
+                cols = len({col for _, _, col in coordinates})
             return RangeValues(values, rows, cols, refs=payload)
         return [self._eval_node(src) for src in payload]
 
@@ -1124,15 +1237,20 @@ class Evaluator:
             sheet = self.graph.nodes[group[0].source].sheet
             members = range_members(sheet, span.split("!")[-1].replace("$", ""))
             if members:
-                return ("span", members)
+                return ("span", _Span(members))
         if len(group) == 1:
             return ("scalar", group[0].source)
         return ("many", [e.source for e in group])
 
     def _read(self, cid: str):
-        self.read_attempts.setdefault(cid, set()).add(self._current_cell)
-        if cid in self.values:
-            return self.values[cid]
+        attempts = self.read_attempts.get(cid)
+        if attempts is None:
+            self.read_attempts[cid] = {self._current_cell}
+        else:
+            attempts.add(self._current_cell)
+        values = self.values
+        if cid in values:
+            return values[cid]
         if cid in self.graph.nodes:
             return Unresolved("range-uncomputed")
         if self.strict_proof:
@@ -1159,9 +1277,18 @@ class Evaluator:
         if node is None:
             return Unresolved("missing-node")
         if node.kind == "const":
+            # ``literal`` parses text every time (ISO date regex, float). The
+            # result is immutable (float, str, bool, None), so it is cached
+            # per const node in the shared index.
+            cache = self.index.const_cache
+            if node_id in cache:
+                return cache[node_id]
             if node.op == "text" and node.value == "":
-                return ""
-            return literal(node.value if node.value != "" else node.expr)
+                value = ""
+            else:
+                value = literal(node.value if node.value != "" else node.expr)
+            cache[node_id] = value
+            return value
         if node.kind == "range":
             return self._expand_range(node)
         if node.kind == "name":
@@ -1178,14 +1305,17 @@ class Evaluator:
         """A range node the parser kept whole; read its cells one by one."""
         if getattr(node, "range_truncated", False):
             return Unresolved("whole-column-range-exceeds-bound")
-        members = range_members(node.sheet, node.coordinate or "")
-        if not members:
+        cache = self.index.range_cache
+        span = cache.get(node.id)
+        if span is None:
+            members = range_members(node.sheet, node.coordinate or "")
+            span = _Span(members) if members else ()
+            cache[node.id] = span
+        if not span:
             return Unresolved("opaque-range")
-        coordinates = [_split(cid) for cid in members]
-        rows = len({row for _, row, _ in coordinates})
-        cols = len({col for _, _, col in coordinates})
+        read = self._read
         return RangeValues(
-            [self._read(cid) for cid in members], rows, cols, refs=members
+            [read(cid) for cid in span], span.rows, span.cols, refs=span
         )
 
     def _apply(self, node):
@@ -1300,17 +1430,25 @@ class Evaluator:
         # (``_xlfn.NORM.DIST``), which the tokenizer keeps verbatim. Try the
         # bare name first, but keep the raw lookup as fallback: handlers like
         # ``_fn__xlfn_vstack`` exist only under the prefixed spelling.
-        bare = op
-        for prefix in ("_XLFN.", "_XLWS."):
-            if bare.startswith(prefix):
-                bare = bare[len(prefix):]
-        handler = getattr(self, f"_fn_{bare.replace('.', '_').lower()}", None)
-        if handler is None and bare != op:
-            handler = getattr(self, f"_fn_{op.replace('.', '_').lower()}", None)
+        cache_key = (type(self), op)
+        try:
+            handler = _HANDLER_CACHE[cache_key]
+        except KeyError:
+            bare = op
+            for prefix in ("_XLFN.", "_XLWS."):
+                if bare.startswith(prefix):
+                    bare = bare[len(prefix):]
+            handler = getattr(type(self), f"_fn_{bare.replace('.', '_').lower()}", None)
+            if handler is None and bare != op:
+                handler = getattr(type(self), f"_fn_{op.replace('.', '_').lower()}", None)
+            _HANDLER_CACHE[cache_key] = handler
         if handler is None:
-            self.unknown_ops[op] += 1
+            seen_key = (self._current_cell, op)
+            if seen_key not in self._unknown_seen:
+                self._unknown_seen.add(seen_key)
+                self.unknown_ops[op] += 1
             return Unresolved(f"unsupported:{op}")
-        value = handler(args)
+        value = handler(self, args)
         if op in selective:
             self._selective_sources[node.id] = self._selective_dependencies(
                 node, args, value
@@ -2797,16 +2935,23 @@ class Evaluator:
         adj: dict[str, set] = {}
         radj: dict[str, set] = {}
         try:
+            root_of = self.graph.root_of
+            active_sources = self._active_node_sources
             for target in cells:
                 cell_count += 1
-                root = self.graph.root_of(target)
+                root = root_of(target)
                 if root is None:
                     continue
-                radj[target] = set()
+                targets_sources = radj[target] = set()
                 self._current_cell = target
-                for source in self._active_node_sources(root):
-                    adj.setdefault(source, set()).add(target)
-                    radj.setdefault(target, set()).add(source)
+                sources = active_sources(root)
+                for source in sources:
+                    consumers = adj.get(source)
+                    if consumers is None:
+                        adj[source] = {target}
+                    else:
+                        consumers.add(target)
+                targets_sources.update(sources)
             return adj, radj
         finally:
             metric = self._benchmark["active_graph"]
@@ -2815,9 +2960,22 @@ class Evaluator:
             metric["seconds"] += time.perf_counter() - started
 
     @staticmethod
-    def _cell_key(cell):
+    def _cell_key_static(cell):
         sheet, row, col = _split(cell)
         return str(sheet), int(row), int(col), str(cell)
+
+    def _cell_key(self, cell):
+        """Sort key for a cell id, memoized in the shared index.
+
+        Every component plan sorts the whole cell universe and every adjacency
+        list with this key; the regex split behind it is a property of the id.
+        """
+        cache = self.index.cell_key_cache
+        key = cache.get(cell)
+        if key is None:
+            sheet, row, col = _split(cell)
+            key = cache[cell] = (str(sheet), int(row), int(col), str(cell))
+        return key
 
     def _component_plan(self, cells, active_adj):
         """Return deterministic SCC and topological metadata for an active graph."""
@@ -2889,15 +3047,92 @@ class Evaluator:
         metric["seconds"] += time.perf_counter() - started
         return result
 
-    def _evaluate_acyclic(self, groups, topo, cyclic, evaluable, seeded):
+    def _volatile_cells(self):
+        """Cells whose formula reads the clock; they are dirty in every sweep."""
+        cache = self.index.range_cache
+        cached = cache.get("\0volatile")
+        if cached is None:
+            cached = frozenset(
+                node.owner
+                for node in self.graph.nodes.values()
+                if node.kind == "op" and node.op in VOLATILE_OPS and node.owner
+            )
+            cache["\0volatile"] = cached
+        return cached
+
+    @staticmethod
+    def _same_value(before, after) -> bool:
+        if before is after:
+            return True
+        if type(before) is not type(after):
+            return False
+        if isinstance(before, (float, int, str, bool)):
+            return before == after
+        return repr(before) == repr(after)
+
+    def _dirty_cells(self, active_adj):
+        """Cells whose inputs may have moved since the previous sweep.
+
+        Roots are every cell whose value differs from the snapshot taken at the
+        start of the previous sweep (so changes made during that sweep and any
+        direct write since, e.g. a cyclic advance or probe seed, both count);
+        the set is closed forward over the graph the current plan was built
+        from. A consumer whose active edge set changed but whose sources all
+        kept their values already read those same values in the previous
+        sweep, because the graph is rebuilt from post-sweep selector values and
+        any selector that moved is itself a changed root. Volatile cells are
+        always included. Returns None when a full sweep is required.
+        """
+        snapshot = self._sweep_snapshot
+        if snapshot is None:
+            return None
+        values = self.values
+        same = self._same_value
+        dirty = set(self._volatile_cells())
+        for cell, current in values.items():
+            if cell in snapshot:
+                if not same(snapshot[cell], current):
+                    dirty.add(cell)
+            else:
+                dirty.add(cell)
+        stack = list(dirty)
+        while stack:
+            for consumer in active_adj.get(stack.pop(), ()):
+                if consumer not in dirty:
+                    dirty.add(consumer)
+                    stack.append(consumer)
+        return dirty
+
+    def _evaluate_acyclic(
+        self, groups, topo, cyclic, evaluable, seeded, active_adj=None
+    ):
+        """One topological sweep over the acyclic components.
+
+        With ``optimize`` and an ``active_adj`` for the graph the plan was built
+        from, cells that cannot have changed since the previous sweep under the
+        same graph are skipped (see ``_dirty_cells``). Evaluation order and the
+        values produced are identical either way; only work is skipped.
+        """
         started = time.perf_counter()
         try:
+            values = self.values
+            dirty = None
+            if self.optimize and active_adj is not None:
+                dirty = self._dirty_cells(active_adj)
+                # Baseline for the next sweep: values as they stand before
+                # this one runs.
+                self._sweep_snapshot = dict(values)
+            else:
+                self._sweep_snapshot = None
+            eval_cell = self._eval_cell
             for index in topo:
                 if index in cyclic:
                     continue
                 for cell in groups[index]:
                     if cell in evaluable and cell not in seeded:
-                        self.values[cell] = self._eval_cell(cell)
+                        if dirty is not None and cell not in dirty:
+                            continue
+                        values[cell] = eval_cell(cell)
         finally:
             metric = self._benchmark["acyclic_evaluation"]
             metric["calls"] += 1
@@ -2905,11 +3140,7 @@ class Evaluator:
 
     @staticmethod
     def _graph_signature(active_adj):
-        return tuple(sorted(
-            (source, target)
-            for source, targets in active_adj.items()
-            for target in targets
-        ))
+        return _GraphSignature(active_adj)
 
     def _target_signature(self):
         return tuple(
@@ -2977,13 +3208,17 @@ class Evaluator:
             calculation=self.calculation,
             proof_outputs=self.proof_outputs,
             proof_scope=self.proof_scope,
+            index=self.index,
         )
         checker.values = dict(self._proof_endpoint_values)
         checker.values.update(state)
         computed = {}
         for cell in members:
             computed[cell] = checker._eval_cell(cell)
-        active_adj, active_radj = checker._active_graph(self.cg.info)
+        # Only the members' own active equations are compared below, and each
+        # target's active sources depend only on its AST and the values, so
+        # the walk is restricted to the members instead of the whole workbook.
+        active_adj, active_radj = checker._active_graph(members)
         del active_adj
 
         expected_equations = {
@@ -3592,7 +3827,9 @@ class Evaluator:
                 # mutation occurs between these points.
                 self._benchmark["active_graph"]["reused_initial_graphs"] += 1
             groups, topo, cyclic = self._component_plan(cells, active_adj)
-            self._evaluate_acyclic(groups, topo, cyclic, evaluable, seeded)
+            self._evaluate_acyclic(
+                groups, topo, cyclic, evaluable, seeded, active_adj
+            )
 
             # Rebuild after the acyclic sweep so branch and address choices made
             # by newly computed selectors are what stabilization compares.
@@ -3623,7 +3860,16 @@ class Evaluator:
         stabilized_graph_signature = self._graph_signature(active_adj)
         stabilized_target_signature = self._target_signature()
         groups, topo, cyclic = self._component_plan(cells, active_adj)
-        self._evaluate_acyclic(groups, topo, cyclic, evaluable, seeded)
+        if not (topology_stable and targets_stable):
+            # The loop ran out of passes: this graph differs from the one the
+            # last sweep was ordered by, so evaluate under it once.
+            self._evaluate_acyclic(
+                groups, topo, cyclic, evaluable, seeded, active_adj
+            )
+        # On the stable path the last sweep already ran in a topological order
+        # of a graph with exactly these edges, so every acyclic value is
+        # consistent with it and a further sweep would recompute the same
+        # numbers (volatile functions aside).
 
         if self.proof_outputs is None:
             relevant_cone = set(cells)
@@ -3672,7 +3918,9 @@ class Evaluator:
                         )
                 # Recompute deterministic acyclic dependants between workbook
                 # iterations without granting any SCC an extra advance.
-                self._evaluate_acyclic(groups, topo, cyclic, evaluable, seeded)
+                self._evaluate_acyclic(
+                    groups, topo, cyclic, evaluable, seeded, active_adj
+                )
                 for spec in relevant_specs:
                     spec["history"].append(changes[spec["members"]])
                 if all(
@@ -3736,7 +3984,7 @@ class Evaluator:
                         self._value_change(before, after),
                     )
             self._evaluate_acyclic(
-                groups, topo, cyclic, evaluable, seeded
+                groups, topo, cyclic, evaluable, seeded, final_active_adj
             )
             workbook_iterations += 1
             for spec in relevant_specs:
@@ -3959,7 +4207,9 @@ class Evaluator:
                         self.values[cell] = after
                         change = max(change, self._value_change(before, after))
                     probe_changes[spec["members"]] = change
-                self._evaluate_acyclic(groups, topo, cyclic, evaluable, seeded)
+                self._evaluate_acyclic(
+                    groups, topo, cyclic, evaluable, seeded, final_active_adj
+                )
                 if all(
                     not math.isinf(probe_changes[spec["members"]])
                     and probe_changes[spec["members"]]
@@ -4132,10 +4382,17 @@ class Evaluator:
             name: dict(value) if isinstance(value, dict) else value
             for name, value in self._benchmark.items()
         }
+        unknown_op_cells: dict = {}
+        for cell, op in self._unknown_seen:
+            if cell is not None:
+                unknown_op_cells.setdefault(cell, set()).add(op)
         return EvalResult(
             self.values, self.unresolved, iterated, coverage,
             runtime_radj=runtime_radj,
             runtime_address_radj=runtime_address_radj,
+            unknown_op_cells={
+                cell: sorted(ops) for cell, ops in sorted(unknown_op_cells.items())
+            },
             resolved_targets={
                 target: tuple(sorted(sources))
                 for target, sources in sorted(self._resolved_targets.items())

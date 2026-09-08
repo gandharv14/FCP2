@@ -23,14 +23,19 @@ from aa_lib import (
     INPUT_HEADING,
     LEFTOVER_BULLET_RE,
     NOTES_COPY,
+    NOTES_MARKER_END,
+    NOTES_MARKER_START,
     NOTES_NAME,
     OUTPUT_HEADING,
     artifact_name,
     cell_refs_in,
     clause_covered,
+    is_heading_free,
     is_junior,
     is_senior,
     normalize,
+    notes_marker_block,
+    paragraphs_with,
     parse_turns,
     require_cast,
     section_body,
@@ -38,6 +43,7 @@ from aa_lib import (
     split_sections,
     strip_cell_refs,
     strip_claim_comments,
+    strip_fences,
     strip_heading_block,
     write_json,
 )
@@ -62,6 +68,17 @@ ASSUMPTIONS_SECTION = (
     "between colleagues containing assumptions you need to follow. "
     "Use those assumptions when you build.\n"
 )
+# Heading-free instructions (gdpval-prose-instruction) get one paragraph in
+# place of the workbook-notes marker block. No heading, same must-read force.
+PROSE_POINTER = (
+    "Before you begin, read `{notes}` in your working directory. It is a record "
+    "of a conversation between colleagues that provides additional guidance on "
+    "how several rows in this model should be worked out; follow the "
+    "assumptions it records."
+)
+POINTER_PHRASE_RE = re.compile(r"record of a conversation between colleagues", re.I)
+POINTER_GUIDANCE_RE = re.compile(r"additional guidance", re.I)
+DELIVERABLE_RE = re.compile(r"`/[^`\s]*answers\.json`")
 LEFTOVER_TITLE_RE = re.compile(r"senior (?:banker|investor)", re.I)
 REBUILD_FRAME_RE = re.compile(
     r"\b(?:re-?build(?:ing|s|t)?|re-?stor(?:e|es|ed|ing)|"
@@ -421,7 +438,53 @@ def strip_input_pointer(input_body: str) -> str:
     return "".join(lines)
 
 
+def prose_pointer() -> str:
+    return PROSE_POINTER.format(notes=NOTES_NAME)
+
+
+def strip_prose_pointer(text: str) -> str:
+    """Remove an earlier pointer paragraph so a re-apply does not duplicate it."""
+    out = []
+    for paragraph in re.split(r"(\n\s*\n)", text):
+        if NOTES_NAME in paragraph and "working directory" in paragraph.lower():
+            continue
+        out.append(paragraph)
+    joined = "".join(out)
+    return re.sub(r"\n{3,}", "\n\n", joined)
+
+
+def rewrite_prose_instruction(instruction: str) -> str:
+    """Heading-free path: swap the workbook-notes block for one pointer paragraph."""
+    block = notes_marker_block(instruction)
+    pointer = prose_pointer()
+    if block is not None:
+        text = instruction.replace(block, pointer, 1)
+    else:
+        if NOTES_NAME not in instruction:
+            raise DialogueError(
+                "heading-free instruction has no workbook-notes markers to replace"
+            )
+        if not prose_instruction_faults(instruction):
+            # A prose-skill retrofit already wrote a valid pointer where the
+            # writer placed it. Re-applying must not move or reword it.
+            text = re.sub(r"\n{3,}", "\n\n", instruction)
+            return text if text.endswith("\n") else text + "\n"
+        text = strip_prose_pointer(instruction)
+        # /app/answers.json today; older tasks say /workspace/answers.json.
+        deliverable = DELIVERABLE_RE.search(text)
+        if deliverable is None:
+            raise DialogueError("heading-free instruction has no deliverable paragraph")
+        anchor = deliverable.start()
+        para_start = text.rfind("\n\n", 0, anchor)
+        para_start = 0 if para_start < 0 else para_start + 2
+        text = text[:para_start] + pointer + "\n\n" + text[para_start:]
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text if text.endswith("\n") else text + "\n"
+
+
 def rewrite_instruction(instruction: str, task_dir: Path, claims_payload: dict) -> str:
+    if is_heading_free(instruction):
+        return rewrite_prose_instruction(instruction)
     input_pointer, assumptions = expected_pointer(task_dir, claims_payload)
     text = strip_heading_block(instruction, DISCLOSURE_HEADING)
     text = strip_heading_block(text, ASSUMPTIONS_HEADING)
@@ -464,12 +527,49 @@ def patch_dockerfile(text: str, workbook: str) -> str:
 
 
 def update_instruction_hash(task_toml: str, digest: str) -> str:
+    # Every table that records the live instruction hash (naturalizer and
+    # prose_instruction) must move together, or one verifier lies.
     if HASH_RE.search(task_toml):
-        return HASH_RE.sub(r"\g<1>%s\2" % digest, task_toml, count=1)
+        return HASH_RE.sub(r"\g<1>%s\2" % digest, task_toml)
     return task_toml
 
 
+def prose_instruction_faults(instruction: str) -> list[str]:
+    faults = []
+    if not is_heading_free(instruction):
+        faults.append("prose instruction gained a heading")
+    if NOTES_MARKER_START in instruction or NOTES_MARKER_END in instruction:
+        faults.append("instruction still has workbook-notes markers")
+    if LEFTOVER_BULLET_RE.search(strip_fences(instruction)):
+        faults.append("instruction still has Sheet!Range disclosure bullets")
+    pointers = paragraphs_with(instruction, NOTES_NAME)
+    if not pointers:
+        faults.append(f"instruction does not name {NOTES_NAME}")
+        return faults
+    if len(pointers) > 1:
+        faults.append(f"instruction names {NOTES_NAME} in more than one paragraph")
+    body = pointers[0]
+    lower = body.lower()
+    if "working directory" not in lower:
+        faults.append("pointer does not say working directory")
+    if "read" not in lower or "before" not in lower:
+        faults.append("pointer is not must-read language")
+    if not POINTER_PHRASE_RE.search(body) or not POINTER_GUIDANCE_RE.search(body):
+        faults.append(
+            "pointer does not call the notes a record of a conversation between "
+            "colleagues that provides additional guidance"
+        )
+    if LEFTOVER_TITLE_RE.search(body):
+        faults.append("pointer still names a senior banker/investor")
+    hits = sorted({m.group(0) for m in REBUILD_FRAME_RE.finditer(body)})
+    if hits:
+        faults.append("pointer frames the work as a rebuild/restore: %s" % ", ".join(hits))
+    return faults
+
+
 def instruction_faults(instruction: str, claims_payload: dict, task_dir: Path) -> list[str]:
+    if is_heading_free(instruction):
+        return prose_instruction_faults(instruction)
     faults = []
     if DISCLOSURE_HEADING in instruction:
         faults.append("instruction still has ## Workbook disclosure")
@@ -499,7 +599,23 @@ def instruction_faults(instruction: str, claims_payload: dict, task_dir: Path) -
     return faults
 
 
+def prose_identity_faults(original: str, rewritten: str) -> list[str]:
+    """Everything except the notes block / pointer paragraph must be unchanged."""
+    block = notes_marker_block(original)
+    left = original.replace(block, "\0", 1) if block is not None else strip_prose_pointer(original)
+    right = strip_prose_pointer(rewritten)
+    left = re.sub(r"\n{3,}", "\n\n", left.replace("\0", "")).strip()
+    right = re.sub(r"\n{3,}", "\n\n", right).strip()
+    left = re.sub(r"\n\n+", "\n\n", left)
+    right = re.sub(r"\n\n+", "\n\n", right)
+    if left != right:
+        return ["prose outside the notes pointer was rewritten"]
+    return []
+
+
 def identity_faults(original: str, rewritten: str) -> list[str]:
+    if is_heading_free(original):
+        return prose_identity_faults(original, rewritten)
     old_preamble, old_sections = split_sections(original)
     new_preamble, new_sections = split_sections(rewritten)
     if old_preamble != new_preamble:

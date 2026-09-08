@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -270,6 +272,53 @@ def test_retries_use_new_attempts_and_preserve_old_logs(tmp_path: Path) -> None:
     assert (attempts / "attempt-0002" / "final.txt").read_text() == "second\n"
 
 
+def _assistant_event(text: str) -> str:
+    return json.dumps(
+        {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+        }
+    )
+
+
+def test_final_text_keeps_assistant_messages_on_separate_lines() -> None:
+    # The CLI result glues messages together with nothing between them, so
+    # the declaration line at the end of one message ran into the next
+    # ("RECOVERY_USED: YESNo follow-up") and the anchored regex read MISSING.
+    stream = "\n".join(
+        [
+            json.dumps({"type": "system", "subtype": "init"}),
+            _assistant_event("Published the release.\nRECOVERY_USED: YES"),
+            json.dumps({"type": "user", "message": {"content": "tool result"}}),
+            _assistant_event("No follow-up is needed."),
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "Published the release.\nRECOVERY_USED: YESNo follow-up is needed.",
+                }
+            ),
+        ]
+    )
+
+    final = hardened_runner._extract_final_text(stream)
+
+    assert final == "Published the release.\nRECOVERY_USED: YES\nNo follow-up is needed."
+    assert hardened_runner.extract_assistant_segments(stream) == [
+        "Published the release.\nRECOVERY_USED: YES",
+        "No follow-up is needed.",
+    ]
+    import re
+
+    assert re.findall(r"(?m)^RECOVERY_USED: (YES|NO)$", final) == ["YES"]
+
+
+def test_final_text_falls_back_to_result_without_assistant_events() -> None:
+    stream = json.dumps({"type": "result", "result": "only result"})
+
+    assert hardened_runner._extract_final_text(stream) == "only result"
+    assert hardened_runner.extract_assistant_segments(stream) == []
+
+
 def test_process_group_rss_limit_records_timed_out_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -295,6 +344,472 @@ def test_process_group_rss_limit_records_timed_out_state(
         "peak_rss_bytes": 2 * 1024 * 1024,
         "limit_reason": "process_group_rss",
     }
+
+
+def test_observe_only_records_the_peak_without_killing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        hardened_runner,
+        "_process_group_rss_bytes",
+        lambda _process_group: 8 * 1024 * 1024,
+    )
+
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "print('done')"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=1024,
+        memory_observe_only=True,
+        memory_poll_seconds=0.01,
+    )
+
+    assert result["status"] == "completed"
+    assert result["execution_limits"]["peak_rss_bytes"] == 8 * 1024 * 1024
+    assert "limit_reason" not in result["execution_limits"]
+
+
+def test_an_injected_probe_overrides_the_process_group_sum(
+    tmp_path: Path,
+) -> None:
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "print('done')"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=1024 * 1024,
+        memory_observe_only=True,
+        memory_poll_seconds=0.01,
+        memory_probe=lambda _pid: 4096,
+    )
+
+    assert result["execution_limits"]["peak_rss_bytes"] == 4096
+
+
+def test_memory_poll_seconds_must_be_positive(tmp_path: Path) -> None:
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "print('done')"],
+        state_dir=tmp_path / "state",
+        memory_poll_seconds=0,
+    )
+
+    assert result["status"] == "orchestrator_error"
+    assert "memory_poll_seconds" in result["error"]
+
+
+def test_an_unlimited_run_never_samples_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    def _probe(process_group: int) -> int | None:
+        calls.append(process_group)
+        return 1024
+
+    monkeypatch.setattr(hardened_runner, "_process_group_rss_bytes", _probe)
+
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "print('done')"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+    )
+
+    assert result["status"] == "completed"
+    assert calls == []
+    assert "execution_limits" not in result
+
+
+def test_cgroup_peak_prefers_memory_peak(tmp_path: Path) -> None:
+    uid = os.getuid()
+    directory = (
+        tmp_path
+        / "user.slice"
+        / f"user-{uid}.slice"
+        / f"user@{uid}.service"
+        / "app.slice"
+        / "harbor-lane-a-0001-0.scope"
+    )
+    directory.mkdir(parents=True)
+    (directory / "memory.peak").write_text("4096\n", encoding="utf-8")
+    (directory / "memory.current").write_text("2048\n", encoding="utf-8")
+
+    peak = hardened_runner.cgroup_peak_bytes("harbor-lane-a-0001-0", tmp_path)
+
+    assert peak == 4096
+
+
+def test_cgroup_peak_falls_back_to_memory_current(tmp_path: Path) -> None:
+    uid = os.getuid()
+    directory = (
+        tmp_path
+        / "user.slice"
+        / f"user-{uid}.slice"
+        / f"user@{uid}.service"
+        / "harbor-old.scope"
+    )
+    directory.mkdir(parents=True)
+    (directory / "memory.current").write_text("777\n", encoding="utf-8")
+
+    assert hardened_runner.cgroup_peak_bytes("harbor-old", tmp_path) == 777
+
+
+def test_cgroup_peak_is_none_without_a_live_scope(tmp_path: Path) -> None:
+    assert hardened_runner.cgroup_peak_bytes("harbor-missing", tmp_path) is None
+
+
+def test_cgroup_anon_and_cpu_are_read_from_stat_files(tmp_path: Path) -> None:
+    uid = os.getuid()
+    directory = (
+        tmp_path
+        / "user.slice"
+        / f"user-{uid}.slice"
+        / f"user@{uid}.service"
+        / "app.slice"
+        / "harbor-lane-a-0003-0.scope"
+    )
+    directory.mkdir(parents=True)
+    (directory / "memory.stat").write_text(
+        "anon 1234\nfile 999999\nkernel 5\n", encoding="utf-8"
+    )
+    (directory / "cpu.stat").write_text(
+        "usage_usec 777000\nuser_usec 700000\nsystem_usec 77000\n",
+        encoding="utf-8",
+    )
+
+    assert hardened_runner.cgroup_anon_bytes("harbor-lane-a-0003-0", tmp_path) == 1234
+    assert hardened_runner.cgroup_cpu_usec("harbor-lane-a-0003-0", tmp_path) == 777000
+    assert hardened_runner.cgroup_anon_bytes("harbor-missing", tmp_path) is None
+    assert hardened_runner.cgroup_cpu_usec("harbor-missing", tmp_path) is None
+
+
+def test_cgroup_events_are_parsed(tmp_path: Path) -> None:
+    uid = os.getuid()
+    directory = (
+        tmp_path
+        / "user.slice"
+        / f"user-{uid}.slice"
+        / f"user@{uid}.service"
+        / "app.slice"
+        / "harbor-lane-a-0002-1.scope"
+    )
+    directory.mkdir(parents=True)
+    (directory / "memory.events").write_text(
+        "low 0\nhigh 12\nmax 3\noom 1\noom_kill 1\n", encoding="utf-8"
+    )
+
+    events = hardened_runner.cgroup_events("harbor-lane-a-0002-1", tmp_path)
+
+    assert events["high"] == 12
+    assert events["oom_kill"] == 1
+
+
+def test_memory_scope_is_unsupported_without_delegation(tmp_path: Path) -> None:
+    assert hardened_runner.memory_scope_supported(tmp_path) is False
+
+
+def test_scope_command_carries_a_ceiling_and_no_throttle_band() -> None:
+    command = hardened_runner._scope_command(
+        "harbor-lane-a-0001-0",
+        ["agent", "--run"],
+        memory_max_bytes=1000,
+    )
+
+    assert command[:5] == [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--unit=harbor-lane-a-0001-0",
+    ]
+    assert "--property=MemoryMax=1000" in command
+    # Swapless host, anonymous footprint: a throttle band only delays the
+    # same OOM kill, so MemoryHigh is pinned to MemoryMax.
+    assert hardened_runner.MEMORY_HIGH_FRACTION == 1.0
+    assert "--property=MemoryHigh=1000" in command
+    assert "--property=MemorySwapMax=0" in command
+    assert command[-2:] == ["agent", "--run"]
+
+
+def test_scope_command_explicit_memory_high_still_wins() -> None:
+    command = hardened_runner._scope_command(
+        "harbor-lane-a-0001-0",
+        ["agent"],
+        memory_max_bytes=1000,
+        memory_high_bytes=800,
+    )
+
+    assert "--property=MemoryMax=1000" in command
+    assert "--property=MemoryHigh=800" in command
+
+
+def test_scope_command_without_a_limit_omits_memory_properties() -> None:
+    command = hardened_runner._scope_command(
+        "harbor-x", ["agent"], memory_max_bytes=None
+    )
+
+    assert not [item for item in command if item.startswith("--property=Memory" "Max")]
+    assert command[-1] == "agent"
+
+
+def test_scope_unit_names_are_sanitized() -> None:
+    unit = hardened_runner.scope_unit_name("state/lane a", "00/01", 2)
+
+    assert unit.startswith("harbor-state-lane-a-00-01-")
+    assert unit.endswith("-2")
+    assert " " not in unit and "/" not in unit
+
+
+def test_scope_unit_names_never_truncate_the_attempt_index() -> None:
+    # The attempt index is the last part, so naive truncation would cut it
+    # first and two attempts of one row would share a unit name -- which
+    # either fails against a lingering scope or reads a stale peak.
+    lane = "l" * 64
+    workbook = "w" * 128
+    names = {
+        hardened_runner.scope_unit_name(lane, workbook, index) for index in range(6)
+    }
+
+    assert len(names) == 6
+    for index, name in enumerate(
+        hardened_runner.scope_unit_name(lane, workbook, i) for i in range(6)
+    ):
+        assert name.endswith(f"-{index}")
+        assert len(name) < 200
+
+
+def _passthrough_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the command unwrapped, since systemd-run is absent off-fleet."""
+
+    monkeypatch.setattr(
+        hardened_runner,
+        "_scope_command",
+        lambda _scope, command, **_kwargs: list(command),
+    )
+
+
+def test_a_scoped_attempt_reads_its_peak_from_the_cgroup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _passthrough_scope(monkeypatch)
+    monkeypatch.setattr(hardened_runner, "cgroup_peak_bytes", lambda _s: 5000)
+    monkeypatch.setattr(hardened_runner, "cgroup_anon_bytes", lambda _s: None)
+    monkeypatch.setattr(hardened_runner, "cgroup_events", lambda _s: {"high": 4})
+    monkeypatch.setattr(
+        hardened_runner,
+        "_process_group_rss_bytes",
+        lambda _process_group: 99,
+    )
+
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "print('done')"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=8192,
+        memory_scope="harbor-lane-a-0001-0",
+        memory_poll_seconds=0.01,
+    )
+
+    limits = result["execution_limits"]
+    assert result["status"] == "completed"
+    # The cgroup reading wins over the process-group sum, and the kernel owns
+    # enforcement so this loop must not kill anything itself.
+    assert limits["peak_rss_bytes"] == 5000
+    assert limits["cgroup_peak_bytes"] == 5000
+    assert limits["memory_events"] == {"high": 4}
+    assert limits["memory_scope"] == "harbor-lane-a-0001-0"
+    assert limits["memory_max_bytes"] == 8192
+    assert "limit_reason" not in limits
+
+
+def test_a_scoped_attempt_calibrates_on_anon_not_page_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # memory.peak charges page cache to the scope. A row streaming a large
+    # AST through the cache would otherwise report a peak near MemoryMax and
+    # teach the calibrator that every row needs the whole ceiling.
+    _passthrough_scope(monkeypatch)
+    monkeypatch.setattr(hardened_runner, "cgroup_peak_bytes", lambda _s: 30_000)
+    monkeypatch.setattr(hardened_runner, "cgroup_anon_bytes", lambda _s: 6_000)
+    monkeypatch.setattr(hardened_runner, "cgroup_events", lambda _s: {})
+
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "print('done')"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=32_000,
+        memory_scope="harbor-lane-a-0001-0",
+        memory_poll_seconds=0.01,
+    )
+
+    limits = result["execution_limits"]
+    assert limits["peak_rss_bytes"] == 6_000
+    assert limits["cgroup_peak_bytes"] == 30_000
+
+
+def test_a_silent_scope_with_no_cpu_is_killed_as_a_stall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _passthrough_scope(monkeypatch)
+    monkeypatch.setattr(hardened_runner, "cgroup_peak_bytes", lambda _s: 1)
+    monkeypatch.setattr(hardened_runner, "cgroup_anon_bytes", lambda _s: 1)
+    monkeypatch.setattr(hardened_runner, "cgroup_events", lambda _s: {})
+    # Flat CPU: the scope never burns anything.
+    monkeypatch.setattr(hardened_runner, "cgroup_cpu_usec", lambda _s: 100)
+
+    started = time.monotonic()
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=8192,
+        memory_scope="harbor-lane-a-0001-0",
+        memory_poll_seconds=0.01,
+        stall_seconds=0.3,
+    )
+
+    assert result["status"] == "timed_out"
+    assert result["execution_limits"]["limit_reason"] == "stall"
+    assert time.monotonic() - started < 10
+
+
+def test_a_silent_scope_that_burns_cpu_is_not_a_stall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An agent blocked on a long xl_*.py child writes nothing to its stream
+    # while the child computes inside the same scope. Rising CPU proves life.
+    _passthrough_scope(monkeypatch)
+    monkeypatch.setattr(hardened_runner, "cgroup_peak_bytes", lambda _s: 1)
+    monkeypatch.setattr(hardened_runner, "cgroup_anon_bytes", lambda _s: 1)
+    monkeypatch.setattr(hardened_runner, "cgroup_events", lambda _s: {})
+    ticks = {"usec": 0}
+
+    def busy() -> int:
+        ticks["usec"] += hardened_runner.STALL_CPU_BUDGET_USEC + 1
+        return ticks["usec"]
+
+    monkeypatch.setattr(hardened_runner, "cgroup_cpu_usec", lambda _s: busy())
+
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "import time; time.sleep(0.8)"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=8192,
+        memory_scope="harbor-lane-a-0001-0",
+        memory_poll_seconds=0.01,
+        stall_seconds=0.2,
+    )
+
+    assert result["status"] == "completed"
+    assert "limit_reason" not in result["execution_limits"]
+
+
+def test_a_stall_detector_without_a_cpu_probe_never_fires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _passthrough_scope(monkeypatch)
+    monkeypatch.setattr(hardened_runner, "cgroup_peak_bytes", lambda _s: 1)
+    monkeypatch.setattr(hardened_runner, "cgroup_anon_bytes", lambda _s: 1)
+    monkeypatch.setattr(hardened_runner, "cgroup_events", lambda _s: {})
+    monkeypatch.setattr(hardened_runner, "cgroup_cpu_usec", lambda _s: None)
+
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "import time; time.sleep(0.6)"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=8192,
+        memory_scope="harbor-lane-a-0001-0",
+        memory_poll_seconds=0.01,
+        stall_seconds=0.2,
+    )
+
+    assert result["status"] == "completed"
+
+
+def test_an_oom_loop_is_killed_within_its_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # oom climbing with oom_kill pinned at zero is the immunity-loop
+    # signature. The fix in _oom_killable_command prevents it; this catches a
+    # regression in seconds instead of a six-hour wall clock.
+    _passthrough_scope(monkeypatch)
+    monkeypatch.setattr(hardened_runner, "cgroup_peak_bytes", lambda _s: 1)
+    monkeypatch.setattr(hardened_runner, "cgroup_anon_bytes", lambda _s: 1)
+    monkeypatch.setattr(hardened_runner, "cgroup_cpu_usec", lambda _s: None)
+    counter = {"oom": 0}
+
+    def looping() -> dict[str, int]:
+        counter["oom"] += 1000
+        return {"oom": counter["oom"], "oom_kill": 0}
+
+    monkeypatch.setattr(hardened_runner, "cgroup_events", lambda _s: looping())
+    monkeypatch.setattr(hardened_runner, "OOM_LOOP_SECONDS", 0.2)
+
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=8192,
+        memory_scope="harbor-lane-a-0001-0",
+        memory_poll_seconds=0.01,
+    )
+
+    assert result["status"] == "timed_out"
+    assert result["execution_limits"]["limit_reason"] == "oom_loop"
+
+
+def test_a_cgroup_kill_is_attributed_from_the_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _passthrough_scope(monkeypatch)
+    monkeypatch.setattr(hardened_runner, "cgroup_peak_bytes", lambda _s: None)
+    monkeypatch.setattr(hardened_runner, "cgroup_events", lambda _s: {})
+
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "raise SystemExit(137)"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=8192,
+        memory_scope="harbor-lane-a-0001-0",
+        memory_poll_seconds=0.01,
+    )
+
+    assert result["status"] == "failed"
+    assert result["execution_limits"]["limit_reason"] == "cgroup_oom"
+
+
+def test_a_scope_request_is_recorded_even_when_systemd_run_is_missing(
+    tmp_path: Path,
+) -> None:
+    result = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "print('done')"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=8192,
+        memory_scope="harbor-lane-a-0001-0",
+        memory_poll_seconds=0.01,
+    )
+
+    assert result["execution_limits"]["memory_scope"] == "harbor-lane-a-0001-0"
 
 
 def test_timeout_reconciliation_reads_publication_without_rewriting_pointer(
@@ -513,3 +1028,151 @@ def test_recovery_worker_rejects_malformed_release_pointer(
     monkeypatch.setattr(restricted_recovery_worker, "OUTPUT", output)
 
     assert restricted_recovery_worker.promoted("0001") is False
+
+
+# -- OOM immunity reset -------------------------------------------------------
+#
+# oom_score_adj is inherited across fork and exec. The fleet gives sshd -1000,
+# every lane starts from an SSH session, and a MemoryMax scope whose tasks are
+# all immune makes the kernel print an OOM report and retry forever. These
+# tests pin the reset that stops it.
+
+
+def test_oom_killable_command_wraps_and_preserves_the_payload() -> None:
+    wrapped = hardened_runner._oom_killable_command(["agent", "--run", "a b"])
+
+    assert wrapped[:2] == ["/bin/sh", "-c"]
+    assert "/proc/self/oom_score_adj" in wrapped[2]
+    assert wrapped[2].endswith('exec "$@"')
+    # $0 is a label, $1 is the adjust value, the payload follows verbatim.
+    assert wrapped[3] == "harbor-oom-adjust"
+    assert wrapped[4] == str(hardened_runner.CHILD_OOM_SCORE_ADJ)
+    assert wrapped[-3:] == ["agent", "--run", "a b"]
+
+
+def test_oom_killable_command_rejects_an_empty_payload() -> None:
+    # The bare prologue exits 0 having run nothing, which would report a
+    # phantom success.
+    with pytest.raises(ValueError, match="empty"):
+        hardened_runner._oom_killable_command([])
+
+
+def test_oom_wrapper_runs_the_payload_with_nothing_on_stderr() -> None:
+    # On a host without /proc (macOS) the guard skips the write and the
+    # payload still runs; on Linux the write succeeds. Either way, silence.
+    completed = subprocess.run(
+        hardened_runner._oom_killable_command(
+            [sys.executable, "-c", "import sys; print('ok'); sys.exit(3)"]
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.stdout.strip() == "ok"
+    assert completed.stderr == ""
+    assert completed.returncode == 3
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/oom_score_adj").exists(),
+    reason="oom_score_adj is Linux-only",
+)
+def test_oom_wrapper_pulls_an_inherited_score_back_to_zero() -> None:
+    # The delta test: a parent raises itself to 500 (always permitted), and
+    # the wrapped child must report 0. A plain "child is not immune" check
+    # would pass vacuously on any host already at 0.
+    probe = [
+        "/bin/sh",
+        "-c",
+        'printf 500 > /proc/self/oom_score_adj 2>/dev/null || exit 97; exec "$@"',
+        "harbor-oom-selftest",
+        *hardened_runner._oom_killable_command(
+            ["/bin/cat", "/proc/self/oom_score_adj"]
+        ),
+    ]
+    completed = subprocess.run(probe, capture_output=True, text=True)
+    if completed.returncode == 97:
+        pytest.skip("host forbids raising oom_score_adj")
+
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == "0"
+
+
+def test_scope_command_adds_oom_policy_only_when_supported() -> None:
+    with_policy = hardened_runner._scope_command(
+        "harbor-x", ["agent"], memory_max_bytes=1000, oom_policy=True
+    )
+    without_policy = hardened_runner._scope_command(
+        "harbor-x", ["agent"], memory_max_bytes=1000, oom_policy=False
+    )
+
+    assert "--property=OOMPolicy=kill" in with_policy
+    # After the positional prefix the existing test pins, and before the
+    # payload.
+    assert with_policy.index("--property=OOMPolicy=kill") >= 5
+    assert with_policy[-1] == "agent"
+    assert "--property=OOMPolicy=kill" not in without_policy
+
+
+def test_scope_command_probes_the_host_when_oom_policy_is_unspecified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hardened_runner, "oom_policy_supported", lambda: True)
+    assert "--property=OOMPolicy=kill" in hardened_runner._scope_command(
+        "harbor-x", ["agent"], memory_max_bytes=None
+    )
+    monkeypatch.setattr(hardened_runner, "oom_policy_supported", lambda: False)
+    assert "--property=OOMPolicy=kill" not in hardened_runner._scope_command(
+        "harbor-x", ["agent"], memory_max_bytes=None
+    )
+
+
+def test_oom_policy_probe_requires_systemd_253(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hardened_runner, "_OOM_POLICY_SUPPORTED", None)
+    monkeypatch.setattr(hardened_runner, "systemd_version", lambda: 252)
+    assert hardened_runner.oom_policy_supported() is False
+    monkeypatch.setattr(hardened_runner, "_OOM_POLICY_SUPPORTED", None)
+    monkeypatch.setattr(hardened_runner, "systemd_version", lambda: 255)
+    assert hardened_runner.oom_policy_supported() is True
+    monkeypatch.setattr(hardened_runner, "_OOM_POLICY_SUPPORTED", None)
+    monkeypatch.setattr(hardened_runner, "systemd_version", lambda: None)
+    assert hardened_runner.oom_policy_supported() is False
+
+
+def test_child_oom_score_adj_is_recorded_only_for_scoped_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _passthrough_scope(monkeypatch)
+    monkeypatch.setattr(hardened_runner, "cgroup_peak_bytes", lambda _s: 1)
+    monkeypatch.setattr(hardened_runner, "cgroup_events", lambda _s: {})
+    # The first sample can beat the shell's write and see the inherited
+    # -1000; the running maximum must converge on the reset value.
+    readings = iter([-1000, 0, 0])
+    monkeypatch.setattr(
+        hardened_runner,
+        "read_oom_score_adj",
+        lambda _pid: next(readings, 0),
+    )
+
+    scoped = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "import time; time.sleep(0.2)"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=8192,
+        memory_scope="harbor-lane-a-0001-0",
+        memory_poll_seconds=0.01,
+    )
+    unscoped = run_ready_attempt(
+        _record(),
+        [sys.executable, "-c", "print('done')"],
+        state_dir=tmp_path / "state",
+        timeout_seconds=30,
+        memory_limit_bytes=8192,
+        memory_observe_only=True,
+        memory_poll_seconds=0.01,
+    )
+
+    assert scoped["execution_limits"]["child_oom_score_adj"] == 0
+    assert "child_oom_score_adj" not in unscoped.get("execution_limits", {})

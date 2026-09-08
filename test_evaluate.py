@@ -23,7 +23,6 @@ def make_node(node_id, kind, *, sheet="Sheet", row=None, col=None, owner="",
         label="",
         formula="",
         value=str(value),
-        in_cycle=False,
     )
 
 
@@ -33,11 +32,7 @@ def make_edge(source, target, index):
         target=target,
         role="arg",
         arg_index=index,
-        op="",
-        cell="",
-        ref="",
         via_range="",
-        cross_sheet=False,
     )
 
 

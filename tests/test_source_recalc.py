@@ -935,3 +935,76 @@ def test_real_excel_recalculation_preserves_semantics(tmp_path):
     assert result["semantic_diff"]["equivalent_semantics"] is True
     assert (tmp_path / "real-excel-output.xlsx").is_file()
 
+
+
+def _publish_from(source: Path, ast: Path, root: Path):
+    request, result, health = _publication_inputs(source)
+    return publication.publish_source_generation(
+        source,
+        ast,
+        root,
+        request=request,
+        result=result,
+        health=health,
+        builder_args=["--production"],
+    )
+
+
+def test_staging_hardlinks_build_files_under_root(tmp_path):
+    root = tmp_path / "published"
+    build = root / ".source-build-x"
+    build.mkdir(parents=True)
+    source = build / "source.xlsx"
+    _workbook(source)
+    ast = build / "ast"
+    _ast(ast, "linked")
+    destination, manifest = _publish_from(source, ast, root)
+    layout = manifest["layout"]
+    for staged, origin in (
+        (destination / layout["source_workbook"], source),
+        (destination / layout["ast_directory"] / "nodes.csv", ast / "nodes.csv"),
+        (destination / layout["ast_directory"] / "edges.csv", ast / "edges.csv"),
+    ):
+        assert staged.stat().st_ino == origin.stat().st_ino
+        assert staged.stat().st_nlink == 2
+    # The build tree is deleted right after publish; the generation survives.
+    shutil.rmtree(build)
+    assert (destination / layout["source_workbook"]).stat().st_nlink == 1
+    publication.validate_source_generation(destination)
+
+
+def test_staging_copies_files_outside_root(tmp_path):
+    source = tmp_path / "source.xlsx"
+    _workbook(source)
+    ast = tmp_path / "ast"
+    _ast(ast, "copied")
+    root = tmp_path / "published"
+    destination, manifest = _publish_from(source, ast, root)
+    layout = manifest["layout"]
+    staged = destination / layout["source_workbook"]
+    assert staged.stat().st_ino != source.stat().st_ino
+    assert staged.stat().st_nlink == 1
+    # A caller editing its own file afterwards must not touch the generation.
+    assert os.access(source, os.W_OK)
+    (ast / "nodes.csv").write_text("edited\n", encoding="utf-8")
+    publication.validate_source_generation(destination)
+
+
+def test_staging_falls_back_to_copy_when_link_fails(tmp_path, monkeypatch):
+    root = tmp_path / "published"
+    build = root / ".source-build-x"
+    build.mkdir(parents=True)
+    source = build / "source.xlsx"
+    _workbook(source)
+    ast = build / "ast"
+    _ast(ast, "fallback")
+
+    def refuse(*args, **kwargs):
+        raise OSError("EXDEV")
+
+    monkeypatch.setattr(publication.os, "link", refuse)
+    destination, manifest = _publish_from(source, ast, root)
+    staged = destination / manifest["layout"]["source_workbook"]
+    assert staged.stat().st_nlink == 1
+    assert staged.read_bytes() == source.read_bytes()
+    publication.validate_source_generation(destination)

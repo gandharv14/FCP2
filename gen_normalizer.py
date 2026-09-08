@@ -428,11 +428,16 @@ import os
 from pathlib import Path
 
 RUN = Path(__file__).resolve().parent
+# Byte-stability requires running this script twice and comparing the output.
+# NORMALIZE_OUT_DIR redirects only the outputs, so the two runs can execute at
+# once instead of racing on the same files. Inputs always come from RUN, and
+# the default keeps single-run behavior identical.
+OUT = Path(os.environ.get("NORMALIZE_OUT_DIR") or RUN)
 DRAFT = RUN / "draft.json"
-NORMALIZED = RUN / "normalized.json"
-EXCLUSIONS = RUN / "exclusions.json"
-REPORT = RUN / "normalization_report.json"
 PROFILES = RUN / "source_profiles.json"
+NORMALIZED = OUT / "normalized.json"
+EXCLUSIONS = OUT / "exclusions.json"
+REPORT = OUT / "normalization_report.json"
 
 RESEARCH = {{
     "id": "sourced-market-research",
@@ -502,6 +507,7 @@ def excluded_entry(draft_id):
 
 
 def main():
+    OUT.mkdir(parents=True, exist_ok=True)
     draft = json.loads(DRAFT.read_text(encoding="utf-8"))
     draft_ids = [row["draft_id"] for row in draft["rows"]]
     dispositions = []

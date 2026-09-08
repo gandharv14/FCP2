@@ -35,7 +35,6 @@ def _cell(ref, kind, value, formula=""):
         label=ref,
         formula=formula,
         value=str(value),
-        in_cycle=False,
     )
 
 
@@ -66,7 +65,6 @@ def _ast(
         label=op or value,
         formula="",
         value=str(value),
-        in_cycle=False,
     )
 
 
@@ -76,11 +74,7 @@ def _edge(source, target, index=0, *, role="arg", op="", via=""):
         target=target,
         role=role,
         arg_index=index,
-        op=op,
-        cell=target.split("#", 1)[0],
-        ref="",
         via_range=via,
-        cross_sheet=False,
     )
 
 

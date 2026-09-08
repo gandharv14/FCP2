@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict, deque
 from pathlib import Path
@@ -32,10 +33,37 @@ except ImportError:  # pragma: no cover
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+def _populated_cells(ws):
+    """Every populated cell of a worksheet, full or read-only.
+
+    The AST builder's streamer reproduces full-mode semantics on a read-only
+    sheet (ignores a wrong <dimension>, keeps out-of-order rows, blanks merged
+    members). Reuse it when the repo is importable; otherwise fall back to
+    iter_rows() with the declared dimension cleared.
+    """
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from xl_ast_graph import iter_cells  # type: ignore
+
+        return iter_cells(ws)
+    except Exception:
+        reset = getattr(ws, "reset_dimensions", None)
+        if reset is not None:
+            reset()
+        return [cell for row in ws.iter_rows() for cell in row]
+
+
 DEFAULT_TASKS_ROOT = REPO_ROOT.parent / "08_12_34_samples_tasks_outputs_hinted"
 DEFAULT_RUNS_ROOT = REPO_ROOT / "runs" / "disclosure"
 OUTPUT_HEADING = "\n## Output\n"
 SECTION_START = "## Workbook disclosure"
+# Heading-free instructions (gdpval-prose-instruction) carry the same bullets
+# between these two markers instead of under a heading.
+NOTES_MARKER_START = "<!-- workbook-notes:start -->"
+NOTES_MARKER_END = "<!-- workbook-notes:end -->"
 STALE_AGENT_SECTIONS = (
     "## Custom formula hints",
     "## Modelling conventions in this workbook",
@@ -170,22 +198,24 @@ class Book:
         self.formula: dict[str, str] = {}
         self.value: dict[str, object] = {}
         self.sheets: list[str] = []
-        wbf = openpyxl.load_workbook(path, data_only=False)
+        # The formula pass only iterates, so it streams; the value pass is
+        # indexed per formula cell and stays a full load (read-only random
+        # access re-parses the sheet per lookup).
+        wbf = openpyxl.load_workbook(path, data_only=False, read_only=True)
         wbv = openpyxl.load_workbook(path, data_only=True)
         try:
             for ws in wbf.worksheets:
                 self.sheets.append(ws.title)
                 vs = wbv[ws.title]
-                for row in ws.iter_rows():
-                    for cell in row:
-                        if cell.value is None:
-                            continue
-                        k = key(ws.title, cell.coordinate)
-                        if isinstance(cell.value, str) and cell.value.startswith("="):
-                            self.formula[k] = cell.value
-                            self.value[k] = vs[cell.coordinate].value
-                        else:
-                            self.value[k] = cell.value
+                for cell in _populated_cells(ws):
+                    if cell.value is None:
+                        continue
+                    k = key(ws.title, cell.coordinate)
+                    if isinstance(cell.value, str) and cell.value.startswith("="):
+                        self.formula[k] = cell.value
+                        self.value[k] = vs[cell.coordinate].value
+                    else:
+                        self.value[k] = cell.value
         finally:
             wbf.close()
             wbv.close()
@@ -382,8 +412,30 @@ def run_dir(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT) -> Path:
 
 
 def write_json(path: Path, payload: dict):
+    """Write a stage artifact atomically.
+
+    A plain write can leave a truncated file if the process dies mid-write,
+    and the next run's read_stage then fails with a confusing parse error far
+    from the real cause. Staging into a sibling and renaming means a reader
+    sees either the old file or the new one. Matches the temp-plus-replace
+    pattern used elsewhere in the pipeline.
+    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, default=jsonable) + "\n", encoding="utf-8")
+    body = json.dumps(payload, indent=2, default=jsonable) + "\n"
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def read_stage(task_dir: Path, name: str, runs_root: Path = DEFAULT_RUNS_ROOT) -> dict:
@@ -3836,8 +3888,7 @@ def verify_task(task_dir: Path) -> dict:
     for heading in STALE_AGENT_SECTIONS[:-1]:
         if heading in text:
             faults.append(f"stale agent-facing section remains: {heading}")
-    if SECTION_START in text:
-        section = SECTION_START + text.split(SECTION_START, 1)[1].split("\n## Output", 1)[0]
+    section = disclosure_section_text(text)
     custom = [
         r for r in payload.get("records", [])
         if r.get("source") == "custom_method_detector"
@@ -3895,6 +3946,21 @@ def verify_task(task_dir: Path) -> dict:
             faults.append(f"custom structural verification failed: {exc}")
     faults.extend(audit_text(section, task_dir, shipped))
     return {"task": task_dir.name, "passed": not faults, "faults": faults}
+
+
+def disclosure_section_text(text: str) -> str:
+    """The agent-facing disclosure text, headed or heading-free.
+
+    Headed form: `## Workbook disclosure` up to `## Output`. Heading-free
+    form (gdpval-prose-instruction): the span between the workbook-notes
+    markers. Neither present: empty, and custom records fail to render.
+    """
+    if SECTION_START in text:
+        return SECTION_START + text.split(SECTION_START, 1)[1].split("\n## Output", 1)[0]
+    if NOTES_MARKER_START in text and NOTES_MARKER_END in text:
+        inner = text.split(NOTES_MARKER_START, 1)[1].split(NOTES_MARKER_END, 1)[0]
+        return NOTES_MARKER_START + inner + NOTES_MARKER_END
+    return ""
 
 
 def cmd_verify(args):

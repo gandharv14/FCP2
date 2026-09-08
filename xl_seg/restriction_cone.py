@@ -35,7 +35,17 @@ _A1_TARGET_RE = re.compile(
 
 
 class RestrictionConeError(ValueError):
-    """The restricted source cannot be proven safe for the selected outputs."""
+    """The restricted source cannot be proven safe for the selected outputs.
+
+    ``locations`` names the workbook cells the failure is about (a volatile
+    call inside the cone, a dynamic reference whose targets could not be
+    fixed). Empty when the failure is structural and belongs to no cell, so a
+    caller pruning the output cone knows it cannot attribute the failure.
+    """
+
+    def __init__(self, message: str, *, locations=()):
+        super().__init__(message)
+        self.locations = tuple(str(item) for item in locations if item)
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -507,6 +517,23 @@ def _match_event_nodes(graph: model.Graph, events: list[dict]) -> list[list[str]
                 f"restriction event remains closed: {event.get('event')}"
             )
     used_operations = set()
+    # One pass over the AST indexes every op node by (owner, function) and
+    # collects the restricted operations, instead of scanning all nodes once
+    # per event group and once more at the end (13M nodes x hundreds of
+    # groups on the largest workbook). Insertion order is the nodes.csv
+    # order the per-group scans produced.
+    ops_by_host_function: dict = {}
+    restricted_operations: set = set()
+    restricted_functions = {"OFFSET", "INDIRECT", "TODAY", "NOW", "CELL"}
+    wanted_hosts = {host for host, _ in by_host_function}
+    for node in graph.nodes.values():
+        if node.kind != "op":
+            continue
+        function_name = node.op.upper().removeprefix("_XLFN.")
+        if function_name in restricted_functions:
+            restricted_operations.add(node.id)
+        if node.owner in wanted_hosts:
+            ops_by_host_function.setdefault((node.owner, function_name), []).append(node)
     for (host, function), indices in sorted(by_host_function.items()):
         host_node = graph.nodes.get(host)
         if host_node is None or host_node.kind != "formula":
@@ -532,15 +559,7 @@ def _match_event_nodes(graph: model.Graph, events: list[dict]) -> list[list[str]
             raise RestrictionConeError(
                 f"restriction event mapping is ambiguous for {host} {function}"
             )
-        nodes = [
-            node
-            for node in graph.nodes.values()
-            if (
-                node.kind == "op"
-                and node.owner == host
-                and node.op.upper().removeprefix("_XLFN.") == function
-            )
-        ]
+        nodes = ops_by_host_function.get((host, function), [])
         if len(nodes) != len(indices):
             raise RestrictionConeError(
                 f"restriction event/AST coverage mismatch for {host} {function}"
@@ -579,15 +598,6 @@ def _match_event_nodes(graph: model.Graph, events: list[dict]) -> list[list[str]
             assignments[index] = [node.id]
     if any(item is None for item in assignments):
         raise RestrictionConeError("restriction event coverage is incomplete")
-    restricted_operations = {
-        node.id
-        for node in graph.nodes.values()
-        if (
-            node.kind == "op"
-            and node.op.upper().removeprefix("_XLFN.")
-            in {"OFFSET", "INDIRECT", "TODAY", "NOW", "CELL"}
-        )
-    }
     unmatched_operations = sorted(restricted_operations - used_operations)
     if unmatched_operations:
         raise RestrictionConeError(
@@ -690,14 +700,22 @@ def build_certificate(
         ):
             continue
         op_node = graph.nodes[ast_nodes[0]]
-        if function == "OFFSET":
-            targets, arguments = _offset_targets(graph, op_node, immutable)
-        else:
-            targets, arguments = _indirect_targets(graph, op_node, immutable)
+        try:
+            if function == "OFFSET":
+                targets, arguments = _offset_targets(graph, op_node, immutable)
+            else:
+                targets, arguments = _indirect_targets(graph, op_node, immutable)
+        except RestrictionConeError as exc:
+            if exc.locations:
+                raise
+            raise RestrictionConeError(
+                f"{exc} (at {location})", locations=[location]
+            ) from exc
         raw_runtime = runtime_targets_map.get(op_node.id)
         if not isinstance(raw_runtime, list) or not raw_runtime:
             raise RestrictionConeError(
-                f"runtime targets were omitted for operation {op_node.id}"
+                f"runtime targets were omitted for operation {op_node.id}",
+                locations=[location],
             )
         if (
             any(not isinstance(target, str) for target in raw_runtime)
@@ -705,7 +723,8 @@ def build_certificate(
             or set(targets) != set(raw_runtime)
         ):
             raise RestrictionConeError(
-                f"static/runtime targets differ for operation {op_node.id}"
+                f"static/runtime targets differ for operation {op_node.id}",
+                locations=[location],
             )
         missing = [
             target for target in targets
@@ -713,7 +732,8 @@ def build_certificate(
         ]
         if missing:
             raise RestrictionConeError(
-                f"dynamic targets are absent from AST: {missing[:3]}"
+                f"dynamic targets are absent from AST: {missing[:3]}",
+                locations=[location],
             )
         omitted_formulas = [
             target for target in targets
@@ -728,10 +748,13 @@ def build_certificate(
         if omitted_formulas:
             raise RestrictionConeError(
                 f"dynamic target formulas are omitted from AST: "
-                f"{omitted_formulas[:3]}"
+                f"{omitted_formulas[:3]}",
+                locations=[location],
             )
         if not set(targets) <= cone:
-            raise RestrictionConeError("runtime closure omitted a dynamic target")
+            raise RestrictionConeError(
+                "runtime closure omitted a dynamic target", locations=[location]
+            )
         immutable_proofs = {
             object_hash(dependency): dependency
             for argument in arguments
@@ -803,7 +826,8 @@ def build_certificate(
             if function in {"TODAY", "NOW", "CELL"}:
                 if in_cone:
                     raise RestrictionConeError(
-                        f"{function} is inside the selected output cone at {location}"
+                        f"{function} is inside the selected output cone at {location}",
+                        locations=[location],
                     )
                 resolution_status = "outside_output_cone"
                 disposition = "allowed_only_outside_output_cone"

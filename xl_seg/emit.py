@@ -117,6 +117,41 @@ def apply_fallback(path: Path, bands) -> int:
     return changed
 
 
+PRUNED_MARKER = "# pruned: "
+
+
+def apply_pruning(path: Path, implicated: dict) -> int:
+    """Flip ``include`` off for verifier-implicated bands, recording why.
+
+    ``implicated`` maps band -> reason codes. The marker rides the boolean line
+    (``include = false  # pruned: output_mismatch``) for the same reason as
+    ``apply_fallback``: ``read_curation`` strips inline comments from unquoted
+    scalars only. Bands already excluded are left alone. The rewritten file is
+    a pure function of the previous file and ``implicated``, so a rerun on the
+    same cone reproduces it byte for byte.
+    """
+    if not implicated or not path.exists():
+        return 0
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out, band, changed = [], None, 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("band = "):
+            band = stripped[len("band = "):].strip().strip('"')
+        if (
+            band in implicated
+            and stripped.startswith("include = ")
+            and stripped.split("#", 1)[0].strip() == "include = true"
+        ):
+            codes = ",".join(sorted(set(implicated[band])))
+            out.append(f"include = false  {PRUNED_MARKER}{codes}")
+            changed += 1
+            continue
+        out.append(line)
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return changed
+
+
 def read_curation(path: Path) -> list[dict]:
     """Minimal reader for the subset of TOML this file uses."""
     if not path.exists():
@@ -242,7 +277,12 @@ def write_segments(
         },
         "presentation_bands": sorted(cd.mirrors),
         "embedded_literals": literals[:200],
-        "verification": verify,
+        # ``attribution`` is the uncapped cell-level evidence behind blocking
+        # reasons, kept for pruning and ``last-verification.json``; the
+        # published record keeps its bounded samples.
+        "verification": {
+            key: value for key, value in verify.items() if key != "attribution"
+        },
         "unfed_components": sorted(part.unfed),
     }
     if proof is not None:

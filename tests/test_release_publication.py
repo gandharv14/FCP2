@@ -1472,3 +1472,35 @@ def test_legacy_snapshot_is_immutable_and_never_used_after_cas(
     _publish(case, legacy_snapshot_hash=snapshot["snapshot_hash"])
     with pytest.raises(release.ReleasePublicationError, match="disabled"):
         release.resolve_legacy_snapshot(case["release_root"])
+
+
+def test_pre_cas_revalidation_clears_the_digest_memo(tmp_path, monkeypatch):
+    """The re-read before CAS must not trust digests memoised earlier."""
+    import xl_hash_cache
+
+    xl_hash_cache.clear()
+    xl_hash_cache.reset_stats()
+    case = _fixture(tmp_path, monkeypatch)
+    seen: dict[str, object] = {}
+    real_clear = xl_hash_cache.clear
+
+    def spy_clear():
+        seen["cleared_after_write"] = seen.get("written", False)
+        seen["misses_at_clear"] = xl_hash_cache.stats()["misses"]
+        real_clear()
+
+    monkeypatch.setattr(xl_hash_cache, "clear", spy_clear)
+
+    def fault(observed):
+        if observed == "after_immutable_release_write":
+            seen["written"] = True
+            seen["entries_before_clear"] = xl_hash_cache.stats()["entries"]
+        if observed == "before_pointer_cas":
+            seen["misses_before_cas"] = xl_hash_cache.stats()["misses"]
+
+    _publish(case, fault=fault)
+    assert seen["entries_before_clear"] > 0, "build never used the memo"
+    assert seen["cleared_after_write"] is True
+    assert seen["misses_before_cas"] > seen["misses_at_clear"], (
+        "pre-CAS validate_release did not re-read any bytes"
+    )

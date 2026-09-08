@@ -13,7 +13,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from . import diagnostics, restriction_cone
+from . import diagnostics, restriction_cone, retention
 
 
 MANIFEST_SCHEMA_VERSION = "segmentation-generation/v2"
@@ -51,11 +51,8 @@ def _canonical_bytes(value) -> bytes:
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    # Memoised on (dev, ino, size, mtime_ns, ctime_ns); first sight reads.
+    return diagnostics.sha256_file(path)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -496,6 +493,10 @@ def build_manifest(
             "ordered": ordered,
             "fingerprint": selected,
         },
+        # Candidates vs. retained outputs and why the rest were excluded. A pure
+        # function of the staged curation.toml, so it never perturbs the
+        # immutable-collision check on re-publish.
+        "output_retention": retention.output_retention(stage_dir / "curation.toml"),
         "artifacts": artifacts,
     }
 
@@ -1175,6 +1176,15 @@ def publish_generation(
     if fault:
         fault("generation_published")
 
+    if "source_restriction_evidence" in manifest.get("bindings", {}):
+        # Restricted routes never switch the pointer here, so the require_pass
+        # validation below would only decide between two identical returns.
+        # That validation re-parses the whole AST (restriction_cone
+        # .validate_certificate is deliberately a fresh load); skipping it
+        # here changes nothing observable and the downstream require_pass
+        # gates (resolve_generation_by_id, release publication, disclosure
+        # verify) still perform it fresh from disk.
+        return destination, manifest
     try:
         validate_generation_directory(
             destination,
@@ -1185,8 +1195,6 @@ def publish_generation(
     except GenerationValidationError:
         passing = False
     if not passing:
-        return destination, manifest
-    if "source_restriction_evidence" in manifest.get("bindings", {}):
         return destination, manifest
     if source_path is None or ast_dir is None:
         raise GenerationValidationError(

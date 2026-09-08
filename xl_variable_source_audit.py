@@ -20,10 +20,12 @@ import re
 import sys
 import urllib.error
 import urllib.request
+import weakref
 from pathlib import Path
 
 import openpyxl
 from openpyxl.utils import range_boundaries
+from openpyxl.utils.cell import coordinate_to_tuple
 
 from xl_task_build import DEFAULT_PROJECT_ID, PROD_ENDPOINT, read_env_key
 
@@ -99,12 +101,72 @@ def _value_summary(values):
     return summary
 
 
+class _SheetValues:
+    """One streaming pass per sheet, then dictionary lookups.
+
+    ``book[sheet][coord]`` on a read-only workbook re-parses the sheet XML from
+    the top for every call, so a band audit over thousands of cells was
+    quadratic in sheet size (about three minutes per run on a mid-sized
+    model). One pass per touched sheet is linear and gives the same values.
+    """
+
+    def __init__(self, book):
+        self.book = book
+        self._grids = {}
+
+    def _grid(self, sheet):
+        grid = self._grids.get(sheet)
+        if grid is None:
+            grid = {}
+            if sheet in self.book.sheetnames:
+                ws = self.book[sheet]
+                reset = getattr(ws, "reset_dimensions", None)
+                if reset is not None:
+                    # A wrong <dimension> would otherwise truncate the pass.
+                    reset()
+                for line in ws.iter_rows():
+                    for cell in line:
+                        if cell.value is not None:
+                            grid[(cell.row, cell.column)] = cell.value
+            self._grids[sheet] = grid
+        return grid
+
+    def get(self, ref):
+        sheet, _, coord = ref.rpartition("!")
+        sheet = sheet.strip("'")
+        if not sheet or sheet not in self.book.sheetnames:
+            return None
+        try:
+            row, col = coordinate_to_tuple(coord.replace("$", ""))
+        except (ValueError, TypeError):
+            return None
+        return self._grid(sheet).get((row, col))
+
+
+_LOOKUPS = weakref.WeakKeyDictionary()
+
+
 def _cell_value(book, ref):
-    sheet, _, coord = ref.rpartition("!")
-    sheet = sheet.strip("'")
-    if not sheet or sheet not in book.sheetnames:
-        return None
-    return book[sheet][coord].value
+    """Value at ``ref`` from a workbook or a prepared ``_SheetValues``.
+
+    A raw workbook gets one ``_SheetValues`` for its lifetime, so repeated
+    calls with the same book still cost one pass per touched sheet rather
+    than one pass per call.
+    """
+
+    if isinstance(book, _SheetValues):
+        return book.get(ref)
+    try:
+        lookup = _LOOKUPS.get(book)
+    except TypeError:  # pragma: no cover - unweakrefable stand-in
+        lookup = None
+    if lookup is None:
+        lookup = _SheetValues(book)
+        try:
+            _LOOKUPS[book] = lookup
+        except TypeError:  # pragma: no cover
+            pass
+    return lookup.get(ref)
 
 
 def build_inventory(workbook, artifact, seg_dir, *, segmentation=None):
@@ -114,6 +176,7 @@ def build_inventory(workbook, artifact, seg_dir, *, segmentation=None):
     )
     book = openpyxl.load_workbook(artifact, data_only=True, read_only=True)
     try:
+        lookup = _SheetValues(book)
         rows = []
         seen = set()
         candidates = list(segments.get("inputs") or [])
@@ -124,7 +187,7 @@ def build_inventory(workbook, artifact, seg_dir, *, segmentation=None):
                 continue
             seen.add(band)
             cells = entry.get("cells") or []
-            values = [_cell_value(book, ref) for ref in cells]
+            values = [_cell_value(lookup, ref) for ref in cells]
             summary = _value_summary(values)
             # Empty formula-host bands carry no auditable supplied value. A
             # promoted literal has its hardcoded value in the label/band.

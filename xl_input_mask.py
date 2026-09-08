@@ -78,10 +78,16 @@ except ImportError:  # pragma: no cover
     sys.exit("xl_input_mask.py expects xl_level_split.py to sit next to it")
 
 try:
-    from xl_ast_graph import human_size
+    from xl_ast_graph import human_size, iter_cells
 except ImportError:  # pragma: no cover
     def human_size(n):
         return "%.1f KB" % (n / 1024.0)
+
+    def iter_cells(ws):
+        cells = getattr(ws, "_cells", None)
+        if cells is not None:
+            return list(cells.values())
+        return [c for row in ws.iter_rows() for c in row]
 
 from xl_seg.proof import load_contract
 from xl_seg.publication import (
@@ -707,7 +713,9 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
     """
     warnings.simplefilter("ignore")
     masked = openpyxl.load_workbook(out_path)
-    original = openpyxl.load_workbook(src_path, data_only=True)
+    # The original is only iterated (masked is indexed per cell), so stream it
+    # instead of holding a second full copy of the source next to the mask.
+    original = openpyxl.load_workbook(src_path, data_only=True, read_only=True)
     faults = {"formula": [], "leaked": [], "lost": [], "changed": []}
 
     # No chart part may still carry cached series values: re-scrubbing the
@@ -764,10 +772,9 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
         denied = deny.get(ws.title, set())
         must_hold = frontier.get(ws.title, set())
         now = masked[ws.title]
-        cells = getattr(ws, "_cells", None)
-        iterable = cells.values() if cells is not None else (
-            c for row in ws.iter_rows() for c in row)
-        for cell in iterable:
+        # iter_cells streams a read-only sheet with full-mode semantics (file
+        # order, merged members blanked, wrong <dimension> ignored).
+        for cell in iter_cells(ws):
             before = cell.value
             if before is None:
                 continue
@@ -790,6 +797,7 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
             elif before != after:
                 faults["changed"].append(where)
 
+    original.close()
     return faults
 
 

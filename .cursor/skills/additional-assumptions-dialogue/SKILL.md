@@ -319,6 +319,17 @@ Pointer copy (both Input and Additional assumptions). Do not say rebuild:
 
 > It records a conversation between colleagues containing assumptions you need to follow.
 
+Heading-free instructions (written by `gdpval-prose-instruction`) take a
+different apply: the `<!-- workbook-notes:start -->` ... `<!-- workbook-notes:end -->`
+block is replaced by one paragraph and no heading is added:
+
+> Before you begin, read `additional-assumptions.md` in your working directory.
+> It is a record of a conversation between colleagues that provides additional
+> guidance on how several rows in this model should be worked out; follow the
+> assumptions it records.
+
+`apply` picks the path by inspecting the instruction; nothing else changes.
+
 Then `docker build` `$TASK/environment` and `docker run --rm IMAGE test -f /app/additional-assumptions.md`.
 A text-only Dockerfile check is not enough. Build the **main** image, not `mcp-server`.
 Apply always proves COPY semantics (sources exist and the Dockerfile copies the notes to `/app`). If the Docker daemon is down, use `--skip-smoke` and re-run:
@@ -342,6 +353,9 @@ mutated bundle — they undo the work or restore `## Workbook disclosure`:
 - `xl_output_task.py` / `xl_harbor_prep.py` (xlsx-only Dockerfile)
 - create-harbor-task steps 11–15 (repackaging, disclose write/verify,
   naturalize, oracle env check before this step)
+- `gdpval-prose-instruction` in pipeline mode (it would need the disclosure
+  block back). Retrofit mode on an already-applied task is allowed: it keeps
+  the pointer paragraph and refreshes `tests/dialogue-applied.json`.
 
 `plain_eligibility.check_plain_environment` and
 `xl_mcp_oracle.check_environment` may run after apply: they allow
@@ -358,8 +372,11 @@ repackaging that stages a fresh bundle.
 - Dockerfile copies it to `/app/additional-assumptions.md`
 - image smoke passed
 - `instruction.md` has no `## Workbook disclosure`
-- `## Input` names `additional-assumptions.md`, says working directory, and
-  tells the agent to read it before building
+- headed form: `## Input` names `additional-assumptions.md`, says working
+  directory, and tells the agent to read it before building
+- heading-free form: still no `#` heading, no `<!-- workbook-notes` marker,
+  exactly one paragraph names `additional-assumptions.md` as "a record of a
+  conversation between colleagues that provides additional guidance"
 - pointer copy says colleagues / assumptions, not senior banker, and does
   not say rebuild or restore
 - `review.json` exists for the latest round

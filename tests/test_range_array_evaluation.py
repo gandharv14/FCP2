@@ -220,8 +220,8 @@ def test_model_loader_accepts_legacy_node_columns(tmp_path):
 
     graph = load(out, workbook.stem)
     member = graph.nodes["Arrays!D2"]
-    assert member.array_formula is True
-    assert member.array_anchor == ""
+    # ``array_formula``/``array_anchor`` are parsed but no longer stored on
+    # the Node (no downstream reader); the member coordinates still default.
     assert member.array_ref == ""
     assert member.array_row is None
     assert member.array_col is None

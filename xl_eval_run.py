@@ -82,17 +82,24 @@ def fmt_cell_value(value):
 
 
 def serialize_workbook(path):
-    wb = openpyxl.load_workbook(path, data_only=True)
+    # Iteration only, so stream rather than materialise every cell.
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     lines = []
-    for ws in wb.worksheets:
-        lines.append("### sheet: %s" % ws.title)
-        for row in ws.iter_rows():
-            for cell in row:
-                if cell.value is not None:
-                    lines.append("%s!%s = %s"
-                                 % (ws.title, cell.coordinate,
-                                    fmt_cell_value(cell.value)))
-        lines.append("")
+    try:
+        for ws in wb.worksheets:
+            lines.append("### sheet: %s" % ws.title)
+            reset = getattr(ws, "reset_dimensions", None)
+            if reset is not None:
+                reset()  # a wrong <dimension> must not truncate the dump
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value is not None:
+                        lines.append("%s!%s = %s"
+                                     % (ws.title, cell.coordinate,
+                                        fmt_cell_value(cell.value)))
+            lines.append("")
+    finally:
+        wb.close()
     return "\n".join(lines)
 
 

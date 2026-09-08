@@ -107,7 +107,12 @@ Stage all requested workbooks before promoting any of them.
 - Preserve an existing `curation.toml`. Never pass `--recurate` unless the user
   explicitly asks to discard curation.
 - Do not silently change curated outputs because normalization, profiling,
-  masking, packaging, or rollout is difficult.
+  masking, packaging, or rollout is difficult. Outputs leave the cone only
+  through `xl_segment.py --prune-failing-outputs` (verifier-implicated, marked
+  `# pruned: <codes>`) or a hand exclusion marked
+  `include = false  # excluded: <code> <evidence>` with a code from
+  `RECOVERY.md`. The delivery gate rejects an unmarked exclusion of an
+  auto-included output.
 - Generate and package the GPT 5.6 Sol variable/source audit. Never pass
   `--no-variable-source-audit`.
 - Run `/task-disclosure` against the exact staged workbook before
@@ -115,6 +120,9 @@ Stage all requested workbooks before promoting any of them.
   failure, or a blocking fresh-review finding is a blocker.
 - Run `/naturalize-finance-task-instruction` after the complete instruction is
   packaged. Any generation, validation, or semantic-review failure is a blocker.
+  When the build was started with `--gdpval-prose`, run
+  `/gdpval-prose-instruction` instead; it is the gate-13 implementation for
+  that flag and the same failure rules apply.
 - Missing audit credentials or audit failure is a blocker. An audit that
   yields no resolvable candidates is an audit failure, not a plain-task trigger.
 - Missing profile skill, unresolved draft rows, partial masking, source-profile
@@ -248,9 +256,13 @@ If curation exists, record its hash before running segmentation. Do not use
 ```bash
 test ! -f "$SEG_ROOT/$WB/curation.toml" || \
   shasum -a 256 "$SEG_ROOT/$WB/curation.toml"
-python3 xl_segment.py "$WB" \
+python3 xl_segment.py "$WB" --prune-failing-outputs \
   --source-generation-root source_out \
   --source-generation-id "$SOURCE_GENERATION_ID" -o "$SEG_ROOT"
+# Exit 3: the verifier pruned implicated outputs into curation.toml
+# (`include = false  # pruned: <codes>`) but the re-proof did not fit the
+# time budget; rerun the same command. Blame per output is in
+# $SEG_ROOT/$WB/last-verification.json.
 GENERATION_ID="<generation_id returned by xl_segment.py>"
 python3 -m xl_seg.publication validate-id "$SEG_ROOT/$WB" "$GENERATION_ID" \
   --source "$SOURCE_FILE" --ast-dir "$AST_ROOT/$WB" \
@@ -432,7 +444,13 @@ python3 xl_variable_mcp.py validate-spec "$NORMALIZED"
 ### 8. Review maskability, duplicates, and extra cells
 
 Before build, inspect every included variable against the golden and baseline
-workbooks. Write `"$RUN/maskability_report.json"` and fail unless:
+workbooks. Write the review script to `"$RUN/maskability.py"`, not to `/tmp`,
+so that an editable-by-anyone path is never on the execution path. It must take
+the workbook ID as its single positional argument, because `build_one.sh`
+invokes it as `python3 "$RUN/maskability.py" "$WB"` and derives every other
+path itself; a script that requires extra flags fails gate 8. `build_one.sh`
+refuses to run when the file is absent and reports that separately from a
+detected leak. Write `"$RUN/maskability_report.json"` and fail unless:
 
 - every representation of the value that would reveal the masked variable is
   found, including repeated assumptions, active-case copies, sensitivity-table
@@ -583,7 +601,18 @@ sections, and no formulas/evidence in the agent-facing instruction.
 
 ### 13. Naturalize the complete staged instruction
 
-Load and follow
+**Prose mode.** If `build_one.sh` ran with `--gdpval-prose` (or
+`HARBOR_GDPVAL_PROSE=1`), gate 13 is `/gdpval-prose-instruction`, not the
+naturalizer. Load `.cursor/skills/gdpval-prose-instruction/SKILL.md`, use
+`PROSE_RUN="runs/$WB-instruction-prose"` and `prose_recovery.py` for `init`,
+`submit --body`, `accept`/`reject`, `apply`, `verify-applied`. The result has
+no headings; disclosure bullets sit between `<!-- workbook-notes:start -->`
+and `<!-- workbook-notes:end -->`. Then resume with
+`./build_one.sh "$WB" ... --resume-after-naturalization --gdpval-prose`
+and continue at the faithfulness review below. Skip the rest of this
+subsection's naturalizer commands.
+
+**Default mode.** Load and follow
 `.cursor/skills/naturalize-finance-task-instruction/SKILL.md`. Initialize or
 resume its code-owned recovery state. Launch at most two fresh `generalPurpose`
 subagents with model `gpt-5.6-sol-high`; each receives the same immutable source
@@ -783,6 +812,12 @@ Require `$STAGED/environment/additional-assumptions.md`, a Dockerfile
 `$STAGED/tests/dialogue-applied.json`, and no `## Workbook disclosure` left
 in `instruction.md`.
 
+Prose mode: the dialogue skill detects a heading-free instruction, removes
+the `workbook-notes` marker block, and inserts one pointer paragraph instead
+of `## Input` / `## Additional assumptions` sections. Require that
+`instruction.md` still has no `#` heading and no `<!-- workbook-notes` marker
+after apply.
+
 ### 16. Promote only after every gate passes
 
 If a requested set contains multiple workbooks, wait until every staged bundle
@@ -791,10 +826,18 @@ as an immutable task generation, then atomically compare-and-swaps the one
 authoritative `current-release.json`. Compatibility task paths are copies only.
 
 After any additional-assumptions apply, verify that the live instruction still
-matches the naturalizer metadata hash:
+matches the gate-13 metadata hash. Default mode:
 
 ```bash
 python3 .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py \
+  verify-metadata --instruction "$STAGED/instruction.md" \
+  --task-toml "$STAGED/task.toml"
+```
+
+Prose mode (`--gdpval-prose`): the table is `[metadata.prose_instruction]`.
+
+```bash
+python3 .cursor/skills/gdpval-prose-instruction/scripts/prose_recovery.py \
   verify-metadata --instruction "$STAGED/instruction.md" \
   --task-toml "$STAGED/task.toml"
 ```

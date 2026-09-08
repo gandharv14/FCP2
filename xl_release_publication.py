@@ -17,6 +17,8 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
+import xl_hash_cache
+
 
 RELEASE_SCHEMA_VERSION = "workbook-release/v2"
 RELEASE_IDENTITY_SCHEMA_VERSION = "workbook-release-identity/v2"
@@ -75,11 +77,8 @@ def canonical_hash(value: object) -> str:
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    # Memoised on (dev, ino, size, mtime_ns, ctime_ns); first sight reads.
+    return xl_hash_cache.sha256_file(path)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -868,6 +867,9 @@ def publish_release(
         if fault:
             fault("after_immutable_release_write")
         # Revalidate immediately before CAS so no mutable path can be smuggled in.
+        # Drop the digest memo first so this check re-reads every byte instead
+        # of trusting a digest recorded earlier in this process.
+        xl_hash_cache.clear()
         validate_release(
             destination,
             source_root=source_root,

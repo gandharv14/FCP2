@@ -1,0 +1,17 @@
+{"type": "system", "subtype": "init", "model": "m", "session_id": "s", "note": "synthetic fixture: hand-written from the documented cursor agent stream-json shape (tool_call started/completed, shellToolCall.args.command, result.success.exitCode); not a captured VM stream"}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Starting gate 1."}]}, "session_id": "s"}
+{"type": "tool_call", "subtype": "started", "call_id": "c1", "tool_call": {"shellToolCall": {"args": {"command": "python xl_source_health.py --workbook 0001", "workingDirectory": "/w/task-0001"}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "completed", "call_id": "c1", "tool_call": {"shellToolCall": {"args": {"command": "python xl_source_health.py --workbook 0001"}, "result": {"success": {"exitCode": 0, "stdout": "ok"}}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "started", "call_id": "c2", "tool_call": {"readToolCall": {"args": {"path": "xl_seg/emit.py"}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "completed", "call_id": "c2", "tool_call": {"readToolCall": {"args": {"path": "xl_seg/emit.py"}, "result": {"success": {"content": "...", "totalLines": 3}}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "started", "call_id": "c3", "tool_call": {"editToolCall": {"args": {"path": "xl_seg/emit.py", "old": "a", "new": "b"}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "completed", "call_id": "c3", "tool_call": {"editToolCall": {"args": {"path": "xl_seg/emit.py"}, "result": {"success": {"linesAdded": 1}}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "started", "call_id": "c4", "tool_call": {"shellToolCall": {"args": {"command": "bash build_one.sh 0001 --resume-after-naturalization"}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "completed", "call_id": "c4", "tool_call": {"shellToolCall": {"args": {"command": "bash build_one.sh 0001 --resume-after-naturalization"}, "result": {"success": {"exitCode": 2, "stderr": "gate 13 failed"}}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "started", "call_id": "c5", "tool_call": {"writeToolCall": {"args": {"path": "a.md", "contents": "# Recovery"}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "completed", "call_id": "c5", "tool_call": {"writeToolCall": {"args": {"path": "a.md"}, "result": {"success": {"linesCreated": 12, "fileSize": 300}}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "started", "call_id": "c6", "tool_call": {"shellToolCall": {"args": {"command": "never-completed --hang"}}}, "session_id": "s"}
+{"type": "tool_call", "subtype": "completed", "call_id": "c7", "tool_call": {"newFancyToolCall": {"args": {"widget": 1}, "result": {"error": "unsupported"}}}, "session_id": "s"}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Published.\nRECOVERY_USED: YES"}]}, "session_id": "s"}
+{"type": "result", "subtype": "success", "result": "Starting gate 1.Published.\nRECOVERY_USED: YES", "session_id": "s"}
+this line is not json

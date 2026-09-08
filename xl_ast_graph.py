@@ -104,17 +104,68 @@ def split_areas(ref: str):
     return [p.strip() for p in parts if p.strip()]
 
 
+def _iter_read_only_cells(ws):
+    """Stream every populated cell of a ReadOnlyWorksheet, in file order.
+
+    The read-only sheet's own iter_rows() trusts the file's <dimension> and
+    drops rows that fall outside it or arrive out of order, and pads every row
+    to its last column with empty filler. Driving the same WorkSheetParser
+    that full mode uses for bind_cells avoids all three and hands back the
+    same (row, column, value, data_type) tuples, so the AST built from a
+    streamed load is byte-identical to one built from a fully loaded workbook.
+
+    Full mode also blanks the non-anchor cells of every merged range after
+    binding (Worksheet._clean_merge_range), so the same is done here from the
+    parser's <mergeCells> block, which follows <sheetData> in the XML.
+    """
+    from openpyxl.cell.read_only import ReadOnlyCell
+    from openpyxl.worksheet._reader import WorkSheetParser
+
+    wb = ws.parent
+    collected = []
+    with ws._get_source() as src:
+        parser = WorkSheetParser(
+            src,
+            ws._shared_strings,
+            data_only=wb.data_only,
+            epoch=wb.epoch,
+            date_formats=wb._date_formats,
+            timedelta_formats=wb._timedelta_formats,
+        )
+        for _idx, row in parser.parse():
+            for cell in row:
+                collected.append(ReadOnlyCell(ws, **cell))
+        merged = getattr(parser, "merged_cells", None)
+    ranges = list(getattr(merged, "mergeCell", None) or []) if merged is not None else []
+    if not ranges:
+        return collected
+    blanked = set()
+    for rng in ranges:
+        try:
+            spots = iter(rng.cells)
+            next(spots)  # the anchor keeps its value, as in full mode
+            blanked.update(spots)
+        except Exception:
+            continue
+    if not blanked:
+        return collected
+    return [c for c in collected if (c.row, c.column) not in blanked]
+
+
 def iter_cells(ws):
     """Yield only cells that actually exist.
 
     ws.iter_rows() walks the sheet's whole declared bounding box and instantiates a
     Cell for every empty coordinate inside it, which on sparse-but-large sheets means
     tens of millions of throwaway objects. The internal _cells dict is the populated
-    set, so prefer it and keep iter_rows() as a fallback.
+    set, so prefer it. A ReadOnlyWorksheet has no _cells; it is streamed straight
+    from the parser instead. iter_rows() stays as the last resort.
     """
     cells = getattr(ws, "_cells", None)
     if cells is not None:
         return list(cells.values())
+    if hasattr(ws, "_get_source") and hasattr(ws, "_shared_strings"):
+        return _iter_read_only_cells(ws)
     return [c for row in ws.iter_rows() for c in row]
 
 
@@ -630,8 +681,16 @@ class AstGraph:
         return self
 
     def _load(self):
+        # Both passes stream. Full mode materialises a Cell object with a
+        # style array for every populated cell and, on the first pass, kept
+        # that whole workbook alive while the second pass built another one:
+        # 13 GB peak for a 14 MB file. Read-only mode shares the same
+        # WorkSheetParser (formula translation, ArrayFormula, data types,
+        # defined names), so the graph built from it is byte-identical; see
+        # _iter_read_only_cells for the two places its convenience iterators
+        # differ and how they are bypassed.
         self.log("reading formulas...")
-        wb = openpyxl.load_workbook(self.path, data_only=False)
+        wb = openpyxl.load_workbook(self.path, data_only=False, read_only=True)
         self.sheet_names = list(wb.sheetnames)
 
         for ws in wb.worksheets:
@@ -694,7 +753,7 @@ class AstGraph:
 
         self.log("reading cached values...")
         try:
-            wbv = openpyxl.load_workbook(self.path, data_only=True)
+            wbv = openpyxl.load_workbook(self.path, data_only=True, read_only=True)
         except Exception as exc:  # pragma: no cover
             self.warnings.append("could not read cached values: %s" % exc)
             return
@@ -752,6 +811,13 @@ class AstGraph:
                 value = getattr(defn, "value", None) or getattr(defn, "attr_text", None)
                 if value:
                     self.names_local[(ws.title, str(name).upper())] = value
+        # Names were the workbook's last use. A read-only workbook holds the
+        # zip archive open until closed, and nothing after this point reads it.
+        try:
+            wb.close()
+        except Exception:
+            pass
+        self._wb = None
 
     # -- reference resolution -------------------------------------------
     def _split_ref(self, token):

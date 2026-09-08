@@ -49,7 +49,7 @@ def r1c1(formula: str, row: int, col: int) -> str:
     return re.sub(r"\x00(\d+)\x00", lambda m: strings[int(m.group(1))], body)
 
 
-@dataclass
+@dataclass(slots=True)
 class Band:
     id: str
     sheet: str
@@ -79,6 +79,10 @@ class BandGraph:
     of_cell: dict[str, str]
     adj: dict[str, set] = field(default_factory=dict)
     radj: dict[str, set] = field(default_factory=dict)
+    # range node id -> bands its populated members belong to; filled by
+    # ``build`` and reused by lineage so range references never have to be
+    # expanded to cells again.
+    range_bands: dict[str, set] = field(default_factory=dict)
 
 
 def _vgroup(vtype: str) -> str:
@@ -117,18 +121,71 @@ def build(cg: CellGraph) -> BandGraph:
 
     adj: dict[str, set] = {}
     radj: dict[str, set] = {}
-    for src, targets in cg.adj.items():
-        bsrc = of_cell.get(src)
-        if bsrc is None:
-            continue
-        for dst in targets:
-            bdst = of_cell.get(dst)
-            if bdst is None or bdst == bsrc:
+    range_bands: dict[str, set] = {}
+    if cg.sources_of:
+        _band_edges_from_references(cg, of_cell, adj, radj, range_bands)
+    else:
+        # Hand-built CellGraphs (tests) carry an eager cell-level ``adj``.
+        for src, targets in cg.adj.items():
+            bsrc = of_cell.get(src)
+            if bsrc is None:
                 continue
-            adj.setdefault(bsrc, set()).add(bdst)
-            radj.setdefault(bdst, set()).add(bsrc)
+            for dst in targets:
+                bdst = of_cell.get(dst)
+                if bdst is None or bdst == bsrc:
+                    continue
+                adj.setdefault(bsrc, set()).add(bdst)
+                radj.setdefault(bdst, set()).add(bsrc)
 
-    return BandGraph(bands=bands, of_cell=of_cell, adj=adj, radj=radj)
+    return BandGraph(
+        bands=bands, of_cell=of_cell, adj=adj, radj=radj, range_bands=range_bands
+    )
+
+
+def _band_edges_from_references(
+    cg: CellGraph, of_cell, adj, radj, bands_of_range
+) -> None:
+    """Band adjacency straight from per-cell references, no cell-level pairs.
+
+    Equivalent to collapsing the eager cell graph: a range reference
+    contributes the bands of its populated members (computed once per range
+    node), a cell reference contributes that cell's band, and edges inside one
+    band are dropped. A member equal to the consumer maps to the consumer's
+    own band, so it is excluded by the same-band rule exactly as the eager
+    ``src == dst`` skip excluded it.
+    """
+    members = cg.range_members
+    done: set = set()
+    for dst, refs in cg.sources_of.items():
+        bdst = of_cell.get(dst)
+        if bdst is None:
+            continue
+        for ref in refs:
+            span = members.get(ref)
+            if span is None:
+                bsrc = of_cell.get(ref)
+                if bsrc is None or bsrc == bdst:
+                    continue
+                adj.setdefault(bsrc, set()).add(bdst)
+                radj.setdefault(bdst, set()).add(bsrc)
+                continue
+            key = (bdst, ref)
+            if key in done:
+                continue
+            done.add(key)
+            covered = bands_of_range.get(ref)
+            if covered is None:
+                covered = set()
+                for member in span:
+                    band = of_cell.get(member)
+                    if band is not None:
+                        covered.add(band)
+                bands_of_range[ref] = covered
+            for bsrc in covered:
+                if bsrc == bdst:
+                    continue
+                adj.setdefault(bsrc, set()).add(bdst)
+                radj.setdefault(bdst, set()).add(bsrc)
 
 
 def attach_literal_sources(bg: BandGraph, cg: CellGraph, is_notable) -> list[dict]:

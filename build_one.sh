@@ -3,8 +3,11 @@
 # Gate 15.5 (additional-assumptions-dialogue) is agent-only and is not part of
 # this shell automation.
 # Staging root tasks_outputs_mcp/ is shape-agnostic: MCP or plain.
-# Usage: build_one.sh <WB> [--release-id ID]
+# Usage: build_one.sh <WB> [--release-id ID] [--gdpval-prose]
 #        build_one.sh <WB> --source-generation-id ID --segmentation-generation-id ID
+# --gdpval-prose (default off) swaps gate 13 from naturalize-finance-task-instruction
+# to gdpval-prose-instruction (heading-free GDPval-style brief). Pass it on both the
+# initial call and the --resume-after-naturalization call.
 set -uo pipefail
 # Every gate path below is relative, so a failed cd would run all 15 gates --
 # and stamp BUILDOK -- against whatever tree the caller happens to be in.
@@ -19,9 +22,11 @@ RELEASE_ID=""
 SOURCE_GENERATION_ID=""
 SEGMENTATION_GENERATION_ID=""
 RESUME=0
+GDPVAL_PROSE="${HARBOR_GDPVAL_PROSE:-0}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --resume-after-naturalization) RESUME=1; shift ;;
+    --gdpval-prose) GDPVAL_PROSE=1; shift ;;
     --release-id) RELEASE_ID="$2"; shift 2 ;;
     --source-generation-id) SOURCE_GENERATION_ID="$2"; shift 2 ;;
     --segmentation-generation-id) SEGMENTATION_GENERATION_ID="$2"; shift 2 ;;
@@ -30,15 +35,42 @@ while [ "$#" -gt 0 ]; do
 done
 RUN="runs/$WB-variable-sources"
 STAGED="tasks_outputs_mcp/$WB-outputs"
-NAT_RUN="runs/$WB-instruction-naturalization"
+# Gate 13 has two implementations. Default: the two-span naturalizer. With
+# --gdpval-prose: the heading-free prose skill. Same CLI verbs, different
+# recovery script and state dir, so a resume with the wrong flag fails closed.
+if [ "$GDPVAL_PROSE" = "1" ]; then
+  NAT_RUN="runs/$WB-instruction-prose"
+  NAT_SCRIPT=.cursor/skills/gdpval-prose-instruction/scripts/prose_recovery.py
+  NAT_SKILL=gdpval-prose-instruction
+  NAT_RESUME_FLAGS="--resume-after-naturalization --gdpval-prose"
+else
+  NAT_RUN="runs/$WB-instruction-naturalization"
+  NAT_SCRIPT=.cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py
+  NAT_SKILL=naturalize-finance-task-instruction
+  NAT_RESUME_FLAGS="--resume-after-naturalization"
+fi
 D=.cursor/skills/task-disclosure/scripts/disclose.py
-LOG="/tmp/build/$WB.log"
-mkdir -p /tmp/build
+# Gate 8 runs an agent-authored script. Keeping it beside the run artifacts
+# rather than in world-writable /tmp keeps an editable-by-anyone path off the
+# execution path.
+MASKABILITY="${MASKABILITY_SCRIPT:-$RUN/maskability.py}"
+mkdir -p "$RUN"
+# Per-run scratch, so two builds of the same workbook cannot overwrite each
+# other's intermediates. Fixed /tmp/build/$WB.* paths used to make any
+# concurrency unsafe.
+BUILD_TMP="$(mktemp -d "${TMPDIR:-/tmp}/harbor-build-$WB.XXXXXX")" \
+  || { echo "BUILDFAIL $WB tmp :: cannot create scratch dir"; exit 1; }
+trap 'rm -rf "$BUILD_TMP"' EXIT INT TERM HUP
+# Inside the run dir rather than a shared /tmp path, so concurrent builds of one
+# workbook cannot overwrite each other's log. Worktree quarantine copies runs/
+# along with everything else, so a failed build's log is still preserved; only a
+# successfully delivered worktree discards it, and then it is not needed. Set
+# BUILD_LOG to keep logs outside the worktree entirely.
+LOG="${BUILD_LOG:-$RUN/build.log}"
 
 if [ "$RESUME" -eq 1 ]; then
-  python3 .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py \
-    verify-applied "$NAT_RUN" >/dev/null 2>&1 \
-    || { echo "BUILDFAIL $WB gate=13 :: naturalization is not safely applied"; exit 1; }
+  python3 "$NAT_SCRIPT" verify-applied "$NAT_RUN" >/dev/null 2>&1 \
+    || { echo "BUILDFAIL $WB gate=13 :: $NAT_SKILL is not safely applied (state dir $NAT_RUN; resume must carry the same --gdpval-prose setting as the initial call)"; exit 1; }
   python3 "$D" verify --task-dir "$STAGED" >/dev/null 2>&1 \
     || { echo "BUILDFAIL $WB gate=13 :: post-naturalization disclosure failed"; exit 1; }
   GS="$RUN/grader-smoke"
@@ -136,10 +168,23 @@ python3 xl_variable_mcp.py import "$RUN/$WB-inputs-variable-sources.md" \
 python3 gen_normalizer.py "$WB" --source-file "$SOURCE_FILE" \
   --source-sha256 "$SOURCE_SHA256" "${NORMALIZER_PIN_ARGS[@]}" \
   2>/dev/null || exit 92
-python3 "$RUN/normalize_$WB.py" >/dev/null 2>&1 || exit 92
-cp "$RUN/normalized.json" "/tmp/build/$WB.n1.json"
-python3 "$RUN/normalize_$WB.py" >/dev/null 2>&1 || exit 92
-cmp -s "/tmp/build/$WB.n1.json" "$RUN/normalized.json" || exit 93   # not byte-stable
+# Byte-stability needs two runs of the generated normalizer. These stay
+# sequential: the emitted script reads only draft.json and source_profiles.json
+# -- the workbook loads all happen once inside gen_normalizer.analyse above --
+# so both runs take well under a second and overlapping them would add a race
+# surface for no gain.
+#
+# NORMALIZE_OUT_DIR is cleared for the first run and set for the second. An
+# inherited value would send the first run's output elsewhere, leaving a stale
+# $RUN/normalized.json for cmp to compare against and pass -- a silently wrong
+# spec rather than a failure.
+NORMALIZE_OUT_DIR= python3 "$RUN/normalize_$WB.py" >/dev/null 2>&1 || exit 92
+NORMALIZE_OUT_DIR="$BUILD_TMP/normalize-b" \
+  python3 "$RUN/normalize_$WB.py" >/dev/null 2>&1 || exit 92
+# Compared directly, with no intermediate copy: distinct output dirs mean both
+# results are already on disk at their own paths.
+cmp -s "$RUN/normalized.json" "$BUILD_TMP/normalize-b/normalized.json" \
+  || exit 93   # not byte-stable
 
 python3 - "$RUN/draft.json" "$RUN/normalized.json" "$RUN/normalization_report.json" <<'PY' >/dev/null 2>&1 || exit 94
 import json, sys
@@ -157,8 +202,7 @@ for row in rows:
         raise SystemExit(1)
 PY
 
-python3 plain_eligibility.py "$RUN" >/tmp/build/$WB.mode || exit 114
-MODE=$(cat /tmp/build/$WB.mode)
+MODE=$(python3 plain_eligibility.py "$RUN") || exit 114
 if [ "$MODE" = plain ]; then
   PLAIN=1
   python3 - "$RUN/normalized.json" <<'PY' >/dev/null 2>&1 || exit 115
@@ -175,14 +219,42 @@ if [ "$PLAIN" -eq 0 ]; then
 python3 xl_variable_mcp.py validate-spec "$RUN/normalized.json" >/dev/null 2>&1 || exit 95
 
 # ---- gate 8: maskability ------------------------------------------------
-python3 /tmp/maskability.py "$WB" >/dev/null 2>&1 || exit 96
+# A missing script is not a masking leak; reporting it as one sends the
+# operator looking for a leak that does not exist.
+[ -f "$MASKABILITY" ] || exit 122
+python3 "$MASKABILITY" "$WB" >/dev/null 2>&1 || exit 96
 
 # ---- gate 9: deterministic double build + validate + smoke -------------
 rm -rf "$RUN/mcp-build-a" "$RUN/mcp-build-b" "$RUN/mcp"
-python3 xl_variable_mcp.py build "$RUN/normalized.json" "$RUN/mcp-build-a" \
-  --workbook "$WB" --source "$SOURCE_ROOT" >/dev/null 2>&1 || exit 97
-python3 xl_variable_mcp.py build "$RUN/normalized.json" "$RUN/mcp-build-b" \
-  --workbook "$WB" --source "$SOURCE_ROOT" >/dev/null 2>&1 || exit 97
+# Byte-stability needs two independent builds, but not two waits. They are safe
+# to overlap: each writes only inside its own output dir, the seed comes from
+# the spec rather than the clock, and there is no shared temp path or lock.
+# Separate processes, not threads -- verify_against_golden sets the
+# process-global warnings filter.
+#
+# Each build calls verify_against_golden, which loads the golden workbook, so
+# overlapping them holds two workbooks in memory at once. On a lane whose
+# memory reservation was sized for serial execution that can trip the cgroup
+# ceiling, so HARBOR_SEQUENTIAL_BUILDS=1 forces the old behavior.
+if [ "${HARBOR_SEQUENTIAL_BUILDS:-0}" = "1" ]; then
+  python3 xl_variable_mcp.py build "$RUN/normalized.json" "$RUN/mcp-build-a" \
+    --workbook "$WB" --source "$SOURCE_ROOT" >/dev/null 2>&1 || exit 97
+  python3 xl_variable_mcp.py build "$RUN/normalized.json" "$RUN/mcp-build-b" \
+    --workbook "$WB" --source "$SOURCE_ROOT" >/dev/null 2>&1 || exit 97
+else
+  python3 xl_variable_mcp.py build "$RUN/normalized.json" "$RUN/mcp-build-a" \
+    --workbook "$WB" --source "$SOURCE_ROOT" >/dev/null 2>&1 &
+  BUILD_A=$!
+  python3 xl_variable_mcp.py build "$RUN/normalized.json" "$RUN/mcp-build-b" \
+    --workbook "$WB" --source "$SOURCE_ROOT" >/dev/null 2>&1 &
+  BUILD_B=$!
+  # This script runs without `set -e`, so a bare `wait` would discard both exit
+  # codes. Wait for both before judging, so a failure in one never orphans the
+  # other outside this subshell.
+  wait "$BUILD_A"; BUILD_A_STATUS=$?
+  wait "$BUILD_B"; BUILD_B_STATUS=$?
+  [ "$BUILD_A_STATUS" -eq 0 ] && [ "$BUILD_B_STATUS" -eq 0 ] || exit 97
+fi
 diff -qr "$RUN/mcp-build-a" "$RUN/mcp-build-b" >/dev/null 2>&1 || exit 98
 python3 - "$RUN/mcp-build-a" <<'PY' >/dev/null 2>&1 || exit 99
 import sys
@@ -272,8 +344,16 @@ python3 "$D" select --task-dir "$STAGED" --golden "$SOURCE_FILE" \
   --ast-dir "$AST_ROOT" --seg-root "$SEGMENTATION_ROOT" --segmentation-mode strict \
   "${PIN_ARGS[@]}" \
   >/dev/null 2>&1 || exit 106
-python3 "$D" probe   --task-dir "$STAGED" >/dev/null 2>&1 || exit 106
-python3 "$D" roles   --task-dir "$STAGED" >/dev/null 2>&1 || exit 106
+# probe and roles both read only bands.json from select and write different
+# files, with no stage index or lock between them, so they can overlap. Note
+# roles opens the golden workbook and probe does not.
+python3 "$D" probe   --task-dir "$STAGED" >/dev/null 2>&1 &
+PROBE_PID=$!
+python3 "$D" roles   --task-dir "$STAGED" >/dev/null 2>&1 &
+ROLES_PID=$!
+wait "$PROBE_PID"; PROBE_STATUS=$?
+wait "$ROLES_PID"; ROLES_STATUS=$?
+[ "$PROBE_STATUS" -eq 0 ] && [ "$ROLES_STATUS" -eq 0 ] || exit 106
 # Collisions are fine as long as a complete Sol High resolution file covers them.
 python3 - "$WB" <<'PY' >/dev/null 2>&1 || exit 107
 import json, os, sys
@@ -310,8 +390,8 @@ PY
 
 # Retain AST evidence: strict live validation and safe reruns require it.
 
-# ---- gate 13 recoverable state (naturalization applied separately) -----
-python3 .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py \
+# ---- gate 13 recoverable state (rewrite applied separately by the skill) --
+python3 "$NAT_SCRIPT" \
   init "$STAGED/instruction.md" --state-dir "$NAT_RUN" \
   --instruction "$STAGED/instruction.md" --task-toml "$STAGED/task.toml" \
   --answer-key "$STAGED/tests/answer_key.json" >/dev/null 2>&1 || exit 120
@@ -370,7 +450,8 @@ else:
   117) fail 11 "plain environment hygiene failed" ;;
   118) fail 4  "versioned segmentation generation gate failed" ;;
   119) fail 4  "baseline inputs generation binding failed" ;;
-  120) fail 13 "naturalization recovery initialization failed" ;;
-  121) echo "BUILDPENDING $WB gate=13 :: run naturalization, then rerun with --resume-after-naturalization"; exit 75 ;;
+  120) fail 13 "$NAT_SKILL recovery initialization failed" ;;
+  121) echo "BUILDPENDING $WB gate=13 :: run /$NAT_SKILL, then rerun with $NAT_RESUME_FLAGS"; exit 75 ;;
+  122) fail 8  "maskability review script missing at $MASKABILITY" ;;
   *)   fail ?  "unexpected rc=$RC" ;;
 esac

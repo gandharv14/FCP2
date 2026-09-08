@@ -147,7 +147,6 @@ def _restricted_offset_graph():
             label=ref,
             formula=formula,
             value=str(value),
-            in_cycle=False,
             parse_status="ok" if kind == "formula" else "not_applicable",
         )
 
@@ -167,7 +166,6 @@ def _restricted_offset_graph():
             label=op or value,
             formula="",
             value=str(value),
-            in_cycle=False,
         )
 
     base = cell("Sheet!A1", "input", 0)
@@ -190,11 +188,7 @@ def _restricted_offset_graph():
             target=operation.id,
             role="address" if index == 0 else "arg",
             arg_index=index,
-            op="OFFSET",
-            cell=output.id,
-            ref="",
             via_range="",
-            cross_sheet=False,
         )
         for index, source in enumerate([base.id, rows.id, columns.id])
     ]
@@ -203,11 +197,7 @@ def _restricted_offset_graph():
         target=output.id,
         role="result",
         arg_index=0,
-        op="OFFSET",
-        cell=output.id,
-        ref="",
         via_range="",
-        cross_sheet=False,
     ))
     graph = model.Graph(
         "case",
@@ -787,6 +777,53 @@ def test_rollout_performance_gate_enforces_only_supplied_thresholds():
 
     assert check_rollout_performance(passing, baseline)["passed"] is True
     assert check_rollout_performance(failing, baseline)["passed"] is False
+
+
+def test_rollout_gate_skips_memory_when_neither_side_measured_it():
+    # peak_memory_bytes is opt-in via FCP_TRACE_MEMORY. Comparing an unmeasured
+    # run against an unmeasured baseline proves nothing, so the memory budget
+    # is skipped rather than reported as a missing metric.
+    unmeasured = {
+        "benchmark": {"verifier_runtime_p95_s": 100.0, "peak_memory_bytes": None}
+    }
+    slower = {
+        "benchmark": {"verifier_runtime_p95_s": 126.0, "peak_memory_bytes": None}
+    }
+
+    result = check_rollout_performance(unmeasured, unmeasured)
+
+    assert result["passed"] is True
+    assert result["peak_memory_measured"] is False
+    assert result["peak_memory_ratio"] is None
+    assert "missing_metrics" not in result
+    # The runtime budget must still bite.
+    assert check_rollout_performance(slower, unmeasured)["passed"] is False
+
+
+def test_rollout_gate_reports_a_one_sided_memory_measurement():
+    measured = {
+        "benchmark": {"verifier_runtime_p95_s": 100.0, "peak_memory_bytes": 1000}
+    }
+    unmeasured = {
+        "benchmark": {"verifier_runtime_p95_s": 100.0, "peak_memory_bytes": None}
+    }
+
+    result = check_rollout_performance(unmeasured, measured)
+
+    assert result["passed"] is False
+    assert result["missing_metrics"] == ["current.peak_memory_bytes"]
+
+
+def test_segment_memory_tracing_is_opt_in(monkeypatch: pytest.MonkeyPatch):
+    import xl_segment
+
+    for value in ("", "0", "false", "no", "off"):
+        monkeypatch.setenv(xl_segment.TRACE_MEMORY_ENV, value)
+        assert xl_segment._trace_memory_enabled() is False
+    monkeypatch.delenv(xl_segment.TRACE_MEMORY_ENV, raising=False)
+    assert xl_segment._trace_memory_enabled() is False
+    monkeypatch.setenv(xl_segment.TRACE_MEMORY_ENV, "1")
+    assert xl_segment._trace_memory_enabled() is True
 
 
 @pytest.mark.parametrize(

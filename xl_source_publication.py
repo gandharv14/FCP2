@@ -13,6 +13,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import xl_hash_cache
+
 
 MANIFEST_SCHEMA_VERSION = "source-generation/v2"
 LEGACY_MANIFEST_SCHEMA_VERSION = "source-generation/v1"
@@ -35,11 +37,8 @@ def _canonical_bytes(value: object) -> bytes:
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    # Memoised on (dev, ino, size, mtime_ns, ctime_ns); first sight reads.
+    return xl_hash_cache.sha256_file(path)
 
 
 def _bytes_hash(content: bytes) -> str:
@@ -712,11 +711,11 @@ def publish_source_generation(
     stage = Path(tempfile.mkdtemp(prefix=".source-stage-", dir=str(root)))
     try:
         (stage / "source").mkdir()
-        shutil.copyfile(source, stage / layout["source_workbook"])
+        _stage_file(source, stage / layout["source_workbook"], root=root)
         generation_ast = stage / layout["ast_directory"]
         generation_ast.mkdir(parents=True)
         for name in AST_FILES:
-            shutil.copyfile(ast / name, generation_ast / name)
+            _stage_file(ast / name, generation_ast / name, root=root)
         documents = {
             "request.json": request_value,
             "result.json": result_value,
@@ -773,6 +772,39 @@ def publish_source_generation(
         if stage.exists():
             shutil.rmtree(stage)
         raise
+
+
+def _inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _stage_file(origin: Path, target: Path, *, root: Path) -> None:
+    """Place ``origin`` at ``target`` inside the staging directory.
+
+    The recalc driver builds the source copy and both AST CSVs under
+    ``root`` (``.source-build-*``) and deletes that tree right after publish,
+    so a hardlink saves one full write of source + CSVs per generation and the
+    later ``chmod 0o444`` and ``rmtree`` are harmless on the shared inode.
+
+    Anything outside ``root`` is copied instead: a link would let a caller's
+    later in-place edit of its own file rewrite the immutable generation, and
+    the publish-time ``chmod`` would make the caller's file read-only.
+    """
+
+    origin = Path(origin)
+    if _inside(origin, Path(root)) and not origin.is_symlink():
+        try:
+            os.link(origin, target)
+            return
+        except OSError:
+            # Cross-device, unsupported filesystem, or link-count limit.
+            if target.exists():
+                target.unlink()
+    shutil.copyfile(origin, target)
 
 
 def _read_json(path: Path, description: str) -> dict:

@@ -249,7 +249,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "freeze":
-        source = args.source.read_text(encoding="utf-8")
+        source = args.source.read_bytes().decode("utf-8")
         try:
             writer_source, spans = freeze(source)
         except SpanError as exc:

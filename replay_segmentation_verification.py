@@ -454,11 +454,17 @@ def execute_shadow_replay(
     manifest_path=DEFAULT_MANIFEST,
     root=DEFAULT_ROOT,
     shadow_root=None,
+    *,
+    workbook_ids=None,
 ) -> dict:
     """Run three isolated generations per ready case beneath ``shadow_root``."""
     if shadow_root is None:
         raise ValueError("shadow_root is required for execution")
     manifest = load_manifest(manifest_path)
+    selected = None if workbook_ids is None else set(workbook_ids)
+    if selected is not None and (len(selected) != len(workbook_ids)
+            or not selected or selected - {case['id'] for case in manifest['cases']}):
+        raise ValueError('selected workbooks must be unique members of the frozen cohort')
     validation = build_replay_report(manifest_path, root)
     manifest_cases = {case["id"]: case for case in manifest["cases"]}
     shadow_root = Path(shadow_root)
@@ -477,6 +483,9 @@ def execute_shadow_replay(
 
     for case_record in validation["cases"]:
         case_id = case_record["id"]
+        if selected is not None and case_id not in selected:
+            results.append({'id': case_id, 'state': 'not_run', 'reason': 'not_selected'})
+            continue
         if case_record["state"] != "ready":
             results.append({
                 "id": case_id,
@@ -559,6 +568,7 @@ def execute_shadow_replay(
                     lineage_max=4000,
                     recurate=False,
                     llm=False,
+                    no_auto_adjudication=True,
                     model="",
                     env_file="__shadow_replay_never_reads_env__",
                     no_verify=False,
@@ -761,6 +771,9 @@ def main(argv=None):
     parser.add_argument("--root", default=str(DEFAULT_ROOT))
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--shadow-root")
+    parser.add_argument("--output", help="Write the complete report atomically to this JSON file")
+    parser.add_argument("--workbooks", nargs="+",
+                        help="Isolate selected cases while retaining all 53 report rows")
     parser.add_argument(
         "--baseline-report",
         help="optional replay report whose p95 runtime and peak memory set rollout budgets",
@@ -768,7 +781,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.execute:
         report = execute_shadow_replay(
-            args.manifest, args.root, args.shadow_root
+            args.manifest, args.root, args.shadow_root, workbook_ids=args.workbooks
         )
     else:
         report = build_replay_report(args.manifest, args.root)
@@ -780,10 +793,17 @@ def main(argv=None):
             report,
             baseline,
         )
-    print(json.dumps(report, indent=2, sort_keys=True))
+    if args.output:
+        from scripts.batch.hardened_runner import atomic_write_json
+        atomic_write_json(Path(args.output), report)
+        print(json.dumps({'report': str(Path(args.output).resolve()),
+                          'case_count': report.get('case_count')}, sort_keys=True))
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
     if args.execute and any(
         result.get("state") != "completed"
         for result in report.get("results", [])
+        if result.get("reason") != "not_selected"
     ):
         return 1
     if (

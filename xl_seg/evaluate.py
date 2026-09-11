@@ -29,6 +29,7 @@ from xml.etree import ElementTree
 from .condense import strongly_connected, topo_order
 from .model import A1_RE, Graph, a1, col_number, range_members, split_ref
 from .project import CellGraph
+from . import active_graph as compact_graph
 
 
 def _split(cid: str):
@@ -128,6 +129,9 @@ class RangeValues(list):
         self.refs = tuple(refs) if refs is not None and len(refs) == len(self) else None
 
 
+NATIVE_ERRORS = frozenset({"#NULL!", "#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#NUM!", "#N/A"})
+
+
 def is_bad(value) -> bool:
     return isinstance(value, (Unresolved, ExcelError))
 
@@ -195,7 +199,26 @@ def literal(raw: str):
     return raw
 
 
+def primitive_value(node):
+    """Decode supplied primitive cells using the AST's original Python type."""
+    if node.value_type == "str":
+        return node.value
+    if node.value_type == "bool":
+        raw = str(node.value).strip().lower()
+        if raw in {"true", "1"}:
+            return True
+        if raw in {"false", "0"}:
+            return False
+        return Unresolved("invalid-boolean-primitive")
+    return literal(node.value)
+
+
 def num(value, default=0.0):
+    # A proven one-cell result (e.g. INDEX(row=0) of a one-row range)
+    # has the same numeric value as its only cell. Never guess an implicit
+    # intersection for a general list or a multi-cell/malformed range.
+    if isinstance(value, RangeValues) and value.rows == value.cols == len(value) == 1:
+        value = value[0]
     if value is None:
         return default
     if isinstance(value, bool):
@@ -262,6 +285,20 @@ def _matches(value, criteria) -> bool:
             ">=": left >= target, "<=": left <= target, "<>": left != target,
         }[op]
     return left != target if op == "<>" else False
+
+
+def _date_number(value):
+    """Supported date/offset coercion without turning invalid text into zero."""
+    if isinstance(value, RangeValues) and value.rows == value.cols == len(value) == 1:
+        value = value[0]
+    if is_bad(value):
+        return value
+    serial = num(value, math.nan) if value is not None else 0.0
+    if math.isnan(serial):
+        return ExcelError("#VALUE!")
+    if not math.isfinite(serial):
+        return ExcelError("#NUM!")
+    return serial
 
 
 def _eomonth(start, months):
@@ -710,6 +747,12 @@ def _binary_value(op, left, right):
             return left
         if isinstance(right, error_type):
             return right
+    if op in {"+", "-", "*", "/", "^"}:
+        # Formula-produced empty strings are text, unlike an empty cell None.
+        # Keep numeric text coercion, but never silently turn other text into 0.
+        for value in (left, right):
+            if isinstance(value, str) and math.isnan(num(value, math.nan)):
+                return ExcelError("#VALUE!")
     return BINARY[op](left, right)
 
 
@@ -797,6 +840,7 @@ class EvalResult:
     # Every grid read attempted by a formula, including reads which produced no
     # value.  This is diagnostic provenance, not a new frontier-closure policy.
     read_attempts: dict = dataclass_field(default_factory=dict)
+    scalar_primitive_reads: dict = dataclass_field(default_factory=dict)
     missing_reads: dict = dataclass_field(default_factory=dict)
     seed_provenance: dict = dataclass_field(default_factory=dict)
     seeded_cells: set = dataclass_field(default_factory=set)
@@ -882,11 +926,15 @@ class Evaluator:
         self.unresolved: dict = {}
         self.unknown_ops: dict = defaultdict(int)
         self._arg_cache: dict = {}
+        self._source_pool = compact_graph.Pool()
+        self._span_shape_cache: dict[tuple[str, ...], tuple[int, int]] = {}
+        self._span_shape_cache_members = 0
         self._subtotal_provenance: dict[str, bool] = {}
-        self.oracle_reads: dict = {}
-        self.oracle_accesses: dict = {}
-        self.read_attempts: dict = {}
-        self.missing_reads: dict = {}
+        self.oracle_reads = compact_graph.ReadRelation(self._source_pool)
+        self.oracle_accesses = compact_graph.ReadRelation(self._source_pool)
+        self.read_attempts = compact_graph.ReadRelation(self._source_pool)
+        self.scalar_primitive_reads: dict = {}
+        self.missing_reads = compact_graph.ReadRelation(self._source_pool)
         self.runtime_address_radj: dict = {}
         self._resolved_targets: dict = {}
         self._resolved_operation_targets: dict = {}
@@ -920,6 +968,100 @@ class Evaluator:
         }
 
     # -- AST walking ------------------------------------------------------
+    def _legacy_average_arithmetic(self, node):
+        """Narrow saved-IIE context; intrinsic array functions never opt in.
+
+        A normal saved formula has IIE semantics. Modern Excel saves a formula
+        whose AE behavior can differ as an array, even for a one-cell result.
+        Source acceptance still requires its normal trusted proof; this helper
+        does not infer dialect from cached values or workbook age.
+        """
+        owner = self.graph.nodes.get(node.owner)
+        if owner is None or owner.kind != "formula":
+            return False
+        if any(getattr(owner, field, False) for field in
+               ("array_formula", "array_ref", "array_span", "array_anchor")):
+            return False
+        root_id = self.graph.root_of(owner.id)
+        root = self.graph.nodes.get(root_id)
+        if root is None or root.op != "AVERAGE" or root.op_kind != "func":
+            return False
+        # Do not cross an intrinsic array-evaluation island or an array
+        # constant. This first implementation proves only a simple arithmetic
+        # tree of cell/range references and scalar constants below AVERAGE.
+        pending = [edge.source for edge in self.graph.in_edges.get(root_id, ())]
+        checked = set()
+        while pending:
+            source_id = pending.pop()
+            if source_id in checked:
+                continue
+            checked.add(source_id)
+            source = self.graph.nodes.get(source_id)
+            if source is None:
+                return False
+            if source.is_cell or source.kind in {"const", "range"}:
+                continue
+            if not ((source.op_kind == "infix" and source.op in {"+", "-", "*", "/", "^"})
+                    or (source.op_kind in {"prefix", "postfix"} and source.op in UNARY)):
+                return False
+            pending.extend(edge.source for edge in self.graph.in_edges.get(source_id, ()))
+        current = node
+        seen = set()
+        while current.id != root_id:
+            if current.id in seen or current.owner != owner.id:
+                return False
+            seen.add(current.id)
+            if not ((current.op_kind == "infix" and current.op in {"+", "-", "*", "/", "^"})
+                    or (current.op_kind in {"prefix", "postfix"} and current.op in UNARY)):
+                return False
+            parents = self.graph.out_edges.get(current.id, ())
+            if len(parents) != 1:
+                return False
+            current = self.graph.nodes.get(parents[0].target)
+            if current is None:
+                return False
+        return bool(seen)
+
+    def _legacy_static_operand(self, node, index):
+        """Return (handled, selected ref/error) without reading range values."""
+        kind, payload = self._arg_specs(node)[index]
+        if kind == "span":
+            refs = list(payload)
+        elif kind == "scalar":
+            source = self.graph.nodes.get(payload)
+            if source is None or source.kind != "range":
+                return False, None
+            if source.range_truncated:
+                return True, Unresolved("whole-column-range-exceeds-bound")
+            refs = range_members(source.sheet, source.coordinate or "")
+        else:
+            return False, None
+        coordinates = [split_ref(ref) for ref in refs]
+        if not refs or any(item is None for item in coordinates):
+            return True, Unresolved("implicit-intersection-invalid-reference")
+        sheets = {item[0] for item in coordinates}
+        rows = {item[1] for item in coordinates}
+        cols = {item[2] for item in coordinates}
+        if len(sheets) != 1 or (len(rows) != 1 and len(cols) != 1):
+            return True, Unresolved("implicit-intersection-shape-unproved")
+        owner = self.graph.nodes[node.owner]
+        if owner.row is None or owner.col is None:
+            return True, Unresolved("implicit-intersection-owner-unproved")
+        selected = [ref for ref, (_, row, col) in zip(refs, coordinates)
+                    if len(refs) == 1 or (len(rows) == 1 and col == owner.col)
+                    or (len(cols) == 1 and row == owner.row)]
+        if len(selected) != 1:
+            return True, ExcelError("#VALUE!")
+        return True, selected[0]
+
+    def _legacy_arithmetic_args(self, node):
+        values = []
+        for index, spec in enumerate(self._arg_specs(node)):
+            handled, selected = self._legacy_static_operand(node, index)
+            values.append(self._read(selected) if isinstance(selected, str)
+                          else selected if handled else self._arg_value(spec))
+        return values
+
     def _arg_specs(self, node):
         """Cached positional argument specifications for an op node.
 
@@ -945,11 +1087,23 @@ class Evaluator:
         if kind == "scalar":
             return self._eval_node(payload)
         if kind == "span":
-            values = [self._read(cid) for cid in payload]
-            coordinates = [_split(cid) for cid in payload]
-            rows = len({row for _, row, _ in coordinates})
-            cols = len({col for _, _, col in coordinates})
-            return RangeValues(values, rows, cols, refs=payload)
+            values = self._read_span(payload)
+            # Only coordinate metadata is reusable. Read each value above on
+            # every call so changed inputs and proof read accounting stay live.
+            key = tuple(payload) if self.optimize else None
+            shape = self._span_shape_cache.get(key) if key is not None else None
+            if shape is None:
+                coordinates = [_split(cid) for cid in payload]
+                shape = (len({row for _, row, _ in coordinates}),
+                         len({col for _, _, col in coordinates}))
+                if (
+                    key is not None
+                    and len(self._span_shape_cache) < 32768
+                    and self._span_shape_cache_members + len(key) <= 1000000
+                ):
+                    self._span_shape_cache[key] = shape
+                    self._span_shape_cache_members += len(key)
+            return RangeValues(values, *shape, refs=payload)
         return [self._eval_node(src) for src in payload]
 
     def _arg(self, node, index):
@@ -1148,18 +1302,18 @@ class Evaluator:
     def _active_spec_sources(self, spec, seen=None):
         kind, payload = spec
         if kind == "span":
-            return set(payload)
+            return self._source_pool.sources(payload)
         if kind == "scalar":
             return self._active_node_sources(payload, seen)
         if kind == "many":
-            sources = set()
+            sources = compact_graph.Builder(self._source_pool)
             for source in payload:
                 sources.update(self._active_node_sources(source, seen))
-            return sources
+            return sources.freeze()
         return set()
 
     def _has_subtotal_provenance(self, node_id, seen=None):
-        """Whether a cell's evaluated lineage contains SUBTOTAL or AGGREGATE."""
+        """Whether this cell's own formula contains SUBTOTAL or AGGREGATE."""
         cached = self._subtotal_provenance.get(node_id)
         if cached is not None:
             return cached
@@ -1172,7 +1326,11 @@ class Evaluator:
             return False
         if node.is_cell:
             root = self.graph.root_of(node.id)
-            result = root is not None and self._has_subtotal_provenance(root, seen)
+            root_node = self.graph.nodes.get(root)
+            # An ordinary link to a subtotal is a supplied reference here;
+            # it is not a nested SUBTOTAL expression in this cell's formula.
+            result = (root_node is not None and not root_node.is_cell
+                      and self._has_subtotal_provenance(root, seen))
         elif node.kind == "op":
             bare = node.op.upper()
             for prefix in ("_XLFN.", "_XLWS."):
@@ -1196,10 +1354,10 @@ class Evaluator:
         code = int(num(code_value)) % 100
         kept = []
         for index in range(1, len(self._arg_specs(node))):
-            source = self._reference_arg(node, index)
+            source = self._reference_arg(node, index, read=False)
             if source.refs:
                 kept.extend(
-                    value for value, ref in zip(source, source.refs)
+                    self._read(ref) for ref in source.refs
                     if not self._has_subtotal_provenance(ref)
                 )
             else:
@@ -1236,15 +1394,31 @@ class Evaluator:
         span = group[0].via_range
         if span:
             sheet = self.graph.nodes[group[0].source].sheet
-            members = range_members(sheet, span.split("!")[-1].replace("$", ""))
+            coordinate = span.split("!")[-1].replace("$", "")
+            members = self._source_pool.span((sheet, coordinate), lambda: range_members(sheet, coordinate))
             if members:
                 return ("span", members)
         if len(group) == 1:
             return ("scalar", group[0].source)
         return ("many", [e.source for e in group])
 
-    def _read(self, cid: str):
-        self.read_attempts.setdefault(cid, set()).add(self._current_cell)
+    def _record_read(self, name, cid, journal):
+        if journal is None:
+            getattr(self, name).setdefault(cid, set()).add(self._current_cell)
+        else:
+            journal.setdefault(name, set()).add(cid)
+
+    def _read_span(self, members):
+        journal = {}
+        consumer = self._current_cell
+        try:
+            return [self._read(cid, _journal=journal) for cid in members]
+        finally:
+            for name, visited in journal.items():
+                getattr(self, name).add_group(visited, consumer)
+
+    def _read(self, cid: str, *, _journal=None):
+        self._record_read("read_attempts", cid, _journal)
         if cid in self.values:
             return self.values[cid]
         if cid in self.graph.nodes:
@@ -1253,10 +1427,10 @@ class Evaluator:
             # Proof mode may record the absence, but it cannot ask the golden
             # workbook for a saved answer.  Comparison cache access happens
             # only after ``run`` has returned.
-            self.missing_reads.setdefault(cid, set()).add(self._current_cell)
+            self._record_read("missing_reads", cid, _journal)
             return None
         if self.oracle is not None:
-            self.oracle_accesses.setdefault(cid, set()).add(self._current_cell)
+            self._record_read("oracle_accesses", cid, _journal)
             raw = self.oracle(*_split(cid))
             value = literal(raw) if isinstance(raw, str) else raw
             if value is not None:
@@ -1264,7 +1438,7 @@ class Evaluator:
                 # straight from the golden workbook's cache, not from any
                 # rebuild. Record who consumed it so verification can refuse
                 # to count outputs fed this way.
-                self.oracle_reads.setdefault(cid, set()).add(self._current_cell)
+                self._record_read("oracle_reads", cid, _journal)
             return value
         return None
 
@@ -1273,16 +1447,32 @@ class Evaluator:
         if node is None:
             return Unresolved("missing-node")
         if node.kind == "const":
-            if node.op == "text" and node.value == "":
-                return ""
+            if node.op == "error":
+                value = node.value if node.value != "" else node.expr
+                return ExcelError(value) if value in NATIVE_ERRORS else Unresolved("unknown-error-literal")
+            if node.op == "text":
+                return node.value
+            if node.op == "logical":
+                raw = str(node.value).upper()
+                return raw == "TRUE" if raw in {"TRUE", "FALSE"} else Unresolved("invalid-logical-constant")
             return literal(node.value if node.value != "" else node.expr)
         if node.kind == "range":
             return self._expand_range(node)
         if node.kind == "name":
+            # Older/current graphs may misparse an unsupported reference
+            # constructor as a name between whitespace intersections. A bare
+            # colon cannot be a defined name; IFERROR must not hide this gap.
+            if node.label == ":":
+                return Unresolved("unsupported-reference-constructor")
             return ExcelError("#NAME?")
         if node.kind == "external":
             return Unresolved("external-reference")
         if node.is_cell:
+            # Preserve primitive scalar reads during native iteration, not
+            # merely the dependency branch selected at the final endpoint.
+            if node.kind in {"input", "label"} and self._current_cell is not None:
+                self.read_attempts.setdefault(node_id, set()).add(self._current_cell)
+                self.scalar_primitive_reads.setdefault(node_id, set()).add(self._current_cell)
             if node_id in self.values:
                 return self.values[node_id]
             return Unresolved("uncomputed-precedent")
@@ -1292,18 +1482,20 @@ class Evaluator:
         """A range node the parser kept whole; read its cells one by one."""
         if getattr(node, "range_truncated", False):
             return Unresolved("whole-column-range-exceeds-bound")
-        members = range_members(node.sheet, node.coordinate or "")
+        members = self._source_pool.span((node.sheet, node.coordinate or ""), lambda: range_members(node.sheet, node.coordinate or ""))
         if not members:
             return Unresolved("opaque-range")
         coordinates = [_split(cid) for cid in members]
         rows = len({row for _, row, _ in coordinates})
         cols = len({col for _, _, col in coordinates})
         return RangeValues(
-            [self._read(cid) for cid in members], rows, cols, refs=members
+            self._read_span(members), rows, cols, refs=members
         )
 
     def _apply(self, node):
         op = node.op
+        if op == ":":
+            return self._reference_range(node)
         if op == "OFFSET":
             return self._offset(node)
         if op == "SUBTOTAL":
@@ -1316,6 +1508,8 @@ class Evaluator:
             return self._indirect(node)
         if op == "ROW":
             return self._row(node)
+        if op == "COLUMN":
+            return self._column(node)
         if op == "COUNTA":
             return self._counta(node)
         if op == "IFERROR":
@@ -1356,7 +1550,18 @@ class Evaluator:
                 if truthy(cond):
                     return self._arg(node, index + 1)
             return ExcelError("#N/A")
-        args = self._args(node)
+        if op in {"HLOOKUP", "VLOOKUP"}:
+            plan = self._lookup_reference_plan(node)
+            if plan is not None:
+                lookup_args, sources, selected = plan
+                if selected is not None:
+                    table = lookup_args[1]
+                    table[table.refs.index(selected)] = self._read(selected)
+                self._selective_sources[node.id] = sources
+                handler = self._fn_hlookup if op == "HLOOKUP" else self._fn_vlookup
+                return handler(lookup_args)
+        args = (self._legacy_arithmetic_args(node)
+                if self._legacy_average_arithmetic(node) else self._args(node))
         if node.op_kind == "infix":
             if op in BINARY:
                 return _binary(op, args[0], args[1]) if len(args) > 1 \
@@ -1502,7 +1707,14 @@ class Evaluator:
         return any(truthy(value) for value in flatten(args) if value is not None)
 
     def _fn_year(self, args):
-        return float(_excel_date_parts(int(num(args[0])))[0])
+        # A workbook's "-" date sentinel must reach its surrounding IFERROR.
+        serial = _date_number(args[0])
+        if is_bad(serial):
+            return serial
+        try:
+            return float(_excel_date_parts(int(serial))[0])
+        except (OverflowError, ValueError):
+            return ExcelError("#NUM!")
 
     def _fn_month(self, args):
         return float(_excel_date_parts(int(num(args[0])))[1])
@@ -1522,10 +1734,21 @@ class Evaluator:
             return ExcelError("#NUM!")
 
     def _fn_eomonth(self, args):
-        return float(_eomonth(args[0], args[1]))
+        return self._date_month_shift(args, _eomonth)
 
     def _fn_edate(self, args):
-        return float(_edate(args[0], args[1]))
+        return self._date_month_shift(args, _edate)
+
+    @staticmethod
+    def _date_month_shift(args, operation):
+        values = [_date_number(value) for value in args[:2]]
+        for value in values:
+            if is_bad(value):
+                return value
+        try:
+            return float(operation(*values))
+        except (OverflowError, ValueError):
+            return ExcelError("#NUM!")
 
     def _fn_numbervalue(self, args):
         if not args:
@@ -1885,7 +2108,8 @@ class Evaluator:
         return RangeValues(values, rows, cols)
 
     def _fn_irr(self, args):
-        return _irr(numbers([args[0]]))
+        guess = num(args[1], 0.1) if len(args) > 1 else 0.1
+        return _irr(numbers([args[0]]), guess)
 
     def _fn_xirr(self, args):
         # Blanks are kept as zeros on both sides rather than dropped. A blank date
@@ -1894,10 +2118,11 @@ class Evaluator:
         # that far, and Excel's answer depends on it.
         flows = list(flatten([args[0]]))
         dates = list(flatten([args[1]]))
-        if not flows or not dates:
+        if not flows or len(flows) != len(dates):
             return ExcelError("#NUM!")
         pairs = [(num(v, 0.0), num(d, 0.0)) for v, d in zip(flows, dates)]
-        return _xirr([p[0] for p in pairs], [p[1] for p in pairs])
+        guess = num(args[2], 0.1) if len(args) > 2 else 0.1
+        return _xirr([p[0] for p in pairs], [p[1] for p in pairs], guess)
 
     def _fn_xnpv(self, args):
         rate = num(args[0])
@@ -2133,6 +2358,50 @@ class Evaluator:
 
     def _fn_power(self, args):
         return _power(num(args[0]), num(args[1]) if len(args) > 1 else 0.0)
+
+    @staticmethod
+    def _elementary_number(value):
+        """Numeric scalar coercion without silently turning invalid text into zero."""
+        if isinstance(value, RangeValues):
+            if value.rows != 1 or value.cols != 1 or len(value) != 1:
+                return Unresolved("elementary-function-array-shape")
+            value = value[0]
+        if is_bad(value):
+            return value
+        if isinstance(value, (list, tuple)):
+            return Unresolved("elementary-function-array-shape")
+        if value is None:
+            return 0.0
+        if not isinstance(value, (str, int, float, bool)):
+            return ExcelError("#VALUE!")
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return ExcelError("#VALUE!")
+        except OverflowError:
+            return ExcelError("#NUM!")
+        return result if math.isfinite(result) else ExcelError("#NUM!")
+
+    def _fn_sqrt(self, args):
+        if len(args) != 1:
+            return Unresolved("sqrt-arity")
+        value = self._elementary_number(args[0])
+        if is_bad(value):
+            return value
+        return math.sqrt(value) if value >= 0 else ExcelError("#NUM!")
+
+    def _fn_sln(self, args):
+        if len(args) != 3:
+            return Unresolved("sln-arity")
+        values = [self._elementary_number(value) for value in args]
+        bad = next((value for value in values if is_bad(value)), None)
+        if bad is not None:
+            return bad
+        cost, salvage, life = values
+        if life == 0:
+            return ExcelError("#DIV/0!")
+        result = (cost - salvage) / life
+        return result if math.isfinite(result) else ExcelError("#NUM!")
 
     def _fn_exp(self, args):
         try:
@@ -2535,6 +2804,63 @@ class Evaluator:
         cols = len({col for _, _, col in coordinates}) or 1
         return RangeValues(values, rows, cols, refs=targets)
 
+    def _column(self, node):
+        """Static reference coordinates, never the referenced cell's contents."""
+        specs = self._arg_specs(node)
+        owner = self.graph.nodes.get(node.owner)
+        current = self.graph.nodes.get(self._current_cell)
+        if (owner is not None and current is not None and owner.array_anchor
+                and current.array_anchor == owner.array_anchor):
+            owner = current
+        if not specs:
+            return (float(owner.col) if owner is not None and owner.col is not None
+                    else ExcelError("#REF!"))
+        if len(specs) != 1:
+            return Unresolved("column-arity")
+        kind, payload = specs[0]
+        if kind == "scalar":
+            source = self.graph.nodes.get(payload)
+            if source is None:
+                return Unresolved("column-missing-reference")
+            if source.is_cell:
+                return float(source.col) if source.col is not None else ExcelError("#REF!")
+            if source.kind == "range":
+                match = re.fullmatch(r"([A-Za-z]{1,3})[1-9][0-9]*:([A-Za-z]{1,3})[1-9][0-9]*", source.coordinate or "")
+                if not match:
+                    return Unresolved("column-range-reference")
+                left, right = sorted(col_number(value) for value in match.groups())
+                columns = list(range(left, right + 1))
+            elif source.kind == "const":
+                value = self._eval_node(source.id)
+                return value if is_bad(value) else ExcelError("#VALUE!")
+            else:
+                return Unresolved("column-dynamic-reference")
+        elif kind in ("span", "many"):
+            coordinates = [split_ref(value) for value in payload]
+            if not coordinates or any(value is None for value in coordinates):
+                return Unresolved("column-reference-shape")
+            sheets = {value[0] for value in coordinates}
+            rows = {value[1] for value in coordinates}
+            cols = {value[2] for value in coordinates}
+            if (len(sheets) != 1 or len(set(coordinates)) != len(rows) * len(cols)
+                    or len(rows) != max(rows) - min(rows) + 1
+                    or len(cols) != max(cols) - min(cols) + 1):
+                return Unresolved("column-multiple-areas")
+            columns = sorted(cols)
+        else:
+            return Unresolved("column-missing-reference")
+        if not columns or any(not 1 <= value <= 16384 for value in columns):
+            return ExcelError("#REF!")
+        if len(columns) == 1:
+            return float(columns[0])
+        if owner is not None and (owner.array_formula or owner.array_ref or owner.array_span):
+            return RangeValues([float(value) for value in columns], 1, len(columns))
+        if owner is not None and self.graph.root_of(owner.id) == node.id:
+            return float(columns[0])
+        # Nested array consumers require an established evaluation context;
+        # don't assume legacy intersection or dynamic array evaluation.
+        return Unresolved("column-array-context")
+
     def _row(self, node):
         """Excel ROW, using the referenced range or the formula owner's row."""
         incoming = sorted(self.graph.in_edges.get(node.id, ()), key=lambda edge: edge.arg_index)
@@ -2565,6 +2891,171 @@ class Evaluator:
         # Excel's COUNTA counts every non-empty cell, including formulas that
         # display as "" -- only genuinely empty cells (None here) are skipped.
         return float(sum(value is not None for value in values))
+
+    def _index_reference_endpoint(self, node):
+        """Bounded single-area reference form; do not read the referenced values.
+
+        INDEX's scalar value handler intentionally remains unchanged. A colon
+        needs addresses, including zero-index whole-row/column references.
+        Multiple areas, calculated reference sources and array selectors are
+        outside this proof and remain unresolved, even under IFERROR.
+        """
+        if node.kind != "op" or node.op != "INDEX" or str(node.arity) not in {"2", "3"}:
+            return Unresolved("index-range-endpoint")
+        specs = self._arg_specs(node)
+        if len(specs) != int(node.arity) or node.range_truncated:
+            return Unresolved("index-range-arguments")
+        kind, payload = specs[0]
+        if kind == "scalar":
+            source = self.graph.nodes.get(payload)
+            if source is None or source.range_truncated or not (source.is_cell or source.kind == "range"):
+                return Unresolved("index-range-static-reference")
+            if source.kind == "range":
+                match = re.fullmatch(r"\$?([A-Za-z]{1,3})\$?([1-9][0-9]*)(?::\$?([A-Za-z]{1,3})\$?([1-9][0-9]*))?", source.coordinate or "")
+                if match is None:
+                    return Unresolved("index-range-coordinate")
+                c0, r0 = col_number(match[1]), int(match[2])
+                c1, r1 = col_number(match[3] or match[1]), int(match[4] or match[2])
+                if (not 1 <= r0 <= r1 <= 1048576 or not 1 <= c0 <= c1 <= 16384
+                        or (r1-r0+1)*(c1-c0+1) > 10000):
+                    return Unresolved("index-range-bounds")
+                refs = [a1(source.sheet, r, c) for r in range(r0, r1+1) for c in range(c0, c1+1)]
+            else:
+                refs = [source.id]
+        elif kind == "span" and payload and len(payload) <= 10000:
+            refs = list(payload)
+            if any(self.graph.nodes.get(ref) is not None and self.graph.nodes[ref].range_truncated for ref in refs):
+                return Unresolved("index-range-truncated")
+        else:
+            return Unresolved("index-range-static-reference")
+        coordinates = [split_ref(ref) for ref in refs]
+        if not coordinates or any(item is None or not 1 <= item[1] <= 1048576
+                                  or not 1 <= item[2] <= 16384 for item in coordinates):
+            return Unresolved("index-range-coordinate")
+        sheet, row0, col0 = coordinates[0]
+        rows, cols = len({item[1] for item in coordinates}), len({item[2] for item in coordinates})
+        if (len(refs) != rows*cols
+                or refs != [a1(sheet, row0+r, col0+c) for r in range(rows) for c in range(cols)]):
+            return Unresolved("index-range-shape")
+        origins = [self.graph.nodes.get(edge.source) for edge in self.graph.in_edges.get(node.id, ()) if edge.arg_index == 0]
+        if not origins or any(source is None or source.sheet != sheet or not (source.is_cell or source.kind == "range") for source in origins):
+            return Unresolved("index-range-internal-reference")
+        selectors = []
+        for index in range(1, len(specs)):
+            value = self._arg(node, index)
+            if is_bad(value):
+                return value
+            if type(value) not in {int, float} or not math.isfinite(value) or value != int(value):
+                return Unresolved("index-range-scalar-integer-selector")
+            selectors.append(int(value))
+        row, col = (1, selectors[0]) if len(selectors) == 1 and rows == 1 else (selectors[0], selectors[1] if len(selectors) == 2 else 1)
+        if not 0 <= row <= rows or not 0 <= col <= cols:
+            return ExcelError("#REF!")
+        selected = [refs[r*cols+c] for r in (range(rows) if row == 0 else [row-1])
+                    for c in (range(cols) if col == 0 else [col-1])]
+        self._record_resolved_targets(node, selected)
+        return selected
+
+    def _index_range_endpoints(self, node):
+        specs = self._arg_specs(node)
+        if len(specs) != 2 or any(kind != "scalar" for kind, _ in specs):
+            return None
+        ends = [self.graph.nodes.get(payload) for _, payload in specs]
+        return ends if all(end is not None and end.kind == "op" and end.op == "INDEX" for end in ends) else None
+
+    def _reference_range_targets(self, node):
+        endpoints = self._index_range_endpoints(node)
+        if endpoints is None:
+            return self._static_offset_range_targets(node)
+        left, right = [self._index_reference_endpoint(end) for end in endpoints]
+        # Unproved semantics must not be hidden by a caught error in the other
+        # endpoint. Ordinary Excel errors propagate only after both are proved.
+        for value in (left, right):
+            if isinstance(value, Unresolved):
+                return value
+        for value in (left, right):
+            if isinstance(value, ExcelError):
+                return value
+        points = [split_ref(ref) for ref in left + right]
+        if len({point[0] for point in points}) != 1:
+            return Unresolved("index-range-cross-sheet")
+        sheet = points[0][0]
+        r0, r1 = min(p[1] for p in points), max(p[1] for p in points)
+        c0, c1 = min(p[2] for p in points), max(p[2] for p in points)
+        if (r1-r0+1)*(c1-c0+1) > 10000:
+            return Unresolved("index-range-hard-cap")
+        targets = [a1(sheet, r, c) for r in range(r0, r1+1) for c in range(c0, c1+1)]
+        self._record_resolved_targets(node, targets)
+        return targets
+
+    def _static_offset_range_targets(self, node):
+        """Only the parser's signed integer literal OFFSET endpoint is supported.
+
+        Preserve the OFFSET operation for occurrence-specific policy evidence.
+        Resolve both coordinates without reading any workbook value or cache.
+        """
+        groups = {}
+        for edge in self.graph.in_edges.get(node.id, ()):
+            groups.setdefault(edge.arg_index, []).append(edge.source)
+        if set(groups) != {0, 1} or any(len(v) != 1 for v in groups.values()):
+            return Unresolved("static-offset-range-shape")
+        start = self.graph.nodes.get(groups[0][0])
+        offset = self.graph.nodes.get(groups[1][0])
+        if (start is None or not start.is_cell or offset is None
+                or offset.kind != "op" or offset.op != "OFFSET"
+                or str(offset.arity) != "3"):
+            return Unresolved("static-offset-range-endpoint")
+        arguments = {}
+        for edge in self.graph.in_edges.get(offset.id, ()):
+            arguments.setdefault(edge.arg_index, []).append(edge.source)
+        if set(arguments) != {0, 1, 2} or any(len(v) != 1 for v in arguments.values()):
+            return Unresolved("static-offset-range-arguments")
+        base = self.graph.nodes.get(arguments[0][0])
+        if (base is None or not base.is_cell or start.sheet != node.sheet
+                or base.sheet != node.sheet):
+            return Unresolved("static-offset-range-sheet")
+        offsets = []
+        for index in (1, 2):
+            literal_node = self.graph.nodes.get(arguments[index][0])
+            sign = 1
+            if literal_node is not None and literal_node.kind == "op" and literal_node.op in {"u+", "u-"}:
+                unary_edges = list(self.graph.in_edges.get(literal_node.id, ()))
+                if str(literal_node.arity) != "1" or len(unary_edges) != 1 or unary_edges[0].arg_index != 0:
+                    return Unresolved("static-offset-range-unary")
+                sign = -1 if literal_node.op == "u-" else 1
+                literal_node = self.graph.nodes.get(unary_edges[0].source)
+            if (literal_node is None or literal_node.kind != "const" or literal_node.op != "number"
+                    or self.graph.in_edges.get(literal_node.id)):
+                return Unresolved("static-offset-range-literal")
+            value = literal(literal_node.value)
+            if (type(value) not in {int, float} or not math.isfinite(value)
+                    or abs(value) > 1048576 or value != int(value)):
+                return Unresolved("static-offset-range-integer")
+            offsets.append(sign * int(value))
+        if any(type(value) is not int for value in (start.row, start.col, base.row, base.col)):
+            return Unresolved("static-offset-range-coordinate")
+        end_row, end_col = base.row + offsets[0], base.col + offsets[1]
+        if not all(1 <= row <= 1048576 and 1 <= col <= 16384
+                   for row, col in [(start.row, start.col), (base.row, base.col), (end_row, end_col)]):
+            return Unresolved("static-offset-range-bounds")
+        height, width = abs(start.row - end_row) + 1, abs(start.col - end_col) + 1
+        if height * width > 10_000:
+            return Unresolved("static-offset-range-hard-cap")
+        targets = [a1(node.sheet, row, col)
+                   for row in range(min(start.row, end_row), max(start.row, end_row) + 1)
+                   for col in range(min(start.col, end_col), max(start.col, end_col) + 1)]
+        self._record_resolved_targets(offset, [a1(node.sheet, end_row, end_col)])
+        self._record_resolved_targets(node, targets)
+        return targets
+
+    def _reference_range(self, node):
+        targets = self._reference_range_targets(node)
+        if is_bad(targets):
+            return targets
+        coordinates = [_split(target) for target in targets]
+        return RangeValues([self._read(target) for target in targets],
+                           len({row for _, row, _ in coordinates}),
+                           len({col for _, _, col in coordinates}), refs=targets)
 
     def _offset(self, node):
         """Resolve a dynamic reference, including optional range dimensions."""
@@ -2633,11 +3124,112 @@ class Evaluator:
     def _refs(value):
         return list(value.refs or ()) if isinstance(value, RangeValues) else []
 
-    def _selective_dependencies(self, node, args, result):
+    def _lookup_reference_plan(self, node):
+        """Read a static table's search vector, never its unselected result cells.
+
+        Reuse the existing lookup dependency selector and value handler. Unknown
+        keys/indices keep the whole table frontier until they are reconstructed.
+        This is dependency discovery, not a new matching or error policy.
+        """
+        specs = self._arg_specs(node)
+        if len(specs) not in {3, 4}:
+            return None
+        if node.range_truncated:
+            return None
+        kind, payload = specs[1]
+        if kind == "scalar":
+            table_node = self.graph.nodes.get(payload)
+            if (table_node is None or table_node.range_truncated
+                    or not (table_node.is_cell or table_node.kind == "range")):
+                return None
+            if table_node.kind == "range":
+                # range_members allocates eagerly: establish cardinality and
+                # worksheet bounds before _reference_arg can expand anything.
+                match = re.fullmatch(
+                    r"\$?([A-Za-z]{1,3})\$?([1-9][0-9]*)(?::\$?([A-Za-z]{1,3})\$?([1-9][0-9]*))?",
+                    table_node.coordinate or "")
+                if match is None:
+                    return None
+                col0, row0 = col_number(match[1]), int(match[2])
+                col1, row1 = col_number(match[3] or match[1]), int(match[4] or match[2])
+                if (not 1 <= row0 <= row1 <= 1048576 or not 1 <= col0 <= col1 <= 16384
+                        or (row1 - row0 + 1) * (col1 - col0 + 1) > 10000):
+                    return None
+            else:
+                ref = split_ref(table_node.id)
+                if (ref is None or not 1 <= ref[1] <= 1048576 or not 1 <= ref[2] <= 16384):
+                    return None
+        elif kind == "span":
+            if not payload or len(payload) > 10000:
+                return None
+            coordinates = []
+            for source_id in payload:
+                source = self.graph.nodes.get(source_id)
+                if source is not None and source.range_truncated:
+                    return None
+                ref = split_ref(source_id)
+                if ref is None or not 1 <= ref[1] <= 1048576 or not 1 <= ref[2] <= 16384:
+                    return None
+                coordinates.append(ref)
+            sheet, first_row, first_col = coordinates[0]
+            rows = len({ref[1] for ref in coordinates})
+            cols = len({ref[2] for ref in coordinates})
+            if (len(payload) != rows * cols or list(payload) != [a1(sheet, first_row + r, first_col + c)
+                    for r in range(rows) for c in range(cols)]):
+                return None
+        else:
+            return None
+        table = self._reference_arg(node, 1, read=False)
+        refs = self._refs(table)
+        if not refs or len(refs) != table.rows * table.cols or len(refs) > 10000:
+            return None
+        coordinates = [split_ref(ref) for ref in refs]
+        if any(item is None for item in coordinates):
+            return None
+        sheet, row, col = coordinates[0]
+        if refs != [a1(sheet, row + r, col + c)
+                    for r in range(table.rows) for c in range(table.cols)]:
+            return None
+        key, index = self._arg(node, 0), self._arg(node, 2)
+        mode = self._arg(node, 3) if len(specs) == 4 else True
+        if any(is_bad(value) or isinstance(value, (RangeValues, list))
+               for value in (key, index, mode)):
+            return None
+        dimension = table.rows if node.op == "HLOOKUP" else table.cols
+        if (type(index) not in {int, float} or not math.isfinite(index)
+                or int(index) != index or not 1 <= index <= dimension):
+            return None
+        search_positions = (range(table.cols) if node.op == "HLOOKUP"
+                            else range(0, len(refs), table.cols))
+        values = [None] * len(refs)
+        search_refs = []
+        journal = {}
+        consumer = self._current_cell
+        try:
+            for position in search_positions:
+                search_refs.append(refs[position])
+                values[position] = self._read(refs[position], _journal=journal)
+                if is_bad(values[position]):
+                    return None
+        finally:
+            for name, visited in journal.items():
+                getattr(self, name).add_group(visited, consumer)
+        table = RangeValues(values, table.rows, table.cols, refs=refs)
+        args = [key, table, index, mode]
+        sources, selected = self._selective_dependencies(node, args, None, return_selected=True)
+        # Complete search-vector coverage is retained even if an exact match
+        # occurs early. Key, index and mode's transitive inputs remain present.
+        sources = compact_graph.Builder(self._source_pool, sources)
+        sources.update(self._source_pool.sources(search_refs))
+        if len(selected) > 1:
+            return None
+        return args, sources.freeze(), selected[0] if selected else None
+
+    def _selective_dependencies(self, node, args, result, *, return_selected=False):
         """Value precedents used by a selector, excluding unselected result cells."""
         op = node.op
         specs = self._arg_specs(node)
-        sources = set()
+        sources = compact_graph.Builder(self._source_pool)
 
         def add_slot(index):
             if index < len(specs):
@@ -2775,7 +3367,7 @@ class Evaluator:
 
         sources.update(selected_refs)
         self._record_resolved_targets(node, selected_refs)
-        return sources
+        return (sources.freeze(), selected_refs) if return_selected else sources.freeze()
 
     def _active_node_sources(self, node_id, seen=None):
         """Cell precedents actually evaluated under the current selector values."""
@@ -2784,7 +3376,7 @@ class Evaluator:
             cached = self._static_source_cache.get(node_id)
             if cached is not None:
                 self._benchmark["active_graph"]["static_source_cache_hits"] += 1
-                return set(cached)
+                return cached
             self._benchmark["active_graph"]["static_source_cache_misses"] += 1
 
         seen = set() if root_call else seen
@@ -2797,12 +3389,62 @@ class Evaluator:
         if node.is_cell:
             return {node.id}
         if node.kind == "range":
-            return set(range_members(node.sheet, node.coordinate or ""))
+            return self._source_pool.sources(self._source_pool.span((node.sheet, node.coordinate or ""), lambda: range_members(node.sheet, node.coordinate or "")))
         if node.kind != "op":
             return set()
 
+        if node.op == "COLUMN" and not is_bad(self._column(node)):
+            # A proved coordinate result never consumes the anchor's value.
+            return set()
+
+        if node.op == ":":
+            targets = self._reference_range_targets(node)
+            sources = compact_graph.Builder(self._source_pool, targets if isinstance(targets, list) else ())
+            endpoints = self._index_range_endpoints(node)
+            if endpoints is not None:
+                for endpoint in endpoints:
+                    specs = self._arg_specs(endpoint)
+                    for spec in specs[1:]:
+                        sources.update(self._active_spec_sources(spec, seen))
+                    # Before selectors can be reconstructed retain the full
+                    # conservative table frontier; narrow only after proof.
+                    if isinstance(targets, Unresolved) and specs:
+                        sources.update(self._active_spec_sources(specs[0], seen))
+            return sources.freeze()
+
+        if self._legacy_average_arithmetic(node):
+            sources = compact_graph.Builder(self._source_pool)
+            for index, spec in enumerate(self._arg_specs(node)):
+                handled, selected = self._legacy_static_operand(node, index)
+                if isinstance(selected, str):
+                    sources.add(selected)
+                elif not handled:
+                    sources.update(self._active_spec_sources(spec, seen))
+            return sources.freeze()
+
+        if node.op == "SUBTOTAL":
+            # Nested subtotals are excluded by Excel. Their values and their
+            # dependency edges must both be excluded, or ignored totals can
+            # manufacture active cycles in the reconstruction proof.
+            specs = self._arg_specs(node)
+            sources = compact_graph.Builder(self._source_pool, self._active_spec_sources(specs[0], seen) if specs else ())
+            for index in range(1, len(specs)):
+                reference = self._reference_arg(node, index, read=False)
+                if reference.refs:
+                    sources.update(ref for ref in reference.refs
+                                   if not self._has_subtotal_provenance(ref))
+                else:
+                    sources.update(self._active_spec_sources(specs[index], seen))
+            return sources.freeze()
+
         if node.op in ("SUMIF", "SUMIFS"):
             return self._conditional_sources(node)
+        if node.op in {"HLOOKUP", "VLOOKUP"}:
+            plan = self._lookup_reference_plan(node)
+            if plan is not None:
+                return set(plan[1])
+            # Do not reuse a selection from older key/index/mode values.
+            self._selective_sources.pop(node.id, None)
         if node.op in (
             "VLOOKUP", "HLOOKUP", "XLOOKUP", "_XLFN.XLOOKUP",
             "LOOKUP", "MATCH", "INDEX",
@@ -2854,13 +3496,13 @@ class Evaluator:
             if isinstance(self._arg(node, 0), ExcelError) and len(specs) > 1:
                 indices.append(1)
 
-        sources = set()
+        sources = compact_graph.Builder(self._source_pool)
         for index in indices:
             if index >= len(specs):
                 continue
             kind, payload = specs[index]
             if kind == "span":
-                sources.update(payload)
+                sources.update(self._source_pool.sources(payload))
             elif kind == "scalar":
                 sources.update(self._active_node_sources(payload, seen))
             elif kind == "many":
@@ -2881,8 +3523,8 @@ class Evaluator:
             and self.optimize
             and self._source_walk_purity_cache.get(node_id) is True
         ):
-            self._static_source_cache[node_id] = frozenset(sources)
-        return sources
+            self._static_source_cache[node_id] = sources.freeze()
+        return sources.freeze()
 
     def _source_walk_is_pure(self, node_id, visiting=None):
         """Prove that an AST subtree's active sources cannot depend on values."""
@@ -2918,20 +3560,16 @@ class Evaluator:
         """Build source-to-consumer edges after pruning inactive formula branches."""
         started = time.perf_counter()
         cell_count = 0
-        adj: dict[str, set] = {}
-        radj: dict[str, set] = {}
+        radj = {}
         try:
             for target in cells:
                 cell_count += 1
                 root = self.graph.root_of(target)
                 if root is None:
                     continue
-                radj[target] = set()
                 self._current_cell = target
-                for source in self._active_node_sources(root):
-                    adj.setdefault(source, set()).add(target)
-                    radj.setdefault(target, set()).add(source)
-            return adj, radj
+                radj[target] = self._source_pool.sources(self._active_node_sources(root))
+            return compact_graph.transpose(radj, self._source_pool), compact_graph.Rows(radj)
         finally:
             metric = self._benchmark["active_graph"]
             metric["calls"] += 1
@@ -2958,31 +3596,19 @@ class Evaluator:
                 metric["seconds"] += time.perf_counter() - started
                 return cached
             metric["cache_misses"] += 1
-        ordered_adj = {
-            source: tuple(sorted(targets, key=self._cell_key))
-            for source, targets in active_adj.items()
-        }
+        ordered_adj = compact_graph.OrderedRows(active_adj, self._cell_key)
         groups = strongly_connected(ordered_cells, ordered_adj)
         groups = [tuple(sorted(group, key=self._cell_key)) for group in groups]
         groups.sort(key=lambda group: self._cell_key(group[0]))
         comp_of = {
             cell: index for index, group in enumerate(groups) for cell in group
         }
-        comp_adj = {index: set() for index in range(len(groups))}
-        indegree = {index: 0 for index in range(len(groups))}
-        for source, targets in active_adj.items():
-            source_comp = comp_of.get(source)
-            for target in targets:
-                target_comp = comp_of.get(target)
-                if (
-                    source_comp is None
-                    or target_comp is None
-                    or source_comp == target_comp
-                    or target_comp in comp_adj[source_comp]
-                ):
-                    continue
-                comp_adj[source_comp].add(target_comp)
-                indegree[target_comp] += 1
+        comp_adj, indegree = compact_graph.components(
+            active_adj, comp_of, len(groups), self._source_pool
+        )
+        ordered_components = compact_graph.OrderedRows(
+            comp_adj, lambda item: self._cell_key(groups[item][0])
+        )
         ready = []
         for index, count in indegree.items():
             if count == 0:
@@ -2991,10 +3617,7 @@ class Evaluator:
         while ready:
             _, index = heappop(ready)
             topo.append(index)
-            for target in sorted(
-                comp_adj[index],
-                key=lambda item: self._cell_key(groups[item][0]),
-            ):
+            for target in ordered_components[index]:
                 indegree[target] -= 1
                 if indegree[target] == 0:
                     heappush(
@@ -3013,14 +3636,142 @@ class Evaluator:
         metric["seconds"] += time.perf_counter() - started
         return result
 
-    def _evaluate_acyclic(self, groups, topo, cyclic, evaluable, seeded):
+    def _cycle_independent_values(self, cells, seeded):
+        """Prove closed static formulas depend only on fixed supplied inputs.
+
+        Reuse is local to the workbook-iteration phase after initial topology
+        stabilization. It uses reconstructed evaluator values, never caches
+        from the original workbook. Unknown/dynamic/array expressions decline.
+        """
+        if not self.optimize or not self.strict_proof or self.oracle is not None:
+            return frozenset()
+        allowed = frozenset({
+            "+", "-", "*", "/", "^", "&", "u+", "u-", "%",
+            "=", "<>", ">", "<", ">=", "<=", "SUM", "AVERAGE",
+            "MIN", "MAX", "ABS", "ROUND", "ROUNDUP", "ROUNDDOWN",
+            "DATE", "EDATE", "EOMONTH", "YEAR", "MONTH", "DAY",
+            "IFERROR", "SUMIFS",
+        })
+        scope = set(cells)
+        memo = {}
+        visiting = set()
+        walked = [0]
+
+        def rectangle(spec):
+            kind, payload = spec
+            if kind == "span":
+                refs = payload
+            elif kind == "scalar":
+                node = self.graph.nodes.get(payload)
+                if node is None or node.range_truncated:
+                    return None
+                if node.is_cell:
+                    refs = (node.id,)
+                elif node.kind == "range":
+                    match = re.fullmatch(
+                        r"\$?([A-Za-z]{1,3})\$?([1-9][0-9]*)(?::\$?([A-Za-z]{1,3})\$?([1-9][0-9]*))?",
+                        node.coordinate or "")
+                    if match is None:
+                        return None
+                    c0, r0 = col_number(match[1]), int(match[2])
+                    c1, r1 = col_number(match[3] or match[1]), int(match[4] or match[2])
+                    if (not 1 <= r0 <= r1 <= 1048576 or not 1 <= c0 <= c1 <= 16384
+                            or (r1-r0+1)*(c1-c0+1) > 10000):
+                        return None
+                    refs = tuple(a1(node.sheet, r, c) for r in range(r0,r1+1)
+                                 for c in range(c0,c1+1))
+                else:
+                    return None
+            else:
+                return None
+            if not refs or len(refs) > 10000:
+                return None
+            coordinates = [split_ref(ref) for ref in refs]
+            if any(x is None or not 1 <= x[1] <= 1048576 or not 1 <= x[2] <= 16384
+                   for x in coordinates):
+                return None
+            sheet, top, left = coordinates[0]
+            rows = len({x[1] for x in coordinates})
+            cols = len({x[2] for x in coordinates})
+            if list(refs) != [a1(sheet,top+r,left+c) for r in range(rows) for c in range(cols)]:
+                return None
+            return tuple(refs), rows, cols
+
+        def spec_safe(spec):
+            kind, payload = spec
+            if kind == "none":
+                return True
+            if kind == "span":
+                layout = rectangle(spec)
+                return layout is not None and all(visit(ref) for ref in layout[0])
+            if kind == "scalar":
+                return visit(payload)
+            return False
+
+        def visit(node_id):
+            if node_id in memo:
+                return memo[node_id]
+            if node_id in visiting or len(visiting) >= 128 or walked[0] >= 50000:
+                return False
+            walked[0] += 1
+            node = self.graph.nodes.get(node_id)
+            if node is None:
+                # A named absent static cell is a blank in strict proof mode;
+                # unknown AST identifiers are not assumed to be blank cells.
+                ref = split_ref(node_id)
+                return bool(ref and 1 <= ref[1] <= 1048576 and 1 <= ref[2] <= 16384)
+            if node.range_truncated:
+                return False
+            visiting.add(node_id)
+            try:
+                if node.is_cell:
+                    if node.id not in scope:
+                        safe = False
+                    elif node.kind in {"input", "label"}:
+                        safe = node.id in seeded
+                    elif (node.kind != "formula" or any(getattr(node, key, False)
+                            for key in ("array_formula", "array_anchor", "array_ref", "array_span"))):
+                        safe = False
+                    else:
+                        root = self.graph.root_of(node.id)
+                        safe = root is not None and visit(root)
+                elif node.kind == "const":
+                    safe = True
+                elif node.kind == "range":
+                    layout = rectangle(("scalar", node.id))
+                    safe = layout is not None and all(visit(ref) for ref in layout[0])
+                elif node.kind == "op" and node.op in allowed:
+                    specs = self._arg_specs(node)
+                    safe = True
+                    if node.op == "SUMIFS":
+                        # Prove the complete static sum/criterion rectangles,
+                        # including unselected summands and selector inputs.
+                        layouts = [rectangle(specs[i]) for i in [0,*range(1,len(specs),2)]] if specs else []
+                        safe = (len(specs) >= 3 and len(specs)%2 == 1
+                                and all(layout is not None for layout in layouts)
+                                and all(layout[1:] == layouts[0][1:] for layout in layouts))
+                    safe = safe and all(spec_safe(spec) for spec in specs)
+                else:
+                    safe = False
+            finally:
+                visiting.remove(node_id)
+            memo[node_id] = safe
+            return safe
+
+        return frozenset(cell for cell in cells
+            if self.graph.nodes[cell].kind == "formula" and cell not in seeded
+            and type(self.values.get(cell)) in (bool, int, float, str)
+            and not (isinstance(self.values.get(cell), float) and not math.isfinite(self.values[cell]))
+            and visit(cell))
+
+    def _evaluate_acyclic(self, groups, topo, cyclic, evaluable, seeded, reusable=frozenset()):
         started = time.perf_counter()
         try:
             for index in topo:
                 if index in cyclic:
                     continue
                 for cell in groups[index]:
-                    if cell in evaluable and cell not in seeded:
+                    if cell in evaluable and cell not in seeded and cell not in reusable:
                         self.values[cell] = self._eval_cell(cell)
         finally:
             metric = self._benchmark["acyclic_evaluation"]
@@ -3029,11 +3780,7 @@ class Evaluator:
 
     @staticmethod
     def _graph_signature(active_adj):
-        return tuple(sorted(
-            (source, target)
-            for source, targets in active_adj.items()
-            for target in targets
-        ))
+        return compact_graph.Signature(active_adj)
 
     def _target_signature(self):
         return tuple(
@@ -3110,14 +3857,10 @@ class Evaluator:
         active_adj, active_radj = checker._active_graph(self.cg.info)
         del active_adj
 
-        expected_equations = {
-            cell: tuple(sorted(self._proof_active_radj.get(cell, ())))
-            for cell in members
-        }
-        actual_equations = {
-            cell: tuple(sorted(active_radj.get(cell, ())))
-            for cell in members
-        }
+        expected_equations, actual_equations = compact_graph.endpoint_equations(
+            {cell: self._proof_active_radj.get(cell, ()) for cell in members},
+            {cell: active_radj.get(cell, ()) for cell in members},
+        )
         if actual_equations != expected_equations:
             return {
                 "safe": False,
@@ -3203,6 +3946,9 @@ class Evaluator:
                 "reason": "non_numeric_affine_endpoint",
             }
         branch_guards = []
+        constant_error_branches = []
+        equation_condition_proofs = []
+        equation_inline_mode = False
         unsupported_nodes = []
 
         def reject(node_id, reason):
@@ -3241,7 +3987,45 @@ class Evaluator:
             )
 
         def is_constant(value):
+            if equation_inline_mode:
+                return all(coefficient == 0.0 for coefficient in value[0]) and all(bound == 0.0 for bound in value[2])
             return all(abs(coefficient) <= CONVERGENCE for coefficient in value[0])
+
+        def equation_constant(value, seen):
+            """Unfold finitely many member equations, never a circular assumption.
+
+            Used only for a selector on an exact fixed-point constraint such as
+            a fully repaid balance. Each chosen piecewise branch still adds its
+            independent guard. No approximate-zero coefficient becomes zero.
+            """
+            nonlocal equation_inline_mode
+            original_mode = equation_inline_mode
+            equation_inline_mode = True
+            expanded = []
+            try:
+                while True:
+                    if any(bound != abs(coefficient) for bound, coefficient in zip(value[2], value[0])):
+                        return None
+                    remaining = [index for index, coefficient in enumerate(value[0]) if coefficient != 0.0]
+                    if not remaining:
+                        return value, expanded
+                    index = remaining[0]
+                    member = members[index]
+                    if member in expanded or len(expanded) >= dimension:
+                        return None
+                    root = self.graph.root_of(member)
+                    if root is None:
+                        return None
+                    replacement = derive(root, seen | set(expanded))
+                    if replacement is None:
+                        return None
+                    expanded.append(member)
+                    factor = value[0][index]
+                    coefficients = list(value[0]); coefficients[index] = 0.0
+                    remainder = (coefficients, value[1], [abs(c) for c in coefficients])
+                    value = combine(remainder, scale(replacement, factor))
+            finally:
+                equation_inline_mode = original_mode
 
         def derive_spec(spec, seen, *, sum_blank_as_zero=False):
             kind, payload = spec
@@ -3278,6 +4062,21 @@ class Evaluator:
         def derive_condition(spec, seen):
             kind, payload = spec
             node = self.graph.nodes.get(payload) if kind == "scalar" else None
+            if node is not None and node.kind == "op" and node.op in {"AND", "OR", "NOT"}:
+                if node.id in seen:
+                    return None
+                arguments = self._arg_specs(node)
+                if not arguments or (node.op == "NOT" and len(arguments) != 1):
+                    return None
+                conditions = [derive_condition(arg, seen | {node.id}) for arg in arguments]
+                # Excel evaluates all Boolean arguments. An error, unknown
+                # scalar, or unguarded branch cannot be hidden by another arg.
+                if any(value is None for value in conditions):
+                    return None
+                selected = (all(conditions) if node.op == "AND" else
+                            any(conditions) if node.op == "OR" else not conditions[0])
+                actual = self._eval_node(node.id)
+                return selected if not is_bad(actual) and truthy(actual) == selected else None
             if node is not None and node.kind == "op" and node.op in {
                 "=", "<>", "<", "<=", ">", ">=",
             }:
@@ -3304,15 +4103,74 @@ class Evaluator:
                     abs(left[0][index] - right[0][index])
                     for index in range(dimension)
                 )
-                if gap <= CONVERGENCE and sensitivity > CONVERGENCE:
-                    return None
-                if sensitivity > CONVERGENCE:
+                threshold = 0.0 if equation_inline_mode else CONVERGENCE
+                if gap <= CONVERGENCE and sensitivity > threshold:
+                    if equation_inline_mode:
+                        return None
+                    start_guards, start_errors = len(branch_guards), len(unsupported_nodes)
+                    expanded_left = equation_constant(left, seen | {node.id})
+                    expanded_right = equation_constant(right, seen | {node.id})
+                    if expanded_left is None or expanded_right is None:
+                        del branch_guards[start_guards:]
+                        del unsupported_nodes[start_errors:]
+                        return None
+                    lvalue, lmembers = expanded_left
+                    rvalue, rmembers = expanded_right
+                    a, b = lvalue[1], rvalue[1]
+                    condition = {"=": a == b, "<>": a != b, "<": a < b,
+                                 "<=": a <= b, ">": a > b, ">=": a >= b}[node.op]
+                    if condition != truthy(self._eval_node(node.id)):
+                        # A proof about an equilibrium cannot select another
+                        # branch than the actual native finite-stop endpoint.
+                        del branch_guards[start_guards:]
+                        del unsupported_nodes[start_errors:]
+                        return None
+                    equation_condition_proofs.append({
+                        "node": node.id, "operator": node.op,
+                        "members": sorted(set(lmembers + rmembers)),
+                        "left_constant": a, "right_constant": b,
+                        "selected": condition,
+                    })
+                    return condition
+                if sensitivity > threshold:
                     branch_guards.append((left, right, gap))
                 return truthy(self._eval_node(node.id))
             values = derive_spec(spec, seen)
             if values is None or len(values) != 1 or not is_constant(values[0]):
                 return None
             return truthy(values[0][1])
+
+        def fixed_native_error(spec, seen):
+            """An explicit native error dominates supported scalar arithmetic.
+
+            Other operands must still have a valid affine derivation. A domain
+            error observed only at this endpoint, an unknown operation, or a
+            cycle-dependent division error is never a constant-error proof.
+            """
+            kind, node_id = spec
+            if kind != "scalar" or node_id in seen:
+                return None
+            node = self.graph.nodes.get(node_id)
+            if node is None or node.is_cell:
+                return None
+            if node.kind == "const" and node.op == "error":
+                value = node.value if node.value != "" else node.expr
+                return [node_id] if value in NATIVE_ERRORS else None
+            if node.kind != "op" or node.op not in {"+", "-", "*", "/", "^", "u+", "u-"}:
+                return None
+            specs = self._arg_specs(node)
+            expected = 1 if node.op in {"u+", "u-"} else 2
+            if len(specs) != expected or any(item[0] != "scalar" for item in specs):
+                return None
+            errors = [fixed_native_error(item, seen | {node_id}) for item in specs]
+            if not any(errors):
+                return None
+            for item, error in zip(specs, errors):
+                if error is None:
+                    value = derive_spec(item, seen | {node_id})
+                    if value is None or len(value) != 1:
+                        return None
+            return sorted({leaf for group in errors if group for leaf in group})
 
         def derive(node_id, seen):
             if node_id in seen:
@@ -3343,6 +4201,15 @@ class Evaluator:
             if node.kind != "op":
                 return reject(node_id, "unsupported_node_kind")
             specs = self._arg_specs(node)
+            if node.op == "IFERROR" and len(specs) == 2:
+                errors = fixed_native_error(specs[0], seen | {node_id})
+                if errors:
+                    fallback = derive_spec(specs[1], seen | {node_id})
+                    if fallback is not None and len(fallback) == 1:
+                        constant_error_branches.append({"node": node_id, "native_error_nodes": errors,
+                                                        "fallback_spec": specs[1]})
+                        return fallback[0]
+                    return reject(node_id, "unsupported_constant_error_fallback")
             if node.op == "IF" and len(specs) >= 2:
                 condition = derive_condition(specs[0], seen | {node_id})
                 if condition is None:
@@ -3564,6 +4431,15 @@ class Evaluator:
         # Banach's theorem gives a unique fixed point and the useful endpoint
         # error bound ||x-x*||∞ <= residual / (1-||A||∞).
         residual = self._equation_residual(members)[0]
+        if equation_condition_proofs and residual is not None:
+            # A constrained selector need not describe the map off its member
+            # equations. Bound distance using the selected affine system too,
+            # rather than borrowing only the original nonlinear-map residual.
+            affine_residual = max(abs(sum(matrix[row][col] * float(self.values[members[col]])
+                                             for col in range(dimension)) + constants[row]
+                                      - float(self.values[members[row]]))
+                                  for row in range(dimension))
+            residual = max(residual, affine_residual)
         endpoint_error_bound = (
             None
             if residual is None
@@ -3595,6 +4471,8 @@ class Evaluator:
             denominator = 1.0 - coefficient
             return {
                 "certified": True,
+                **({"constant_error_branches": constant_error_branches} if constant_error_branches else {}),
+                **({"equation_condition_proofs": equation_condition_proofs} if equation_condition_proofs else {}),
                 "kind": "scalar_affine",
                 "coefficient": coefficient,
                 "constant": constants[0],
@@ -3606,6 +4484,8 @@ class Evaluator:
             }
         return {
             "certified": True,
+                **({"constant_error_branches": constant_error_branches} if constant_error_branches else {}),
+                **({"equation_condition_proofs": equation_condition_proofs} if equation_condition_proofs else {}),
             "kind": "affine_system",
             "dimension": dimension,
             "contractive": True,
@@ -3646,7 +4526,7 @@ class Evaluator:
                     # evaluate its AST (or fail) instead of seeding that answer.
                     seed_categories["formula_cache_rejected"].add(cid)
                 if requested and info.node.kind in ("input", "label"):
-                    self.values[cid] = literal(info.node.value)
+                    self.values[cid] = primitive_value(info.node)
                     seed_categories["requested_frontier"].add(cid)
                     seed_categories[
                         "primitive_input" if info.node.kind == "input"
@@ -3658,7 +4538,7 @@ class Evaluator:
                     seed_categories["implicit_seed_rejected"].add(cid)
                 continue
             if requested or info.node.kind in ("input", "label") or info.is_literal:
-                self.values[cid] = literal(info.node.value)
+                self.values[cid] = primitive_value(info.node)
                 if requested:
                     seed_categories["requested_frontier"].add(cid)
                 if info.node.kind == "input":
@@ -3792,6 +4672,7 @@ class Evaluator:
         relevant_specs = [
             spec for spec in cycle_specs if spec["output_relevant"]
         ]
+        reusable_values = self._cycle_independent_values(cells, seeded) if iterate and relevant_specs else frozenset()
         workbook_iterations = 0
         if iterate and relevant_specs:
             for workbook_iteration in range(1, iteration_limit + 1):
@@ -3808,7 +4689,7 @@ class Evaluator:
                         )
                 # Recompute deterministic acyclic dependants between workbook
                 # iterations without granting any SCC an extra advance.
-                self._evaluate_acyclic(groups, topo, cyclic, evaluable, seeded)
+                self._evaluate_acyclic(groups, topo, cyclic, evaluable, seeded, reusable_values)
                 for spec in relevant_specs:
                     spec["history"].append(changes[spec["members"]])
                 if all(
@@ -3872,7 +4753,7 @@ class Evaluator:
                         self._value_change(before, after),
                     )
             self._evaluate_acyclic(
-                groups, topo, cyclic, evaluable, seeded
+                groups, topo, cyclic, evaluable, seeded, reusable_values
             )
             workbook_iterations += 1
             for spec in relevant_specs:
@@ -3914,6 +4795,8 @@ class Evaluator:
             pre_iteration_targets_stable and joint_targets_stable
         )
 
+        native_scalar_primitive_reads = {source: set(consumers)
+                                         for source, consumers in self.scalar_primitive_reads.items()}
         cycle_diagnostics = []
         diagnostics_by_members = {}
         for spec in cycle_specs:
@@ -3965,6 +4848,11 @@ class Evaluator:
                 and not unresolved_records
             )
             certification = self._affine_cycle_certificate(pending)
+            if not certification.get("certified") and len(pending) <= 128:
+                from .cycle_regimes import certify as certify_finite_regime
+                finite_regime = certify_finite_regime(self, pending)
+                if finite_regime.get("certified"):
+                    certification = finite_regime
             certified = bool(
                 certification.get("certified")
                 and certification.get("contractive")
@@ -4168,9 +5056,7 @@ class Evaluator:
         # Preserve the canonical proof endpoint before compatibility unresolved
         # markers are applied to disabled or demonstrated-non-unique cycles.
         self._proof_endpoint_values = dict(self.values)
-        self._proof_active_radj = {
-            target: set(sources) for target, sources in final_active_radj.items()
-        }
+        self._proof_active_radj = final_active_radj
         self._proof_resolved_targets = {
             target: set(sources)
             for target, sources in canonical_resolved_targets.items()
@@ -4256,9 +5142,7 @@ class Evaluator:
         # including runtime-resolved dynamic references (OFFSET targets) that
         # the static edge list cannot see. Verification walks the output cone
         # over these edges as well as the static ones.
-        runtime_radj = {
-            target: set(sources) for target, sources in final_active_radj.items()
-        }
+        runtime_radj = final_active_radj
         runtime_address_radj = {
             target: set(sources)
             for target, sources in self.runtime_address_radj.items()
@@ -4282,10 +5166,11 @@ class Evaluator:
                     self._resolved_operation_targets.items()
                 )
             },
-            oracle_reads=self.oracle_reads,
-            oracle_accesses=self.oracle_accesses,
-            read_attempts=self.read_attempts,
-            missing_reads=self.missing_reads,
+            oracle_reads=self.oracle_reads.snapshot(),
+            oracle_accesses=self.oracle_accesses.snapshot(),
+            read_attempts=self.read_attempts.snapshot(),
+            scalar_primitive_reads=native_scalar_primitive_reads,
+            missing_reads=self.missing_reads.snapshot(),
             seed_provenance={
                 "effective": {
                     "count": len(seeded),
@@ -4394,7 +5279,11 @@ class Evaluator:
                 if getattr(node, "array_span", ""):
                     return self._array_element(node, value)
                 return value[0] if value else None
-            return value
+            # A blank reference becomes numeric zero only when Excel stores
+            # the scalar formula result. Keep primitive/range blanks as None
+            # so INDEX reference contexts and aggregations retain their semantics.
+            # Unresolved precedents, errors, and explicit empty strings survive.
+            return 0.0 if value is None else value
         if info.empty_ref:
             return 0.0
         return Unresolved("no-ast-root")
@@ -4582,6 +5471,67 @@ def workbook_calculation_metadata(path) -> CalculationMetadata:
     )
 
 
+class CachedEmptyString(str):
+    """Comparison-only evidence for an explicitly cached empty formula string."""
+
+    def __new__(cls):
+        return super().__new__(cls, "")
+
+
+def _empty_string_formula_caches(path):
+    # openpyxl maps both absent <v> and t="str"/<v/> to None. Preserve only
+    # the latter, which source health already recognizes as a populated cache.
+    # This reader is never installed in the reconstruction evaluator.
+    import posixpath
+
+    main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel = "http://schemas.openxmlformats.org/package/2006/relationships"
+    office = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    result = {}
+    with zipfile.ZipFile(path) as archive:
+        workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        relationships = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        targets = {}
+        for record in relationships.findall(f"{{{rel}}}Relationship"):
+            identity = record.get("Id")
+            if identity in targets:
+                raise ValueError("duplicate worksheet relationship identity")
+            targets[identity] = record
+        parts = set()
+        for sheet in workbook.findall(f"{{{main}}}sheets/{{{main}}}sheet"):
+            name = sheet.get("name")
+            record = targets.get(sheet.get(f"{{{office}}}id"))
+            if record is None or record.get("TargetMode", "Internal") != "Internal":
+                raise ValueError("missing or external worksheet relationship")
+            if record.get("Type") != office + "/worksheet":
+                continue  # Chartsheets have no cell caches.
+            target = record.get("Target", "")
+            part = posixpath.normpath(target.lstrip("/") if target.startswith("/") else "xl/" + target)
+            if not target or part.startswith("../") or part == ".." or name in result or part in parts:
+                raise ValueError("ambiguous worksheet cache identity")
+            parts.add(part)
+            empty = set()
+            seen = set()
+            with archive.open(part) as stream:
+                for _, cell in ElementTree.iterparse(stream, events=("end",)):
+                    if cell.tag != f"{{{main}}}c":
+                        continue
+                    coordinate = cell.get("r", "")
+                    if coordinate in seen:
+                        raise ValueError("duplicate worksheet cache coordinate")
+                    seen.add(coordinate)
+                    values = cell.findall(f"{{{main}}}v")
+                    formulas = cell.findall(f"{{{main}}}f")
+                    match = A1_RE.fullmatch(coordinate)
+                    if (match and cell.get("t") == "str" and len(formulas) == 1
+                            and len(values) == 1 and values[0].text in (None, "")
+                            and not len(values[0])):
+                        empty.add((int(match.group(2)), col_number(match.group(1))))
+                    cell.clear()
+            result[name] = empty
+    return result
+
+
 class ExpectedValueCache:
     """Comparison-only workbook cache with explicit read provenance."""
 
@@ -4590,6 +5540,7 @@ class ExpectedValueCache:
         self.book = book
         self.cache: dict = {}
         self.reads: dict = {}
+        self.empty_string_caches = None
 
     def __call__(self, sheet, row, col):
         cid = a1(sheet, row, col)
@@ -4605,6 +5556,11 @@ class ExpectedValueCache:
                             grid[(cell.row, cell.column)] = cell.value
                 self.cache[sheet] = grid
         value = self.cache[sheet].get((row, col))
+        if value is None:
+            if self.empty_string_caches is None:
+                self.empty_string_caches = _empty_string_formula_caches(self.path)
+            if (row, col) in self.empty_string_caches.get(sheet, ()):
+                return CachedEmptyString()
         if isinstance(value, datetime):
             return _datetime_to_serial(value)
         return value
@@ -4642,6 +5598,8 @@ def compare(expected: str, actual, tolerance=1e-6):
     """Relative comparison against the workbook's cached value."""
     if isinstance(actual, Unresolved):
         return "unresolved", None
+    if isinstance(expected, CachedEmptyString):
+        return ("match" if isinstance(actual, str) and actual == "" else "mismatch"), None
     want = literal(expected)
     if want is None:
         # The workbook cached no value, so there is no ground truth to compare

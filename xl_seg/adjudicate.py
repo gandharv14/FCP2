@@ -115,8 +115,8 @@ def adjudicate(wb: str, candidates, api_key: str, model=DEFAULT_MODEL, timeout=1
                 "content-type": "application/json",
             },
         )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    from xl_transport import read_response
+    payload = json.loads(read_response(request, timeout=timeout).decode("utf-8"))
     if proxy:
         text = "".join(
             choice.get("message", {}).get("content") or ""

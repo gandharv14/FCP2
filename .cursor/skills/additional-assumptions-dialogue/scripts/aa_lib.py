@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import json
 import json
 import re
 from pathlib import Path
@@ -123,6 +125,17 @@ def taxonomy_from_task_toml(task_dir: Path) -> str:
 
 def clean_label(raw: str) -> str:
     text = str(raw or "").strip()
+    # Disclosure labels use a matched outer string delimiter. Strip that pair
+    # once; stripping every quote character truncates labels ending in a quote.
+    candidate = re.sub(r"^Row labelled\s+", "", text, flags=re.I)
+    if len(candidate) >= 2 and candidate[0] in "\"'" and candidate[-1] == candidate[0]:
+        try:
+            decoded = ast.literal_eval(candidate)
+        except (ValueError, SyntaxError):
+            pass
+        else:
+            if isinstance(decoded, str):
+                return decoded.strip()
     text = text.strip("\"'")
     text = re.sub(r"^Row labelled\s+", "", text, flags=re.I)
     text = text.strip("\"'")
@@ -180,8 +193,39 @@ def _stem(token: str) -> str:
 
 
 def clause_covered(clause: str, haystack: str) -> bool:
+    literal_prefix = "the text literal "
+    if clause.startswith(literal_prefix):
+        # Formula string operands may be short, case-sensitive, or contain
+        # significant whitespace. Token stemming/casefolding is not proof.
+        try:
+            expected = json.loads(clause[len(literal_prefix):])
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(expected, str):
+            return False
+        for match in re.finditer(r'"(?:[^"\\]|\\.)*"', haystack):
+            # Same-spelling quoted names/rows/sheets are not occurrences of a
+            # formula string operand. The mandatory atom explicitly supplies
+            # this type to the writer, so require an explicit type in prose.
+            if not re.search(r"\b(?:text|literal|string)\s*$", haystack[:match.start()], re.I):
+                continue
+            try:
+                if json.loads(match.group()) == expected:
+                    return True
+            except ValueError:
+                continue
+        return False
+    # Row labels may contain actual newlines in the workbook and JSON-escaped
+    # newlines in mandatory atoms. Whitespace layout is not a new row identity.
+    if clause.startswith('the row labelled '):
+        try:
+            label=json.loads(clause[len('the row labelled '):])
+            if isinstance(label,str):clause='the row labelled '+label
+        except (ValueError,TypeError):pass
     needle = normalize(clause)
     blob = normalize(haystack)
+    if needle=='plus' and re.search(r"\b(?:add|adding|sum)\b",blob):
+        return True
     if not needle:
         return True
     if needle in blob:
@@ -237,14 +281,22 @@ def strip_heading_block(text: str, heading: str) -> str:
 
 
 def parse_turns(dialogue: str) -> list[dict]:
-    lines = (dialogue or "").splitlines()
+    # Tokenize complete comments before physical lines, so a workbook row label
+    # containing a newline remains the same exact claim identity.
+    text=dialogue or ""
+    lines=[];cursor=0
+    for match in re.finditer(r"<!--[\s\S]*?-->",text):
+        lines.extend(text[cursor:match.start()].splitlines())
+        if CLAIM_COMMENT_RE.fullmatch(match.group(0)):lines.append(match.group(0))
+        cursor=match.end()
+    lines.extend(text[cursor:].splitlines())
     turns = []
     current = None
-    pending_claim = None
+    pending_claims = []
     for line in lines:
         comment = CLAIM_COMMENT_RE.search(line)
         if comment:
-            pending_claim = comment.group(1).strip()
+            pending_claims.append(comment.group(1).strip())
         stripped = CLAIM_COMMENT_RE.sub("", line).rstrip()
         match = SPEAKER_PREFIX_RE.match(stripped)
         if match:
@@ -262,10 +314,11 @@ def parse_turns(dialogue: str) -> list[dict]:
             current = {
                 "speaker": speaker,
                 "text": match.group(2).strip(),
-                "record_id": pending_claim,
+                "record_id": pending_claims[0] if pending_claims else None,
+                "record_ids": list(pending_claims),
                 "allowed": speaker in ALLOWED_TITLES,
             }
-            pending_claim = None
+            pending_claims = []
             continue
         if current:
             extra = stripped.strip()
@@ -298,3 +351,11 @@ def artifact_name(task_dir: Path) -> str:
     if len(books) != 1:
         raise ValueError("expected exactly one workbook in environment/")
     return books[0].name
+
+
+def junior_scope_text(claim: dict) -> str:
+    """Exact disclosed cell geometry for a junior's contextual question."""
+    cells = claim.get('junior_scope') or []
+    if not isinstance(cells, list) or any(not isinstance(ref, str) for ref in cells):
+        raise ValueError('invalid junior cell scope')
+    return 'For ' + ', '.join('`' + ref + '`' for ref in cells) if cells else ''

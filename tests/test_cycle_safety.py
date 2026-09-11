@@ -410,7 +410,8 @@ def test_sum_range_formula_returning_blank_is_zero_for_cycle_certificate():
     ).run({blank_input.id})
 
     diagnostic = result.iterated[0]
-    assert result.values[blank_formula.id] is None
+    assert result.values[blank_input.id] is None
+    assert result.values[blank_formula.id] == 0
     assert diagnostic["converged"] is True
     assert diagnostic["certified"] is True
     assert diagnostic["certification"]["coefficient"] == 0.5

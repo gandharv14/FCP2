@@ -85,6 +85,53 @@ def test_subtotal_excludes_nested_subtotal_lineage_but_sum_does_not(tmp_path):
     assert result.values["Totals!A7"] == 90
 
 
+def test_ignored_subtotals_do_not_create_active_cycles(tmp_path):
+    path = tmp_path / "nested-cycle.xlsx"
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.title = "S"
+    sheet["A1"] = 5
+    sheet["B1"] = "=SUBTOTAL(9,A1,C1)"
+    sheet["C1"] = "=SUBTOTAL(9,B1)"
+    book.save(path)
+    book.close()
+    _, result, inputs, proof = _strict_evaluate(path, {"S!B1"})
+    assert result.values["S!B1"] == 5
+    assert inputs == {"S!A1"}
+    assert proof["runtime_radj"]["S!B1"] == ["S!A1"]
+    assert "S!C1" not in result.read_attempts
+
+
+def test_cross_sheet_links_to_subtotals_are_not_nested_subtotal_expressions(tmp_path):
+    path = tmp_path / "subtotal-links.xlsx"
+    book = openpyxl.Workbook()
+    costs = book.active
+    costs.title = "Costs"
+    costs["A1"] = 5
+    costs["A2"] = "=SUBTOTAL(9,A1)"
+    summary = book.create_sheet("Summary")
+    summary["A1"] = "=Costs!A2"
+    summary["A2"] = "=SUBTOTAL(9,A1)"
+    book.save(path)
+    book.close()
+    _, result, _, _ = _strict_evaluate(path, {"Summary!A2"})
+    assert result.values["Summary!A2"] == 5
+
+
+def test_ordinary_sum_cycle_remains_unresolved(tmp_path):
+    path = tmp_path / "sum-cycle.xlsx"
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.title = "S"
+    sheet["A1"] = 5
+    sheet["B1"] = "=SUM(A1,C1)"
+    sheet["C1"] = "=SUM(B1)"
+    book.save(path)
+    book.close()
+    _, result, _, _ = _strict_evaluate(path, {"S!B1"})
+    assert isinstance(result.values["S!B1"], Unresolved)
+
+
 def test_unary_plus_preserves_lookup_text_and_coerces_numeric_text(tmp_path):
     path = tmp_path / "unary.xlsx"
     book = openpyxl.Workbook()

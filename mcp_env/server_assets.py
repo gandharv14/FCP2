@@ -197,7 +197,7 @@ if __name__ == "__main__":
 SIDECAR_DOCKERFILE = """\
 FROM python:3.12-slim
 
-RUN pip install --no-cache-dir "fastmcp>=2.0"
+RUN pip install --no-cache-dir "fastmcp==2.14.7"
 
 WORKDIR /srv
 COPY server.py /srv/server.py

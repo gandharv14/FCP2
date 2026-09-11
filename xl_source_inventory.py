@@ -248,7 +248,14 @@ def _validate_equivalence_certificate(
             "conversion equivalence certificate validation failed: "
             + ", ".join(sorted(set(failures)))
         )
-    return certificate
+    # v1 binds self-asserted metadata only. It does not independently parse
+    # binary-original semantics or verify an isolated trusted conversion receipt.
+    # Keep historical documents inspectable, but never let these flags grant
+    # conversion_equivalent until an executable trusted proof contract exists.
+    raise SourceInventoryError(
+        "legacy conversion equivalence proof is unsupported: independently "
+        "verified binary-to-OOXML semantics and a trusted receipt are required"
+    )
 
 
 def _conversion_record(
@@ -358,6 +365,54 @@ def _derived_workbook_record(
         "health_report": health,
         "conversion": conversion,
     }
+
+
+def transformed_workbook_record(workbook_id, original, candidate, curation, receipt):
+    """Observe a native OOXML candidate with independently revalidated lineage."""
+    original, candidate, curation = map(lambda p: Path(p).resolve(),
+                                        (original, candidate, curation))
+    record = _derived_workbook_record(workbook_id, candidate, candidate.parent, None)
+    record["transformation"] = {
+        "schema_version": "source-transformation-lineage/v1",
+        "original_source": _record(original, original.parent),
+        "original_path": str(original), "candidate_path": str(candidate),
+        "curation_path": str(curation), "receipt": receipt,
+        "receipt_sha256": _object_hash(receipt),
+    }
+    _validate_transformation(record)
+    return record
+
+
+def _validate_transformation(record):
+    lineage = record.get("transformation")
+    if lineage is None:
+        return
+    try:
+        if isinstance(lineage, dict) and lineage.get("schema_version") == "source-transformation-lineage/v2":
+            from xl_table_quarantine_inventory import validate_quarantine_transformation
+            validate_quarantine_transformation(record)
+            return
+        if (not isinstance(lineage, dict)
+                or lineage.get("schema_version") != "source-transformation-lineage/v1"
+                or record.get("conversion") is not None
+                or not _valid_file_record(lineage.get("original_source"))
+                or lineage.get("receipt_sha256") != _object_hash(lineage.get("receipt"))):
+            raise ValueError("invalid lineage contract")
+        original = Path(lineage["original_path"])
+        candidate = Path(lineage["candidate_path"])
+        curation = Path(lineage["curation_path"])
+        if (not all(path.is_absolute() for path in (original, candidate, curation))
+                or _record(original, original.parent) != lineage["original_source"]
+                or _record(candidate, candidate.parent) != {
+                    key: record[key] for key in ("path", "sha256", "size_bytes")}):
+            raise ValueError("lineage source bytes changed")
+        receipt = lineage["receipt"]
+        from xl_presentation_tables import POLICY, verify_materialization
+        if receipt.get("policy_version") != POLICY:
+            raise ValueError("unsupported transformation policy")
+        verify_materialization(original, candidate, curation, receipt)
+    except (KeyError, TypeError, OSError, ValueError) as exc:
+        raise SourceInventoryError(f"transformation lineage failed: {exc}") from exc
 
 
 def assemble_inventory_manifest(workbooks: list[dict]) -> dict:
@@ -577,6 +632,10 @@ def validate_inventory_manifest(
             failures.append(f"route:{workbook_id}")
 
         conversion = item.get("conversion")
+        try:
+            _validate_transformation(item)
+        except SourceInventoryError:
+            failures.append(f"transformation:{workbook_id}")
         expected_classification = "native_source"
         if conversion is not None:
             if not isinstance(conversion, dict):

@@ -9,6 +9,12 @@ cell, its formula, its recomputed value, and the cells it consumed.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping
+from functools import partial
+import hashlib
+import json
+from pathlib import Path
+import tempfile
 from dataclasses import dataclass, field
 
 from .condense import strongly_connected
@@ -39,6 +45,72 @@ class Trace:
     stats: dict
 
 
+class CellTraceStore:
+    """Private disposable spool; retain one decoded trace at a time."""
+
+    def __init__(self):
+        self._temporary = tempfile.TemporaryDirectory(prefix="xl-lineage-")
+        self.directory = Path(self._temporary.name)
+        self._records = {}
+        self._closed = False
+
+    def get(self, key, factory):
+        if self._closed:
+            raise ValueError("lineage trace store is closed")
+        record = self._records.get(key)
+        if record is None:
+            detail = factory()
+            path = self.directory / f"{len(self._records)}.json"
+            temporary = path.with_suffix(".tmp")
+            try:
+                with temporary.open("w", encoding="utf-8") as handle:
+                    json.dump(detail, handle)
+                content = temporary.read_bytes()
+                digest = hashlib.sha256(content).hexdigest()
+                temporary.replace(path)
+                self._records[key] = (path, digest)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return detail
+        path, digest = record
+        content = path.read_bytes()
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise ValueError("lineage trace spool changed")
+        return json.loads(content)
+
+    def close(self):
+        self._closed = True
+        self._temporary.cleanup()
+
+
+class CellTraces(Mapping):
+    def __init__(self, cells, store, factory):
+        self._cells = tuple(cells)
+        self._keys = set(self._cells)
+        self._store = store
+        self._factory = factory
+
+    def __len__(self):
+        return len(self._cells)
+
+    def __iter__(self):
+        return iter(self._cells)
+
+    def __getitem__(self, cell):
+        if cell not in self._keys:
+            raise KeyError(cell)
+        return self._store.get(cell, partial(self._factory, cell_id=cell))
+
+
+class Traces(list):
+    def __init__(self, traces, store):
+        super().__init__(traces)
+        self._store = store
+
+    def close(self):
+        self._store.close()
+
+
 def _restricted_topo(cone: set, adj: dict, radj: dict) -> list:
     indeg = {n: sum(1 for p in radj.get(n, ()) if p in cone) for n in cone}
     queue = deque(sorted(n for n, d in indeg.items() if d == 0))
@@ -52,7 +124,8 @@ def _restricted_topo(cone: set, adj: dict, radj: dict) -> list:
                 if indeg[succ] == 0:
                     queue.append(succ)
     # Anything left sits in a cycle the caller already contracted; append it.
-    order.extend(sorted(n for n in cone if n not in set(order)))
+    ordered = set(order)
+    order.extend(sorted(n for n in cone if n not in ordered))
     return order
 
 
@@ -239,45 +312,46 @@ def build(
         if (band := bg.of_cell.get(cell)) is not None
         if (comp := cd.comp_of.get(band)) is not None
     }
-    traces = []
-    for comp in outputs:
-        band_id = primary_band(cd, bg, comp)
-        band = bg.bands[band_id]
-        steps = band_trace(
-            bg,
-            cd,
-            part,
-            comp,
-            comp_adj=comp_adj,
-            comp_radj=comp_radj,
-            proof_input_comps=proof_input_comps,
-        )
-        cells = {}
-        for cid in band.cells:
-            cells[cid] = cell_trace(
-                cg,
-                values,
-                cid,
-                input_cells,
-                cell_limit,
-                adj=cell_adj,
-                radj=cell_radj,
+    # Freeze scalar proof results at the same point as the previous eager build.
+    # Graphs are immutable during emission; each cell's exact trace is computed
+    # once, then integrity-checked on subsequent Markdown/JSON reads.
+    store = CellTraceStore()
+    try:
+        factory = partial(cell_trace, cg=cg, values=dict(values),
+                          input_cells=set(input_cells), limit=cell_limit,
+                          adj=cell_adj, radj=cell_radj)
+        traces = []
+        for comp in outputs:
+            band_id = primary_band(cd, bg, comp)
+            band = bg.bands[band_id]
+            steps = band_trace(
+                bg,
+                cd,
+                part,
+                comp,
+                comp_adj=comp_adj,
+                comp_radj=comp_radj,
+                proof_input_comps=proof_input_comps,
             )
-        traces.append(
-            Trace(
-                output=band_id,
-                label=band.label,
-                sheet=band.sheet,
-                band_steps=steps,
-                cell_traces=cells,
-                stats={
-                    "band_steps": len(steps),
-                    "inputs_used": sum(1 for s in steps if s.bucket == INPUT),
-                    "middle_steps": sum(1 for s in steps if s.bucket == MIDDLE),
-                    "max_depth": max((s.depth for s in steps), default=0),
-                    "output_cells": len(cells),
-                },
+            cells = CellTraces(band.cells, store, factory)
+            traces.append(
+                Trace(
+                    output=band_id,
+                    label=band.label,
+                    sheet=band.sheet,
+                    band_steps=steps,
+                    cell_traces=cells,
+                    stats={
+                        "band_steps": len(steps),
+                        "inputs_used": sum(1 for s in steps if s.bucket == INPUT),
+                        "middle_steps": sum(1 for s in steps if s.bucket == MIDDLE),
+                        "max_depth": max((s.depth for s in steps), default=0),
+                        "output_cells": len(cells),
+                    },
+                )
             )
-        )
-    traces.sort(key=lambda t: -t.stats["band_steps"])
-    return traces
+        traces.sort(key=lambda t: -t.stats["band_steps"])
+        return Traces(traces, store)
+    except BaseException:
+        store.close()
+        raise

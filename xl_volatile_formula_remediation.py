@@ -41,7 +41,7 @@ from xl_source_health import (
 PLAN_SCHEMA = "volatile-formula-remediation-plan/v1"
 MANIFEST_SCHEMA = "volatile-formula-remediation-manifest/v1"
 INSTALL_SCHEMA = "volatile-formula-remediation-install/v1"
-TOOL_VERSION = "volatile-formula-remediation/v1"
+TOOL_VERSION = "volatile-formula-remediation/v3"
 MAX_ACTIONS = 100_000
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 DOC_REL_NS = (
@@ -277,11 +277,10 @@ def _static_cell_values(
             if record["formula"] is not None:
                 continue
             value_match = VALUE_TAG_RE.search(record["block"])
-            if value_match is None:
-                continue
-            value_element = ElementTree.fromstring(value_match.group(0))
-            value = value_element.text or ""
             cell_type = _attrs(record["open_tag"]).get("t")
+            if value_match is None and cell_type != "inlineStr":
+                continue
+            value = (ElementTree.fromstring(value_match.group(0)).text or "") if value_match else ""
             if cell_type == "s":
                 try:
                     value = shared_strings[int(value)]
@@ -430,8 +429,9 @@ def _defined_name_plan(
             location=f"DEFINED_NAME:{record['name']}",
         )
         restricted = any(event.get("allowed") is not True for event in events)
+        false_external = any(event.get("event") == "false_external_detection" for event in events)
         broken = "#REF!" in record["text"].upper()
-        if not (restricted or broken):
+        if not (restricted or broken or false_external):
             continue
         item = {
             "kind": "remove_dead_defined_name",
@@ -511,37 +511,58 @@ def _resolve_indirect(
 ) -> tuple[str, int]:
     substitutions = 0
 
-    def replace(match: re.Match) -> str:
+    def resolved(target):
         nonlocal substitutions
+        if "!" not in target:
+            target = "'" + sheet_name.replace("'", "''") + "'!" + target
+        target_match = A1_TARGET_RE.fullmatch(target)
+        if target_match is None or "[" in target or "]" in target:
+            raise RemediationError(f"INDIRECT target is not internal A1: {target!r}")
+        target_sheet = (
+            target_match.group("quoted").replace("''", "'")
+            if target_match.group("quoted") is not None
+            else target_match.group("plain")
+        )
+        if target_sheet not in sheet_names:
+            raise RemediationError(f"INDIRECT target sheet is missing: {target_sheet}")
+        addresses = []
+        for endpoint in target_match.group("address").split(":"):
+            column, row = coordinate_from_string(endpoint.replace("$", "").upper())
+            if not (1 <= column_index_from_string(column) <= 16_384 and 1 <= row <= 1_048_576):
+                raise RemediationError(f"INDIRECT target is out of bounds: {target!r}")
+            addresses.append(f"${column}${row}")
+        substitutions += 1
+        return "'" + target_sheet.replace("'", "''") + "'!" + ":".join(addresses)
+
+    def replace(match: re.Match) -> str:
         sheet_cell = match.group("sheet_cell").replace("$", "").upper()
         address_cell = match.group("address_cell").replace("$", "").upper()
         values = static_values.get(sheet_name, {})
         if sheet_cell not in values or address_cell not in values:
-            raise RemediationError(
-                f"INDIRECT operands are not static in {sheet_name}: "
-                f"{sheet_cell}, {address_cell}"
-            )
-        target = f"{values[sheet_cell]}!{values[address_cell]}"
-        target_match = A1_TARGET_RE.fullmatch(target)
-        if target_match is None:
-            raise RemediationError(f"INDIRECT target is not internal A1: {target!r}")
-        target_sheet = (
-            (target_match.group("quoted") or "").replace("''", "'")
-            if target_match.group("quoted") is not None
-            else (target_match.group("plain") or "")
-        )
-        if target_sheet not in sheet_names:
-            raise RemediationError(f"INDIRECT target sheet is missing: {target_sheet}")
-        address = target_match.group("address")
-        start = address.split(":", 1)[0].replace("$", "")
-        column, row = coordinate_from_string(start)
-        if not (1 <= column_index_from_string(column) <= 16_384 and 1 <= row <= 1_048_576):
-            raise RemediationError(f"INDIRECT target is out of bounds: {target!r}")
-        substitutions += 1
-        return f"'{target_sheet.replace(chr(39), chr(39) * 2)}'!{address}"
+            raise RemediationError(f"INDIRECT operands are not static in {sheet_name}: {sheet_cell}, {address_cell}")
+        return resolved(f"{values[sheet_cell]}!{values[address_cell]}")
 
-    rewritten = INDIRECT_RE.sub(replace, formula)
-    return rewritten, substitutions
+    rewritten = _sub_executable(INDIRECT_RE, replace, formula)
+    simple = re.compile(r'(?:_xlfn\.)?INDIRECT\s*\(\s*(?P<value>"(?:[^"]|"")*"|\$?[A-Z]{1,3}\$?[1-9][0-9]*)\s*(?:,\s*(?:TRUE|1)\s*)?\)', re.I)
+
+    def replace_simple(match):
+        value = match.group("value")
+        if value.startswith('"'):
+            target = value[1:-1].replace('""', '"')
+        else:
+            target = static_values.get(sheet_name, {}).get(value.replace("$", "").upper())
+        if not isinstance(target, str):
+            raise RemediationError("INDIRECT address is not a static text input")
+        return resolved(target)
+
+    return _sub_executable(simple, replace_simple, rewritten), substitutions
+
+
+def _sub_executable(pattern, replacement, formula):
+    """Never rewrite function-looking text inside Excel string literals."""
+    spans = [match.span() for match in re.finditer(r'"(?:[^"]|"")*"', formula)]
+    return pattern.sub(lambda m: m.group(0) if any(a <= m.start() < b for a, b in spans)
+                       else replacement(m), formula)
 
 
 def _rewrite_offset(formula: str) -> tuple[str, int]:
@@ -561,7 +582,7 @@ def _rewrite_offset(formula: str) -> tuple[str, int]:
             f"ROW({reference})+({rows}))"
         )
 
-    rewritten = OFFSET_BLANK_COLUMN_RE.sub(replace, formula)
+    rewritten = _sub_executable(OFFSET_BLANK_COLUMN_RE, replace, formula)
     return rewritten, substitutions
 
 
@@ -671,48 +692,14 @@ def build_plan(source_path: str | Path) -> dict:
             continue
 
         if TODAY_RE.fullmatch(raw_formula):
-            if record["attributes"].get("t") in {"shared", "array", "dataTable"}:
-                unresolved.append({
-                    "kind": "today_unresolved",
-                    "location": f"{sheet_name}!{coordinate}",
-                    "reason": "TODAY formula is not ordinary",
-                    "formula_sha256": sha256_bytes(raw_formula.encode("utf-8")),
-                })
-                continue
-            cell = _cell_blocks(sheet_xml[sheet_name])[coordinate]
-            if cell["value_xml"] is None:
-                unresolved.append({
-                    "kind": "today_unresolved",
-                    "location": f"{sheet_name}!{coordinate}",
-                    "reason": "TODAY formula has no cached as-of date",
-                    "formula_sha256": sha256_bytes(raw_formula.encode("utf-8")),
-                })
-                continue
-            if _cell_reference_used(
-                sheet_name,
-                coordinate,
-                key,
-                expanded,
-                defined_name_texts,
-                other_formulas,
-            ):
-                unresolved.append({
-                    "kind": "today_unresolved",
-                    "location": f"{sheet_name}!{coordinate}",
-                    "reason": "TODAY cell has live dependents",
-                    "formula_sha256": sha256_bytes(raw_formula.encode("utf-8")),
-                })
-                continue
-            actions.append({
-                "kind": "freeze_cached_today",
-                "rule_id": "unreferenced-today-to-as-of-constant/v1",
-                "part": part_by_sheet[sheet_name],
-                "sheet": sheet_name,
-                "coordinate": coordinate,
-                "raw_formula_sha256": sha256_bytes(raw_formula.encode("utf-8")),
-                "cached_value_sha256": sha256_bytes(
-                    cell["value_xml"].encode("utf-8")
-                ),
+            # A saved cache, even in an unused presentation cell, does not
+            # establish the workbook's intended valuation/as-of date. Keep this
+            # source blocked until independent, hash-bound date evidence exists.
+            unresolved.append({
+                "kind": "today_unresolved",
+                "location": f"{sheet_name}!{coordinate}",
+                "reason": "original as-of meaning is not independently established",
+                "formula_sha256": sha256_bytes(raw_formula.encode("utf-8")),
             })
             continue
 

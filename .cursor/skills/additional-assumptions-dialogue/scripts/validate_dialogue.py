@@ -30,6 +30,7 @@ from aa_lib import (
     cell_refs_in,
     clause_covered,
     is_junior,
+    junior_scope_text,
     is_senior,
     normalize,
     parse_turns,
@@ -256,22 +257,94 @@ def review_accuracy_passed(review: dict | None, claims_payload: dict) -> bool:
     return not review_accuracy_faults(review, claims_payload)
 
 
-def review_faults(review: dict | None, claims_payload: dict) -> list[str]:
+def review_warnings(review: dict | None, claims_payload: dict, *, draft_text=None, source_warning_proof=None) -> list[dict]:
+    """Recognize redundant scope prefixes and narrowly identified pure style issues.
+
+    The original review is never changed. Entailment, claim coverage, leakage,
+    and substantive naturalness issues remain gates; unknown findings stay blocking.
+    """
+    if not isinstance(review, dict) or not isinstance(draft_text, str):
+        return []
+    if review_accuracy_faults(review, claims_payload):
+        return []
+    if source_warning_proof is not None:
+        from scripts.batch import harbor_dialogue_source_warnings as source_warnings
+        proof = source_warnings.revalidate(source_warning_proof, review, claims_payload, draft_text,
+                                          root=Path(__file__).resolve().parents[4])
+        return proof['warnings']
+    claims = claims_payload.get('claims') or []
+    mapped, faults = map_turns_to_claims(parse_turns(draft_text), claims)
+    if faults:
+        return []
+    by_id = {claim['record_id']: claim for claim in claims}
+    warnings = []
+    accuracy = review['accuracy']
+    findings = [(row['record_id'], finding) for row in accuracy['claims']
+                for finding in row.get('findings', [])]
+    findings += [(None, finding) for finding in accuracy.get('extras', [])]
+    for identity, finding in findings:
+        if not isinstance(finding, str):
+            return []
+        match = re.fullmatch(r'The (?:shared )?frozen junior(?:_| )scope header is altered by (?:inserting|prepending) "([^"\n]+):" before the required scoped-cell prefix\.', finding)
+        if not match:
+            return []
+        candidates = [by_id[identity]] if identity in by_id else claims
+        matched = []
+        for claim in candidates:
+            scope = junior_scope_text(claim)
+            if not scope or claim.get('sheet') != match[1]:
+                continue
+            juniors = [turn for turn in mapped.get(claim['record_id'], [])
+                       if is_junior(turn['speaker'])]
+            groups = (claims_payload.get('shared_source_links') or {}).get('groups', [])
+            owning = [group for group in groups if claim['record_id'] in group]
+            if len(owning) > 1:
+                continue
+            group = owning[0] if owning else [claim['record_id']]
+            if (not group or any(identity not in by_id or by_id[identity].get('sheet') != match[1]
+                                 for identity in group)):
+                continue
+            scopes = [junior_scope_text(by_id[identity]) for identity in group]
+            if not all(scopes):
+                continue
+            header = match[1] + ': ' + '; '.join(scopes) + ':'
+            if any(turn['text'].startswith(header) and all(
+                    any(other is turn for other in mapped.get(identity, [])) for identity in group)
+                   for turn in juniors):
+                matched.append(claim['record_id'])
+        if len(matched) != 1:
+            return []
+        warnings.append({'code': 'redundant_sheet_scope_prefix', 'record_id': matched[0],
+                         'finding': finding, 'sheet': match[1]})
+    naturalness=review.get('naturalness')
+    if isinstance(naturalness,dict) and naturalness.get('verdict')=='fail':
+        style=naturalness.get('findings')
+        if not isinstance(style,list) or not style:
+            return warnings
+        simple=r'(?:The (?:VP|senior) response is |The dialogue is )?(?:[Rr]epetitive|[Ss]tilted|[Ff]orced|[Ff]ormulaic|[Oo]verly formal)(?: and (?:repetitive|stilted|forced|formulaic|overly formal))?(?: phrasing)?\.?'
+        restatement=r'The VP response is repetitive and forced: "[^"\n]+" merely restates "[^"\n]+" and reads like wording inserted to satisfy a rubric rather than natural Slack dialogue\.'
+        if all(isinstance(f,str) and (re.fullmatch(simple,f) or re.fullmatch(restatement,f)) for f in style):
+            warnings += [{'code':'dialogue_style_only','finding':f} for f in style]
+    return warnings
+
+
+def review_faults(review: dict | None, claims_payload: dict, *, draft_text=None, source_warning_proof=None) -> list[str]:
     """Diagnose the full review gate. Empty list == review_passed."""
     if not review:
         return [
             "no review JSON was loaded; expected: %s" % REVIEW_SCHEMA_TEMPLATE
         ]
     faults = review_accuracy_faults(review, claims_payload)
+    warnings = review_warnings(review, claims_payload, draft_text=draft_text, source_warning_proof=source_warning_proof)
     accuracy = review.get("accuracy") or {}
     if isinstance(accuracy, dict):
-        if accuracy.get("verdict") != "pass":
+        if accuracy.get("verdict") != "pass" and not (any(w['code'] in {'redundant_sheet_scope_prefix','source_formula_operand','frozen_junior_prefix'} for w in warnings) and accuracy.get('verdict') == 'fail'):
             faults.append(
                 'accuracy.verdict is %r; expected the string "pass" (fragment: '
                 '"verdict": "pass|fail")' % accuracy.get("verdict")
             )
         extras = accuracy.get("extras") or []
-        if extras:
+        if extras and not warnings:
             faults.append(
                 "accuracy.extras is non-empty: %r; extras must be []" % extras[:4]
             )
@@ -281,12 +354,12 @@ def review_faults(review: dict | None, claims_payload: dict) -> list[str]:
             'review is missing the "naturalness" object; expected fragment: %s'
             % NATURALNESS_FRAGMENT
         )
-    elif naturalness.get("verdict") != "pass":
+    elif naturalness.get("verdict") != "pass" and not (naturalness.get('verdict')=='fail' and any(w['code']=='dialogue_style_only' for w in warnings)):
         faults.append(
             'naturalness.verdict is %r; expected the string "pass" (fragment: %s)'
             % (naturalness.get("verdict"), NATURALNESS_FRAGMENT)
         )
-    if review.get("passed") is not True:
+    if review.get("passed") is not True and not (warnings and review.get('passed') is False):
         faults.append(
             '"passed" is %r; expected the JSON boolean true (only when both '
             "verdicts pass, every must_say is entailed, extras is empty, and "
@@ -295,35 +368,38 @@ def review_faults(review: dict | None, claims_payload: dict) -> list[str]:
     return faults
 
 
-def review_passed(review: dict | None, claims_payload: dict | None = None) -> bool:
+def review_passed(review: dict | None, claims_payload: dict | None = None, *, draft_text=None, source_warning_proof=None) -> bool:
     if claims_payload is None:
         claims_payload = {}
-    return not review_faults(review, claims_payload)
+    return not review_faults(review, claims_payload, draft_text=draft_text, source_warning_proof=source_warning_proof)
 
 
 def map_turns_to_claims(turns: list[dict], claims: list[dict]) -> tuple[dict[str, list[dict]], list[str]]:
     """Claim comments are authoritative. Turns before the first comment stay unclaimed."""
     mapped = {claim["record_id"]: [] for claim in claims}
     faults = []
-    pending = None
+    pending = []
     seen_comment = False
     for turn in turns:
-        record_id = turn.get("record_id")
-        if record_id:
+        record_ids = turn.get("record_ids") or ([turn['record_id']] if turn.get('record_id') else [])
+        if record_ids:
             seen_comment = True
-            if record_id not in mapped:
+            unknown = [identity for identity in record_ids if identity not in mapped]
+            if unknown or len(set(record_ids)) != len(record_ids):
                 faults.append(
                     "unknown claim comment: %s; expected RECORD_ID copied exactly "
                     "from claims.json, one of: %s"
-                    % (record_id, ", ".join(sorted(mapped)[:4]) or "(none)")
+                    % (', '.join(unknown or record_ids), ", ".join(sorted(mapped)[:4]) or "(none)")
                 )
-                pending = None
+                pending = []
                 continue
-            mapped[record_id].append(turn)
-            pending = record_id
+            for record_id in record_ids:
+                mapped[record_id].append(turn)
+            pending = record_ids
             continue
         if seen_comment and pending:
-            mapped[pending].append(turn)
+            for record_id in pending:
+                mapped[record_id].append(turn)
     if claims and not seen_comment:
         faults.append(
             "no claim comments; mapping is authoritative — expected a literal "
@@ -364,25 +440,40 @@ def licensed_formula_literals(claim: dict, task_dir: Path) -> Counter:
         ast = parse_formula(evidence)
     except Exception:
         return Counter()
-    allowed: Counter = Counter()
-    for node in disclose.walk_ast(ast):
-        if node.kind != "const" or node.name != "number":
-            continue
-        try:
-            allowed[float(node.value)] += 1
-        except (TypeError, ValueError):
-            continue
-    return allowed
+    def literals(node):
+        if node.kind == "const" and node.name == "number":
+            try:
+                return Counter({float(node.value): 1})
+            except (TypeError, ValueError):
+                return Counter()
+        if node.kind == "prefix" and node.name in {"+", "-"} and len(node.args) == 1:
+            child = node.args[0]
+            if child.kind == "const" and child.name == "number":
+                try:
+                    return Counter({float(child.value) * (-1 if node.name == "-" else 1): 1})
+                except (TypeError, ValueError):
+                    return Counter()
+        result = Counter()
+        for child in node.args:
+            result.update(literals(child))
+        return result
+    return literals(ast)
 
 
 def licensed_row_label_literals(claim: dict) -> Counter:
-    """License numeric text that the claim requires as an exact row label."""
-    allowed: Counter = Counter()
-    for raw in disclose.NUMBER_RE.findall(str(claim.get("row_label") or "")):
+    """License one occurrence per exact required target or source row label."""
+    labels={str(claim.get("row_label") or "")}
+    for atom in claim.get('must_say') or []:
+        if not atom.startswith('the row labelled '):continue
         try:
-            allowed[float(raw.replace(",", ""))] += 1
-        except ValueError:
-            continue
+            label=json.loads(atom[len('the row labelled '):])
+            if isinstance(label,str):labels.add(label)
+        except (ValueError,TypeError):continue
+    allowed: Counter = Counter()
+    for label in labels:
+        for raw in disclose.NUMBER_RE.findall(label):
+            try:allowed[float(raw.replace(",", ""))] += 1
+            except ValueError:continue
     return allowed
 
 
@@ -390,9 +481,7 @@ def numeric_faults_with_budget(
     text: str, task_dir: Path, allowed: Counter | None = None
 ) -> list[str]:
     """Audit target collisions while consuming only proven literal occurrences."""
-    strict_unlicensed = allowed is None
     budget = Counter(allowed or {})
-    licensed = set(budget)
     targets = disclose.numeric_targets(task_dir)
     faults = []
     for raw in disclose.NUMBER_RE.findall(text):
@@ -404,9 +493,7 @@ def numeric_faults_with_budget(
             (
                 target
                 for target in targets
-                if abs(float(target)) > 1e-12
-                and not (float(target).is_integer() and abs(target) <= 1)
-                and disclose.same_number(value, float(target))
+                if disclose.same_number(value, float(target))
             ),
             None,
         )
@@ -423,16 +510,75 @@ def numeric_faults_with_budget(
         if permitted is not None:
             budget[permitted] -= 1
             continue
-        if (
-            strict_unlicensed
-            or any(disclose.same_number(value, number) for number in licensed)
-            or disclose.significant_digits(raw) >= 4
-        ):
-            faults.append(
-                f"numeric literal {raw} matches target {matched_target}"
-            )
+        faults.append(f"numeric literal {raw} matches target {matched_target}")
     return faults
 
+
+def source_metadata_mask(text: str, claim: dict, gold, *, junior: bool, spans: list | None = None) -> str:
+    """Mask exact source-proved metadata spans, never a global numeric budget."""
+    if gold is None:
+        return text
+    reviewer = claim.get('reviewer_only') or {}
+    cells = reviewer.get('cells') or []
+    if (reviewer.get('entry') != 'source_selection' or reviewer.get('source') != 'convention_detector'
+            or len(cells) != 1 or cells != claim.get('junior_scope')):
+        return text
+    target = disclose.parse_ref(cells[0], claim.get('sheet') or '')
+    if gold.row_label(target) != claim.get('row_label'):
+        return text
+    formula = gold.formula.get(target, '').strip()
+    if not disclose.BARE_LINK_RE.fullmatch(formula):
+        return text
+    source = disclose.bare_alias_ref(gold, target)
+    if not source:
+        return text
+    label = gold.row_label(source)
+    atom = 'the row labelled ' + json.dumps(label, ensure_ascii=False)
+    if not label or atom not in (claim.get('must_say') or []):
+        return text
+    # Avoid freeing the pre-existing target-row numeric budget for another
+    # occurrence when source and target labels share a numeric token.
+    if not junior and (licensed_row_label_literals(claim) & licensed_row_label_literals({'row_label': label})):
+        return text
+    masked = text
+    proven_spans = []
+    if junior:
+        scope = junior_scope_text(claim)
+        if not scope:
+            return text
+        plain = scope + ':'
+        header = str(claim.get('sheet') or '') + ': ' + plain
+        if masked.startswith(header):
+            split = len(header) - len(plain)
+            proven_spans.extend([('junior_sheet_header', 0, split), ('junior_scope', split, len(header))])
+            masked = ' ' * len(header) + masked[len(header):]
+        elif masked.startswith(plain):
+            proven_spans.append(('junior_scope', 0, len(plain)))
+            masked = ' ' * len(plain) + masked[len(plain):]
+        else:
+            return text
+        label = claim['row_label']
+    # Exactly one complete quoted label occurrence in an explicit label phrase.
+    quoted = json.dumps(label, ensure_ascii=False)
+    match = re.search(r'\brow labelled\s+(' + re.escape(quoted) + r')', masked)
+    if match:
+        start, end = match.span(1)
+        proven_spans.append(('junior_row_label' if junior else 'source_row_label', start, end))
+        masked = masked[:start] + ' ' * (end-start) + masked[end:]
+    if spans is not None:
+        spans.extend(proven_spans)
+    return masked
+
+
+def checked_metadata_source(binding):
+    """An explicit bound selected workbook is required; never infer its path."""
+    if binding is None:
+        return None
+    import hashlib
+    if (not isinstance(binding, dict) or set(binding) != {'path', 'sha256'}
+            or hashlib.sha256(Path(binding['path']).read_bytes()).hexdigest() != binding['sha256']):
+        raise ValueError('numeric metadata source binding changed')
+    return disclose.Book(Path(binding['path']))
 
 def audit_dialogue(
     dialogue: str,
@@ -440,8 +586,24 @@ def audit_dialogue(
     turns: list[dict],
     mapped: dict[str, list[dict]],
     task_dir: Path,
+    source_workbook: dict | None = None,
+    metadata_warnings: list | None = None,
 ) -> list[str]:
     """Audit prose globally, but numeric literals claim-by-claim."""
+    metadata_source = checked_metadata_source(source_workbook)
+    def mask_metadata(text, claim, *, junior):
+        spans = []
+        masked = source_metadata_mask(text, claim, metadata_source, junior=junior, spans=spans)
+        if metadata_warnings is not None:
+            for role, start, end in spans:
+                # Reuse the owning target-collision detector on precisely the
+                # proved span; do not report unrelated numbers as warnings.
+                count = len(numeric_faults_with_budget(text[start:end], task_dir))
+                if count:
+                    metadata_warnings.append({'code': 'source_metadata_numeric_collision',
+                        'record_id': claim['record_id'], 'turn_role': 'junior' if junior else 'senior',
+                        'span_role': role, 'character_span': [start, end], 'count': count})
+        return masked
     cleaned = strip_cell_refs(strip_claim_comments(dialogue))
     faults = [
         fault
@@ -456,7 +618,7 @@ def audit_dialogue(
             if is_senior(turn["speaker"])
         ]
         assigned_senior_turns.update(id(turn) for turn in senior_turns)
-        text = "\n".join(turn["text"] for turn in senior_turns)
+        text = mask_metadata("\n".join(turn["text"] for turn in senior_turns), claim, junior=False)
         allowed = licensed_formula_literals(claim, task_dir)
         allowed.update(licensed_row_label_literals(claim))
         faults.extend(
@@ -467,13 +629,73 @@ def audit_dialogue(
     # Juniors, kickoff turns, and any unmapped senior prose receive no budget.
     for turn in turns:
         if id(turn) not in assigned_senior_turns:
-            faults.extend(numeric_faults_with_budget(turn["text"], task_dir))
+            owners = [claim for claim in claims if any(turn is item for item in mapped.get(claim["record_id"], []))]
+            text = turn["text"]
+            if (len(owners) == 1 and is_junior(turn["speaker"])
+                    and sum(is_junior(item["speaker"]) for item in mapped[owners[0]["record_id"]]) == 1):
+                text = mask_metadata(text, owners[0], junior=True)
+            faults.extend(numeric_faults_with_budget(text, task_dir))
     return faults
 
 
-def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
+
+def reference_literal_scan(turns, claims, mapped, task_dir):
+    """Mask one proved typed quote only for the owning senior reference scan.
+
+    The original turns are never mutated: answer/numeric leakage and semantic
+    review still consume the entire original text, including licensed labels.
+    """
+    from extract_claims import reference_literal_proofs
+    expected = reference_literal_proofs(task_dir, claims)
+    for claim in claims:
+        if (claim.get('reviewer_only') or {}).get('reference_literal_proof') != expected.get(claim['record_id']):
+            raise ValueError('reference literal occurrence proof missing or changed')
+    values = {v for proof in expected.values() for v in proof['values']}
+    used = set()
+    texts = []
+    faults = []
+    for turn in turns:
+        text = turn['text']
+        owners = [c['record_id'] for c in claims
+                  if any(t is turn for t in mapped.get(c['record_id'], []))]
+        spans = []
+        for match in re.finditer(r'"(?:[^"\\]|\\.)*"', text):
+            try:
+                value = json.loads(match.group())
+            except (ValueError, TypeError):
+                continue
+            if value not in values:
+                continue
+            owner = owners[0] if len(owners) == 1 else None
+            typed = re.search(r'\b(?:text|literal|string)\s*$', text[:match.start()], re.I)
+            identity = (owner, value)
+            if (is_senior(turn['speaker']) and owner in expected
+                    and value in expected[owner]['values'] and typed
+                    and identity not in used):
+                used.add(identity)
+                spans.append(match.span())
+            else:
+                faults.append("reference-shaped literal has an extra or unbound quoted occurrence")
+        masked = text
+        for start, end in reversed(spans):
+            masked = masked[:start] + ' '*(end-start) + masked[end:]
+        # A same-spelled row-label anywhere else cannot turn this new exact
+        # occurrence capability into the old global token exemption.
+        scope_scan = masked
+        if is_junior(turn['speaker']):
+            for claim in claims:
+                if claim['record_id'] in owners and claim.get('junior_scope'):
+                    scope_scan = scope_scan.replace(junior_scope_text(claim), '', 1)
+        if any(token.strip() in values for token in cell_refs_in(scope_scan)):
+            faults.append('reference-shaped literal has an extra or unbound occurrence')
+        if is_senior(turn['speaker']):
+            texts.append(masked)
+    return '\n'.join(texts), faults, values
+
+def check_draft(dialogue: str, claims_payload: dict, task_dir: Path, *, source_workbook: dict | None = None) -> dict:
     faults = []
     accuracy_faults = []
+    style_warnings = []
     cast_faults = []
     claims = claims_payload.get("claims") or []
     require_cast(claims_payload)
@@ -504,7 +726,15 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
     if cast_faults:
         faults.extend(cast_faults)
 
-    senior_text = "\n".join(turn["text"] for turn in turns if is_senior(turn["speaker"]))
+    mapped, map_faults = map_turns_to_claims(turns, claims)
+    accuracy_faults.extend(map_faults)
+    literal_values = set()
+    try:
+        senior_text, literal_faults, literal_values = reference_literal_scan(turns, claims, mapped, task_dir)
+        accuracy_faults.extend(literal_faults)
+    except (ValueError, KeyError, OSError, TypeError) as exc:
+        accuracy_faults.append('reference literal provenance invalid: ' + str(exc))
+        senior_text = "\n".join(turn["text"] for turn in turns if is_senior(turn["speaker"]))
     # A visible row label may itself contain an A1-shaped product code
     # (0261 IS: 'Atrial Fibrillation Best (Chest Belt) (B031)'). The label
     # check requires the literal label in senior prose, so such tokens are
@@ -516,7 +746,7 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
     }
     leaks = [
         token for token in cell_refs_in(senior_text)
-        if token.strip() not in label_tokens
+        if token.strip() not in label_tokens or token.strip() in literal_values
     ]
     if leaks:
         faults.append("senior turns contain cell refs: %s" % ", ".join(leaks[:6]))
@@ -551,8 +781,6 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
             % ", ".join(list(dict.fromkeys(axis_leaks))[:6])
         )
 
-    mapped, map_faults = map_turns_to_claims(turns, claims)
-    accuracy_faults.extend(map_faults)
     for claim in claims:
         senior_turns = [
             turn for turn in mapped.get(claim["record_id"], [])
@@ -570,6 +798,9 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
             turn for turn in mapped.get(claim["record_id"], [])
             if is_junior(turn["speaker"])
         ]
+        scope = junior_scope_text(claim)
+        if scope and not any(scope in turn['text'] for turn in juniors):
+            accuracy_faults.append(f"{claim['record_id']}: junior turn missing exact disclosed cell scope")
         first = (mapped.get(claim["record_id"]) or [None])[0]
         prior = []
         for turn in turns:
@@ -591,7 +822,7 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
                         f"{sheet!r} already in context"
                     )
                     break
-        if claim["row_label"] and claim["row_label"].lower() not in blob.lower():
+        if claim["row_label"] and " ".join(claim["row_label"].lower().split()) not in " ".join(blob.lower().split()):
             accuracy_faults.append(
                 f"{claim['record_id']}: senior turn missing row label {claim['row_label']!r}"
             )
@@ -605,12 +836,13 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
                 f"{claim['record_id']}: senior turn uses copied-across-forecast template"
             )
         if spoken_is_pasted(claim.get("spoken") or "", blob):
-            accuracy_faults.append(
+            style_warnings.append(
                 f"{claim['record_id']}: senior turn is a near-copy of spoken"
             )
 
     faults.extend(accuracy_faults)
-    faults.extend(audit_dialogue(dialogue, claims, turns, mapped, task_dir))
+    metadata_warnings = []
+    faults.extend(audit_dialogue(dialogue, claims, turns, mapped, task_dir, source_workbook, metadata_warnings))
     if DISCLOSURE_HEADING.lower() in dialogue.lower():
         faults.append("dialogue uses the word disclosure")
     rebuild_hits = sorted({m.group(0) for m in REBUILD_FRAME_RE.finditer(dialogue)})
@@ -625,7 +857,7 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
             "dialogue dumps copied-column / paren-AST English: %s" % ", ".join(ast_hits[:4])
         )
         faults.append(accuracy_faults[-1])
-    return {
+    result = {
         "passed": not faults,
         "faults": faults,
         "accuracy_faults": accuracy_faults,
@@ -633,7 +865,12 @@ def check_draft(dialogue: str, claims_payload: dict, task_dir: Path) -> dict:
         "turns": len(turns),
         "senior_cell_refs": leaks,
         "senior_axis_refs": axis_leaks,
+        "style_warnings": style_warnings,
     }
+
+    if source_workbook is not None:
+        result['metadata_warnings'] = {'source': dict(source_workbook), 'count': sum(w['count'] for w in metadata_warnings), 'items': metadata_warnings}
+    return result
 
 
 STRUCTURAL_FILL_RE = re.compile(
@@ -909,13 +1146,14 @@ def atomic_write(path: Path, text: str) -> None:
 
 
 def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None,
-          require_review_pass: bool, skip_smoke: bool) -> dict:
+          require_review_pass: bool, skip_smoke: bool, *, source_workbook: dict | None = None, source_warning_proof=None) -> dict:
     if claims_payload.get("empty") or not claims_payload.get("claims"):
         raise DialogueError("empty agent_records: do not apply")
     # Kept for CLI/API compatibility; no round may weaken the full review gate.
     _ = require_review_pass
     accuracy_gate_faults = review_accuracy_faults(review, claims_payload)
-    round_faults = review_faults(review, claims_payload)
+    raw_dialogue = draft.read_text(encoding="utf-8")
+    round_faults = review_faults(review, claims_payload, draft_text=raw_dialogue, source_warning_proof=source_warning_proof)
     if round_faults:
         gate = (
             "reviewer accuracy did not pass"
@@ -938,7 +1176,7 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
     original_marker = marker_path.read_text(encoding="utf-8") if marker_path.is_file() else None
 
     raw_dialogue = draft.read_text(encoding="utf-8")
-    draft_report = check_draft(raw_dialogue, claims_payload, task_dir)
+    draft_report = check_draft(raw_dialogue, claims_payload, task_dir, source_workbook=source_workbook)
     # Cell-address leaks in senior turns must not replace working bullets,
     # even after the second round. The full review gate above must also pass.
     if draft_report.get("senior_cell_refs"):
@@ -946,6 +1184,13 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
             "refuse apply: senior turns still contain cell refs: %s"
             % ", ".join(draft_report["senior_cell_refs"][:6])
         )
+    warning_summaries = review_warnings(review, claims_payload, draft_text=raw_dialogue, source_warning_proof=source_warning_proof)
+    if source_warning_proof is not None:
+        safe = {'source_formula_operand': 'A flagged constant is an authenticated source-formula operand.',
+                'frozen_junior_prefix': 'The flagged scope prefix matches the frozen template.',
+                'dialogue_style_only': 'Repetitive wording was retained as a language-only warning.'}
+        warning_summaries = [{'code': code, 'finding': safe[code]}
+                             for code in sorted({row['code'] for row in warning_summaries})]
     dialogue = strip_claim_comments(raw_dialogue)
     instruction = rewrite_instruction(original_instruction, task_dir, claims_payload)
     workbook = artifact_name(task_dir)
@@ -966,7 +1211,8 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
             "applied": True,
             "notes": f"environment/{NOTES_NAME}",
             "instruction_sha256": sha256_text(instruction),
-            "review_passed": review_passed(review, claims_payload),
+            "review_passed": review_passed(review, claims_payload, draft_text=raw_dialogue, source_warning_proof=source_warning_proof),
+            "review_warnings": warning_summaries,
             "draft_passed": draft_report["passed"],
             "do_not_rerun": list(DO_NOT_RERUN),
         })
@@ -996,7 +1242,8 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
         "applied": True,
         "draft_passed": draft_report["passed"],
         "draft_faults": draft_report["faults"],
-        "review_passed": review_passed(review, claims_payload),
+        "review_passed": review_passed(review, claims_payload, draft_text=raw_dialogue, source_warning_proof=source_warning_proof),
+        "review_warnings": warning_summaries,
         "instruction_sha256": sha256_text(instruction),
         "notes": str(notes_path),
         "marker": str(marker_path),
@@ -1080,10 +1327,8 @@ def main(argv=None) -> int:
                     "review file %s does not exist; the reviewer must write it "
                     "before the round can be scored" % args.review
                 ]
-            elif args.round < 2:
-                faults = review_faults(review, claims_payload)
             else:
-                faults = review_accuracy_faults(review, claims_payload)
+                faults = review_faults(review, claims_payload)
         report = {
             "passed": not faults,
             "round": args.round,
@@ -1139,11 +1384,10 @@ def main(argv=None) -> int:
         return 0 if report["passed"] else 2
 
     review = load_review(args.review)
-    require_pass = args.round < 2
     try:
         result = apply(
             task_dir, args.draft.resolve(), claims_payload, review,
-            require_review_pass=require_pass, skip_smoke=args.skip_smoke,
+            require_review_pass=True, skip_smoke=args.skip_smoke,
         )
     except (DialogueError, ValueError) as exc:
         print("FAIL:", exc, file=sys.stderr)

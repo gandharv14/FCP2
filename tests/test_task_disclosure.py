@@ -208,11 +208,79 @@ def test_ungraded_row_label_year_is_licensed_from_target_collision(
         "leak_flag": False,
     }
 
-    allowed = disclose.trusted_row_label_literal_counts([record], task)
+    import openpyxl
+    workbook = openpyxl.Workbook(); workbook.active.title = 'Overview'
+    workbook.active['D55'] = 'Adjusted EBITDA (FY 2013)'
+    workbook.active['F55'] = '=1+2'
+    path = tmp_path / 'gold.xlsx'; workbook.save(path)
+    gold = disclose.Book(path)
+    allowed = disclose.trusted_row_label_literal_counts([record], task, gold)
 
     assert allowed[2013.0] == 1
     assert disclose.audit_text(
         disclose.render_sentence(record),
         task,
         records=[record],
+        gold=gold,
     ) == []
+
+
+def test_source_label_collision_needs_exact_occurrence_provenance(tmp_path):
+    import openpyxl
+    disclose = _load_disclose()
+    task = tmp_path / '0001-outputs'; (task / 'tests').mkdir(parents=True)
+    (task / 'tests/answer_key.json').write_text(json.dumps({'targets': {'Model!Z1': 6}}))
+    wb = openpyxl.Workbook(); wb.active.title = 'Model'; ws = wb.create_sheet('Inputs')
+    wb['Model']['B10'] = '=Inputs!B20'; wb['Model']['K10'] = '=Inputs!K20'
+    ws['B20'] = 'Care home 6'; ws['K20'] = '=1+1'
+    path = tmp_path / 'source.xlsx'; wb.save(path)
+    gold = disclose.Book(path)
+    # Establish the linked literal label even without an Excel display cache.
+    gold.value['Model!B10'] = 'Care home 6'
+    record = {'entry': 'source_selection', 'value': 'source', 'disposition': 'disclosed',
+        'cell_keys': ['Model!K10'], 'source_cell': 'Inputs!K20',
+        'fields': {'label': '"Care home 6"',
+                   'ingredient': 'cell Inputs!K20 on the row labelled "Care home 6"'}}
+    sentence = disclose.render_sentence(record)
+    assert disclose.trusted_row_label_literal_counts([record], task, gold)[6] == 2
+    assert disclose.audit_text(sentence, task, [record], gold=gold) == []
+    assert disclose.audit_text(sentence + ' The answer is 6.', task, [record], gold=gold)
+    assert disclose.audit_text(sentence, task, [record])
+    changed = {**record, 'source_cell': 'Inputs!K21'}
+    assert disclose.audit_text(sentence, task, [changed], gold=gold)
+    gold.formula['Model!K10'] = '=-Inputs!K20'
+    assert disclose.audit_text(sentence, task, [record], gold=gold)
+
+
+def test_verify_uses_only_hash_bound_custom_root_gold_for_leak_audit(tmp_path, monkeypatch):
+    import hashlib
+    import openpyxl
+    disclose = _load_disclose()
+    task = tmp_path / 'custom' / '0001-outputs'
+    (task / 'tests').mkdir(parents=True)
+    path = tmp_path / 'custom-golden.xlsx'
+    workbook = openpyxl.Workbook()
+    workbook.active.title = 'Model'
+    workbook.active['A1'] = 3
+    workbook.save(path)
+    environment = tmp_path / 'delivered.xlsx'
+    workbook.save(environment)
+    payload = {'golden': str(path), 'golden_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    (task / 'tests/disclosure.json').write_text(json.dumps(payload))
+    (task / 'tests/answer_key.json').write_text(json.dumps({'targets': {'Model!A1': 3}}))
+    (task / 'instruction.md').write_text(disclose.SECTION_START + '\n')
+    monkeypatch.setattr(disclose, 'find_environment', lambda *_: environment)
+    monkeypatch.setattr(disclose, 'find_golden', lambda *_: (_ for _ in ()).throw(
+        AssertionError('legacy lookup must not be used')))
+    observed = []
+    monkeypatch.setattr(disclose, 'audit_text', lambda *a, **kw: observed.append(kw['gold']) or [])
+    result = disclose.verify_task(task)
+    # This fixture intentionally has no segmentation proof: that separate gate
+    # still fails, while leak auditing receives the independently bound book.
+    assert not result['passed']
+    assert observed[-1].value['Model!A1'] == 3
+    assert not any('golden binding' in f for f in result['faults'])
+    path.write_bytes(b'altered evidence')
+    result = disclose.verify_task(task)
+    assert observed[-1] is None
+    assert 'disclosure golden binding is missing or changed' in result['faults']

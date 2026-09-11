@@ -3,8 +3,8 @@
 
 Applies the review rules established on the 0438 pilot:
 
-* a draft row is included only when every referenced cell is a typed cell in the
-  golden workbook and still present in the baseline inputs workbook;
+* each referenced cell is assessed independently; retained typed inputs require
+  a hash-bound semantic review of research eligibility and financial dimensions;
 * a value that also appears in an uncovered typed cell is a leak.  The leak is
   covered with ``extra_cells`` only when the duplicate sits on a data-validation
   or picklist sheet, which carries no modelling content.  Any other leak excludes
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import copy
 import hashlib
 import json
 import os
@@ -33,7 +34,7 @@ from openpyxl.utils import column_index_from_string as ci, get_column_letter as 
 from xl_artifact_paths import resolve_workbook_artifact
 
 # Locate !A1 / !A1:B2, then take the sheet name immediately before the bang.
-# Excel sheet names are at most 31 characters and cannot contain \ / ? * [ ] : !
+# Excel sheet names are at most 31 characters and cannot contain \ / ? * [ ] :
 CELL = r"\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?"
 CELL_AT = re.compile(r"!(" + CELL + r")")
 SHEET_BREAK = re.compile(r"`|<br\s*/?>|[\n;]", re.I)
@@ -91,9 +92,9 @@ def extract_refs(text, sheets=None):
     for match in CELL_AT.finditer(text or ""):
         cell = match.group(1)
         prefix = text[: match.start()]
-        quoted = re.search(r"'([^']+)'\s*$", prefix)
+        quoted = re.search(r"'((?:[^']|'')+)'\s*$", prefix)
         if quoted:
-            sheet = quoted.group(1).strip()
+            sheet = quoted.group(1).replace("''", "'")
         else:
             chunk = SHEET_BREAK.split(prefix)[-1]
             sheet = chunk[-31:].strip(" \t\"=[")
@@ -118,8 +119,12 @@ def extract_refs(text, sheets=None):
 
 
 def expand(ref, sheets):
-    ref = ref.strip().replace("$", "").strip("'").strip("`")
-    m = re.match(r"^(.+?)!([A-Z]{1,3})(\d+)(?::([A-Z]{1,3})(\d+))?$", ref, re.I)
+    ref = ref.strip().strip("`")
+    if "!" not in ref:
+        return None, []
+    sheet, address = ref.rsplit("!", 1)
+    ref = sheet + "!" + address.replace("$", "")
+    m = re.match(r"^(.+)!([A-Z]{1,3})(\d+)(?::([A-Z]{1,3})(\d+))?$", ref, re.I)
     if not m:
         return None, []
     sh, c1, r1, c2, r2 = m.groups()
@@ -185,8 +190,8 @@ def atomic_json(path, payload):
     os.replace(tmp, path)
 
 
-def analyse(wb, source_file, expected_source_sha256):
-    run = Path(f"runs/{wb}-variable-sources")
+def analyse(wb, source_file, expected_source_sha256, *, runs_root="runs", inputs_root="inputs_out"):
+    run = Path(runs_root) / f"{wb}-variable-sources"
     draft = json.loads((run / "draft.json").read_text(encoding="utf-8"))
     source = Path(source_file)
     if source.name != f"{wb}.xlsx" or not source.is_file() or source.is_symlink():
@@ -200,7 +205,7 @@ def analyse(wb, source_file, expected_source_sha256):
     G = openpyxl.load_workbook(source, data_only=False)
     GV = openpyxl.load_workbook(source, data_only=True)
     BI = openpyxl.load_workbook(
-        resolve_workbook_artifact("inputs_out", wb, "%s-inputs"),
+        resolve_workbook_artifact(inputs_root, wb, "%s-inputs"),
         data_only=False)
     sheets = {s.strip().upper(): s for s in G.sheetnames}
 
@@ -219,43 +224,53 @@ def analyse(wb, source_file, expected_source_sha256):
 
     val_index = collections.defaultdict(list)
     for s in GV.sheetnames:
-        for row in GV[s].iter_rows():
-            for c in row:
-                k = vkey(c.value)
-                if k is not None:
-                    val_index[k].append(f"{s}!{c.coordinate}")
+        for c in GV[s]._cells.values():
+            k = vkey(c.value)
+            if k is not None and s in BI.sheetnames and BI[s][c.coordinate].value is not None:
+                val_index[k].append(f"{s}!{c.coordinate}")
+    # Each typed-value relationship is stored once, shared by every candidate.
+    val_index = {k: sorted(refs) for k, refs in val_index.items()}
 
+    baseline = resolve_workbook_artifact(inputs_root, wb, "%s-inputs")
+    evidence = {"draft_sha256": _sha256(run / "draft.json"),
+                "source_sha256": actual_sha256,
+                "baseline_sha256": _sha256(baseline)}
     rows = []
     for row in draft["rows"]:
-        cells = []
-        codes = []
+        atoms = []
         refs = extract_refs(row["value_text"], sheets)
         if not refs:
-            codes.append("unparsable_reference")
+            atoms.append((None, None, "unparsable_reference"))
+        seen = set()
         for ref in refs:
             sh, cs = expand(ref, sheets)
             if sh is None:
-                codes.append("unknown_sheet")
+                atoms.append((None, ref, "unknown_sheet"))
                 continue
             for c in cs:
-                gf = G[sh][c].value
-                if isinstance(gf, str) and gf.startswith("="):
-                    codes.append("formula_cell")
+                if (sh, c) in seen:
                     continue
-                if BI[sh][c].value is None:
-                    codes.append("blank_in_baseline")
-                    continue
-                cells.append((sh, c, GV[sh][c].value))
-        unique_codes = []
-        for code in codes:
-            if code not in unique_codes:
-                unique_codes.append(code)
-        rows.append({
-            "row": row,
-            "cells": cells,
-            "codes": unique_codes,
-            "clean": bool(cells) and not unique_codes,
-        })
+                seen.add((sh, c))
+                code = None
+                if G[sh][c].data_type == "f":
+                    code = "formula_cell"
+                elif sh not in BI.sheetnames or BI[sh][c].value is None:
+                    code = "blank_in_baseline"
+                atoms.append((sh, c, code))
+        for sh, c, code in atoms:
+            rows.append({
+                "row": row,
+                "cells": [(sh, c, GV[sh][c].value)] if sh and not code else [],
+                "reference": f"{sh}!{c}" if sh else c,
+                "multi": len(atoms) > 1,
+                "codes": [code] if code else [],
+                "clean": code is None,
+                "evidence": evidence,
+                "evidence_paths": {"draft_sha256": str((run / "draft.json").absolute()),
+                                   "source_sha256": str(source.absolute()),
+                                   "baseline_sha256": str(baseline.absolute())},
+                "duplicate_refs": val_index.get(vkey(GV[sh][c].value), []) if sh and not code else [],
+            })
 
     for r in rows:
         if not r["clean"]:
@@ -264,7 +279,7 @@ def analyse(wb, source_file, expected_source_sha256):
             r["reason"] = CAUSE_PROSE.get(code, CAUSE_PROSE["unparsable_reference"])
         r["extra"] = []
 
-    # Dropping a row un-covers the values it was masking, which can create a new
+    # Dropping an atomic cell uncovers its value, which can create a new
     # leak elsewhere. Iterate until the surviving set is leak-free.
     while True:
         in_scope = {f"{sh}!{c}" for r in rows if r["clean"] for sh, c, _ in r["cells"]}
@@ -273,49 +288,195 @@ def analyse(wb, source_file, expected_source_sha256):
             if r["clean"]:
                 covered |= set(r["extra"])
         newly_dropped = False
+        closure_cache = {}
         for r in rows:
             if not r["clean"]:
                 continue
-            extra, leaks = list(r["extra"]), []
-            for sh, c, val in r["cells"]:
-                k = vkey(val)
-                if k is None:
-                    continue
-                for other in val_index.get(k, []):
-                    if other in covered or other in extra:
+            group = r["duplicate_refs"]
+            cache_key = (id(group), tuple(r["extra"]))
+            if cache_key not in closure_cache:
+                extra_set = set(r["extra"])
+                leaks = []
+                for other in group:
+                    if other in covered or other in extra_set:
                         continue
-                    osh, oc = other.split("!", 1)
-                    # A formula cell can still ship its cached value, so the only
-                    # question that matters is whether the delivered book holds it.
-                    if BI[osh][oc].value is None:
-                        continue
-                    if PICKLIST.search(osh):
-                        extra.append(other)
-                    else:
-                        leaks.append(other)
-            r["extra"] = sorted(set(extra))
+                    osh, _ = other.rsplit("!", 1)
+                    if PICKLIST.search(osh): extra_set.add(other)
+                    else: leaks.append(other)
+                closure_cache[cache_key] = (sorted(extra_set), sorted(set(leaks)))
+            extra, leaks = closure_cache[cache_key]
+            r["extra"] = extra
             if leaks:
                 r["clean"] = False
-                r["leaks"] = sorted(set(leaks))
+                r["leaks"] = leaks
                 r["code"] = "duplicate_value_leak"
                 r["codes"] = list(r.get("codes") or []) + ["duplicate_value_leak"]
                 r["reason"] = (
                     "Value also occurs in typed cell(s) %s that carry unrelated "
                     "modelling content, so the variable cannot be masked completely."
-                    % ", ".join(sorted(set(leaks))[:4])
+                    % ", ".join(leaks[:4])
                 )
                 newly_dropped = True
         if not newly_dropped:
             break
+    G.close()
+    GV.close()
+    BI.close()
     return draft, rows
 
 
-def emit(wb, draft, rows, *, pipeline_bindings=None):
+def audit_sources(row):
+    """Preserve audited URLs; identify simulated private evidence explicitly."""
+    notes = str(row.get("source_notes") or "").strip()
+    if not notes:
+        raise SystemExit("included input has no audited source description")
+    urls = row.get("source_urls") or []
+    return [
+        {"id": "audit-source-" + hashlib.sha256((url + "\n" + notes).encode()).hexdigest()[:16],
+         "name": notes, "url": url, "role": "primary", "kind": "external"}
+        for url in dict.fromkeys(urls)
+    ] if urls else [{
+        "id": "audit-private-" + slug(row["draft_id"]),
+        "name": notes,
+        "url": "internal://supplied-workbook/" + slug(row["draft_id"]),
+        "role": "primary", "kind": "internal",
+    }]
+
+
+def apply_semantic_review(rows, run):
+    """Maskability does not establish that a cell is a research assumption."""
+    candidates = [r for r in rows if r["clean"]]
+    if not candidates:
+        return None
+    path = Path(run) / "normalization-review.json"
+    if not path.is_file():
+        raise SystemExit("maskable cells require normalization-review.json before emission")
+    review = json.loads(path.read_text(encoding="utf-8"))
+    if (review.get("schema_version") != "normalization-review/v1"
+            or not str(review.get("reviewer") or "").strip()
+            or not isinstance(review.get("cells"), dict)):
+        raise SystemExit("invalid normalization semantic review")
+    for r in candidates:
+        if any(review.get(k) != v for k, v in r["evidence"].items()):
+            raise SystemExit("stale normalization semantic review")
+        decision = review["cells"].get(r["reference"], {})
+        if (type(decision.get("eligible")) is not bool
+                or not str(decision.get("reason") or "").strip()
+                or not isinstance(decision.get("evidence_refs"), list)
+                or not decision["evidence_refs"]
+                or any(not isinstance(v, str) or not v.strip()
+                       for v in decision["evidence_refs"])):
+            raise SystemExit("missing or incomplete cell review: " + r["reference"])
+        if decision["eligible"]:
+            for key in ("entity", "period", "scenario", "basis"):
+                if not isinstance(decision.get(key), str) or not decision[key].strip():
+                    raise SystemExit("missing reviewed dimension: " + key)
+            if "variable_name" in decision and (
+                    not isinstance(decision["variable_name"], str)
+                    or not decision["variable_name"].strip()):
+                raise SystemExit("invalid reviewed variable_name: " + r["reference"])
+            r["semantic_review"] = decision
+        else:
+            r.update(clean=False, code="not_research_input",
+                     codes=["not_research_input"], reason=decision["reason"])
+    return _sha256(path)
+
+
+def apply_source_display_review(rows, run):
+    """Apply independently reviewed private-source display labels only.
+
+    Audit text, source IDs/URIs, financial dimensions and eligibility are immutable.
+    This optional addendum never substitutes for the normalization review.
+    """
+    path = Path(run) / "source-display-review.json"
+    if not path.exists():
+        return {}
+    review = json.loads(path.read_text(encoding="utf-8"))
+    keys = {"schema_version", "reviewer", "normalization_review_sha256",
+            "draft_sha256", "source_sha256", "baseline_sha256", "cells"}
+    if (not isinstance(review, dict) or set(review) != keys
+            or review["schema_version"] != "normalization-source-display/v1"
+            or not isinstance(review["reviewer"], str) or not review["reviewer"].strip()
+            or not isinstance(review["cells"], dict) or not review["cells"]
+            or review["normalization_review_sha256"] != _sha256(Path(run) / "normalization-review.json")):
+        raise SystemExit("invalid source display review")
+    candidates = {r["reference"]: r for r in rows if r["clean"]}
+    if set(review["cells"]) - set(candidates):
+        raise SystemExit("source display review names an unaccepted cell")
+    for ref, decision in review["cells"].items():
+        if sum(r["clean"] and r["reference"] == ref for r in rows) != 1:
+            raise SystemExit("ambiguous source display cell: " + ref)
+        row = candidates[ref]
+        if any(review.get(k) != value for k, value in row["evidence"].items()):
+            raise SystemExit("stale source display review")
+        original = audit_sources(row["row"])
+        if (not isinstance(decision, dict)
+                or set(decision) != {"original_sources", "display_name", "reason", "evidence_refs"}
+                or not original
+                or decision["original_sources"] != original
+                or any(s["kind"] != "internal" or not s["url"].startswith("internal://supplied-workbook/") for s in original)
+                or not isinstance(decision["display_name"], str)
+                or not decision["display_name"].startswith("Supplied-workbook ")
+                or not decision["display_name"][len("Supplied-workbook "):].strip()
+                or not isinstance(decision["reason"], str) or not decision["reason"].strip()
+                or not isinstance(decision["evidence_refs"], list)
+                or ref not in decision["evidence_refs"]
+                or any(not isinstance(v, str) or not v.strip() for v in decision["evidence_refs"])):
+            raise SystemExit("invalid private-source display decision: " + ref)
+        row["reviewed_sources"] = [{**s, "name": decision["display_name"]} for s in original]
+    return {str(path.absolute()): _sha256(path)}
+
+
+def coalesce_same_atom_aliases(variables, included):
+    """One physical atom can have several independently reviewed source routes.
+
+    Coalescing changes neither eligibility nor financial meaning. Conflicting
+    descriptions of the same cells need diagnosis, never invented dimensions.
+    Every original ID/source set remains recoverable from explicit provenance.
+    """
+    def canonical(value):
+        return json.dumps(value,sort_keys=True,separators=(",", ":"),ensure_ascii=False,allow_nan=False).encode()
+    if len({v["id"] for v in variables})!=len(variables):raise ValueError("duplicate emitted ID requires diagnosis")
+    groups={};order=[]
+    for variable in variables:
+        cells=variable.get("cells")
+        if not isinstance(cells,list) or not cells or len(cells)!=len(set(cells)):
+            raise ValueError("same-atom alias requires a complete unique physical cell set")
+        key=tuple(sorted(cells))
+        if key not in groups:groups[key]=[];order.append(key)
+        groups[key].append(variable)
+    merged=[];mapping={};provenance=[]
+    for key in order:
+        rows=groups[key]
+        if len(rows)==1:
+            merged.append(copy.deepcopy(rows[0]));mapping[rows[0]["id"]]=rows[0]["id"];continue
+        comparable=[]
+        for row in rows:
+            item={k:v for k,v in row.items() if k not in {"id","sources"}}
+            item["cells"]=sorted(item["cells"])
+            if "extra_cells" in item:item["extra_cells"]=sorted(item["extra_cells"])
+            comparable.append(canonical(item))
+        if len(set(comparable))!=1:
+            raise ValueError("same physical atom has conflicting semantic dimensions/value/question/notes; diagnosis required")
+        chosen=min(rows,key=lambda row:row["id"]);value=copy.deepcopy(chosen)
+        sources={canonical(source):copy.deepcopy(source) for row in rows for source in row["sources"]}
+        value["sources"]=[sources[k] for k in sorted(sources)];merged.append(value)
+        aliases=[]
+        for row in sorted(rows,key=lambda row:row["id"]):
+            mapping[row["id"]]=chosen["id"]
+            aliases.append(dict(id=row["id"],sources=copy.deepcopy(row["sources"]),definition_sha256=hashlib.sha256(canonical(row)).hexdigest()))
+        provenance.append(dict(canonical_id=chosen["id"],cells=list(key),aliases=aliases))
+    projected={draft:list(dict.fromkeys(mapping[vid] for vid in ids)) for draft,ids in included.items()}
+    if set(mapping)!={v["id"] for v in variables}:raise ValueError("alias provenance does not cover emitted identities")
+    return merged,projected,dict(schema_version="same-physical-atom-aliases/v1",original_entries=len(variables),canonical_atoms=len(merged),groups=provenance)
+
+
+def emit(wb, draft, rows, *, pipeline_bindings=None, runs_root="runs", dry_run=False):
     # Cells the packager creates (e.g. the Embedded Assumptions disclosure sheet)
     # only exist in the delivered bundle, so the oracle is the first thing that can
     # see those duplicates. Feed its verdict back in here.
     forced = set()
-    fp = Path(f"runs/{wb}-variable-sources/oracle_forced_exclusions.json")
+    fp = Path(runs_root) / f"{wb}-variable-sources/oracle_forced_exclusions.json"
     if fp.exists():
         raw = json.loads(fp.read_text(encoding="utf-8"))
         if isinstance(raw, list):
@@ -323,13 +484,37 @@ def emit(wb, draft, rows, *, pipeline_bindings=None):
         elif isinstance(raw, dict):
             forced = set(raw.get("ids") or raw.get("exclusions") or [])
 
+    for r in rows:
+        if r["clean"] and (r["row"]["draft_id"] in forced
+                            or slug(r["row"]["draft_id"]) in forced):
+            r.update(clean=False, code="forced_exclusion", codes=["forced_exclusion"],
+                     reason=CAUSE_PROSE["forced_exclusion"])
+    review_sha256 = apply_semantic_review(rows, Path(runs_root) / f"{wb}-variable-sources")
+    display_evidence = apply_source_display_review(rows, Path(runs_root) / f"{wb}-variable-sources")
+    # A semantic exclusion restores that input in the delivered workbook.
+    # Reclose duplicates so no remaining research variable leaks through it.
+    while True:
+        covered = {r["reference"] for r in rows if r["clean"]}
+        covered.update(ref for r in rows if r["clean"] for ref in r["extra"])
+        dropped = False
+        uncovered = {}
+        for r in rows:
+            group = r.get("duplicate_refs", [])
+            if id(group) not in uncovered:
+                uncovered[id(group)] = any(ref not in covered for ref in group)
+            if r["clean"] and uncovered[id(group)]:
+                r.update(clean=False, code="duplicate_value_leak", codes=["duplicate_value_leak"],
+                         reason=CAUSE_PROSE["duplicate_value_leak"])
+                dropped = True
+        if not dropped:
+            break
     included = [r for r in rows if r["clean"]]
 
     var_defs, inc_map, reasons = [], {}, {}
     used = set()
     for r in included:
         ids = []
-        multi = len(r["cells"]) > 1
+        multi = r.get("multi", len(r["cells"]) > 1)
         base = slug(r["row"]["draft_id"])
         if base in forced or r["row"]["draft_id"] in forced:
             r["clean"] = False
@@ -346,7 +531,7 @@ def emit(wb, draft, rows, *, pipeline_bindings=None):
                 n += 1
             used.add(vid)
             ids.append(vid)
-            name = r["row"]["variable_text"].strip()
+            name = r["semantic_review"].get("variable_name", r["row"]["variable_text"]).strip()
             unit, _ = ("date", False) if is_date else unit_for(val, name)
             display = val   # exact workbook value; never rescaled
             var_defs.append({
@@ -355,8 +540,12 @@ def emit(wb, draft, rows, *, pipeline_bindings=None):
                 "value": display,
                 "raw": None,
                 "unit": unit,
-                "period": "Model horizon",
-                "basis": "Externally sourced assumption",
+                "period": r["semantic_review"]["period"],
+                "basis": r["semantic_review"]["basis"],
+                "entity": r["semantic_review"]["entity"],
+                "scenario": r["semantic_review"]["scenario"],
+                "source_notes": r["row"].get("source_notes", ""),
+                "sources": r.get("reviewed_sources", audit_sources(r["row"])),
                 "question": (
                     "What %s should the model use, per the sourced research?"
                     % ((name[0].lower() + name[1:]) if name else "this assumption")
@@ -367,7 +556,7 @@ def emit(wb, draft, rows, *, pipeline_bindings=None):
                 # multi-cell rows would leave known duplicates unmasked
                 "extra_cells": r["extra"] if idx == 0 else [],
             })
-        inc_map[r["row"]["draft_id"]] = ids
+        inc_map.setdefault(r["row"]["draft_id"], []).extend(ids)
         for e in r["extra"]:
             reasons[e] = (
                 "Data-validation / picklist cell repeating the sourced value; "
@@ -375,19 +564,22 @@ def emit(wb, draft, rows, *, pipeline_bindings=None):
             )
     excluded = [r for r in rows if not r["clean"]]
     exc_map = {}
+    cell_exclusions = []
     for r in excluded:
         code = r.get("code") or primary_code(r.get("codes") or []) or "unparsable_reference"
-        exc_map[r["row"]["draft_id"]] = {
-            "reason": r.get("reason") or CAUSE_PROSE[code],
-            "code": code,
-        }
+        item = {"reason": r.get("reason") or CAUSE_PROSE[code], "code": code}
+        cell_exclusions.append({"draft_id": r["row"]["draft_id"],
+                                "reference": r.get("reference"), **item})
+        if r["row"]["draft_id"] not in inc_map:
+            exc_map.setdefault(r["row"]["draft_id"], item)
     inc_map = {k: v for k, v in inc_map.items() if k not in exc_map}
     keep = {i for ids in inc_map.values() for i in ids}
     var_defs = [v for v in var_defs if v["id"] in keep]
+    var_defs, inc_map, alias_provenance = coalesce_same_atom_aliases(var_defs, inc_map)
 
     histogram = collections.Counter(item["code"] for item in exc_map.values())
 
-    run = Path(f"runs/{wb}-variable-sources")
+    run = Path(runs_root) / f"{wb}-variable-sources"
     first_path = run / "first_normalization.json"
     snapshot = {
         "schema_version": "1.0",
@@ -399,15 +591,16 @@ def emit(wb, draft, rows, *, pipeline_bindings=None):
         "exclusion_reason_codes": dict(sorted(histogram.items())),
         "forced_exclusions": sorted(forced),
     }
-    if not first_path.exists():
+    if not first_path.exists() and not dry_run:
         atomic_json(first_path, snapshot)
-    first = json.loads(first_path.read_text(encoding="utf-8"))
+    first = json.loads(first_path.read_text(encoding="utf-8")) if first_path.exists() else snapshot
 
     script = run / f"normalize_{wb}.py"
-    script.write_text(TEMPLATE.format(
+    script_text = TEMPLATE.format(
         wb=wb,
         seed=int(wb),
         variables=pprint.pformat(var_defs, indent=4, width=96, sort_dicts=True),
+        aliases=pprint.pformat(alias_provenance, indent=4, width=96, sort_dicts=True),
         included=pprint.pformat(inc_map, indent=4, width=96, sort_dicts=True),
         excluded=pprint.pformat(exc_map, indent=4, width=96, sort_dicts=True),
         reasons=pprint.pformat(reasons, indent=4, width=96, sort_dicts=True),
@@ -415,10 +608,18 @@ def emit(wb, draft, rows, *, pipeline_bindings=None):
                              width=96, sort_dicts=True),
         first_atomic=int(first.get("atomic_variables") or 0),
         forced=pprint.pformat(sorted(forced), indent=4, width=96),
+        cell_exclusions=pprint.pformat(cell_exclusions, sort_dicts=True),
+        review_sha256=repr(review_sha256),
+        evidence=pprint.pformat({**({path: rows[0]["evidence"][key]
+                   for key, path in rows[0].get("evidence_paths", {}).items()}
+                   if rows else {}), **display_evidence}, sort_dicts=True),
         pipeline_bindings=pprint.pformat(
             pipeline_bindings, indent=4, width=96, sort_dicts=True
         ),
-    ), encoding="utf-8")
+    )
+    if dry_run:
+        return {"script": script_text, "first": first, "snapshot": snapshot}
+    script.write_text(script_text, encoding="utf-8")
     print(f"{wb}: {len(draft['rows'])} draft rows -> {len(inc_map)} included, "
           f"{len(exc_map)} excluded, {len(var_defs)} atomic variables, "
           f"{len(reasons)} extra cells")
@@ -430,6 +631,7 @@ TEMPLATE = '''#!/usr/bin/env python3
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -440,14 +642,6 @@ NORMALIZED = RUN / "normalized.json"
 EXCLUSIONS = RUN / "exclusions.json"
 REPORT = RUN / "normalization_report.json"
 PROFILES = RUN / "source_profiles.json"
-
-RESEARCH = {{
-    "id": "sourced-market-research",
-    "name": "Sourced market and contractual research",
-    "url": "internal://research-service/sourced-assumptions",
-    "role": "primary",
-    "kind": "internal",
-}}
 
 VAR_DEFS = {variables}
 
@@ -465,6 +659,11 @@ FORCED_EXCLUSIONS = {forced}
 
 PIPELINE_BINDINGS = {pipeline_bindings}
 
+CELL_EXCLUSIONS = {cell_exclusions}
+ALIAS_PROVENANCE = {aliases}
+REVIEW_SHA256 = {review_sha256}
+EVIDENCE = {evidence}
+
 
 def build_variables():
     out = []
@@ -479,13 +678,14 @@ def build_variables():
             "name": d["name"],
             "value": d["value"],
             "unit": d["unit"],
-            "entity": "Workbook {wb} subject company",
+            "entity": d["entity"],
             "period": d["period"],
-            "scenario": "Base case",
+            "scenario": d["scenario"],
             "basis": d["basis"],
-            "status": "Approved",
+            "status": "Supplied workbook input",
             "question": d["question"],
-            "sources": [RESEARCH],
+            "sources": d["sources"],
+            "source_notes": d["source_notes"],
             "workbook": workbook,
         }})
     return out
@@ -509,6 +709,12 @@ def excluded_entry(draft_id):
 
 
 def main():
+    evidence = dict(EVIDENCE)
+    if REVIEW_SHA256:
+        evidence[str(RUN / "normalization-review.json")] = REVIEW_SHA256
+    for path, expected in evidence.items():
+        if not Path(path).is_file() or hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
+            raise SystemExit("normalizer evidence changed: " + path)
     draft = json.loads(DRAFT.read_text(encoding="utf-8"))
     draft_ids = [row["draft_id"] for row in draft["rows"]]
     dispositions = []
@@ -549,6 +755,8 @@ def main():
         "seed": {seed},
         "variables": variables,
     }}
+    if ALIAS_PROVENANCE["groups"]:
+        spec["variable_aliases"] = ALIAS_PROVENANCE
     if PIPELINE_BINDINGS is not None:
         spec["pipeline_bindings"] = PIPELINE_BINDINGS
     if PROFILES.exists():
@@ -578,6 +786,9 @@ def main():
         "exclusion_reason_codes": EXCLUSION_REASON_CODES,
         "forced_exclusions": FORCED_EXCLUSIONS,
         "extra_cell_reasons": EXTRA_CELL_REASONS,
+        "cell_exclusions": CELL_EXCLUSIONS,
+        "semantic_review_sha256": REVIEW_SHA256,
+        **({{"variable_aliases": ALIAS_PROVENANCE}} if ALIAS_PROVENANCE["groups"] else {{}}),
         "dispositions": dispositions,
         **({{"pipeline_bindings": PIPELINE_BINDINGS}}
            if PIPELINE_BINDINGS is not None else {{}}),
@@ -602,6 +813,8 @@ if __name__ == "__main__":
     parser.add_argument("--source-generation-id")
     parser.add_argument("--segmentation-root", default="seg_out")
     parser.add_argument("--segmentation-generation-id")
+    parser.add_argument("--runs-root", default="runs")
+    parser.add_argument("--inputs-root", default="inputs_out")
     args = parser.parse_args()
     if args.release_id and not args.release_root:
         parser.error("--release-id requires --release-root")
@@ -649,5 +862,7 @@ if __name__ == "__main__":
         args.workbook,
         args.source_file,
         args.source_sha256,
+        runs_root=args.runs_root, inputs_root=args.inputs_root,
     )
-    emit(args.workbook, draft, rows, pipeline_bindings=pipeline_bindings)
+    emit(args.workbook, draft, rows, pipeline_bindings=pipeline_bindings,
+         runs_root=args.runs_root)

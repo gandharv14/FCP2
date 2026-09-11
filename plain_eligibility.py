@@ -95,7 +95,7 @@ def exclusion_codes(report: dict, exclusions: dict | None) -> list[str]:
     return codes
 
 
-def evaluate(run: Path) -> dict:
+def evaluate(run: Path, *, allow_grouped: bool = True) -> dict:
     report = _load(run / "normalization_report.json")
     spec = _load(run / "normalized.json")
     draft = _load(run / "draft.json")
@@ -178,7 +178,13 @@ def evaluate(run: Path) -> dict:
         result["mode"] = "fail"
         result["reason"] = "audit sentinel row (no candidates were identified)"
         return result
-    if draft_rows < floor:
+    grouped = None
+    if draft_rows < floor and allow_grouped and (run / 'grouped-plain-qualification.json').exists():
+        from scripts.batch.harbor_grouped_plain_qualification import validate_sidecar
+        grouped = validate_sidecar(run)
+        result['authenticated_audit_atoms'] = grouped['coverage']['audit_atoms']
+        result['authenticated_reviewed_references'] = grouped['coverage']['reviewed_candidate_references']
+    if draft_rows < floor and grouped is None:
         result["mode"] = "fail"
         result["reason"] = (
             f"draft_rows {draft_rows} below floor {floor} "

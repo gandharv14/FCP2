@@ -19,10 +19,14 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
+import posixpath
 import re
 import shutil
 import sys
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 import openpyxl
@@ -166,7 +170,9 @@ SEMANTIC_HINTS = {
 
 
 def quote_sheet(sheet):
-    return "'%s'" % sheet if any(c in sheet for c in " -&()") else sheet
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", sheet):
+        return sheet
+    return "'" + sheet.replace("'", "''") + "'"
 
 
 def display_name(label, sheet):
@@ -189,6 +195,130 @@ def display_name(label, sheet):
     if len(context) == 1 and context[0].startswith("("):
         return "%s %s" % (head, context[0])
     return "%s (%s)" % (head, ", ".join(context))
+
+
+def output_label(entry):
+    """Optional display labels fall back to the unchanged curated reference."""
+    return entry.get("name") or entry.get("label") or entry["band"]
+
+
+def output_sheet(entry):
+    """The qualified band owns sheet identity; optional metadata must agree."""
+    sheet, separator, _ = entry["band"].rpartition("!")
+    if not separator or not sheet:
+        raise SystemExit("curated output requires a sheet-qualified band")
+    if entry.get("sheet") is not None and entry["sheet"] != sheet:
+        raise SystemExit("curated output sheet differs from its band")
+    return sheet
+
+
+def source_display_repairs(source, outputs, gold):
+    """Prove a narrow auto-label defect without changing curated output identity.
+
+    A staffing shift header above an IRR/MOIC cell is not its unit. Repair only
+    that specific dimensional contradiction when literal row labels, adjacent
+    units, original formula type, and number formats independently agree.
+    Deliberate custom names and other qualifiers are left untouched.
+    """
+    candidates = []
+    for entry in outputs:
+        raw = output_label(entry)
+        parts = raw.split(" / ")
+        if (raw != entry.get("label") or len(parts) != 2
+                or parts[0].strip().lower() not in {"irr", "equity irr", "moic"}
+                or not re.fullmatch(r"shift\s*\(hours?\)", parts[1].strip(), re.I)):
+            continue
+        cells = band_cells(entry["band"])
+        if len(cells) == 1 and cells[0][0] == output_sheet(entry):
+            candidates.append((entry, parts, cells[0]))
+    if not candidates:
+        return {}
+    namespace = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    relationship = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    source = Path(source)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    repairs = {}
+    with zipfile.ZipFile(source) as archive:
+        strings = ([] if "xl/sharedStrings.xml" not in archive.namelist() else
+                   ["".join(node.itertext()) for node in
+                    ET.fromstring(archive.read("xl/sharedStrings.xml"))])
+        relationships = {node.attrib["Id"]: node.attrib["Target"] for node in
+                         ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))}
+        sheets = {node.attrib["name"]: relationships[node.attrib[relationship]]
+                  for node in ET.fromstring(archive.read("xl/workbook.xml")).find("s:sheets", namespace)}
+        for sheet in {cell[0] for _, _, cell in candidates}:
+            selected = [(entry, parts, coordinate) for entry, parts, (name, coordinate)
+                        in candidates if name == sheet]
+            columns = {gold[sheet][coordinate].column for _, _, coordinate in selected}
+            rows = {gold[sheet][coordinate].row for _, _, coordinate in selected}
+            evidence, column_text = {}, {column: [] for column in columns}
+            member = sheets[sheet]
+            member = member.lstrip("/") if member.startswith("/") else posixpath.normpath("xl/" + member)
+            with archive.open(member) as stream:
+                for _, node in ET.iterparse(stream, events=("end",)):
+                    if node.tag != "{" + namespace["s"] + "}c":
+                        continue
+                    coordinate = node.attrib.get("r")
+                    if not coordinate:
+                        node.clear()
+                        continue
+                    column, row, _, _ = range_boundaries(coordinate)
+                    if row not in rows and column not in columns:
+                        node.clear()
+                        continue
+                    formula, value = node.find("s:f", namespace), node.find("s:v", namespace)
+                    kind = node.attrib.get("t", "n")
+                    text = value.text if value is not None else None
+                    if kind == "s" and text is not None:
+                        text = strings[int(text)]
+                    elif kind == "inlineStr":
+                        inline = node.find("s:is", namespace)
+                        text = "".join(inline.itertext()) if inline is not None else ""
+                    elif kind != "str":
+                        text = None
+                    item = {"reference": sheet + "!" + coordinate, "text": text,
+                            "literal_text": formula is None and text is not None,
+                            "formula": formula.text if formula is not None else None}
+                    if row in rows:
+                        evidence[(row, column)] = item
+                    if column in columns and isinstance(text, str) and text.strip():
+                        column_text[column].append((row, item))
+                    node.clear()
+            for entry, parts, coordinate in selected:
+                cell = gold[sheet][coordinate]
+                left = [item for (row, column), item in evidence.items()
+                        if row == cell.row and column < cell.column
+                        and item["literal_text"] and item["text"].strip() == parts[0].strip()]
+                unit = evidence.get((cell.row, cell.column + 1), {})
+                original = evidence.get((cell.row, cell.column), {})
+                preceding = sorted((row, item) for row, item in column_text[cell.column] if row < cell.row)
+                if (len(left) != 1 or not unit.get("literal_text") or not preceding
+                        or preceding[-1][1]["text"].strip() != parts[1].strip()
+                        or not preceding[-1][1]["literal_text"] or not original.get("formula")):
+                    continue
+                is_irr = parts[0].strip().lower() in {"irr", "equity irr"}
+                unit_text = unit["text"].strip()
+                format_text = cell.number_format
+                numeric_format = re.sub(r'"[^"]*"|\\.', '', format_text)
+                if is_irr:
+                    proved = (unit_text == "%" and "%" in numeric_format
+                              and bool(re.match(r"\s*(?:X?IRR)\s*\(", original["formula"], re.I)))
+                else:
+                    proved = (unit_text.lower() == "x" and "%" not in numeric_format
+                              and bool(re.search(r"[0#]\.0", numeric_format)))
+                if not proved:
+                    continue
+                name = parts[0].strip() + " (" + unit_text + ")"
+                repairs[entry["band"]] = {
+                    "schema_version": "source-output-display-repair/v1",
+                    "policy": "stale-staffing-hours-suffix/v1", "source_sha256": source_hash,
+                    "before": display_name(entry["label"], sheet), "after": name,
+                    "row_label": left[0], "adjacent_unit": unit,
+                    "stale_column_header": preceding[-1][1],
+                    "output_reference": original["reference"],
+                    "original_formula": original["formula"], "number_format": format_text,
+                }
+    return repairs
 
 
 def band_cells(band):
@@ -408,14 +538,16 @@ def collect(workbook, source_dir, seg_root, inputs_root, *, seg_dir=None):
     if not outputs:
         raise SystemExit("%s: curation.toml includes no outputs" % workbook)
 
-    gold = openpyxl.load_workbook(
-        resolve_workbook_artifact(source_dir, workbook), data_only=True)
+    source = resolve_workbook_artifact(source_dir, workbook)
+    gold = openpyxl.load_workbook(source, data_only=True)
     masked = openpyxl.load_workbook(
         resolve_workbook_artifact(inputs_root, workbook, "%s-inputs"),
         data_only=True)
 
+    display_repairs = source_display_repairs(source, outputs, gold)
     resolved, targets = [], {}
     for entry in outputs:
+        selected_sheet = output_sheet(entry)
         refs = []
         for sheet, coord in band_cells(entry["band"]):
             if sheet not in gold.sheetnames:
@@ -439,13 +571,16 @@ def collect(workbook, source_dir, seg_root, inputs_root, *, seg_dir=None):
                 "every cell's gold value is missing, text or an error value; "
                 "re-save the golden workbook with cached values or fix "
                 "curation.toml"
-                % (workbook, entry.get("name") or entry["label"],
+                % (workbook, output_label(entry),
                    entry["band"]))
-        raw = entry.get("name") or entry["label"]
-        resolved.append({"name": display_name(raw, entry["sheet"]),
+        raw = output_label(entry)
+        repair = display_repairs.get(entry["band"])
+        resolved.append({"name": repair["after"] if repair else display_name(raw, selected_sheet),
                          "raw_label": raw,
-                         "sheet": entry["sheet"], "band": entry["band"],
+                         "sheet": selected_sheet, "band": entry["band"],
                          "score": entry.get("score"), "refs": refs})
+        if repair:
+            resolved[-1]["display_name_evidence"] = repair
     if not resolved:
         raise SystemExit("%s: no curated output produced any answer cells"
                          % workbook)
@@ -458,11 +593,10 @@ def scenario_for(workbook, family, outputs, mcp=False):
     if mcp:
         return (
             "A colleague has sent you %s with every calculated figure stripped "
-            "out, and this time the externally-sourced input assumptions have "
-            "been removed from the sheets as well: market rates, tax rates, "
-            "macro assumptions, contractual terms and opening balances have to "
-            "be researched through the data service described below before "
-            "anything can be computed. Rebuild the calculations from the "
+            "out, and selected financial inputs have been removed from the "
+            "sheets as well. Retrieve those inputs through the research data "
+            "service described below, using the workbook's labels and context "
+            "to identify the relevant records. Rebuild the calculations from the "
             "remaining inputs plus your research, and report the %d headline "
             "figures the model exists to produce, such as %s. The full list of "
             "figures and the cells they belong in is given below."
@@ -504,7 +638,7 @@ You may install Python packages (for example `openpyxl`) to read it.
 
 INPUT_SECTION_MCP = """\
 The workbook `%s` is in your working directory. Every cell the model is meant
-to work out is blank, and a set of externally-sourced input assumptions has
+to work out is blank, and a set of selected financial inputs has
 additionally been removed from the sheets. Those removed inputs are only
 retrievable through the research data service described in the next section;
 every other input - drivers, historicals and labels - is present. The artifact
@@ -516,9 +650,9 @@ labels, and sheet structure. You may install Python packages (for example
 RESEARCH_SECTION = """\
 ## Research data service
 
-The removed input assumptions (rates, tax and macro assumptions, contractual
-terms, opening balances, dates and similar externally-sourced values) are
-served by a mock research MCP server at `%s` (streamable HTTP transport). It
+The removed financial inputs are served by a mock research MCP server at
+`%s` (streamable HTTP transport). Use the records' provenance and financial
+dimensions to identify the values relevant to the workbook. The server
 exposes five tools:
 
 - `list_sources` - the organizations and data platforms available
@@ -650,6 +784,9 @@ def load_plain_meta(workbook, audit_root="runs"):
     elig = {}
     if elig_path.is_file():
         elig = json.loads(elig_path.read_text(encoding="utf-8"))
+    if (run / "grouped-plain-qualification.json").exists():
+        import plain_eligibility
+        elig = plain_eligibility.evaluate(run)
     codes = report.get("exclusion_reason_codes") or {}
     reason = elig.get("plain_reason") or elig.get("reason") or (
         "all %s audit rows excluded" % report.get("excluded_rows", 0)
@@ -669,6 +806,7 @@ def load_plain_meta(workbook, audit_root="runs"):
 def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
          nat_meta, hints=None, hint_style="", mcp_dir=None, audit_meta=None,
          formula_report=None, formula_hints=None, audit_root="runs",
+         normalization_root=None,
          proof_contract=None, generation_manifest=None,
          generation_manifest_path=None, inputs_generation=None,
          inputs_generation_path=None, pipeline_bindings=None,
@@ -799,6 +937,21 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
                 audit_meta["inventory_sha256"],
             "variable_source_audit_rows": audit_meta["inventory_rows"],
         })
+        if audit_meta.get("validator_upgrade_receipt"):
+            metadata["variable_source_audit_validator_upgrade_sha256"] = audit_meta["validator_upgrade_sha256"]
+            metadata["variable_source_audit_current_inventory_sha256"] = audit_meta["current_inventory_sha256"]
+            copied = out_dir / "tests" / "audit_validator_upgrade.json"
+            shutil.copy2(audit_meta["validator_upgrade_receipt"], copied)
+            if hashlib.sha256(copied.read_bytes()).hexdigest() != audit_meta["validator_upgrade_sha256"]:
+                raise ValueError("audit validator upgrade changed during packaging")
+        if audit_meta.get("applicability_receipt"):
+            metadata["variable_source_audit_applicability_sha256"] = audit_meta["applicability_sha256"]
+            metadata["variable_source_audit_current_inventory_sha256"] = audit_meta["current_inventory_sha256"]
+            shutil.copy2(audit_meta["applicability_receipt"],
+                         out_dir / "tests" / "audit_applicability.json")
+            copied = out_dir / "tests" / "audit_applicability.json"
+            if hashlib.sha256(copied.read_bytes()).hexdigest() != audit_meta["applicability_sha256"]:
+                raise ValueError("audit applicability changed during packaging")
     if mcp_dir is not None:
         metadata.update({
             "mcp_environment": str(mcp_dir),
@@ -809,7 +962,8 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
             ).__len__(),
         })
     else:
-        plain_meta, exclusions_path = load_plain_meta(workbook, audit_root)
+        plain_meta, exclusions_path = load_plain_meta(
+            workbook, normalization_root if normalization_root is not None else audit_root)
         if plain_meta:
             metadata.update(plain_meta)
         if exclusions_path is not None:
@@ -921,6 +1075,127 @@ def audit_segmentation_binding(pipeline_context):
     return binding
 
 
+def load_applicable_audit(workbook, artifact, audit_root, receipt_path,
+                          pipeline_context, *, model, project_id):
+    """Revalidate an existing audit against the actual selected build inputs."""
+    from xl_audit_equivalence import read, file_record, validate_audit_equivalence
+    if pipeline_context is None or pipeline_context.get("workbook_id") != workbook:
+        raise ValueError("audit applicability requires the pinned workbook context")
+    receipt_path = Path(receipt_path)
+    if receipt_path.is_symlink():
+        raise ValueError("audit applicability receipt cannot be a symlink")
+    receipt_path = receipt_path.resolve()
+    receipt_binding = file_record(receipt_path)
+    receipt = read(receipt_path)
+    b = pipeline_context["bindings"]
+    current = {
+        "original_raw_source": receipt["current_bindings"]["original_raw_source"],
+        "source_file": file_record(pipeline_context["source_path"]),
+        "baseline_inputs": file_record(artifact),
+        "baseline_segmentation": file_record(inputs_sidecar_path(artifact)),
+    }
+    for component, directory_key in (("source", "source_dir"),
+                                     ("segmentation", "segmentation_dir")):
+        current[component + "_generation"] = {
+            "path": str(Path(pipeline_context[directory_key]).resolve()),
+            "id": b[component + "_generation_id"],
+            "manifest_sha256": b[component + "_manifest_sha256"],
+        }
+    run = Path(audit_root) / (workbook + "-variable-sources")
+    prefix = workbook + "-inputs-variable-sources"
+    for key, suffix in (("variable_source_metadata", ".metadata.json"),
+                        ("variable_source_inventory", ".inventory.json"),
+                        ("variable_source_audit", ".md")):
+        if receipt["old_bindings"][key] != file_record(run / (prefix + suffix)):
+            raise ValueError("audit applicability differs from the selected audit root")
+    # This independently rechecks complete coverage, journals, exact financial
+    # inventory, original/source identity, sidecar and current production proof.
+    validate_audit_equivalence(receipt_path, current_bindings=current,
+        model=model, endpoint=PROD_ENDPOINT, project_id=project_id,
+        validator_upgrade=receipt.get("validator_upgrade"),
+        original_auditor=receipt.get("original_auditor"))
+    metadata = read(run / (prefix + ".metadata.json"))
+    if metadata.get("workbook") != workbook:
+        raise ValueError("audit applicability workbook mismatch")
+    if (file_record(receipt_path) != receipt_binding
+            or file_record(run / (prefix + ".metadata.json")) != receipt["old_bindings"]["variable_source_metadata"]):
+        raise ValueError("audit applicability evidence changed during validation")
+    return {**metadata, "cache_hit": True,
+            "applicability_receipt": str(receipt_path),
+            "applicability_sha256": receipt_binding["sha256"],
+            "current_inventory_sha256": receipt["current_inventory_sha256"]}
+
+
+
+def load_upgraded_audit(workbook, artifact, audit_root, receipt_path,
+                        original_code_path, pipeline_context, *, model, project_id):
+    """Consume a completed 56ab audit through its exact current owning upgrade.
+
+    The CLI supplies the actual pinned pair and independently selected original
+    code path. Receipt flags never select a generation or authorize a model call.
+    Other historical protocols continue through their own applicability route.
+    """
+    import xl_audit_validator_upgrade as upgrade
+    from xl_audit_inventory_upgrade import BEFORE_SHA256
+    from xl_audit_equivalence import read, file_record
+    if pipeline_context is None or pipeline_context.get("workbook_id") != workbook:
+        raise ValueError("audit upgrade requires the pinned workbook context")
+    def bound(path):
+        path = Path(path)
+        if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+            raise ValueError("audit upgrade evidence cannot contain a symlink")
+        return file_record(path.resolve())
+    receipt_binding, original_code = bound(receipt_path), bound(original_code_path)
+    receipt = read(receipt_binding["path"])
+    if (receipt.get("schema_version") != upgrade.SCHEMA
+            or original_code["sha256"] != BEFORE_SHA256
+            or receipt.get("identity", {}).get("original_generator") != original_code):
+        raise ValueError("direct packaging requires the exact completed 56ab upgrade")
+    b = pipeline_context["bindings"]
+    current = {"source_file": bound(pipeline_context["source_path"]),
+        "baseline_inputs": bound(artifact),
+        "baseline_segmentation": bound(inputs_sidecar_path(artifact))}
+    for component, key in (("source", "source_dir"), ("segmentation", "segmentation_dir")):
+        directory = Path(pipeline_context[key]).resolve()
+        current[component + "_generation"] = {
+            "path": str(directory), "id": b[component + "_generation_id"],
+            "manifest_sha256": b[component + "_manifest_sha256"]}
+    run = Path(audit_root) / (workbook + "-variable-sources")
+    prefix = workbook + "-inputs-variable-sources"
+    for key, suffix in zip(upgrade.AUDIT_KEYS, (".metadata.json", ".inventory.json", ".md")):
+        current[key] = bound(run / (prefix + suffix))
+    # This re-enters current generation/builder/reconstruction, exact inventory,
+    # complete original response history, coverage, configuration and budgets.
+    files = upgrade.validate_upgrade(receipt_binding, bindings=current,
+        original_code=original_code, model=model, endpoint=PROD_ENDPOINT,
+        project_id=project_id)
+    metadata = read(current["variable_source_metadata"]["path"])
+    if metadata.get("workbook") != workbook:
+        raise ValueError("audit upgrade workbook mismatch")
+    for path, sha in files.items():
+        if bound(path)["sha256"] != sha:
+            raise ValueError("audit upgrade evidence changed during validation")
+    return {**metadata, "cache_hit": True,
+        "validator_upgrade_receipt": receipt_binding["path"],
+        "validator_upgrade_sha256": receipt_binding["sha256"],
+        "current_inventory_sha256": metadata["inventory_sha256"]}
+
+
+def model_config(args):
+    """Packaging may require complete cached reviews without reading credentials."""
+    offline = args.require_cached_variable_source_audit
+    if offline and (not args.no_naturalize or args.no_variable_source_audit
+                    or args.refresh_variable_source_audit):
+        raise ValueError("cached-only packaging requires --no-naturalize and a retained, unrefreshed audit")
+    return {
+        "enabled": not args.no_naturalize,
+        "base_url": PROD_ENDPOINT,
+        "api_key": "" if offline else read_env_key(args.env_file),
+        "model": args.model,
+        "project_id": args.project_id,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Build rebuild-the-model tasks from curated outputs")
@@ -964,8 +1239,24 @@ def main(argv=None):
     parser.add_argument("--model", default="openai/gpt-5.6-luna")
     parser.add_argument("--no-naturalize", action="store_true")
     parser.add_argument(
+        "--require-cached-variable-source-audit", action="store_true",
+        help="require a complete current audit; never read credentials or issue model calls",
+    )
+    parser.add_argument(
         "--variable-source-audit-root", default="runs",
         help="root for <workbook>-variable-sources audit artifacts",
+    )
+    parser.add_argument(
+        "--audit-equivalence-receipt", default=None,
+        help="revalidate a completed audit's applicability to the pinned generation pair",
+    )
+    parser.add_argument("--audit-validator-upgrade-receipt", default=None,
+        help="validate a completed direct audit upgrade without model dispatch")
+    parser.add_argument("--audit-upgrade-original-code", default=None,
+        help="independently selected retained original auditor for the direct upgrade")
+    parser.add_argument(
+        "--normalization-root", default=None,
+        help="normalization artifacts root; defaults to --variable-source-audit-root",
     )
     parser.add_argument(
         "--variable-source-audit-inputs-root", default="inputs_out",
@@ -1015,6 +1306,19 @@ def main(argv=None):
     )
     parser.add_argument("-o", "--out", default="tasks_outputs")
     args = parser.parse_args(argv)
+    if bool(args.audit_validator_upgrade_receipt) != bool(args.audit_upgrade_original_code):
+        parser.error("direct audit upgrade requires both receipt and original code")
+    if args.audit_validator_upgrade_receipt and (
+        args.audit_equivalence_receipt or not args.require_cached_variable_source_audit
+        or not args.no_naturalize
+    ):
+        parser.error("direct audit upgrade requires cached-only packaging and cannot accompany equivalence")
+    if (args.audit_equivalence_receipt or args.audit_validator_upgrade_receipt) and (
+        len(args.workbooks) != 1 or args.no_variable_source_audit
+        or args.refresh_variable_source_audit or args.segmentation_mode != "strict"
+        or not (args.release_root or (args.source_generation_id and args.segmentation_generation_id))
+    ):
+        parser.error("audit applicability requires one strict pinned workbook and cannot skip or refresh its audit")
     if args.hints and args.semantic_hints:
         parser.error("--hints and --semantic-hints are mutually exclusive")
     if args.release_id and not args.release_root:
@@ -1043,15 +1347,12 @@ def main(argv=None):
     if args.custom_formula_report and len(args.workbooks) != 1:
         parser.error("custom-formula artifacts require exactly one workbook")
 
+    try:
+        config = model_config(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     taxonomy = json.loads(Path(args.taxonomy).read_text(encoding="utf-8"))
     families = {Path(k).stem: v.get("primary", "") for k, v in taxonomy.items()}
-    config = {
-        "enabled": not args.no_naturalize,
-        "base_url": PROD_ENDPOINT,
-        "api_key": read_env_key(args.env_file),
-        "model": args.model,
-        "project_id": args.project_id,
-    }
 
     mcp_dir = Path(args.mcp) if args.mcp else None
     if mcp_dir is not None and not (mcp_dir / "runtime").is_dir():
@@ -1168,20 +1469,32 @@ def main(argv=None):
             audit_artifact = resolve_workbook_artifact(
                 args.variable_source_audit_inputs_root, workbook, "%s-inputs")
             audit_segmentation = audit_segmentation_binding(pipeline_context)
-            audit_meta = generate_audit(
-                workbook,
-                audit_artifact,
-                seg_dir,
-                Path(args.variable_source_audit_root)
-                / ("%s-variable-sources" % workbook),
-                config["api_key"],
-                model=args.variable_source_audit_model,
-                endpoint=PROD_ENDPOINT,
-                project_id=args.project_id,
-                refresh=args.refresh_variable_source_audit,
-                log=lambda message: print("   ", message),
-                segmentation=audit_segmentation,
-            )
+            if args.audit_equivalence_receipt:
+                audit_meta = load_applicable_audit(
+                    workbook, audit_artifact, args.variable_source_audit_root,
+                    args.audit_equivalence_receipt, pipeline_context,
+                    model=args.variable_source_audit_model, project_id=args.project_id)
+            elif args.audit_validator_upgrade_receipt:
+                audit_meta = load_upgraded_audit(
+                    workbook, audit_artifact, args.variable_source_audit_root,
+                    args.audit_validator_upgrade_receipt, args.audit_upgrade_original_code,
+                    pipeline_context, model=args.variable_source_audit_model,
+                    project_id=args.project_id)
+            else:
+                audit_meta = generate_audit(
+                    workbook,
+                    audit_artifact,
+                    seg_dir,
+                    Path(args.variable_source_audit_root)
+                    / ("%s-variable-sources" % workbook),
+                    config["api_key"],
+                    model=args.variable_source_audit_model,
+                    endpoint=PROD_ENDPOINT,
+                    project_id=args.project_id,
+                    refresh=args.refresh_variable_source_audit,
+                    log=lambda message: print("   ", message),
+                    segmentation=audit_segmentation,
+                )
         hints = None
         hint_style = ""
         if args.hints:
@@ -1221,6 +1534,7 @@ def main(argv=None):
              mcp_dir=mcp_dir, audit_meta=audit_meta,
              formula_report=formula_report, formula_hints=formula_hints,
              audit_root=args.variable_source_audit_root,
+             normalization_root=args.normalization_root,
              proof_contract=proof_contract,
              generation_manifest=generation_manifest,
              generation_manifest_path=(

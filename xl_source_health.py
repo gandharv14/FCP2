@@ -565,7 +565,7 @@ def inspect_workbook(
             source_problem = "source_symlink"
         elif not stat.S_ISREG(metadata.st_mode):
             source_problem = "source_not_regular"
-        elif source.suffix.casefold() != ".xlsx":
+        elif source.suffix.casefold() not in {".xlsx", ".xlsm"}:
             source_problem = "unsupported_source_format"
         else:
             source_size = metadata.st_size

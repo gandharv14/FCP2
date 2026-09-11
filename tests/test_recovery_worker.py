@@ -2829,3 +2829,14 @@ def test_queue_mutation_writes_full_ledger_and_current_evidence(
         (config.state / "task-evidence" / "0001.json").read_text()
     )
     assert evidence["queue_integrity_failure"] is True
+
+
+def test_recovery_prompt_preserves_quality_and_semantic_retry_limits(tmp_path):
+    config, rows, _ = _config(tmp_path)
+    worker = RecoveryWorker(config)
+    prompt = worker._generation_prompt(rows[0], rows[0].run_source_path,
+                                       config.inventory, None, 0)
+    assert "Never recurate" in prompt
+    assert "cached calculated answers" in prompt
+    assert "reset semantic-review retry counters" in prompt
+    assert "cannot be dropped" not in prompt

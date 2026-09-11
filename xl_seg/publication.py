@@ -185,12 +185,10 @@ def verifier_paths() -> tuple[Path, ...]:
     """Code files whose exact bytes define the verification implementation."""
     package = Path(__file__).resolve().parent
     return (
+        package.parent / "xl_ast_graph.py",
+        package.parent / "xl_graph_store.py",
         package.parent / "xl_segment.py",
-        package / "evaluate.py",
-        package / "diagnostics.py",
-        package / "proof.py",
-        package / "restriction_cone.py",
-        Path(__file__).resolve(),
+        *sorted(package.glob("*.py")),
     )
 
 

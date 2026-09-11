@@ -15,7 +15,7 @@ APPROVAL_SCHEMA_VERSION = "source-inventory-approval/v1"
 DEFAULT_REGISTRY = (
     Path(__file__).resolve().parent
     / "verification_manifests"
-    / "approved_source_inventories.v1.json"
+    / "approved_source_inventories.v2.json"
 )
 HASH_RE = re.compile(r"[0-9a-f]{64}")
 WORKBOOK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -51,6 +51,9 @@ def original_source_ledger(inventory: dict) -> list[dict]:
         original = conversion.get("original_source") if isinstance(
             conversion, dict
         ) else None
+        transformation = item.get("transformation")
+        if isinstance(transformation, dict):
+            original = transformation.get("original_source")
         if not isinstance(original, dict):
             original = {
                 "path": item.get("path"),

@@ -1,0 +1,484 @@
+"""Opt-in bounded independent review partitions, preserving the legacy producer.
+
+Root admits an unused normalization attempt and one immutable partition plan.
+Every partition has the original two-round budget, with retries only after a
+complete invalid semantic response. Uncertain transport never starts a new
+round. No callback can declare semantic success and no tracker is modified.
+"""
+from dataclasses import asdict
+from pathlib import Path
+from types import SimpleNamespace
+import copy
+import json
+import uuid
+from scripts.batch import harbor_normalization_producer as N
+from scripts.batch import harbor_normalization_compact as K
+from scripts.batch import harbor_review_context as C
+from scripts.batch import harbor_model_executor as E
+from scripts.batch.harbor_admission import read as raw_read,record,require
+
+def read(binding):
+    return N.expand_artifact(raw_read(binding))
+from scripts.batch.harbor_tracker_lifecycle import checked_record
+
+SCHEMA='normalization-partitioned-review/v1'
+PROMPT=N.PROMPT+'''
+This is a disjoint partition of one complete normalization review. Return a
+decision for exactly partition_references, not for other cells mentioned in
+shared rows, duplicate evidence or context. Shared candidate groups and
+duplicate-reference groups are lossless tables: expand each candidate by its
+zero-based group index, then its reference/cells and duplicate_refs_group.
+Expand duplicate_refs_group in each primitive check in the same way. The
+common object supplies unchanged workbook context, audit and hash bindings.
+Shared rows may contain other source values; each selected reference requires
+its own independent eligibility decision. Return the ordinary exact
+normalization-review/v1 schema, not a PASS or a summary. Do not merge cells.
+'''
+
+
+def records(value):
+    result={}
+    def walk(v):
+        if isinstance(v,dict):
+            if set(v)=={'path','sha256'}:
+                checked_record(v);result[v['path']]=v['sha256']
+            else:
+                for x in v.values():walk(x)
+        elif isinstance(v,(list,tuple)):
+            for x in v:walk(x)
+    walk(value);return result
+
+
+def scope(s):
+    return E.SemanticScope(s.workbook,s.bindings['original_raw_source']['sha256'],N.LANE,'normalization-review')
+
+
+def owner(s,campaign):
+    return E.safe(campaign.root)/'normalization-partitions'/E.sha(E.canonical(asdict(scope(s))))
+
+
+def old_location(s,campaign):
+    return E.safe(campaign.root)/E.sha(E.canonical(asdict(scope(s))))
+
+
+def unused(s,campaign,*,root=None,prepared=None):
+    original=old_location(s,campaign)
+    require(not original.exists() or not any(p.name not in {'scope.lock','scope-delegation.json'} for p in original.iterdir()),
+            'original normalization already submitted or uncertain; partition transition forbidden')
+    require(not (E.safe(campaign.root)/'attempt-identities'/(s.budget.attempt_id+'.json')).exists(),
+            'original normalization UUID already reserved')
+    marker=original/'scope-delegation.json'
+    if marker.exists():
+        value=read(record(marker))
+        require(set(value)=={'schema_version','scope','original_budget','prepared','root'}
+            and value['schema_version']=='normalization-scope-delegation/v1'
+            and value['scope']==asdict(scope(s)) and value['original_budget']==C.json_value(asdict(s.budget)),
+            'original scope delegation changed')
+        checked_record(value['prepared'])
+        if root is not None:require(value['root']==str(root),'original scope delegated to another partition plan')
+        if prepared is not None:require(value['prepared']==prepared,'original scope delegation selects another plan')
+        require(N.raw(record(marker))==E.canonical(value),'original scope delegation bytes changed')
+    else:require(prepared is None,'partition plan lacks original-scope delegation')
+
+
+def codes():
+    from scripts.batch import harbor_partition_code_applicability as applicability
+    return {**applicability.code_records(),**N.code_bindings(),str(Path(K.__file__).resolve()):record(Path(K.__file__))['sha256'],
+            str(Path(__file__).resolve()):record(Path(__file__))['sha256'],
+            str(Path(E.__file__).resolve()):record(Path(E.__file__))['sha256']}
+
+
+def full_evidence(s):
+    """Reproduce the old pre-limit preparation exactly; no legacy code edits."""
+    plan,first=N.selection_data(s)
+    require(s.budget.ordinal==1 and s.budget.limit==2,'only unsubmitted first logical review can select partition protocol')
+    run=E.safe(s.run)
+    if run.exists():
+        require((run/'production-selection.json').exists(),'unbound old normalization directory')
+        require(read(record(run/'production-selection.json'))==plan,'original normalization selection changed')
+    else:run.mkdir(parents=True,mode=0o700)
+    N.keep(run/'production-selection.json',plan)
+    for key,suffix in [('variable_source_metadata','.metadata.json'),('variable_source_inventory','.inventory.json')]:
+        N.keep(run/(s.workbook+'-inputs-variable-sources'+suffix),N.raw(s.bindings[key]))
+    if first is not None:N.keep(run/'first_normalization.json',N.raw(s.first_normalization))
+    require(not any((run/name).exists() for name in ('normalization-review.json','normalized.phase1.json','phase1-result.json')),
+            'completed normalization cannot change response protocol')
+    draft=N.import_table(Path(s.bindings['variable_source_audit']['path']))
+    require(len(draft['rows'])==draft['row_count'] and all(r.get('normalization_status')=='needs_review' for r in draft['rows']),
+            'lossless audit import incomplete')
+    N.keep(run/'draft.json',json.dumps(draft,indent=2,ensure_ascii=False).encode()+b'\n')
+    actual,rows=N.analyse(s);require(actual==draft,'normalization draft differs')
+    context,checks=N.workbook_context(s.bindings['source_file']['path'],s.bindings['baseline_inputs']['path'],rows)
+    b=s.bindings;dr=record(run/'draft.json')
+    body=dict(source=b['source_file'],baseline=b['baseline_inputs'],draft=dr,
+        source_sha256=b['source_file']['sha256'],baseline_sha256=b['baseline_inputs']['sha256'],draft_sha256=dr['sha256'],
+        candidates=K.json_value([r for r in rows if r['clean']]),context=context,candidate_primitive_checks=checks,
+        audit=b['variable_source_audit'],current_source_generation=b['source_generation'],current_segmentation_generation=b['segmentation_generation'])
+    if b.get('audit_equivalence') is not None:body['audit_equivalence']=b['audit_equivalence']
+    C.normalization_body(body,source=b['source_file'],baseline=b['baseline_inputs'],draft=dr,rows=rows,bindings=b)
+    N.store_evidence(run/'review-evidence.json',body);N.store_evidence(run/'analysis.json',rows)
+    require(body['candidates'],'zero-candidate branch uses the existing no-review producer')
+    return plan,draft,rows,body
+
+
+def request(s,compact,refs):
+    body=dict(schema_version=SCHEMA,partition_references=refs,
+        partition_candidate_ids={ref:K.candidate_id(compact['common'],ref) for ref in refs},evidence=compact)
+    if K.encoded_size(body)>K.MAX_REQUEST_BYTES:
+        raise K.RequestTooLarge('complete indexed review batch exceeds bound')
+    return dict(model=s.policy.model,reasoning_effort=s.policy.reasoning_effort,
+        messages=[dict(role='system',content=PROMPT),dict(role='user',content=K.encoded(body).decode())])
+
+
+def _snapshot(s):
+    names=['production-selection.json','draft.json','review-evidence.json','analysis.json','review-request.json','prepared.json']
+    return {name:record(s.run/name) for name in names if (s.run/name).exists()}
+
+
+def transition(s,prior_plan,plan,body,rows):
+    """An unsent prior namespace may remain intact while current proofs refresh.
+
+    This is not applicability of any old semantic response. Both original
+    scopes are unused; current independent audit/source checks are mandatory.
+    Only proof locators and the new draft path may differ in financial context.
+    """
+    if prior_plan is None:return None
+    from scripts.batch.harbor_normalization_recovery import selection_from
+    previous=read(prior_plan)
+    old=selection_from({k:previous[k] for k in ('workbook','bindings','run','policy','budget','first_normalization')})
+    require(old.workbook==s.workbook and old.policy==s.policy and old.budget==s.budget
+        and old.first_normalization==s.first_normalization,'prior unsubmitted budget or workbook changed')
+    require(old.run!=s.run and old.run not in s.run.parents and s.run not in old.run.parents,'prior run must be an isolated sibling namespace')
+    require(prior_plan==record(old.run/'production-selection.json'),'original producer selection moved')
+    require(not any((old.run/name).exists() for name in ('normalization-review.json','normalized.json','phase1-result.json')),
+        'prior normalization already reviewed or emitted')
+    proof_keys={'audit_equivalence','audit_validator_upgrade','audit_upgrade_original_code'}
+    require({k:v for k,v in old.bindings.items() if k not in proof_keys}=={k:v for k,v in s.bindings.items() if k not in proof_keys},
+        'prior financial inputs, source, curation or inventory changed')
+    require(set(previous)==set(plan)
+        and previous['pipeline_bindings']==plan['pipeline_bindings'] and previous['schema_version']==plan['schema_version']
+        and previous['semantic_budget_reset'] is False,'prior generator or pipeline contract changed')
+    require(isinstance(previous['code'],dict) and previous['code'],'prior generator bindings missing')
+    for path,digest in previous['code'].items():checked_record(dict(path=path,sha256=digest))
+    legacy=_snapshot(old)
+    for key in ('production-selection.json','draft.json'):
+        require(key in legacy,'prior preparation evidence incomplete')
+    require(N.raw(legacy['draft.json'])==N.raw(record(s.run/'draft.json')),'prior audit draft changed')
+    expected_rows=copy.deepcopy(K.json_value(rows))
+    for row in expected_rows:
+        require(row['evidence_paths']['draft_sha256']==str(s.run/'draft.json'),'unexpected current draft evidence')
+        row['evidence_paths']['draft_sha256']=str(old.run/'draft.json')
+    if 'analysis.json' in legacy:
+        require(K.equal(read(legacy['analysis.json']),expected_rows),'prior reference analysis differs')
+    expected_body=copy.deepcopy(body);expected_body['draft']=legacy['draft.json']
+    expected_body['candidates']=[r for r in expected_rows if r['clean']]
+    if old.bindings.get('audit_equivalence') is None:expected_body.pop('audit_equivalence',None)
+    else:expected_body['audit_equivalence']=old.bindings['audit_equivalence']
+    if 'review-evidence.json' in legacy:
+        require(K.equal(read(legacy['review-evidence.json']),expected_body),'prior model financial evidence changed')
+    if 'prepared.json' in legacy:
+        m=read(legacy['prepared.json'])
+        require(m==dict(schema_version='prepared-normalization-review/v1',status='review_required',request=legacy['review-request.json'],
+            evidence=legacy['review-evidence.json'],analysis=legacy['analysis.json'],draft=legacy['draft.json'],selection=prior_plan,
+            candidate_count=len(body['candidates']),candidate_references=sorted(r['reference'] for r in body['candidates']),
+            policy=asdict(s.policy),budget=C.json_value(asdict(s.budget)),semantic_budget_reset=False),'prior prepared request contract changed')
+        require(read(m['request'])==dict(model=s.policy.model,reasoning_effort=s.policy.reasoning_effort,
+            messages=[dict(role='system',content=N.PROMPT),dict(role='user',content=N.raw(m['evidence']).decode())]),'prior request text changed')
+    for name in proof_keys:
+        if old.bindings.get(name) is not None:checked_record(old.bindings[name])
+    return dict(prior_plan=prior_plan,legacy=legacy,original_budget=C.json_value(asdict(old.budget)),
+        financial_context_equal=True,prior_response_reused=False,semantic_attempts_added=0,
+        original_code=previous['code'],current_code=plan['code'],
+        prior_analysis_available='analysis.json' in legacy,
+        prior_evidence_available='review-evidence.json' in legacy)
+
+
+def prepare(s,campaign,root,*,prior_plan=None):
+    """Select one immutable partition plan around untouched legacy preparation."""
+    require(isinstance(campaign,E.Campaign),'root campaign required')
+    plan,draft,rows,body=full_evidence(s);root=E.safe(root)
+    require(root!=s.run and s.run not in root.parents and root not in s.run.parents,'partition evidence needs a separate namespace')
+    previous=transition(s,prior_plan,plan,body,rows)
+    parts=K.partitions(body,lambda value,refs:request(s,value,refs),max_references=K.MAX_REFERENCES)
+    identity=owner(s,campaign)
+    with E.scope_lock(identity), E.scope_lock(old_location(s,campaign)):
+        unused(s,campaign,root=root)
+        root.mkdir(parents=True,exist_ok=True,mode=0o700)
+        legacy=_snapshot(s)
+        # Both the earlier PENDING_MODEL plan and interrupted over-size evidence
+        # stay byte-identical. No response is inferred from absent prepared.json.
+        if 'prepared.json' in legacy:
+            m=read(legacy['prepared.json'])
+            expected=dict(schema_version='prepared-normalization-review/v1',status='review_required',
+                request=legacy['review-request.json'],evidence=legacy['review-evidence.json'],analysis=legacy['analysis.json'],
+                draft=legacy['draft.json'],selection=legacy['production-selection.json'],candidate_count=len(body['candidates']),
+                candidate_references=sorted(r['reference'] for r in body['candidates']),policy=asdict(s.policy),
+                budget=C.json_value(asdict(s.budget)),semantic_budget_reset=False)
+            require(m==expected,'old prepared plan is not the exact unsubmitted producer request')
+            require(read(m['request'])==dict(model=s.policy.model,reasoning_effort=s.policy.reasoning_effort,
+                messages=[dict(role='system',content=N.PROMPT),dict(role='user',content=N.raw(m['evidence']).decode())]),
+                'old unsubmitted request changed')
+        bindings=[]
+        for index,(refs,payload) in enumerate(parts):
+            target=root/('partition-%04d.request.json'%index)
+            data=K.encoded(payload)
+            require(len(data)<=K.MAX_REQUEST_BYTES,'bounded serialized model request required')
+            bindings.append(dict(index=index,references=refs,request=N.keep(target,data)))
+        value=dict(schema_version=SCHEMA,selection=legacy['production-selection.json'],legacy=legacy,previous=previous,
+            campaign=C.json_value(asdict(campaign)),code=codes(),partitions=bindings,
+            full_candidate_references=list(dict.fromkeys(r['reference'] for r in body['candidates'])),
+            max_references=K.MAX_REFERENCES,max_request_bytes=K.MAX_REQUEST_BYTES,
+            logical_limit=2,original_budget=C.json_value(asdict(s.budget)),semantic_budget_reset=False,
+            prior_attempt_submitted=False,root=str(root),lane_approval=False)
+        prepared=N.keep(root/'prepared.json',value)
+        N.keep(old_location(s,campaign)/'scope-delegation.json',dict(schema_version='normalization-scope-delegation/v1',
+            scope=asdict(scope(s)),original_budget=C.json_value(asdict(s.budget)),prepared=prepared,root=str(root)))
+        N.keep(identity/'owner.json',dict(schema_version=SCHEMA,prepared=prepared,selection=legacy['production-selection.json']))
+        return prepared
+
+
+def selection(prepared):
+    m=read(prepared);require(m.get('schema_version')==SCHEMA,'wrong normalization partition schema')
+    raw=read(m['selection'])
+    from scripts.batch.harbor_normalization_recovery import selection_from
+    return selection_from({k:raw[k] for k in ('workbook','bindings','run','policy','budget','first_normalization')})
+
+
+def _current(prepared,*,allow_emitted=False):
+    """Revalidate immutable root state and current full evidence without writes."""
+    m=read(prepared);s=selection(prepared)
+    require(set(m)=={'schema_version','selection','legacy','previous','campaign','code','partitions',
+        'full_candidate_references','max_references','max_request_bytes','logical_limit','original_budget',
+        'semantic_budget_reset','prior_attempt_submitted','root','lane_approval'},'partition preparation fields changed')
+    c=m['campaign'];campaign=E.Campaign(Path(c['root']),Path(c['slot_root']),c['model_slots'])
+    from scripts.batch import harbor_partition_code_applicability as applicability
+    applicability.validate(m, codes(), s)
+    require(m['original_budget']==C.json_value(asdict(s.budget)) and s.budget.ordinal==1 and s.budget.limit==2,'partition budget changed')
+    require(N.raw(record(owner(s,campaign)/'owner.json'))==E.canonical(dict(schema_version=SCHEMA,prepared=prepared,selection=m['selection'])),
+            'partition plan is not the root-owned original scope')
+    unused(s,campaign,prepared=prepared)
+    for record_ in m['legacy'].values():N.raw(record_)
+    require(m['selection']==record(s.run/'production-selection.json'),'old selection moved')
+    current,_=N.selection_data(s);require(read(m['selection'])==current,'current source/audit/generator plan differs')
+    draft,rows=N.analyse(s);require(draft==read(m['legacy']['draft.json']) and K.equal(K.json_value(rows),read(m['legacy']['analysis.json'])),'current analysis differs')
+    body=read(m['legacy']['review-evidence.json'])
+    C.normalization_body(body,source=s.bindings['source_file'],baseline=s.bindings['baseline_inputs'],draft=m['legacy']['draft.json'],rows=rows,bindings=s.bindings)
+    context,checks=N.workbook_context(s.bindings['source_file']['path'],s.bindings['baseline_inputs']['path'],rows)
+    require(K.equal(context,body['context']) and K.equal(checks,body['candidate_primitive_checks']),'complete original context changed')
+    previous=m['previous']
+    require(previous==transition(s,previous['prior_plan'] if previous else None,current,body,rows),'prior unsubmitted transition changed')
+    parts=K.partitions(body,lambda value,refs:request(s,value,refs),max_references=K.MAX_REFERENCES)
+    require(m['full_candidate_references']==list(dict.fromkeys(r['reference'] for r in body['candidates'])) and len(parts)==len(m['partitions']),
+            'partition coverage changed')
+    expected=[]
+    for index,(refs,payload) in enumerate(parts):
+        binding=m['partitions'][index]['request'];N.raw(binding)
+        require(Path(binding['path'])==Path(m['root'])/('partition-%04d.request.json'%index) and N.raw(binding)==K.encoded(payload),
+                'partition request differs from current complete evidence')
+        expected.append(dict(index=index,references=refs,request=binding))
+    require(m['partitions']==expected and m['logical_limit']==2 and m['max_references']==K.MAX_REFERENCES
+        and m['max_request_bytes']==K.MAX_REQUEST_BYTES and m['semantic_budget_reset'] is False
+        and m['prior_attempt_submitted'] is False and m['lane_approval'] is False,'partition contract changed')
+    if not allow_emitted:require(not (s.run/'normalization-review.json').exists(),'normalization already aggregated; no additional calls')
+    return m,s,campaign,draft,rows
+
+
+def _prepared_call(prepared,index,ordinal):
+    m=read(prepared);s=selection(prepared)
+    require(type(index) is int and 0<=index<len(m['partitions']) and type(ordinal) is int and ordinal in (1,2),
+            'invalid partition/round')
+    bid='normalization-partition-'+prepared['sha256'][:32]+'-'+str(index)
+    uid=str(uuid.uuid5(uuid.UUID(s.budget.attempt_id),str(index)+':'+str(ordinal)))
+    return E.PreparedCall(m['partitions'][index]['request'],s.policy,
+        E.SemanticScope(s.workbook,s.bindings['original_raw_source']['sha256'],N.LANE,bid),
+        ordinal,2,uid,s.budget.evidence+(prepared,))
+
+
+def _review(prepared,index,ordinal,campaign,rows):
+    pc=_prepared_call(prepared,index,ordinal);out=E.inspect(pc,campaign)
+    require(out.status in {'completed','response_rejected'},'partition has incomplete/rejected transport; no semantic replay or aggregation')
+    if out.status=='response_rejected':
+        # Executor seals this only after retaining a complete HTTP response and
+        # completed receipt. It is a spent, rejected response, never a review.
+        # HTTP exhaustion and uncertain/partial transport are separate statuses.
+        journal=E.location(pc,campaign);raw=record(journal/'response.raw.json');completed=record(journal/'completed.json')
+        require(read(completed)['response']==raw,'rejected response lacks completed byte binding')
+        outer=read(raw);end=read(completed);submitted=read(record(journal/'submitted.json'))
+        require(isinstance(outer,dict) and outer.get('model')==pc.policy.model and outer.get('object')=='chat.completion'
+            and isinstance(outer.get('id'),str) and bool(outer['id'].strip()),'rejected response is not attributable completed model output')
+        start=submitted.get('submitted_at_ns');finish=end.get('completed_at_ns')
+        require(type(start) is int and type(finish) is int and 0<start<=finish and type(outer.get('created')) is int
+            and start//10**9-60<=outer['created']<=finish//10**9+60,'rejected response chronology is not proven')
+        require(all(submitted.get(k)==getattr(pc.policy,k) for k in ('model','reasoning_effort','endpoint','project_id'))
+            and submitted.get('attempt_id')==pc.attempt_id and submitted.get('response_mode')==end.get('response_mode')=='json_object'
+            and submitted.get('semantic_budget_reset') is False and submitted.get('request')==record(journal/'request.json'),
+            'rejected response submitted configuration changed')
+        choices=outer.get('choices');require(isinstance(choices,list) and len(choices)==1,'rejected model choices ambiguous')
+        choice=choices[0];require(isinstance(choice,dict) and isinstance(choice.get('message'),dict),'rejected response message shape is unknown')
+        message=choice['message']
+        require(choice.get('finish_reason')=='stop' and message.get('role')=='assistant' and not message.get('tool_calls')
+            and not message.get('refusal') and isinstance(message.get('content'),str),'incomplete or refused response cannot receive semantic replay')
+        try:parsed=E.strict_json(message['content'].encode())
+        except (ValueError,UnicodeDecodeError):parsed=None
+        require(not isinstance(parsed,dict),'unexplained rejected complete response remains blocked')
+        response_id=outer['id']
+        return dict(valid=False,reason_code='executor_rejected_complete_response',call=None,outcome=out.outcome,
+            rejected_response=raw,rejected_completed=completed,ordinal=ordinal,
+            result=dict(response_id=response_id,attempt_id=pc.attempt_id,review=None,response_sha256=raw['sha256']))
+    require(out.call is not None,'completed partition lacks actual Call')
+    result=C.validate_call(out.call,read(pc.request),policy=pc.policy)
+    refs=set(read(prepared)['partitions'][index]['references']);selected=[r for r in rows if r['clean'] and r['reference'] in refs]
+    try:C.validate_normalization_review(result['review'],selected)
+    except C.NormalizationReviewRejected as exc:
+        return dict(valid=False,reason_code=exc.reason_code,call=asdict(out.call),outcome=out.outcome,result=result,ordinal=ordinal)
+    return dict(valid=True,reason_code=None,call=asdict(out.call),outcome=out.outcome,result=result,ordinal=ordinal)
+
+
+def dispatch(prepared,index,ordinal,*,credential):
+    """Root-authorized only; shared executor supplies slots and three retries."""
+    m,s,campaign,draft,rows=_current(prepared)
+    with E.scope_lock(owner(s,campaign)),E.scope_lock(old_location(s,campaign)):
+        unused(s,campaign,prepared=prepared)
+        if ordinal==2:
+            # All first-round partitions must be completed before a correction
+            # round starts. A passed partition never gets a fishing retry.
+            first=[_review(prepared,i,1,campaign,rows) for i in range(len(m['partitions']))]
+            require(not first[index]['valid'],'valid partition cannot receive another semantic attempt')
+        return E.execute(_prepared_call(prepared,index,ordinal),campaign,credential=credential)
+
+
+def aggregate(prepared):
+    """Merge exact decisions only after every frozen partition validates."""
+    m,s,campaign,draft,rows=_current(prepared,allow_emitted=True)
+    proofs=[];selected=[];all_calls=[]
+    for index,part in enumerate(m['partitions']):
+        first=_review(prepared,index,1,campaign,rows);proofs.append(first);all_calls.append(first['result'])
+        second_path=E.location(_prepared_call(prepared,index,2),campaign)
+        if first['valid']:
+            require(not second_path.exists(),'passed partition was reviewed again');selected.append(first)
+        else:
+            second=_review(prepared,index,2,campaign,rows);require(second['valid'],'partition semantic review budget exhausted')
+            require(second['result']['response_sha256']!=first['result']['response_sha256'],'rejected response bytes reused as review')
+            C.require_independent(second['result'],all_calls);proofs.append(second);all_calls.append(second['result']);selected.append(second)
+    for i,item in enumerate(all_calls):C.require_independent(item,all_calls[:i])
+    first_end=max(read(item['call']['completed'] if item['call'] else item['rejected_completed'])['completed_at_ns']
+                  for item in proofs if item['ordinal']==1)
+    require(all(read(item['call']['submitted'])['submitted_at_ns']>=first_end for item in proofs if item['ordinal']==2),
+            'second logical round started before the complete first round')
+    review={key:m['legacy'][name]['sha256'] for key,name in [('draft_sha256','draft.json')]}
+    review.update(source_sha256=s.bindings['source_file']['sha256'],baseline_sha256=s.bindings['baseline_inputs']['sha256'],
+        schema_version='normalization-review/v1',reviewer=' | '.join(item['result']['review']['reviewer'] for item in selected),cells={})
+    for item in selected:
+        for ref,decision in item['result']['review']['cells'].items():
+            require(ref not in review['cells'],'duplicate partition decision');review['cells'][ref]=decision
+    C.validate_normalization_review(review,rows)
+    dependency_reconciliation=K.reconcile(read(m['legacy']['review-evidence.json']),review['cells'])
+    files={}
+    files.update(records([prepared,m,proofs]))
+    files.update(records(s.bindings))
+    files.update(read(m['selection'])['audit_validation_files'])
+    files.update(records([record(owner(s,campaign)/'owner.json'),
+        record(old_location(s,campaign)/'scope-delegation.json')]))
+    for index in range(len(m['partitions'])):
+        for ordinal in (1,2):
+            p=E.location(_prepared_call(prepared,index,ordinal),campaign)
+            if not p.exists():continue
+            outcome=read(record(p/'outcome.json'))
+            for name,sha in outcome['evidence'].items():files.update(records(dict(path=str(p/name),sha256=sha)))
+    files.update(codes())
+    return dict(schema_version=SCHEMA,prepared=prepared,review=review,partitions=proofs,
+        dependency_reconciliation=dependency_reconciliation,
+        semantic_attempt=max(x['ordinal'] for x in selected),logical_limit=2,
+        checked_files=dict(sorted(files.items())),lane_approval=False,semantic_budget_reset=False)
+
+
+def validate(binding,*,prepared,source,baseline,draft,rows,policy,bindings):
+    value=read(binding);expected=aggregate(prepared);s=selection(prepared)
+    from scripts.batch import harbor_partition_code_applicability as applicability
+    applicability.validate_aggregate(value, expected, codes())
+    require((source,baseline,draft,policy)==(s.bindings['source_file'],s.bindings['baseline_inputs'],record(s.run/'draft.json'),s.policy),
+            'selected normalization context differs')
+    require(all(bindings.get(k)==v for k,v in s.bindings.items()),'partition source/audit bindings changed')
+    require(K.equal(K.json_value(rows),read(record(s.run/'analysis.json'))),'current aggregate rows differ')
+    return dict(review=expected['review'],semantic_attempt=expected['semantic_attempt'],
+        checked_files={**expected['checked_files'],binding['path']:binding['sha256']})
+
+
+def validate_content(s):
+    require(s.normalization_call is None,'partitioned review cannot nominate one model Call')
+    b=s.bindings;run=s.normalization_run
+    require(run==selection(s.normalization_prepared).run,'partition normalization run differs')
+    draft,rows=N.gen.analyse(s.workbook,b['source_file']['path'],b['source_file']['sha256'],
+        runs_root=run.parent,inputs_root=Path(b['baseline_inputs']['path']).parent)
+    return validate(b['normalization_partitioned_review'],prepared=s.normalization_prepared,
+        source=b['source_file'],baseline=b['baseline_inputs'],draft=b['normalization_draft'],rows=rows,policy=s.model_policy,bindings=b)
+
+
+def emit_phase1(prepared):
+    """Current generator emission; assembled review is explicitly many Calls."""
+    proof=aggregate(prepared);m,s,campaign,draft,rows=_current(prepared,allow_emitted=True)
+    run=s.run;b=s.bindings
+    for name in ('source_profiles.json','source-profile-mapping.json','source-display-review.json','oracle_forced_exclusions.json'):
+        require(not (run/name).exists(),'fresh phase1 cannot consume unreviewed later-stage inputs')
+    proof_record=N.keep(Path(m['root'])/'aggregate.json',proof)
+    N.keep(run/'normalization-review.json',proof['review'])
+    reviewed=copy.deepcopy(rows);N.gen.apply_semantic_review(reviewed,run)
+    plan=read(m['selection'])
+    projection=N.gen.emit(s.workbook,copy.deepcopy(draft),copy.deepcopy(rows),runs_root=run.parent,
+        pipeline_bindings=plan['pipeline_bindings'],dry_run=True)
+    N.keep(run/'first_normalization.json',N.raw(s.first_normalization) if s.first_normalization else E.canonical(projection['snapshot']))
+    script=projection['script'];N.keep(run/f'normalize_{s.workbook}.py',script.encode())
+    _,expected=N.expected_outputs(s.workbook,draft,rows,run,plan['pipeline_bindings'])
+    for path,value in expected.items():
+        if path.exists():require(path.read_bytes()==(json.dumps(value,indent=2,ensure_ascii=False,sort_keys=True)+'\n').encode(),
+            'interrupted normalization output changed')
+    prior=None
+    for _ in range(2):
+        namespace={'__name__':'harbor_current_normalizer','__file__':str(run/f'normalize_{s.workbook}.py')}
+        exec(compile(script,'<current-normalizer>','exec'),namespace);namespace['main']()
+        current={name:record(run/name) for name in ('normalized.json','exclusions.json','normalization_report.json')}
+        if prior is not None:require(current==prior,'normalization is not byte deterministic')
+        prior=current
+    N.validate_emission(s.workbook,draft,rows,run,plan['pipeline_bindings'])
+    spec=read(record(run/'normalized.json'))
+    if spec['variables']:N.validate_spec(spec)
+    require(not N.verify_against_golden(spec,Path(b['source_file']['path'])),'normalized values differ from original primitives')
+    require(N.selection_data(s)[0]==plan,'normalization source/code changed during emission')
+    phase1=N.keep(run/'normalized.phase1.json',(run/'normalized.json').read_bytes())
+    mode=N.plain_eligibility.evaluate(run);mode_record=N.keep(run/'plain-eligibility.json',mode)
+    status='phase1_evidence_ready' if mode['mode'] in {'plain','mcp'} and (mode['mode']!='plain' or mode['eligible'] is True) else 'normalization_rejected'
+    return N.keep(run/'phase1-result.json',dict(schema_version=SCHEMA,status=status,workbook=s.workbook,
+        prepared=prepared,normalization_partitioned_review=proof_record,phase1=phase1,outputs=prior,
+        first_normalization=record(run/'first_normalization.json'),plain_eligibility=mode_record,
+        semantic_attempt=proof['semantic_attempt'],lane_approval=False,semantic_budget_reset=False))
+
+
+def main(argv=None):
+    """Offline root preparation/inspection only; credentials never enter argv."""
+    import argparse
+    from contextlib import redirect_stdout
+    import sys
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('operation',choices=('prepare','aggregate','emit-phase1'))
+    for field in ('selection','campaign','prepared','prior_plan'):
+        parser.add_argument('--'+field.replace('_','-'));parser.add_argument('--'+field.replace('_','-')+'-sha256')
+    parser.add_argument('--root')
+    args=parser.parse_args(argv)
+    def selected(name):
+        path=getattr(args,name);digest=getattr(args,name+'_sha256')
+        require(path and digest,'exact '+name+' path and hash required')
+        return dict(path=str(Path(path).absolute()),sha256=digest)
+    with redirect_stdout(sys.stderr):
+        if args.operation=='prepare':
+            require(args.root,'fresh partition evidence root required')
+            s=N.load_selection(selected('selection'));c=read(selected('campaign'))
+            require(set(c)=={'root','slot_root','model_slots'},'exact root campaign fields required')
+            prior=selected('prior_plan') if args.prior_plan or args.prior_plan_sha256 else None
+            result=prepare(s,E.Campaign(Path(c['root']),Path(c['slot_root']),c['model_slots']),Path(args.root),prior_plan=prior)
+        else:
+            prepared=selected('prepared')
+            result=emit_phase1(prepared) if args.operation=='emit-phase1' else N.keep(Path(read(prepared)['root'])/'aggregate.json',aggregate(prepared))
+    print(json.dumps(result,sort_keys=True));return 0
+
+
+if __name__=='__main__':raise SystemExit(main())

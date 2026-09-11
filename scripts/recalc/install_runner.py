@@ -190,6 +190,12 @@ def preflight(excel_app: Path, openssl: Path, automation_user: str) -> dict:
         for key, value in checks.items()
         if key not in {"openssl_detail"}
     )
+    # Scheduling readiness is distinct from permission to run Excel. The
+    # execution gate still requires live isolation inside the offline window.
+    checks["ready_for_offline_window"] = all(
+        value is True for key, value in checks.items()
+        if key not in {"openssl_detail", "ready", "no_default_network_route"}
+    )
     return checks
 
 
@@ -484,7 +490,7 @@ def check(
         errors.append(f"metadata:{exc}")
     live = preflight(excel_app, openssl, automation_user)
     for name, value in live.items():
-        if name not in {"ready", "openssl_detail"} and value is not True:
+        if name not in {"ready", "ready_for_offline_window", "openssl_detail"} and value is not True:
             errors.append(f"live_preflight:{name}")
     if SUDOERS_PATH.is_file():
         validation = subprocess.run(

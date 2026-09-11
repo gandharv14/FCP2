@@ -9,8 +9,7 @@ pyyaml>=6.0
 # Optional, not installed here:
 #   tomli    - only on Python < 3.11; xl_output_task.py, xl_harbor_prep.py and
 #              xl_eval_run.py fall back to stdlib tomllib on 3.11+.
-#   fastmcp  - generated-server smoke and oracle checks only; normally supplied
-#              ephemerally with `uv run --with fastmcp`.
+# MCP tasks require requirements-harbor.txt for mandatory smoke/oracle checks.
 
 # LLM stages use stdlib urllib against the configured HTTP endpoints, so no SDK
 # is required. `xl_variable_source_audit.py` calls GPT 5.6 Sol through Labelbox

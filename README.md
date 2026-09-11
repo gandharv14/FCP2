@@ -1,8 +1,425 @@
-# How a Financial Spreadsheet Gets Taken Apart
+# Financial workbooks to Harbor reinforcement-learning tasks
 
-### A complete walkthrough of the pipeline, from `.xlsx` file to four labelled buckets
+Generate financial RL tasks from raw Excel workbooks, with independent output
+reconstruction, faithful instructions, research environments, and exact grading.
+The walkthrough below explains the segmentation stages and the required Harbor
+quality gates.
 
 ---
+
+## Private verification and automatic cleanup
+
+A published task has two separate deliverables. The runnable task contains its
+instructions, environment, and private grading assets. A sibling verification
+package retains the evidence needed to establish that the task is sound:
+original financial definitions, reconstruction evidence, semantic reviews,
+trusted receipts, and publication history. Never put that package inside the
+agent-visible task or its Docker build context.
+
+The strict publication coordinator supports automatic custody and cleanup:
+
+```bash
+# Supply this alongside the existing scripts/harbor_publish.py arguments:
+--verification-image sha256:<installed-verifier-image-id> \
+--verification-bundle /absolute/private/path/0001-verification
+```
+
+`FCP_VERIFICATION_IMAGE` supplies the same image setting for CLI invocations.
+Without a configured image, publication retains its intermediates. With it,
+the coordinator automatically performs these steps after strict promotion:
+
+1. Capture the current complete financial and publication proof, preserving all
+   signed bytes. Store each distinct file once in a hash-addressed object store.
+2. Restore its original logical paths in a new namespace and rerun the owning
+   validators in the pinned local Python 3.12 image. The container has no network,
+   Docker socket, or host-original mounts; evidence mounts are read-only. The
+   image needs the pipeline dependencies and `/usr/local/bin/python`. No image is
+   pulled automatically and no agent solve is run.
+3. Bind the private package to the exact tracker, release, final task and current
+   verifier code. Acquire the publication and workbook locks and delete only
+   explicitly selected scratch files whose identical bytes are in that package.
+   Save a verification receipt and resumable cleanup journal beside it.
+
+A failed isolated proof leaves cleanup pending. Changed sources, keys, code,
+release pointers, task files, or package bytes invalidate cleanup authorization.
+Publication success is reported separately from cleanup success. The callable
+`harbor_finalize.FinalizeRequest` / `finalize()` API resumes custody and cleanup
+without republishing the task. After scratch removal,
+`harbor_verification_package.qualify_retained_release()` explicitly qualifies the
+release using its pinned private package; a native validator pointed at deleted
+scratch correctly fails instead of trusting an old pass flag.
+
+The corpus report supports explicit retained-package qualification through
+`--private-verifications /absolute/selection.json` and
+`--private-verifications-sha256 <sha256>`. The selected JSON uses schema
+`harbor-report-private-verifications/v1`, binds `inventory_sha256`, and lists
+`workbooks` with `workbook_id`, `original_sha256`, `harbor_root`, pinned `tracker`,
+`bundle`, `manifest_sha256`, and `verifier_image`. Each Harbor root must also be
+explicitly selected by the report. No sidecar is discovered or trusted
+implicitly; a failed private proof stays failed. All original inventory entries
+remain in the denominator.
+
+The initial storage format compacts evidence by exact-byte deduplication. It
+still retains unique AST/graph evidence required by current validators. It does
+not delete shared source/segmentation generations, original workbooks, curation,
+unknown files, or older builds outside the selected task's scratch roots. Those
+need a separate cross-release retention decision. Logical deleted bytes and
+filesystem free-space change are separate measurements because APFS may share
+physical blocks.
+
+On APFS, package construction and replay first try independently writable
+copy-on-write clones, then fall back to byte copies. Both paths recheck exact
+hashes and file identities; shared hard links to original evidence are rejected.
+Captured original paths on explicitly selected `/Volumes` roots are supported.
+
+For a compact transport copy, export the private package without changing its
+manifest or signed evidence:
+
+```bash
+.venv/bin/python -m scripts.harbor_package_archive export \
+  /absolute/private/package /absolute/private/package.tar.gz \
+  --manifest-sha256 <pinned-manifest-sha256>
+.venv/bin/python -m scripts.harbor_package_archive import \
+  /absolute/private/package.tar.gz /absolute/private/restored-package \
+  --archive-sha256 <exported-archive-sha256> \
+  --manifest-sha256 <pinned-manifest-sha256>
+```
+
+Import verifies bounded, exact contents before exclusive publication. Archive
+transport does not grant cleanup authority or delete the raw verification
+package; retained-release qualification still requires isolated financial replay.
+
+Task production remains stopped. The previous `.corpus-runs/20260908` directory
+was absent when this feature was implemented; its old private proof and yield
+logs cannot be used as current validation. Code changes are in this repository,
+not in that deleted run directory. See [current reliability status](reports/compact-graph-reliability-20260910.md).
+
+## Large graphs and legacy conversion candidates
+
+AST construction accepts `--graph-storage auto|memory|disk` and
+`--graph-storage-dir /absolute/scratch`. Auto mode uses a disposable SQLite graph
+at 100,000 formulas. Segmentation accepts the same options and automatically
+indexes CSV graphs of at least 128 MiB. CSV remains the immutable evidence;
+databases and memory-mapped cycle work arrays are disposable and are closed on
+success or failure. Storage selection preserves targets, dependency edges,
+cycle checks and numeric tolerances. Sparse range projection examines existing
+cells without enumerating the blank area of a large range.
+
+`python scripts/legacy_candidates.py --help` exposes explicit isolated XLS/XLSB
+candidate preparation. It requires hash-pinned inventory and converter
+configuration. Candidates remain `conversion_unverified` until independently
+observed financial equivalence and trusted receipts are available. See
+[legacy candidate instructions](reports/legacy-candidates-20260910.md) for the
+configuration, command and remaining trusted-runner requirements.
+
+## Runtime, validation, and corpus recovery
+
+The pipeline uses Python 3.12. Keep a persistent environment for subprocesses
+and delayed recalculation requests:
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements-dev.txt
+uv pip install --python .venv/bin/python -r requirements-harbor.txt
+.venv/bin/python scripts/test_pipeline.py
+```
+
+`requirements-harbor.txt` installs the MCP runtime required for smoke and live
+retrieval checks. The generated sidecar uses the same FastMCP version.
+`requirements-lock.txt` records the complete Python 3.12 environment used in
+this rebuild; use `uv pip sync --python .venv/bin/python requirements-lock.txt`
+to reproduce it. The installed trusted Excel runner continues using its
+separate system Python and standard-library-only implementation.
+
+The test command includes ordinary tests and the hidden disclosure, source-profile,
+and dialogue regressions through their supported entry points. Add
+`--corpus-roots ../RawWorkbooks1 ../RawWorkbooks2 ../RawWorkbooks3` for private
+workbook checks, and `--host-controls` to exercise actual macOS sandbox controls.
+The root-owned trusted Excel runner intentionally remains compatible with macOS
+system Python; it does not import pipeline dependencies. Hermetic receipt tests
+use the declared `cryptography` development dependency to generate test signatures,
+so they do not silently skip when the host OpenSSL lacks Ed25519 support.
+
+Private root-driver regression fixtures are opt-in through
+`HARBOR_PRETRANSPORT_DRIVER_FIXTURE=/absolute/path/to/prepared-driver-fixture`.
+Without that configured private directory, the portable suite skips that adapter
+fixture; all synthetic pretransport, budget, interrupted-CAS and codec tests run.
+A configured but incomplete fixture fails immediately.
+
+Run qualification against a fixed checkout: editing code during a test or
+workbook run intentionally invalidates captured evidence. Hermetic workflow
+fixtures supply disk-capacity observations and test both sides of the 8 GiB
+boundary; actual workbook dispatch still checks the host's free-space reserve.
+
+The evaluator supports scalar `SQRT` and `SLN`, bounded static `COLUMN`
+references, and proved single-area `INDEX(...):INDEX(...)` ranges. Text and
+logical constants retain their types. Unsupported reference constructors remain
+unresolved even inside `IFERROR`. After a parser/evaluator change, regenerate
+the source AST and affected segmentation proofs; revalidate transformations and
+all dependent gates. Retained historical passes do not certify the new code.
+
+Fresh model calls allow at most three transport retries shared across completed
+transient HTTP errors and typed transient connection/timeout failures before
+response reading starts. Retries keep the same request and logical attempt;
+they do not prove exactly-once provider execution. Opaque errors, certificate
+failures, partial responses and sealed historical attempts are not automatically
+replayed. No semantic-review budget is reset.
+
+Retained normalization partitions and the remaining structured dialogue writer
+round have narrowly versioned code-applicability checks for the reviewed executor
+upgrade. These checks bind archived code, current code and unchanged request
+evidence; an arbitrary code change still invalidates reuse. They permit the
+prospective retry policy on an unsubmitted call and never reopen a sealed call.
+
+Freeze the complete denominator before running intake:
+
+```bash
+.venv/bin/python -m scripts.corpus inventory \
+  ../RawWorkbooks1 ../RawWorkbooks2 ../RawWorkbooks3 \
+  --expected-count 700 --output .corpus-runs/rebuild/inventory.json
+.venv/bin/python -m scripts.corpus screen \
+  --inventory .corpus-runs/rebuild/inventory.json \
+  --run-root .corpus-runs/rebuild --workers 4
+.venv/bin/python -m scripts.corpus_build \
+  --inventory .corpus-runs/rebuild/inventory.json \
+  --run-root .corpus-runs/rebuild --curation-root seg_out --workers 4
+```
+
+Each original identity is counted once, including uppercase extensions, macro
+workbooks, and legacy formats. Duplicate identities fail intake. Workbooks and
+private reports remain outside Git. `scripts.corpus_build` rebuilds source and
+segmentation proofs; its reconstruction count is **not Harbor yield**. Retained
+curation is copied verbatim. Restricted sources additionally require the exact
+versioned inventory and approved batch ID through `--source-inventory` and
+`--inventory-batch-id`. Existing approvals remain in the v1 registry; the current
+v2 registry retains them and adds observed restricted cohorts. For signed
+recalculation, approvals bind the original source; the trusted receipt binds
+the recalculated candidate separately. Explicit request/result pairs under
+`--recalc-root/<workbook-id>` are also consumed for otherwise ready, unrestricted
+sources. Missing pairs, changed evidence, and previously ignored receipts cannot
+silently fall back to the original caches. Signature, source identity, semantic
+comparison and current source-health gates still apply. This route does not
+authorize composing recalculation with a separate source transformation; such
+chains require their own complete provenance and approval.
+
+Workers execute an immutable code snapshot. A frozen checkout uses its validated
+file manifest directly, including when Git is unavailable; empty or changed
+snapshots fail before workbook dispatch. `worker-cap.json` in the run root
+can lower `reconstruction_workers` from four to two while model work is active;
+healthy in-flight workers finish before replacement work starts. SIGTERM/SIGINT
+stops new launches, preserves active results, and leaves unstarted work resumable.
+An independent guardian is armed before each command executes. If its controller
+dies unexpectedly, the guardian terminates that worker process group without
+affecting siblings. It retains the workbook lock through cleanup so an immediate
+resume cannot race the previous worker’s termination grace period. Interrupted controllers cannot provide final resource metrics;
+resume retains that uncertainty and restarts from validated checkpoints.
+
+Source and segmentation generations are validated by their IDs. Preflight
+accepts the same paired generation IDs or release arguments as packaging, so
+an inactive candidate does not need compatibility links. `build_one.sh` accepts
+`PIPELINE_PYTHON`, `RUNS_ROOT`, `INPUTS_ROOT`, `MCP_INPUTS_ROOT`, `STAGING_ROOT`,
+`SOURCE_GENERATION_ROOT`, `SEGMENTATION_ROOT`, and `RELEASE_ROOT`.
+
+Sensitivity-table results remain calculated cells during inspection. A
+presentation-table candidate requires retained targets, complete reconstruction,
+exclusion of every table result from their dependency cones, and a numeric
+answer-leak scan. In-cone tables remain blocked pending deterministic semantics
+and trusted Excel agreement. Every transformed candidate still passes source
+publication and fresh reconstruction. A versioned restricted-source inventory
+can bind a presentation-table candidate to its actual original workbook with
+`source-transformation-lineage/v1`; inventory validation rechecks the original,
+candidate, curation, exclusion proof, and leak scan. Policy
+`presentation-data-tables/v2` also binds the current AST builder and complete
+verification implementation. Historical receipts remain preserved; stale
+receipts require fresh proofs and a new approval inventory. Valid current
+candidates can resume after inventory updates without duplicate inspection.
+Candidate approval never
+replaces the original hash in the corpus denominator or provenance ledger.
+Legacy conversion alone, a passing flag,
+a cached answer, and an answer-key grader smoke do not establish solvability.
+
+Selected mirror bands retain their exact curated cell identity through partitioning.
+Primitive numeric text remains text, and genuine booleans retain their logical
+values during reconstruction. Bounded same-sheet endpoints such as
+`A1:OFFSET(C2,-1,0)` retain the OFFSET operation and independently prove the
+full range; only signed integer literal displacements are supported. Explicit
+empty OOXML array followers retain their validated anchor and position.
+HLOOKUP and VLOOKUP read the complete search vector and selected result for
+proved rectangular references, preserving selector inputs and genuine cycles.
+Truncated, oversized, ambiguous and dynamic tables keep their existing gates.
+IRR and XIRR pass an explicitly supplied starting guess to the rate solver;
+XIRR rejects unequal cash-flow and date vectors before pairing their entries.
+Numeric handlers unwrap a range only when its declared dimensions and actual
+length are exactly one cell. This preserves dates and other scalar values
+returned by INDEX without guessing intersections for multi-cell ranges.
+During workbook iteration, the evaluator can reuse a reconstructed scalar only
+after proving its complete static dependency closure ends in fixed supplied
+inputs. Dynamic references, lookups, arrays, unknown operations and any cycle
+dependency decline reuse. Original iteration order, limits, tolerances and
+cycle certificates remain unchanged; original formula caches never seed reuse.
+Parser changes require fresh source/AST artifacts; verifier changes invalidate
+dependent segmentation and task evidence.
+Completed source checkpoints can retain a current AST after independent checks
+of its builder, source health, original and transformed bytes, approvals, and
+trusted recalculation evidence. Fresh segmentation still runs after a verifier change.
+Historical releases remain immutable during that refresh.
+An unrelated test, reporting or scheduler change can retain completed
+reconstruction after current source authorization, exact live parser/verifier
+fingerprints and fresh preflight all pass. The ledger retains the previous
+snapshot and the new revalidation evidence. Financial implementation changes
+still restart reconstruction. Embedded-assumption ZIP timestamps are fixed so
+unchanged supplied-input workbooks have stable hashes across rebuild times.
+
+Audits require an explicit disposition for every inventory row, including
+grounded exclusions. The saved coverage artifact retains exact raw batch tables
+and reconstructs all resolved final rows. Missing inventory rows cannot become a
+valid audit or plain-task eligibility decision. Qualified publication revalidates
+the bound audit before changing release state and retains its coverage artifact.
+Audit reuse binds that coverage,
+the complete Markdown text, inventory, generator version, and model configuration. Evidence is published atomically under a workbook lock;
+transport retries are bounded separately from semantic review. Naturalization,
+disclosure, dialogue claim coverage, research eligibility, retrieval checks,
+container startup, and grader smoke remain required before release. No solve
+rollouts are part of this rebuild.
+
+Naturalization rejects frozen-span transport markers in submitted instructions.
+For fresh marked writer responses, use `naturalize_recovery.py submit-frozen`
+with the exact preamble and input bodies. The command regenerates the frozen
+authoring inputs from the immutable source, retains the marked and restored
+documents, and requires zero errors and zero span drift before full validation
+and a fresh independent semantic review. Interrupted submissions resume only
+with identical bodies, authoring inputs and submission mode; they consume the
+same bounded attempt.
+
+For an already retained, independently reviewed submission affected by the old
+assembly defect, `span_restoration.restore` can select a separate immutable
+candidate only when the supported freezer proves exact wrapper removal with
+zero span drift and the current full validator passes. The operation preserves
+all original bodies, responses, hashes and consumed attempts. A separately
+hash-bound review-applicability record must establish that the original review
+covers every unchanged prose clause before `accept_review` and ordinary apply.
+This recovery makes no model call and grants no additional attempt. Altered
+prose, missing reviews, changed evidence and noncanonical spans are rejected.
+
+`scripts.corpus_report` reports stage attempts only. For the rebuild's isolated
+Harbor release namespace, run `scripts.corpus_qualification --inventory PATH
+--run-root ROOT --bind-ledgers` with the same Python environment. It revalidates
+original hashes, qualification evidence, required lane outcomes, immutable
+release tuples, and published task bytes before counting a promotion. Stopped
+tasks require matching diagnostic notes and evidence. Its
+`qualified-yield-report.json` always retains the complete original denominator;
+unfinished or corrupted evidence cannot become successful yield. Prior immutable
+promotions whose parser or verifier evidence is stale are reported separately
+and do not count as currently verified yield. Requalification publishes with an
+explicit prior-release compare-and-swap and preserves prior evidence inventories.
+
+For an independently sealed historical stop, the reporter optionally accepts
+`--historical-retirements PATH --historical-retirements-sha256 SHA256`. Both are
+required. The root-selected `harbor-report-historical-retirements/v1` manifest
+binds the original inventory and each exact workbook, namespace, source, tracker,
+seal, contract and activation. The reporter never discovers seals automatically.
+A validated selection records a historical `STOPPED` outcome with
+`current_qualification=false` and `verified_promoted=false`; invalid evidence
+still fails. This mode is read-only and cannot be combined with `--bind-ledgers`.
+
+The predecessor requires intact historical bytes and identity; the replacement
+requires current live reconstruction proof. Transformed promotions additionally
+require independently replayed original-to-candidate lineage. Use
+`--trusted-public-key PATH` with the qualifier when the configured trusted Excel
+runner has a different public-key path.
+
+After qualification, disposable staging files may be removed only when no
+retained proof or release refers to them. Source/AST and segmentation evidence
+referenced by validators must remain readable. On APFS,
+`.venv/bin/python -m scripts.compact_artifacts --roots ROOT... --report NEW_REPORT --apply` reclaims
+duplicate artifact storage in completed generations with independent copy-on-write
+clones. It checks exact hashes before replacement, synchronizes replacement files,
+and records each operation;
+logical files and evidence hashes stay unchanged.
+
+For unique AST and lineage text, macOS native compression preserves the exact
+readable files while reducing allocated storage:
+
+```bash
+.venv/bin/python -m scripts.compress_artifacts \
+  --roots ARTIFACT_ROOT --report NEW_REPORT.json --max-files 1 --apply
+```
+
+Omit `--apply` to inspect; omit `--max-files 1` after a successful canary to
+process all eligible completed artifacts. Only `.json`, `.csv`, `.md` and
+`.txt` files of at least 1 MiB are eligible. Each run probes native filesystem
+support and requires matching logical bytes, hashes, metadata, and compression
+flags before atomic replacement. Exact copies that native tools leave
+uncompressed are recorded and discarded without replacing the original.
+Incomplete generations and invalid historical
+evidence are excluded. Failed native copies or changed evidence stop the run;
+immutable journal events preserve progress. Run from a native local terminal
+where filesystem compression is supported: a restricted sandbox may report a
+successful copy while leaving unusable compressed metadata, which the checks
+reject. Per-file allocated blocks are reported separately from physical free
+space because APFS extents may be shared.
+
+Completed audits can be revalidated after a verifier refresh through
+`xl_audit_equivalence.py propose --historical-bindings OLD.json
+--current-bindings CURRENT.json --receipt NEW.json`. This separate proof permits
+changed segmentation generation identifiers. The v2 contract also permits a
+source-generation identifier change only when builder code provenance is the
+sole change: source workbook, AST CSVs, health, request/result evidence, builder
+arguments and policy must remain byte-identical or exactly equal as applicable.
+It requires fresh live reconstruction,
+unchanged curated targets, baseline contents, financial inventory, model and
+complete historical audit. It preserves every original request, response and
+consumed attempt; it does not create a new model response. Validate it with the
+same command using `validate` and omitting `--historical-bindings`. Publication
+independently revalidates a hash-bound `audit_equivalence` receipt against its
+actual generation IDs. Packaging consumes the same receipt with
+`xl_output_task.py --audit-equivalence-receipt RECEIPT.json`, the original
+`--runs-root` audit directory, and pinned release or paired generation IDs.
+Use `--normalization-root ROOT` when newly reviewed normalization artifacts live
+in a separate directory. This strict single-workbook route revalidates the
+original complete audit and current workbook evidence, makes no audit request,
+and copies the receipt into the task. It cannot be combined with audit refresh
+or audit omission. All downstream quality reviews remain mandatory.
+
+For external direct-literal assumption candidates, see the
+[identity evidence format and commands](reports/external-literal-inputs.md).
+Complete independently approved dependency evidence is required; cached external
+answers cannot substitute for missing files. Legacy conversion remains blocked until a
+[trusted binary-to-OOXML proof producer](reports/legacy-conversion-capability.md)
+is implemented; self-asserted equivalence certificates are rejected.
+
+Workbooks containing data tables use a separate trusted observation path when
+ordinary cache-only recalculation rejects them. The protected table producer
+retains the complete original, Excel staging file, table observations, signed
+receipt and recalculated intermediate. `xl_table_quarantine_lineage.py` checks
+that first edge and the subsequent presentation-table materialization against
+the original curation, complete reconstruction, dependency exclusion and leak
+scan. `xl_table_quarantine_inventory.py` then requires an explicit versioned
+inventory approval, including for candidates whose final health route is
+`pass`. The corpus controller revalidates this complete chain on checkpoint
+reuse. A signed intermediate alone is never an approved source or task.
+
+The [maintained-runner procedure](reports/table-maintained-installer-proposal.md)
+updates an existing protected deployment without reading or replacing its private
+key. It binds exact current and proposed file hashes, retains protected backups,
+and supports recovery after interrupted replacements. Root execution uses the
+separate system Python; pipeline inspection and evidence assembly use persistent
+Python 3.12. Completed ordinary recalculation evidence is rechecked against its
+original execution window, source bytes, concrete engine/version constraints and
+signed controls; expiry after successful execution does not invalidate later
+read-only inspection of the immutable result.
+
+Historical segmentation diagnostics can be isolated with
+`replay_segmentation_verification.py --execute --workbooks 0330 --manifest PATH
+--root ROOT --shadow-root SHADOW`. The report retains all 53 historical rows;
+unselected cases are explicitly marked. Each selected case uses the retained
+curation and three deterministic runs, with automatic model adjudication
+disabled. Missing historical inputs remain missing; a new target selection
+cannot stand in for the original failure cohort.
+
+See [the rebuild report](reports/yield-rebuild-20260908.md) for measured stage
+counts and remaining blockers, and [the runner instructions](scripts/recalc/README.md)
+for temporary offline execution.
 
 ## What is in this repository
 
@@ -26,30 +443,46 @@ the run; you will not find those directories in a fresh clone.
 | `xl_variable_source_audit.py` | GPT 5.6 Sol audit stage: inputs workbook → variable/source Markdown, deterministic inventory, and generation metadata. |
 | `xl_variable_mcp.py` + `mcp_env/` | Variable-source MCP environments: externally-sourced inputs masked from the workbook and served through a mock research service (section 23). |
 | `xl_mcp_oracle.py` | Generic live-sidecar oracle: exact retrieval, provenance, conflicts, masking, leak isolation, and profile-attribution checks. |
-| `requirements.txt` | One dependency, `openpyxl`. |
+| `requirements.txt` | Runtime dependencies: `openpyxl` and `PyYAML`. |
+
+Normalization checks each referenced cell before deciding a grouped audit row's
+disposition. Retained maskable cells require an independent
+`normalization-review.json` bound to the draft, source workbook, and baseline
+file hashes. The review supplies research eligibility, evidence references,
+entity, period, scenario, and basis; passing duplicate checks alone is
+insufficient. The generated script preserves audited source descriptions and
+URLs, records excluded cells even within partially included rows, and checks
+its evidence hashes on every execution. See the
+[normalization lane contract](.cursor/skills/harbor-normalization-engineer/SKILL.md)
+for the complete review schema. Keep failed attempts and first-normalization
+snapshots when rebuilding after a code fix.
+
+The delivered Embedded Assumptions sheet preserves promoted input literals and
+their locators. Formula derivations belong in private provenance artifacts;
+the mask verifier rejects formula text accidentally copied into that sheet.
 
 ```bash
 pip install -r requirements.txt
 
 # Stage 0: a folder of .xlsx -> ast_out/<id>/{nodes.csv, edges.csv, ...}
-python3 xl_ast_graph.py "4-10 100" -o ast_out
+python3.12 xl_ast_graph.py "4-10 100" -o ast_out
 
 # Stages 1-11: ast_out/<id> -> seg_out/<id>, one id per workbook
-python3 xl_segment.py 0248 0262 0449 0450 --source "4-10 100" -o seg_out
+python3.12 xl_segment.py 0248 0262 0449 0450 --source "4-10 100" -o seg_out
 
 # Optional: seg_out/<id> -> a copy of the workbook holding only its inputs
-python3 xl_input_mask.py 0248 0262 0449 0450 -o inputs_out
+python3.12 xl_input_mask.py 0248 0262 0449 0450 -o inputs_out
 
 # Optional: mask externally-sourced inputs and serve them through a mock MCP
 # research sidecar instead (full walkthrough in section 23)
-python3 xl_variable_mcp.py validate-spec \
+python3.12 xl_variable_mcp.py validate-spec \
     runs/0233-variable-sources/normalized.json
-python3 xl_variable_mcp.py build runs/0233-variable-sources/normalized.json \
+python3.12 xl_variable_mcp.py build runs/0233-variable-sources/normalized.json \
     runs/0233-variable-sources/mcp --workbook 0233 --source "4-10 100"
-python3 xl_input_mask.py 0233 --source "4-10 100" -o inputs_out_mcp \
+python3.12 xl_input_mask.py 0233 --source "4-10 100" -o inputs_out_mcp \
     --mask-cells runs/0233-variable-sources/mcp/mask_cells.json
 # Package in staging; the audit always reads the unredacted inputs_out copy.
-python3 xl_output_task.py 0233 --source "4-10 100" --inputs-root inputs_out_mcp \
+python3.12 xl_output_task.py 0233 --source "4-10 100" --inputs-root inputs_out_mcp \
     --variable-source-audit-inputs-root inputs_out \
     --mcp runs/0233-variable-sources/mcp -o tasks_outputs_mcp
 ```
@@ -1401,8 +1834,9 @@ back to reading the original `.xlsx` if the target cell is not in the graph.
 that, and so does `XIRR`.
 
 **`IRR` and `XIRR`.** These have no formula; you have to solve for the rate
-numerically. Newton's method from a starting guess of 0.1, with bisection as a
-backstop.
+numerically. Newton's method starts from the supplied guess (0.1 when omitted),
+with bisection as a backstop. XIRR requires equally sized cash-flow and date
+vectors; no trailing entries are silently dropped.
 
 **Nothing is guessed.** If the evaluator meets something it does not understand,
 it returns a marker called `Unresolved` which spreads to everything downstream
@@ -1549,10 +1983,10 @@ And the code:
 Running it:
 
 ```bash
-python3 xl_segment.py 0248 0262 0449 0450     # all four
-python3 xl_segment.py 0248 --llm              # let an LLM pick the outputs
-python3 xl_segment.py 0248 --recurate         # discard hand edits, re-score
-python3 xl_segment.py 0248 --threshold 8.0    # be pickier about outputs
+python3.12 xl_segment.py 0248 0262 0449 0450     # all four
+python3.12 xl_segment.py 0248 --llm              # let an LLM pick the outputs
+python3.12 xl_segment.py 0248 --recurate         # discard hand edits, re-score
+python3.12 xl_segment.py 0248 --threshold 8.0    # be pickier about outputs
 ```
 
 ---
@@ -1566,7 +2000,7 @@ meant to *work out* is empty — the file you would hand to someone told to rebu
 the model.
 
 ```bash
-python3 xl_input_mask.py 0248 0262 0449 0450       # -> inputs_out/<id>-inputs.xlsx
+python3.12 xl_input_mask.py 0248 0262 0449 0450       # -> inputs_out/<id>-inputs.xlsx
 ```
 
 The point of doing this from the segmentation rather than by hand is that the input
@@ -1879,7 +2313,321 @@ fleet limits are four concurrent workbook agents and two concurrent
 model-heavy operations; the orchestrator lowers those limits when host or
 service capacity is constrained.
 
+For a campaign, the root dispatcher sets `HARBOR_MODEL_SLOT_ROOT` to the same
+absolute directory in every model worker and `HARBOR_MODEL_SLOTS` to `1` or
+`2`. `xl_transport.read_response` holds a shared process lock across the full
+request and its bounded transport retries. Exceptions and process death release
+the lock. The first caller pins the capacity; inconsistent worker settings fail.
+Do not remove or replace that directory or its lock files while the campaign is
+running. Custom model clients must use `xl_transport.model_slot()` around their
+complete operation. Unconfigured standalone calls have no shared fleet limit.
+
+The current rebuild uses `scripts/harbor_parallel_policy.py` to activate four
+fixed workbook lanes. The root retains an exact contract and activation receipt,
+proves the old singleton lock and all selected lanes are idle, and pins each
+persistent lock inode. A fresh coordinator descriptor or explicitly reviewed
+continuation selects its workbook's lane; the existing process guardian keeps
+that lock until child cleanup completes. Different workbooks can build and
+validate concurrently, while the same workbook cannot run twice. Publication
+uses the shared queue lock plus the selected workbook lock. Historical singleton
+drivers are retained as evidence and are no longer admitted after activation.
+
+This rebuild keeps the already-pinned model capacity at one. Parallel workbook
+execution does not change prepared request identities, semantic attempts, or the
+shared model slot directory. Changing those fields to increase throughput would
+invalidate the retained request evidence. The fixed-lane contract also does not
+renew an expired lease or waive any quality gate.
+
+### Tracker control APIs
+
+`scripts.batch.harbor_tracker` provides closed-schema validation and owned
+compare-and-swap updates. `scripts.batch.harbor_tracker_lifecycle` adds
+`create_tracker(...)` and `lease_operation(...)` for trusted root code. Both
+use the same per-workbook lock, revision and byte-hash checks, and durable
+atomic writes. Creation records the original source and requested cohort,
+with every financial lane pending.
+
+The root supplies `RootAuthority` and independent intake, source-lineage,
+stopped-owner, and failure-note validators as applicable. These are trusted
+code callbacks, never model-provided permissions. Lease operations are limited
+to acquire, renew, release, and one explicit expired task-agent replacement
+after proof that its prior owner stopped. A separately versioned
+`harbor_pause_recovery` operation permits one additional recovery when a
+coordinator pause outlasted that replacement lease. It requires a root-selected
+authorization bound to the exact tracker and continuation request, retained
+process-exit evidence, and the workbook's activated lock. It records a new token
+and the complete prior history by compare-and-swap; ordinary expired renewal and
+second replacement remain rejected. It does not reset any model attempt or
+qualify a financial lane. Releasing a `STOPPED` tracker also
+requires independently validated matching failure evidence and notes.
+
+Historical pause validation checks the recorded recovery event without imposing
+an earlier directory-absence condition on later instruction work. Starting a
+new environment recovery still requires the instruction worker to be absent;
+this distinction does not relax lease, process-exit or evidence checks.
+
+`scripts.harbor_retirement_history` validates an explicitly selected immutable
+retirement seal after registered authoring code changes. It checks archived
+bytes at the point of use and retains exact source, notes and released-tracker
+identities. This establishes a historical stopped outcome, not current task
+qualification. `scripts.harbor_slot_turnover` preserves the existing physical
+workbook lock and requires complete predecessor transactions when recovering
+an interrupted assignment. Both adapters currently support the original
+activated lane's exhausted-dialogue stop only; promoted tasks and successor
+retirement require separate supported transitions.
+
+These APIs have no CLI and do not dispatch agents. The installed
+`scripts.batch.harbor_lane_lifecycle.HarborLaneLifecycle` facade runs the fixed
+owning validators in canonical order for lane completion, failure recording,
+archival before mutable repairs, and final readiness transitions. It preserves
+consumed budgets and checks exact revisions, leases, notes, and artifact hashes.
+Clearing a failure requires all affected gates and complete current readiness.
+Explicit migration of historical tracker shapes remains separate work; existing
+trackers are not rewritten automatically.
+
+Run actual model and container operations before the final readiness transaction.
+`harbor_runtime_readiness.run_runtime` captures immutable inputs, exact Docker
+images and commands, live retrieval, startup, and grader evidence; its read-only
+validator checks that observation again before publication. The runtime grader
+smoke checks wiring. Independent source reconstruction establishes solvability.
+`harbor_model_executor` retains exact requests, raw responses and text, completion
+journals, and three bounded transport retries for definitive transient HTTP
+errors. Uncertain completion remains unresolved and cannot be replayed by
+changing an output directory or attempt UUID. The root dispatcher must validate
+the owning lane's actual remaining semantic budget before preparing each call.
+None of these operations publishes a task; immutable publication and release
+compare-and-swap remain serial and separate.
+
+The installed producer APIs prepare concrete evidence before those transitions:
+`harbor_normalization_producer` imports the complete audit and freezes review
+candidates; `harbor_profile_producer` binds accepted profiles to exact sources;
+`harbor_environment_producer` completes normalization and builds the MCP bundle
+twice before packaging; and `harbor_instruction_producer` runs disclosure,
+naturalization and dialogue with their existing review and attempt limits.
+They require root-selected generation, policy and budget records. Producer
+completion alone is not a passed lane: the lifecycle reruns the owning validators.
+
+`harbor_workbook_bootstrap` validates a frozen new-task candidate against the
+original inventory, current source and segmentation proofs, retained curation,
+and prior task history. Its `prepare` and `admit` operations precede acquisition
+of the root-owned workbook lease. `harbor_environment_worker.advance` then runs
+one fixed step through research, normalization, profiling, and packaging. A
+nonempty public-source worklist pauses for independently captured evidence.
+`harbor_public_capture` retains complete HTTP attempt journals and exact raw
+bytes, reconstructs the public text projection, and removes forbidden values
+before profiling. Failed or incomplete captures cannot be hidden by selecting
+only successful pages.
+
+Pass the environment worker's exact `ReadinessSelection` and `Lease` to
+`harbor_instruction_worker.step`. Enable local commands, model calls, and
+containers explicitly through its separate execution arguments. Retain each
+returned checkpoint hash and supply it on the next invocation. The worker
+preserves the complete checkpoint chain and stops for reconciliation after an
+uncertain side effect. It performs independent runtime checks before dialogue
+and after the final task mutation, then enqueues only a task that passes full
+current readiness. Root serialization and immutable release publication remain
+required. These workers must run under the process guardian and the configured
+workbook and model concurrency limits.
+
+For maintained environment execution, `scripts/harbor_campaign.py` accepts one
+root-selected `admit`, `import`, or `step` operation. Supply the exact descriptor
+and checkpoint hashes, a fresh `--journal` directory, the shared `--slot-lock`,
+and the configured `--env-file`. Model dispatch requires `--dispatch-models`.
+Each operation journals its intent, response, resource measurements and outcome
+under a 900-second/8-GiB process-group guard. An interrupted or failed operation
+requires explicit reconciliation; it cannot silently replay a model call. An
+import verifies every retained owning checkpoint before allowing continuation.
+
+`scripts/harbor_instruction_campaign.py` continues an exact maintained
+`ENVIRONMENT_READY` handoff with `start`, then runs one canonical `step` at a
+time. Supply each returned descriptor and result hash. `--models`, `--commands`,
+and `--containers` enable those capabilities explicitly; the coordinator never
+publishes. `import-retry` consumes only an already authorized NAT retry receipt.
+Insufficient remaining lease time returns `LEASE_RENEWAL_REQUIRED` before any
+instruction work; do not substitute a new lease or rewrite a checkpoint.
+
+A completed normalization response with an invalid schema consumes its semantic
+attempt. The producer supplies the full `normalization-review/v1` contract and
+validates it before emission. `harbor_normalization_recovery` supports only the
+reviewed first-attempt field-name defect: it binds the original complete model
+journal and failure, then permits a distinct second attempt in a fresh directory.
+It never repairs or accepts the malformed response as a successful review.
+
+Large unsubmitted normalization reviews can explicitly select
+`harbor_normalization_partitioned.prepare`. It retains the complete original
+context and divides it into disjoint requests with at most 128 candidate cells
+and 4 MiB each. Shared evidence is lossless, and every original reference must
+appear exactly once. The immutable plan blocks the obsolete single-call scope.
+All first-round requests must complete before only failed partitions can use
+their second round; uncertain calls cannot be replayed. `aggregate` verifies
+complete raw journals and merges the decisions, then `emit_phase1` runs the
+unchanged generator and financial checks. Select its explicit
+`normalization_partitioned_review` binding; never fabricate a single model Call
+for the aggregate or silently replace an existing completed review.
+
+The maintained environment coordinator has explicit `refresh` and
+`recover-refresh` actions for completed prefixes affected by an audit-reader
+upgrade or an unused review scope moved to partitioned normalization. Select
+the original worker, completed predecessor, current proof and exact active lease
+by path and hash. The refresh rechecks every completed owning gate before one
+tracker update. Original checkpoints and model journals remain immutable;
+subsequent steps use the separate refresh continuation. Generator-managed
+phase1 outputs receive exact historical witnesses before phase2, and their
+replacement requires a complete current phase2 proof.
+
+For the first mechanically rejected frozen naturalization writer,
+`harbor_nat_retry.authorize` revalidates the completed financial and disclosure
+stages, archives the original response and proof, and records one spent attempt
+with a compare-and-swap update. Its sealed continuation allows only the remaining
+second writer attempt; independent review and all later gates remain mandatory.
+Two separate invocations returning identical text count as two attempts. Replaying
+the exact retained invocation is idempotent.
+
+Fresh naturalization calls use versioned `frozen-boundary-v1` assembly. It
+canonicalizes only scanner-owned outer blank lines, then runs the unchanged
+protected-span and complete instruction validators. Exact legacy calls retain
+their original mode. `harbor_nat_boundary_recovery` can derive a candidate from
+the demonstrated completed second-writer assembly failure while preserving both
+consumed attempts; `harbor_nat_boundary_resume` separately validates the current
+financial prefix and authorizes only a fresh independent review.
+
+Dialogue writers and paraphrasers supply exact slot JSON. The owning assembler
+retains scaffold bytes and junior-slot text; independent semantic review still
+checks the completed dialogue. `harbor_dialogue_retry` supports one reproduced
+first-round structural correction shared across writer and paraphraser. It
+preserves the original call, failure and semantic round, requires current runtime
+and financial proofs, and records an explicit continuation transaction. A second
+structural correction or an uncertain transport cannot use this route.
+
+`harbor_dialogue_semantic_retry.authorize` permits the existing second semantic
+round only after a completed failed first review and fresh current runtime
+validation. It preserves the original writer, paraphraser, reviewer and earlier
+continuation transactions. The second round still needs its own independent
+review; there is no third round or additional structural correction. Every
+numeric target collision, including zero and short integers, needs its own
+independently justified occurrence. Source-proved formula operands are supplied
+to the reviewer with their signed identity and collision status; this evidence
+does not override the review or expose the answer key to the writer.
+
+Source-link grouping supports an explicit `dialogue-source-link-scope/v3`
+certificate for relative project years such as `Year 0` and `Year 1`. The
+original literal headers must form consecutive axes, and every grouped claim
+must retain its exact source formula, matching period and claim identity.
+Unproved links remain individual; numerical equality or column position alone
+does not establish a shared period. Applying a new grouping after a submitted
+review additionally requires explicit applicability of that retained history.
+
+The sparse audit inventory reader parses each selected worksheet once and
+preserves native types and exact sheet identities. Older completed audits require
+an explicit current applicability proof. `xl_audit_inventory_lineage` validates
+previous renderer and locator receipts without executing historical code;
+`harbor_normalization_inventory_applicability` additionally preserves both actual
+normalization calls in the supported schema-recovery chain. These receipts do
+not approve downstream gates or reset review budgets.
+
+For reports spanning a separate campaign, select its Harbor namespace explicitly:
+
+```bash
+.venv/bin/python -B -m scripts.corpus_qualification \
+  --inventory "$RUN/inventory.json" --run-root "$RUN" \
+  --harbor-root harbor/new50-20260909
+```
+
+`--harbor-root` is repeatable and adds to the default `$RUN/harbor` namespace.
+Every original remains in the denominator. Duplicate trackers for one original
+fail qualification rather than selecting whichever result looks best. Stage
+reports accept the same option but do not claim a verified promotion numerator.
+Historical promotions require the explicit `harbor_legacy_requalification`
+transaction when their original tracker predates the strict lifecycle. This
+preserves the original tracker, notes, release, and attempt history and reruns
+current owning checks before one compare-and-swap update. Subsequent code-only
+changes use the separately selected `scripts.harbor_legacy_refresh` transaction
+chain. Every prior qualification, task byte, release identity and consumed review
+attempt remains bound. Current runtime validation determines whether an earlier
+observation is still applicable; code drift cannot substitute for execution.
+
+Publish a newly qualified task through `scripts/harbor_publish.py`, selecting
+the exact completed enqueue checkpoint with `--checkpoint` and
+`--checkpoint-sha256`, plus the tracker, publication, compatibility-output,
+queue-lock, workbook-slot-lock and fresh journal paths. Publication holds both
+locks, revalidates complete readiness, uses the strict publication lease and
+release compare-and-swap, and independently qualifies the result before and
+after releasing leases. A retained interrupted intent can be selected with
+`--resume-intent` and `--resume-sha256`; conflicts or incomplete side effects
+require explicit reconciliation. Publication never runs an agent solve rollout.
+
+An exact completed audit response rejected by the earlier multiline-label
+renderer can be recovered through `xl_audit_renderer_recovery`. Root must bind
+the original generator, incomplete audit metadata, every completed transport
+attempt, and the unchanged native source and segmentation pair. Recovery emits
+separate immutable artifacts and an explicit applicability receipt. It never
+reruns the model or imports historical code; incomplete or altered transport
+evidence fails recovery.
+
+The final disclosure check can use an explicit pre-dialogue witness only when
+its instruction is the exact reviewed naturalization result and every verifier
+input matches the current task. The delivered task's faithfulness and dialogue
+checks still run independently. An empty dialogue is permitted only after a
+fresh, complete empty-claim extraction, unchanged task bytes, and proof that no
+prior dialogue round was spent. Directory evidence is accepted only in the
+registered typed bundle fields, validated against its complete tree hash, and
+expanded into checked file records.
+
+Offline packaging uses `xl_output_task.py --require-cached-variable-source-audit`
+with `--no-naturalize`. It accepts only a complete current audit cache and fails
+on a cache miss without reading credentials or requesting another audit. Use a
+fresh packaging work directory and stage; interrupted command evidence is
+retained and cannot be silently replayed. Normalization phase-two recovery
+accepts only the exact retained old or expected new bytes.
+
+A fresh normalization with no eligible candidate needs no invented
+model review. The consumer independently reconstructs the complete candidate
+analysis, verifies its original zero-variable snapshot, and enforces all plain
+eligibility rules. Any surviving candidate requires the ordinary semantic review.
+Completed historical audits can use only an explicitly supported validator
+upgrade receipt; the current validator checks original response completion,
+coverage, hashes and consumed budget. It never executes historical audit code
+or grants an additional semantic attempt.
+
+`scripts.batch.harbor_admission` supplies the root admission validators: current
+Python 3.12 and dependency probes, Docker availability, frozen original identity,
+approved source lineage, prior-task namespace scans, and inherited audit budgets.
+Its dependency observation expires after five minutes and is independently
+rechecked before admission. Admission starts all lanes pending and does not
+establish task quality.
+Run their combined regression suite with:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_harbor_tracker_schema.py tests/test_harbor_tracker_lifecycle.py
+```
+
 ### Kickoff
+
+Root-selected batches of other sizes use the versioned candidate manifest
+`harbor-qualified-task-candidate-proposal/v1`. Its ordered
+`requested_workbook_ids` must match `selected_candidates` exactly, and
+`target_new_qualified_tasks` must equal their nonzero count. The
+`denominator_for_original_rebuild` binds the complete selected inventory size;
+it is not the number of passing tasks. Original identities, the full history
+survey, retained curation and targets, immutable reconstruction evidence, and
+inherited review budgets still pass the existing owning validators. Existing
+task or tracker identities require preserved-history resume. The older
+`new50-qualified-task-candidate-proposal/v1` contract retains its exact-50
+requirements. Neither manifest grants a task-quality pass.
+
+Naturalization reviews with incomplete source or candidate clause coverage now
+receive up to three reviews of the same candidate: the original review plus
+two automatic corrections containing the exact missing clauses and prior
+response. The writer attempt count does not change. If all three reviews are
+semantically positive but coverage remains incomplete, the configured policy
+continues with a hash-bound `coverage-exception.json`; publication rechecks all
+three responses. Semantic findings, invented quotations, and incomplete model
+transports remain blocking. Retained failures require the explicit root repair
+adapter; they are never erased or treated as fresh attempts.
+
+Dialogue extraction preserves an unused-row disclosure's exact row identity
+without treating it as a calculation cell. Calculation methods and source
+selections continue to require explicit cell identities.
 
 Invoke the skill explicitly in Cursor:
 
@@ -2023,7 +2771,7 @@ be included in the task instruction.
 ### Identify key variables, then match textbook values
 
 ```bash
-python3 .cursor/skills/custom-formula-gate/scripts/extract_gate_context.py \
+python3.12 .cursor/skills/custom-formula-gate/scripts/extract_gate_context.py \
   0256 --source "4-10 100" --seg-dir seg_out/0256 \
   --output runs/0256-custom-formula-gate/context.json
 ```
@@ -2050,7 +2798,7 @@ The stage writes:
 - `runs/<workbook>-custom-formula-gate/hints.json`
 
 ```bash
-python3 .cursor/skills/custom-formula-gate/scripts/validate_gate_outputs.py \
+python3.12 .cursor/skills/custom-formula-gate/scripts/validate_gate_outputs.py \
   runs/0256-custom-formula-gate/context.json \
   runs/0256-custom-formula-gate/report.json \
   runs/0256-custom-formula-gate/hints.json
@@ -2104,7 +2852,7 @@ batch; one corrective retry is allowed.
 # 0. Generate the review artifacts from the inputs-only workbook.
 #    The deterministic inventory is sent to GPT 5.6 Sol through Labelbox's
 #    LiteLLM proxy; lbx_api_key is read from .env and never written to disk.
-python3 xl_variable_source_audit.py 0233 \
+python3.12 xl_variable_source_audit.py 0233 \
     --inputs-root inputs_out --seg-root seg_out --audit-root runs
 #
 #    Emits:
@@ -2113,7 +2861,7 @@ python3 xl_variable_source_audit.py 0233 \
 #    runs/<wb>-variable-sources/<wb>-inputs-variable-sources.metadata.json
 
 # 1. Preserve every table row as a draft review queue
-python3 xl_variable_mcp.py import \
+python3.12 xl_variable_mcp.py import \
     runs/0233-variable-sources/0233-inputs-variable-sources.md \
     runs/0233-variable-sources/draft.json
 
@@ -2130,12 +2878,12 @@ python3 xl_variable_mcp.py import \
 #    rendering. The normalization script embeds only reviewed profiles.
 
 # 4. Validate the atomic spec and reviewed source-profile references.
-python3 xl_variable_mcp.py validate-spec \
+python3.12 xl_variable_mcp.py validate-spec \
     runs/0233-variable-sources/normalized.json
 
 # 5. Build offline and deterministically. Every variable's raw cell value is
 #    verified against the golden workbook; any mismatch aborts.
-python3 xl_variable_mcp.py build \
+python3.12 xl_variable_mcp.py build \
     runs/0233-variable-sources/normalized.json \
     runs/0233-variable-sources/mcp --workbook 0233 --source "4-10 100"
 
@@ -2144,11 +2892,11 @@ uv run --python 3.12 --with fastmcp --with openpyxl \
     python xl_variable_mcp.py smoke runs/0233-variable-sources/mcp
 
 # 7. Mask served variables into a separate inputs workbook.
-python3 xl_input_mask.py 0233 --source "4-10 100" -o inputs_out_mcp \
+python3.12 xl_input_mask.py 0233 --source "4-10 100" -o inputs_out_mcp \
     --mask-cells runs/0233-variable-sources/mcp/mask_cells.json
 
 # 8. Package into staging; audit the unredacted baseline inputs.
-python3 xl_output_task.py 0233 --source "4-10 100" \
+python3.12 xl_output_task.py 0233 --source "4-10 100" \
     --inputs-root inputs_out_mcp --mcp runs/0233-variable-sources/mcp \
     --variable-source-audit-inputs-root inputs_out \
     -o tasks_outputs_mcp

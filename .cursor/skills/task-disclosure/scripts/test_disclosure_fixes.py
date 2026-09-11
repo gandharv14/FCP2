@@ -735,6 +735,73 @@ def test_graded_closure_aliases_and_copies():
     check("closure/0620 same-row copy", "M!C37" in closure, str(sorted(closure)))
 
 
+def test_graded_closure_reaches_deep_aliases_without_dense_row_scans():
+    gold = book_from({'Sheet1': {f'A{row}': f'=A{row - 1}' for row in range(32, 1, -1)}})
+    gold.formula['Sheet1!B32'] = '=A32*2'
+    gold.formula['Sheet1!XFD32'] = '=XFC32*2'
+    # Trigger copying after traversing an alias chain, then further aliasing.
+    gold.formula['Sheet1!A40'] = '=XFD32'
+    gold.formula['Sheet1!A41'] = '=A40'
+    gold.formula['Sheet1!B1'] = '=B32'
+    def dense_scan_forbidden(*args, **kwargs):
+        raise AssertionError('closure must index stored formula cells')
+    gold.row_cells = dense_scan_forbidden
+    closure = disclose.graded_closure(gold, {'Sheet1!A1', 'Sheet1!B1'})
+    check('closure/deep reverse aliases', all(f'Sheet1!A{row}' in closure for row in range(1, 33)), str(closure))
+    check('closure/copy then aliases', {'Sheet1!XFD32', 'Sheet1!A40', 'Sheet1!A41'} <= closure, str(closure))
+
+
+def test_copied_mechanics_preserve_string_literal_semantics():
+    gold = book_from({'M': {'A2': '=IF(A1="Yes",1,0)', 'B2': '=IF(B1="No",1,0)',
+        'C2': '=IF(C1="Yes",1,0)', 'A3': '=EXACT(A1,"A B")',
+        'B3': '=EXACT(B1,"AB")', 'C3': '=EXACT(C1,"a b")'}})
+    check('copy/string shift accepted', disclose.copy_equivalent(gold, 'M!A2', 'M!C2'), 'rejected equivalent copy')
+    check('copy/string value rejected', not disclose.copy_equivalent(gold, 'M!A2', 'M!B2'), 'merged different conditions')
+    check('copy/string whitespace preserved', not disclose.copy_equivalent(gold, 'M!A3', 'M!B3'), 'merged different literal spacing')
+    check('copy/string case preserved', not disclose.copy_equivalent(gold, 'M!A3', 'M!C3'), 'merged case-sensitive literals')
+
+
+def test_book_sparse_cells_preserve_formula_like_literals():
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / 'sparse.xlsx'
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws['A1'] = '=literal assumption'; ws['A1'].data_type = 's'
+        ws['B2'] = '=2+3'; ws['XFD1000'] = 'Far label'
+        wb.save(path); wb.close()
+        with patch('openpyxl.worksheet.worksheet.Worksheet.iter_rows',
+                   side_effect=AssertionError('must not create blank rectangle')):
+            book = disclose.Book(path)
+        check('book/sparse literal type', book.value['Sheet!A1'] == '=literal assumption'
+              and 'Sheet!A1' not in book.formula, str(book.formula))
+        check('book/sparse full width', book.max_col('Sheet') == 16384
+              and book.formula['Sheet!B2'] == '=2+3', str(book.value))
+        check('book/sparse row evidence', book.stored_row_cells('Sheet', 1000) == ['Sheet!XFD1000'], str(book.value))
+        check('book/sparse row bounds', book.stored_row_cells('Sheet', 1000, hi=100) == [], str(book.value))
+
+
+def test_sparse_row_labels_skip_empty_columns_without_changing_nearest_name():
+    gold = book_from({'M': {'B10': 'Older block', 'XFB10': 'Nearest cost label',
+                            'XFC10': 'USD', 'XFD10': '=1+1', 'Z10': 5}})
+    check('book/sparse row ordering', gold.stored_row_cells('M', 10) == [
+        'M!B10', 'M!Z10', 'M!XFB10', 'M!XFC10', 'M!XFD10'], str(gold.value))
+    check('book/sparse nearest label', gold.row_label('M!XFD10') == 'Nearest cost label',
+          gold.row_label('M!XFD10'))
+
+
+def test_ownership_detector_does_not_resolve_labels_for_nonfractions():
+    gold = book_from({'M': {'A1': 'Ownership', 'B1': 0.25, 'C1': 0,
+        'D1': 5, 'E1': True, 'XFD1': 'far stamp'}})
+    looked_up = []
+    def label(cell):
+        looked_up.append(cell)
+        return 'Ownership'
+    gold.row_label = label
+    disclose.detect_stake_scaling(gold, set())
+    check('ownership/filter before labels', looked_up == ['M!B1'], str(looked_up))
+
+
 def test_closure_suppression_spares_standing_exception():
     records = [
         {"entry": "method_returns", "disposition": "disclosed",
@@ -759,12 +826,12 @@ def _numeric_task(targets: dict) -> Path:
 
 
 def test_numeric_collision_policy():
-    """0469: 6 vs 6.0 passes; 4+ significant digits refuse; closure refuses."""
+    """All unproven target coincidences refuse, independent of digit count."""
     task = _numeric_task({"S!C13": 6.0, "S!D13": 1234.5})
     head = "## Workbook disclosure\n- `S!A1`: "
     check(
-        "numeric/small round integer passes",
-        disclose.audit_text(head + "divide (x) by (6).\n", task) == [],
+        "numeric/small round integer needs provenance",
+        bool(disclose.audit_text(head + "divide (x) by (6).\n", task)),
         str(disclose.audit_text(head + "divide (x) by (6).\n", task)),
     )
     faults = disclose.audit_text(head + "multiply (x) by (1234.5).\n", task)
@@ -783,7 +850,7 @@ def test_numeric_collision_policy():
         head + "divide (x) by (6).\n", task,
         records=provenance, closure={"S!Z99"},
     )
-    check("numeric/non-closure provenance passes", faults == [], str(faults))
+    check("numeric/incomplete provenance cannot exempt", bool(faults), str(faults))
 
 
 def test_faithcheck_synthetic():

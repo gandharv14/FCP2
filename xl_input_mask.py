@@ -492,11 +492,9 @@ def redact_assumptions(rows, deny, deny_numbers, deny_texts, outputs):
     - an entry whose host cell is denied, or whose constant equals a denied
       cell's value, loses both value and formula -- the value stays
       retrievable, through the research tools instead of the sheet;
-    - an entry whose formula merely contains a denied value as a literal
-      loses the formula text;
-    - an entry hosted in a curated output cell loses the formula text, which
-      is the answer cell's exact derivation. Its constant is still an input
-      and stays.
+    - every entry loses its formula text. Intermediate formula provenance
+      also reveals the calculation the task asks the agent to reconstruct.
+      Its promoted constant is still an input and stays.
     """
     redacted, stripped = [], []
     out = []
@@ -510,10 +508,7 @@ def redact_assumptions(rows, deny, deny_numbers, deny_texts, outputs):
             entry["value"] = MASKED_VALUE_NOTE
             entry["formula"] = ""
             redacted.append(entry.get("host", ""))
-        elif formula and (
-            (where is not None and where in outputs)
-            or _formula_mentions(formula, deny_numbers)
-        ):
+        elif formula:
             entry["formula"] = ""
             stripped.append(entry.get("host", ""))
         out.append(entry)
@@ -532,16 +527,15 @@ def _assumptions_sheet_xml(rows):
         return ('<c r="%s" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
                 % (ref, _xml_escape(value)))
 
-    table = [["Sheet", "Cells", "Line item", "Hardcoded value", "Formula"]]
+    # Keep the literal in column D for stable source locators. Derivation
+    # provenance belongs to verifier evidence, never the delivered workbook.
+    table = [["Sheet", "Cells", "Line item", "Hardcoded value"]]
     for entry in rows:
         host = entry.get("host", "")
-        coords = host.split("!", 1)[1] if "!" in host else host
-        formula = entry.get("formula", "")
-        if str(formula).startswith("="):
-            formula = "'" + str(formula)
+        coords = host.rsplit("!", 1)[1] if "!" in host else host
         table.append([
             entry.get("sheet", ""), coords, entry.get("label", ""),
-            entry.get("value", ""), formula,
+            entry.get("value", ""),
         ])
 
     body = []
@@ -609,7 +603,11 @@ def inject_assumptions(out_path, rows, existing_sheets):
             info.compress_type = item.compress_type
             info.external_attr = item.external_attr
             out.writestr(info, parts[item.filename])
-        out.writestr(ASSUMPTIONS_PART, _assumptions_sheet_xml(rows))
+        # A new ZIP member otherwise receives the wall-clock timestamp, making
+        # identical baselines invalidate hash-bound audits and model reviews.
+        assumptions_info = zipfile.ZipInfo(ASSUMPTIONS_PART, date_time=(1980, 1, 1, 0, 0, 0))
+        assumptions_info.compress_type = zipfile.ZIP_DEFLATED
+        out.writestr(assumptions_info, _assumptions_sheet_xml(rows))
     os.replace(tmp, out_path)
     return name
 
@@ -705,7 +703,8 @@ def write_masked(src_path, out_path, keep, deny, tally):
 
 def verify(out_path, src_path, keep, frontier, formula_coords, deny,
            assumptions_sheet=None, deny_numbers=(), deny_texts=(),
-           forbidden_formulas=()):
+           forbidden_formulas=(), assumption_formulas=(),
+           expected_assumptions=None):
     """Confirm the mask leaked nothing and cost nothing.
 
     Ways this can go wrong, all worth catching: a formula survives and gives
@@ -739,6 +738,7 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
                         % (name, match.group(0)[:80].decode("utf-8", "replace")))
 
     forbidden_formulas = [f for f in forbidden_formulas if str(f).strip()]
+    assumption_formulas = [str(f) for f in assumption_formulas if str(f).strip()]
 
     for ws in masked.worksheets:
         allowed = keep.get(ws.title, set())
@@ -753,6 +753,10 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
                 spot = (cell.row, cell.column)
                 where = "%s!%s%d" % (ws.title, get_column_letter(cell.column),
                                      cell.row)
+                # Redaction applies to text and logical values too. Check it
+                # before the text/formula branches can skip the numeric path.
+                if spot in denied and not on_assumptions:
+                    faults["leaked"].append("%s=%r (pasted answer)" % (where, value))
                 if isinstance(value, ArrayFormula):
                     faults["formula"].append("%s (array formula)" % where)
                     continue
@@ -770,6 +774,10 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
                     elif any(f in value for f in forbidden_formulas):
                         faults["formula"].append("%s (output cell formula text)"
                                                  % where)
+                    elif on_assumptions and any(
+                            f in value for f in assumption_formulas):
+                        faults["formula"].append(
+                            "%s (embedded derivation text)" % where)
                     elif on_assumptions and _value_matches(
                             value, deny_numbers, deny_texts):
                         faults["leaked"].append("%s=%r (masked value on "
@@ -780,15 +788,29 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
                         faults["leaked"].append("%s=%r (masked value on "
                                                 "assumptions sheet)" % (where, value))
                     continue
-                if spot in denied:
-                    faults["leaked"].append("%s=%r (pasted answer)" % (where, value))
-                elif spot in derived and spot not in allowed:
+                if spot not in denied and spot in derived and spot not in allowed:
                     faults["leaked"].append("%s=%r" % (where, value))
+
+    if assumptions_sheet is not None and expected_assumptions is not None:
+        ws = masked[assumptions_sheet]
+        for row, entry in enumerate(expected_assumptions, 2):
+            actual = ws.cell(row, 4).value
+            expected = entry.get("value", "")
+            if actual != expected and not (actual is None and expected == ""):
+                faults["changed"].append(
+                    "%s!D%d (promoted input literal)" % (assumptions_sheet, row))
+        for row in ws.iter_rows(min_col=5):
+            for cell in row:
+                if cell.value is not None:
+                    faults["formula"].append(
+                        "%s!%s (unexpected derivation column)"
+                        % (assumptions_sheet, cell.coordinate))
 
     # Every typed cell of the original must survive unchanged, and so must the
     # frozen values of the input frontier.
     for ws in original.worksheets:
         if ws.title not in masked.sheetnames:
+            faults["lost"].append("%s (missing worksheet)" % ws.title)
             continue
         derived = formula_coords.get(ws.title, set())
         denied = deny.get(ws.title, set())
@@ -815,8 +837,6 @@ def verify(out_path, src_path, keep, frontier, formula_coords, deny,
             elif isinstance(before, float) and isinstance(after, float):
                 if abs(before - after) > 1e-9 * max(1.0, abs(before)):
                     faults["changed"].append(where)
-            elif isinstance(before, (datetime.datetime, datetime.date)):
-                continue  # date serials round-trip through XML formatting
             elif before != after:
                 faults["changed"].append(where)
 
@@ -962,6 +982,10 @@ def process(wb_id, args):
 
     outputs_at = output_cells(bands)
     assumptions = embedded_assumptions(seg_dir)
+    assumption_formulas = sorted({
+        str(e.get("formula", "")) for e in assumptions
+        if str(e.get("formula", "")).strip()
+    })
     # The exact derivations of answer cells must not appear anywhere as text.
     forbidden_formulas = sorted({
         str(e.get("formula", "")) for e in assumptions
@@ -978,7 +1002,7 @@ def process(wb_id, args):
 
     faults = verify(out_path, source, keep, frontier, formula_coords, deny,
                     assumptions_sheet, deny_numbers, deny_texts,
-                    forbidden_formulas)
+                    forbidden_formulas, assumption_formulas, assumptions)
     broken = sum(len(v) for v in faults.values())
     print("  %s  kept %d  frozen %d  blanked %d  redacted %d  ->  %s (%s)"
           % (wb_id, tally["kept"], tally["frozen"], tally["blanked"],
@@ -1012,8 +1036,7 @@ def process(wb_id, args):
         print("       %d assumption row(s) redacted (masked values): %s"
               % (len(redacted_rows), ", ".join(redacted_rows[:6])))
     if stripped_rows:
-        print("       %d assumption formula(s) withheld (output cells or "
-              "masked literals): %s"
+        print("       %d assumption derivation(s) withheld: %s"
               % (len(stripped_rows), ", ".join(stripped_rows[:6])))
     if admitted:
         derived = Counter(b for b in admitted.values()

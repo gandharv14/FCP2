@@ -164,6 +164,9 @@ Hash the immutable generation manifest, `segments.json`, `bands.csv`,
 
 ```bash
 python3 xl_preflight.py "$WB" --source "$SOURCE" --seg-root "$SEG_ROOT" \
+  --source-generation-root "$SOURCE_GENERATION_ROOT" \
+  --source-generation-id "$SOURCE_GENERATION_ID" \
+  --segmentation-generation-id "$GENERATION_ID" \
   --out "$PREFLIGHT_ROOT"
 ```
 

@@ -14,6 +14,7 @@ def verification(**overrides):
         "skipped": False,
         "passed": False,
         "outputs": {"match": 10, "mismatch": 0, "unresolved": 0, "unverifiable": 0},
+        "ordered_output_cells": [f"Model!A{i}" for i in range(1, 11)],
         "seeded_inside_output_cone_count": 0,
         "oracle_fallback_inside_output_cone_count": 0,
         "iterative_blocks": [],

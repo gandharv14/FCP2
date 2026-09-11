@@ -30,9 +30,44 @@ from pathlib import Path
 
 from xl_seg import adjudicate, bands, condense, diagnostics, emit, evaluate, frontier, lineage
 from xl_seg import model, partition, project, publication, restriction_cone
+from xl_seg.active_graph import Sources
+from xl_seg.group_adjacency import Neighbors
 
 
 MAX_PROOF_CLOSURE_PASSES = 12
+# Closed allocation budget: allow roughly 1 GiB for materialized edge tuples,
+# sorting and SCC adjacency (256 bytes per edge), within an 8 GiB worker.
+# Larger exact proofs require a streaming representation, never truncation.
+MAX_MATERIALIZED_PROOF_EDGES = 4_000_000
+PROOF_EDGE_ESTIMATED_BYTES = 256
+
+
+class ProofResourceExhaustion(MemoryError):
+    reason_code = "resource_exhaustion"
+
+    def __init__(self, count):
+        self.report = {
+            "reason_code": self.reason_code,
+            "resource": "materialized_proof_edges",
+            "observed_edge_count_lower_bound": count,
+            "edge_limit": MAX_MATERIALIZED_PROOF_EDGES,
+            "estimated_allocation_bytes_lower_bound": count * PROOF_EDGE_ESTIMATED_BYTES,
+            "proof_truncated": False,
+            "recovery": "streaming_proof_representation_required",
+        }
+        super().__init__(json.dumps(self.report, sort_keys=True))
+
+
+def _check_proof_edge_budget(radj, cone):
+    """Count exact in-cone edges lazily; stop before allocating edge pairs."""
+    count = 0
+    for target in cone:
+        for source in radj.get(target, ()):
+            if source in cone:
+                count += 1
+                if count > MAX_MATERIALIZED_PROOF_EDGES:
+                    raise ProofResourceExhaustion(count)
+    return count
 
 
 def _eligible_proof_input(cg, cell):
@@ -48,11 +83,27 @@ def _runtime_proof_radj(cg, result):
     for target in cg.info:
         info = cg.info[target]
         if info.node.kind == "formula" and target in runtime:
-            out[target] = set(runtime[target])
+            out[target] = runtime[target] if isinstance(runtime[target], Sources) else set(runtime[target])
         else:
-            out[target] = set(cg.radj.get(target, ()))
+            out[target] = cg.radj.get(target, frozenset())
     for target, sources in runtime.items():
-        out[target] = set(sources)
+        out[target] = sources if isinstance(sources, Sources) else set(sources)
+    # Native cyclic iteration can consume a supplied primitive on an earlier
+    # branch even when the endpoint no longer reads it. Keep that exact edge;
+    # otherwise pruning its seed can change the next fresh evaluation. Formula
+    # caches and unrelated input cells remain ineligible.
+    primitive_by_target = collections.defaultdict(set)
+    for source, consumers in (getattr(result, "scalar_primitive_reads", None) or {}).items():
+        if not _eligible_proof_input(cg, source):
+            continue
+        for target in consumers:
+            info = cg.info.get(target)
+            if info is not None and info.node.kind == "formula":
+                primitive_by_target[target].add(source)
+    for target, sources in primitive_by_target.items():
+        # Do not enumerate shared static range groups just to add a few reads.
+        # None preserves an existing runtime self-edge (unlike a cell key).
+        out[target] = Neighbors(None, frozenset(sources), (out.get(target, ()),))
     return out
 
 
@@ -68,6 +119,7 @@ def _proof_cone(outputs, radj):
 
 
 def _proof_edge_signature(radj, cone):
+    _check_proof_edge_budget(radj, cone)
     return tuple(sorted(
         (source, target)
         for target in cone
@@ -98,6 +150,7 @@ def _resolved_target_signature(result, cone, graph=None):
 
 def _active_cycle_groups(cone, radj):
     """Find exact active SCCs in the stabilized output proof graph."""
+    _check_proof_edge_budget(radj, cone)
     adjacency = {cell: set() for cell in cone}
     for target in cone:
         for source in radj.get(target, ()):
@@ -122,7 +175,15 @@ def _active_cycle_groups(cone, radj):
 
 def _curated_output_identity(entries, chosen, cd, bg):
     """Keep explicit curated bands distinct from their topology components."""
-    selected_bands = {band for band in chosen if band in cd.comp_of}
+    selected_bands = set(chosen)
+    missing = selected_bands - set(bg.bands)
+    unrepresented = selected_bands - set(cd.comp_of)
+    if missing or unrepresented:
+        raise ValueError(
+            "curated output identity is incomplete: "
+            f"missing bands={sorted(missing)}, "
+            f"unrepresented bands={sorted(unrepresented)}"
+        )
     components = {cd.comp_of[band] for band in selected_bands}
     cells_by_band = {
         band: list(bg.bands[band].cells) for band in selected_bands
@@ -404,240 +465,262 @@ def segment(wb: str, args) -> dict:
         curation_path.read_bytes() if curation_path.is_file() else None
     )
 
-    graph = model.load(ast_dir, wb)
-    cg = project.build(graph)
-    bg = bands.build(cg)
-    embedded = bands.attach_literal_sources(bg, cg, frontier.is_notable_literal)
-    cd = condense.build(bg)
+    graph = model.load(ast_dir, wb, storage=getattr(args, "graph_storage", "auto"),
+                       storage_dir=getattr(args, "graph_storage_dir", None))
+    try:
+        cg = project.build(graph)
+        bg = bands.build(cg)
+        embedded = bands.attach_literal_sources(bg, cg, frontier.is_notable_literal)
+        cd = condense.build(bg)
 
-    candidates = frontier.score_outputs(bg, cd)
-    wrote_fresh = args.recurate or not curation_path.exists()
-    if wrote_fresh:
-        emit.write_curation(out_dir, wb, candidates, args.threshold, args.top)
-        if args.llm:
-            key = adjudicate.read_key(Path(args.env_file))
-            if not key:
-                raise SystemExit(
-                    f"--llm needs anthropic_api_key or lbx_api_key in {args.env_file}")
-            proxy = adjudicate.via_proxy(Path(args.env_file))
-            decisions = adjudicate.adjudicate(
-                wb, candidates[: args.top], key, args.model, proxy=proxy)
-            flipped = adjudicate.apply_to_curation(curation_path, decisions)
-            print(f"  adjudicator reviewed {len(decisions)} candidates, changed {flipped}")
-    def included_bands():
-        return {e["band"] for e in emit.read_curation(curation_path) if e.get("include")}
+        candidates = frontier.score_outputs(bg, cd)
+        wrote_fresh = args.recurate or not curation_path.exists()
+        if wrote_fresh:
+            emit.write_curation(out_dir, wb, candidates, args.threshold, args.top)
+            if args.llm:
+                key = adjudicate.read_key(Path(args.env_file))
+                if not key:
+                    raise SystemExit(
+                        f"--llm needs anthropic_api_key or lbx_api_key in {args.env_file}")
+                proxy = adjudicate.via_proxy(Path(args.env_file))
+                decisions = adjudicate.adjudicate(
+                    wb, candidates[: args.top], key, args.model, proxy=proxy)
+                flipped = adjudicate.apply_to_curation(curation_path, decisions)
+                print(f"  adjudicator reviewed {len(decisions)} candidates, changed {flipped}")
+        def included_bands():
+            return {e["band"] for e in emit.read_curation(curation_path) if e.get("include")}
 
-    # Escalation ladder. Only a curation this run wrote is escalated; a
-    # pre-existing (possibly hand-edited) file with zero includes still aborts,
-    # because overriding a human decision is not this code's call to make.
-    chosen = included_bands()
-    rung = "llm" if args.llm else "heuristic"
-    if not chosen and wrote_fresh:
-        if not args.llm:
-            key = adjudicate.read_key(Path(args.env_file))
-            if key:
-                print(f"  {wb}: 0 auto-includes; escalating to LLM adjudicator")
-                try:
-                    decisions = adjudicate.adjudicate(
-                        wb, candidates[: args.top], key, args.model,
-                        proxy=adjudicate.via_proxy(Path(args.env_file)))
-                    adjudicate.apply_to_curation(curation_path, decisions)
-                    rung = "llm"
-                except (ValueError, OSError) as exc:
-                    print(f"  {wb}: WARNING adjudicator escalation failed ({exc})")
-            else:
-                print(f"  {wb}: 0 auto-includes and no API key in {args.env_file}")
-            # Re-read rather than trust the changed count: an adjudicator that
-            # runs cleanly but includes nothing must still fall through.
-            chosen = included_bands()
-        if not chosen:
-            picks = frontier.fallback_outputs(candidates[: args.top])
-            if picks:
-                emit.apply_fallback(curation_path, [c.band for c in picks])
-                rung = "fallback"
-                print(f"  {wb}: fallback auto-included top {len(picks)}: "
-                      + ", ".join(f"{c.band} ({c.label[:32]!r})" for c in picks))
-            chosen = included_bands()
-    tally = {"heuristic": 0, "llm": 0, "fallback": 0}
-    tally[rung] = len(chosen)
-    print(f"  {wb}: outputs {tally['heuristic']} heuristic / "
-          f"{tally['llm']} llm / {tally['fallback']} fallback")
+        # Escalation ladder. Only a curation this run wrote is escalated; a
+        # pre-existing (possibly hand-edited) file with zero includes still aborts,
+        # because overriding a human decision is not this code's call to make.
+        chosen = included_bands()
+        rung = "llm" if args.llm else "heuristic"
+        if not chosen and wrote_fresh:
+            if not args.llm and not getattr(args, "no_auto_adjudication", False):
+                key = adjudicate.read_key(Path(args.env_file))
+                if key:
+                    print(f"  {wb}: 0 auto-includes; escalating to LLM adjudicator")
+                    try:
+                        decisions = adjudicate.adjudicate(
+                            wb, candidates[: args.top], key, args.model,
+                            proxy=adjudicate.via_proxy(Path(args.env_file)))
+                        adjudicate.apply_to_curation(curation_path, decisions)
+                        rung = "llm"
+                    except (ValueError, OSError) as exc:
+                        print(f"  {wb}: WARNING adjudicator escalation failed ({exc})")
+                else:
+                    print(f"  {wb}: 0 auto-includes and no API key in {args.env_file}")
+                # Re-read rather than trust the changed count: an adjudicator that
+                # runs cleanly but includes nothing must still fall through.
+                chosen = included_bands()
+            if not chosen:
+                picks = frontier.fallback_outputs(candidates[: args.top])
+                if picks:
+                    emit.apply_fallback(curation_path, [c.band for c in picks])
+                    rung = "fallback"
+                    print(f"  {wb}: fallback auto-included top {len(picks)}: "
+                          + ", ".join(f"{c.band} ({c.label[:32]!r})" for c in picks))
+                chosen = included_bands()
+        tally = {"heuristic": 0, "llm": 0, "fallback": 0}
+        tally[rung] = len(chosen)
+        print(f"  {wb}: outputs {tally['heuristic']} heuristic / "
+              f"{tally['llm']} llm / {tally['fallback']} fallback")
 
-    curation_entries = emit.read_curation(curation_path)
-    (
-        outputs,
-        selected_output_bands,
-        output_cells,
-        ordered_curated_cells,
-    ) = _curated_output_identity(curation_entries, chosen, cd, bg)
-    if not outputs:
-        raise SystemExit(f"{wb}: no outputs selected in {curation_path}")
-
-    inputs = frontier.input_frontier(cd, outputs)
-    part = partition.build(cd, inputs, outputs)
-
-    input_cells = {c for comp in inputs for b in cd.comp_members[comp] for c in bg.bands[b].cells}
-    if set(ordered_curated_cells) != output_cells:
-        raise SystemExit(
-            f"{wb}: curated output identity does not match selected output cells"
-        )
-
-    verify = _not_run_verification(
-        source,
-        ast_dir,
-        curation_path,
-        ordered_curated_cells,
-        "verification_disabled",
-    )
-    values: dict = {}
-    proof_inputs = set(input_cells)
-    proof_radj = None
-    proof = None
-    evaluator_benchmark = {}
-    already_tracing = tracemalloc.is_tracing()
-    if not already_tracing:
-        tracemalloc.start()
-    memory_before, _ = tracemalloc.get_traced_memory()
-    tracemalloc.reset_peak()
-    verification_started = time.perf_counter()
-    if not args.no_verify:
-        calculation = evaluate.workbook_calculation_metadata(source)
-        result, proof_inputs, proof_radj, proof = stabilize_runtime_proof(
-            graph,
-            cg,
-            input_cells,
+        # Keep the default mirror-bypassed graph for candidate scoring above.
+        # Explicit curation owns output identity, including presentation mirrors.
+        # Retain those bands for partitioning and proof; never substitute a source
+        # component for a selected target, which could seed its calculated answer.
+        cd = condense.build(bg, retain_bands=chosen)
+        curation_entries = emit.read_curation(curation_path)
+        (
+            outputs,
+            selected_output_bands,
             output_cells,
-            calculation=calculation,
+            ordered_curated_cells,
+        ) = _curated_output_identity(curation_entries, chosen, cd, bg)
+        if not outputs:
+            raise SystemExit(f"{wb}: no outputs selected in {curation_path}")
+
+        inputs = frontier.input_frontier(cd, outputs)
+        part = partition.build(cd, inputs, outputs)
+
+        input_cells = {c for comp in inputs for b in cd.comp_members[comp] for c in bg.bands[b].cells}
+        if set(ordered_curated_cells) != output_cells:
+            raise SystemExit(
+                f"{wb}: curated output identity does not match selected output cells"
+            )
+
+        verify = _not_run_verification(
+            source,
+            ast_dir,
+            curation_path,
+            ordered_curated_cells,
+            "verification_disabled",
         )
-        evaluator_benchmark = dict(getattr(result, "benchmark", {}) or {})
-        values = result.values
-        # The expected cache is not opened until bounded discovery and the
-        # final fresh strict proof have both completed.
-        expected_cache = (
-            evaluate.workbook_expected_cache(source) if source.exists() else None
+        values: dict = {}
+        proof_inputs = set(input_cells)
+        proof_radj = None
+        proof = None
+        evaluator_benchmark = {}
+        already_tracing = tracemalloc.is_tracing()
+        if not already_tracing:
+            tracemalloc.start()
+        memory_before, _ = tracemalloc.get_traced_memory()
+        tracemalloc.reset_peak()
+        verification_started = time.perf_counter()
+        if not args.no_verify:
+            calculation = evaluate.workbook_calculation_metadata(source)
+            result, proof_inputs, proof_radj, proof = stabilize_runtime_proof(
+                graph,
+                cg,
+                input_cells,
+                output_cells,
+                calculation=calculation,
+            )
+            evaluator_benchmark = dict(getattr(result, "benchmark", {}) or {})
+            values = result.values
+            # The expected cache is not opened until bounded discovery and the
+            # final fresh strict proof have both completed.
+            expected_cache = (
+                evaluate.workbook_expected_cache(source) if source.exists() else None
+            )
+            verify = _verify(
+                cg, result, proof_inputs, output_cells, part, cd, bg, args,
+                expected_cache=expected_cache,
+                calculation=calculation,
+                source_path=source,
+                ast_dir=ast_dir,
+                curation_path=curation_path,
+                proof=proof,
+                curated_output_cells=ordered_curated_cells,
+            )
+            if expected_cache is not None and hasattr(expected_cache, "close"):
+                expected_cache.close()
+        verification_runtime_s = time.perf_counter() - verification_started
+        _, memory_peak = tracemalloc.get_traced_memory()
+        peak_memory_bytes = max(0, int(memory_peak - memory_before))
+        if not already_tracing:
+            tracemalloc.stop()
+
+        literals = [
+            {**rec, "bucket": part.bucket.get(cd.comp_of.get(rec["band"]), partition.SCAFFOLD)}
+            for rec in embedded
+        ]
+        promoted = sum(1 for rec in literals if rec["bucket"] == partition.INPUT)
+        if literals:
+            print(f"  {wb}: {len(literals)} hardcoded constants promoted to source bands, "
+                  f"{promoted} inside the output cone (-> inputs)")
+        traces = lineage.build(
+            bg,
+            cd,
+            part,
+            cg,
+            values,
+            sorted(outputs),
+            proof_inputs,
+            args.lineage_max,
+            proof_radj=proof_radj,
         )
-        verify = _verify(
-            cg, result, proof_inputs, output_cells, part, cd, bg, args,
-            expected_cache=expected_cache,
-            calculation=calculation,
+
+        if (
+            original_curation is not None
+            and not args.recurate
+            and curation_path.read_bytes() != original_curation
+        ):
+            raise SystemExit(
+                f"{wb}: existing curation.toml changed outside explicit recuration"
+            )
+
+        cone_certificate = None
+        if source_generation is not None:
+            source_route = source_generation["health"].get("route")
+            if source_route in {"restricted_pass", "restricted_recalc_pass"}:
+                if proof is None:
+                    raise SystemExit(
+                        f"{wb}: restricted segmentation requires strict verification"
+                    )
+                try:
+                    cone_certificate = restriction_cone.build_certificate(
+                        source_generation_dir=source_generation["directory"],
+                        graph=graph,
+                        proof=proof,
+                        verification=verify,
+                        ordered_outputs=ordered_curated_cells,
+                        segmentation_fingerprints=verify.get("fingerprints") or {},
+                    )
+                except restriction_cone.RestrictionConeError as exc:
+                    # Certification failure must not erase the reconstruction
+                    # evidence needed to distinguish an evaluator defect from an
+                    # invalid source. This diagnostic is outside generation roots
+                    # and cannot be resolved as a publishable segmentation.
+                    from xl_source_health import atomic_write_report
+                    atomic_write_report(
+                        out_dir / "failed-attempts" / f"{time.time_ns()}.json",
+                        {"schema_version": "segmentation-failed-attempt/v1",
+                         "workbook_id": wb,
+                         "source_generation_id": source_generation["manifest"]["generation_id"],
+                         "stage": "restriction_cone", "failure": str(exc),
+                         "verification": verify},
+                    )
+                    raise SystemExit(
+                        f"{wb}: restriction cone certification failed: {exc}"
+                    ) from exc
+            publication.bind_source_generation(
+                verify,
+                source_generation["manifest"],
+                certificate=cone_certificate,
+            )
+        publication.attach_generation_contract(verify)
+        stage_dir = publication.make_staging_directory(Path(args.out), wb)
+        emit.write_candidates(stage_dir, candidates, bg)
+        emit.write_bands(stage_dir, bg, cd, part)
+        payload = emit.write_segments(
+            stage_dir,
+            wb,
+            bg,
+            cd,
+            part,
+            inputs,
+            outputs,
+            literals,
+            verify,
+            proof=proof,
+            selected_output_bands=selected_output_bands,
+        )
+        emit.write_lineage(stage_dir, wb, traces, values, proof=proof)
+        if cone_certificate is not None:
+            (stage_dir / "restriction-cone-certificate.json").write_bytes(
+                restriction_cone.certificate_bytes(cone_certificate)
+            )
+        generation_dir, generation_manifest = publication.publish_generation(
+            stage_dir,
+            out_dir,
+            verify,
+            ordered_curated_cells,
             source_path=source,
             ast_dir=ast_dir,
-            curation_path=curation_path,
-            proof=proof,
-            curated_output_cells=ordered_curated_cells,
-        )
-        if expected_cache is not None and hasattr(expected_cache, "close"):
-            expected_cache.close()
-    verification_runtime_s = time.perf_counter() - verification_started
-    _, memory_peak = tracemalloc.get_traced_memory()
-    peak_memory_bytes = max(0, int(memory_peak - memory_before))
-    if not already_tracing:
-        tracemalloc.stop()
-
-    literals = [
-        {**rec, "bucket": part.bucket.get(cd.comp_of.get(rec["band"]), partition.SCAFFOLD)}
-        for rec in embedded
-    ]
-    promoted = sum(1 for rec in literals if rec["bucket"] == partition.INPUT)
-    if literals:
-        print(f"  {wb}: {len(literals)} hardcoded constants promoted to source bands, "
-              f"{promoted} inside the output cone (-> inputs)")
-    traces = lineage.build(
-        bg,
-        cd,
-        part,
-        cg,
-        values,
-        sorted(outputs),
-        proof_inputs,
-        args.lineage_max,
-        proof_radj=proof_radj,
-    )
-
-    if (
-        original_curation is not None
-        and not args.recurate
-        and curation_path.read_bytes() != original_curation
-    ):
-        raise SystemExit(
-            f"{wb}: existing curation.toml changed outside explicit recuration"
+            source_generation_dir=(
+                source_generation["directory"]
+                if source_generation is not None
+                else None
+            ),
         )
 
-    cone_certificate = None
-    if source_generation is not None:
-        source_route = source_generation["health"].get("route")
-        if source_route in {"restricted_pass", "restricted_recalc_pass"}:
-            if proof is None:
-                raise SystemExit(
-                    f"{wb}: restricted segmentation requires strict verification"
-                )
-            try:
-                cone_certificate = restriction_cone.build_certificate(
-                    source_generation_dir=source_generation["directory"],
-                    graph=graph,
-                    proof=proof,
-                    verification=verify,
-                    ordered_outputs=ordered_curated_cells,
-                    segmentation_fingerprints=verify.get("fingerprints") or {},
-                )
-            except restriction_cone.RestrictionConeError as exc:
-                raise SystemExit(
-                    f"{wb}: restriction cone certification failed: {exc}"
-                ) from exc
-        publication.bind_source_generation(
-            verify,
-            source_generation["manifest"],
-            certificate=cone_certificate,
-        )
-    publication.attach_generation_contract(verify)
-    stage_dir = publication.make_staging_directory(Path(args.out), wb)
-    emit.write_candidates(stage_dir, candidates, bg)
-    emit.write_bands(stage_dir, bg, cd, part)
-    payload = emit.write_segments(
-        stage_dir,
-        wb,
-        bg,
-        cd,
-        part,
-        inputs,
-        outputs,
-        literals,
-        verify,
-        proof=proof,
-        selected_output_bands=selected_output_bands,
-    )
-    emit.write_lineage(stage_dir, wb, traces, values, proof=proof)
-    if cone_certificate is not None:
-        (stage_dir / "restriction-cone-certificate.json").write_bytes(
-            restriction_cone.certificate_bytes(cone_certificate)
-        )
-    generation_dir, generation_manifest = publication.publish_generation(
-        stage_dir,
-        out_dir,
-        verify,
-        ordered_curated_cells,
-        source_path=source,
-        ast_dir=ast_dir,
-        source_generation_dir=(
-            source_generation["directory"]
-            if source_generation is not None
-            else None
-        ),
-    )
-
-    payload["elapsed_s"] = round(time.time() - started, 2)
-    payload["benchmark"] = {
-        "verifier_runtime_s": verification_runtime_s,
-        "peak_memory_bytes": peak_memory_bytes,
-        "evaluator": evaluator_benchmark,
-    }
-    payload["generation"] = {
-        "generation_id": generation_manifest["generation_id"],
-        "directory": str(generation_dir),
-        "manifest": str(generation_dir / "generation-manifest.json"),
-    }
-    _report(wb, payload, part, verify, traces, generation_dir)
-    return payload
+        payload["elapsed_s"] = round(time.time() - started, 2)
+        payload["benchmark"] = {
+            "verifier_runtime_s": verification_runtime_s,
+            "peak_memory_bytes": peak_memory_bytes,
+            "evaluator": evaluator_benchmark,
+        }
+        payload["generation"] = {
+            "generation_id": generation_manifest["generation_id"],
+            "directory": str(generation_dir),
+            "manifest": str(generation_dir / "generation-manifest.json"),
+        }
+        _report(wb, payload, part, verify, traces, generation_dir)
+        return payload
+    finally:
+        graph.close()
 
 
 def _not_run_verification(
@@ -734,8 +817,12 @@ def _divergence_roots(cg, result, bad_cells):
     def sources(cid):
         cached = source_cache.get(cid)
         if cached is None:
-            cached = set(cg.radj.get(cid, ()))
-            cached.update(runtime_radj.get(cid, ()))
+            from xl_seg.group_adjacency import Neighbors
+            cached = Neighbors(
+                None, frozenset(),
+                (runtime_radj.get(cid, ()) if isinstance(runtime_radj.get(cid), Sources)
+                 else frozenset(runtime_radj.get(cid, ())), cg.radj.get(cid, frozenset())),
+            )
             source_cache[cid] = cached
         return cached
 
@@ -820,8 +907,10 @@ def _verify(
         if stabilized_radj is not None:
             effective_radj[target] = set(stabilized_radj.get(target, ()))
         else:
-            effective_radj[target] = set(cg.radj.get(target, ()))
-            effective_radj[target].update(runtime_radj.get(target, ()))
+            from xl_seg.group_adjacency import Neighbors
+            effective_radj[target] = Neighbors(None, frozenset(),
+                (runtime_radj.get(target, ()) if isinstance(runtime_radj.get(target), Sources)
+                 else frozenset(runtime_radj.get(target, ())), cg.radj.get(target, frozenset())))
     if stabilized_radj is not None:
         for target, sources in stabilized_radj.items():
             effective_radj[target] = set(sources)
@@ -1433,6 +1522,8 @@ def main(argv=None):
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("workbooks", nargs="+", help="workbook ids under --ast-dir")
     parser.add_argument("--ast-dir", default="ast_out")
+    parser.add_argument("--graph-storage", choices=("auto", "memory", "disk"), default="auto")
+    parser.add_argument("--graph-storage-dir", help="directory for disposable disk graph indexes")
     parser.add_argument("--source", default="4-10 100", help="folder holding <wb>.xlsx")
     parser.add_argument(
         "--source-generation-id",
@@ -1463,6 +1554,8 @@ def main(argv=None):
     parser.add_argument("--recurate", action="store_true",
                         help="overwrite curation.toml, discarding hand edits")
     parser.add_argument("--llm", action="store_true", help="let the adjudicator pick outputs")
+    parser.add_argument("--no-auto-adjudication", action="store_true",
+                        help="keep automatic shortlist recovery offline; retain heuristic fallback")
     parser.add_argument("--model", default=adjudicate.DEFAULT_MODEL)
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--no-verify", action="store_true")

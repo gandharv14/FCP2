@@ -10,11 +10,20 @@ set -uo pipefail
 # and stamp BUILDOK -- against whatever tree the caller happens to be in.
 cd "$(dirname "$0")" || { echo "BUILDFAIL cd :: cannot cd to the pipeline root"; exit 1; }
 
+[ "$#" -gt 0 ] || { echo "BUILDFAIL args :: workbook ID required"; exit 1; }
+PIPELINE_PYTHON="${PIPELINE_PYTHON:-$PWD/.venv/bin/python}"
+"$PIPELINE_PYTHON" -c 'import sys; assert sys.version_info >= (3, 12), "Python 3.12 required"' || exit 1
 WB="$1"
+[[ "$WB" =~ ^[0-9]{4}$ ]] || { echo "BUILDFAIL args :: expected four-digit workbook ID"; exit 1; }
 shift
 RELEASE_BASE="${RELEASE_ROOT:-release_out}"
 SOURCE_GENERATION_ROOT="${SOURCE_GENERATION_ROOT:-source_out}"
 SEGMENTATION_ROOT="${SEGMENTATION_ROOT:-seg_out}"
+RUNS_ROOT="${RUNS_ROOT:-runs}"
+INPUTS_ROOT="${INPUTS_ROOT:-inputs_out}"
+MCP_INPUTS_ROOT="${MCP_INPUTS_ROOT:-inputs_out_mcp}"
+STAGING_ROOT="${STAGING_ROOT:-tasks_outputs_mcp}"
+DISCLOSURE_ROOT="$RUNS_ROOT/disclosure"
 RELEASE_ID=""
 SOURCE_GENERATION_ID=""
 SEGMENTATION_GENERATION_ID=""
@@ -28,37 +37,39 @@ while [ "$#" -gt 0 ]; do
     *) echo "BUILDFAIL $WB args :: unknown argument $1"; exit 1 ;;
   esac
 done
-RUN="runs/$WB-variable-sources"
-STAGED="tasks_outputs_mcp/$WB-outputs"
-NAT_RUN="runs/$WB-instruction-naturalization"
+RUN="$RUNS_ROOT/$WB-variable-sources"
+STAGED="$STAGING_ROOT/$WB-outputs"
+NAT_RUN="$RUNS_ROOT/$WB-instruction-naturalization"
 D=.cursor/skills/task-disclosure/scripts/disclose.py
-LOG="/tmp/build/$WB.log"
-mkdir -p /tmp/build
+BUILD_TMP=$(mktemp -d "${TMPDIR:-/tmp}/harbor-build-$WB.XXXXXX") || exit 1
+trap 'rm -rf -- "$BUILD_TMP"' EXIT
+LOG="$BUILD_TMP/build.log"
 
 if [ "$RESUME" -eq 1 ]; then
-  python3 .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py \
+  "$PIPELINE_PYTHON" .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py \
     verify-applied "$NAT_RUN" >/dev/null 2>&1 \
     || { echo "BUILDFAIL $WB gate=13 :: naturalization is not safely applied"; exit 1; }
-  python3 "$D" verify --task-dir "$STAGED" >/dev/null 2>&1 \
+  "$PIPELINE_PYTHON" "$D" verify --task-dir "$STAGED" --runs-root "$DISCLOSURE_ROOT" >/dev/null 2>&1 \
     || { echo "BUILDFAIL $WB gate=13 :: post-naturalization disclosure failed"; exit 1; }
   GS="$RUN/grader-smoke"
   rm -rf "$GS"
   mkdir -p "$GS/workspace" "$GS/output"
-  python3 - "$STAGED/tests/answer_key.json" "$GS/workspace/answers.json" <<'PY' \
+  "$PIPELINE_PYTHON" - "$STAGED/tests/answer_key.json" "$GS/workspace/answers.json" <<'PY' \
     || { echo "BUILDFAIL $WB gate=15 :: answer-key setup failed"; exit 1; }
 import json, sys
 key = json.load(open(sys.argv[1], encoding="utf-8"))
 json.dump(key["targets"], open(sys.argv[2], "w", encoding="utf-8"), indent=2)
 PY
-  python3 "$STAGED/tests/run_grader.py" --workspace "$GS/workspace" \
+  "$PIPELINE_PYTHON" "$STAGED/tests/run_grader.py" --workspace "$GS/workspace" \
     --answer-key "$STAGED/tests/answer_key.json" --output-dir "$GS/output" \
     --mode discrete >/dev/null 2>&1 \
     || { echo "BUILDFAIL $WB gate=15 :: grader failed"; exit 1; }
-  python3 -c "
-import json,sys
-r=json.load(open('$GS/output/reward.json'))
-sys.exit(0 if r.get('score')==1.0 else 1)" \
+  "$PIPELINE_PYTHON" - "$GS/output/reward.json" <<'PY' \
     || { echo "BUILDFAIL $WB gate=15 :: grader score is not 1.0"; exit 1; }
+import json,sys
+r=json.load(open(sys.argv[1]))
+sys.exit(0 if r.get('score')==1.0 else 1)
+PY
   echo "NATURALIZATION_OK_DOWNSTREAM_GATES_PENDING $WB" >&2
   echo "Continue faithfulness, oracle, dialogue, and promotion gates." >&2
   exit 76
@@ -69,7 +80,7 @@ if [ -n "$SOURCE_GENERATION_ID" ] || [ -n "$SEGMENTATION_GENERATION_ID" ]; then
     || { echo "BUILDFAIL $WB args :: both candidate generation IDs are required"; exit 1; }
   [ -z "$RELEASE_ID" ] \
     || { echo "BUILDFAIL $WB args :: release and candidate modes conflict"; exit 1; }
-  SOURCE_STATE=$(python3 -m xl_release_publication resolve-candidate "$WB" \
+  SOURCE_STATE=$("$PIPELINE_PYTHON" -m xl_release_publication resolve-candidate "$WB" \
     --source-root "$SOURCE_GENERATION_ROOT/$WB" \
     --source-generation-id "$SOURCE_GENERATION_ID" \
     --segmentation-root "$SEGMENTATION_ROOT/$WB" \
@@ -85,13 +96,13 @@ if [ -n "$SOURCE_GENERATION_ID" ] || [ -n "$SEGMENTATION_GENERATION_ID" ]; then
 else
   RESOLVE_ARGS=()
   [ -z "$RELEASE_ID" ] || RESOLVE_ARGS+=(--release-id "$RELEASE_ID")
-  SOURCE_STATE=$(python3 -m xl_release_publication resolve \
+  SOURCE_STATE=$("$PIPELINE_PYTHON" -m xl_release_publication resolve \
     "$RELEASE_BASE/$WB" "$WB" \
     --source-root "$SOURCE_GENERATION_ROOT/$WB" \
     --segmentation-root "$SEGMENTATION_ROOT/$WB" \
     "${RESOLVE_ARGS[@]}" 2>/dev/null) \
     || { echo "BUILDFAIL $WB gate=source :: no validated current release"; exit 1; }
-  RELEASE_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["release_id"])' \
+  RELEASE_ID=$("$PIPELINE_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["release_id"])' \
     <<<"$SOURCE_STATE") || exit 1
   PIN_ARGS=(--release-root "$RELEASE_BASE" --release-id "$RELEASE_ID" \
     --source-generation-root "$SOURCE_GENERATION_ROOT")
@@ -99,15 +110,15 @@ else
     --source-generation-root "$SOURCE_GENERATION_ROOT" \
     --segmentation-root "$SEGMENTATION_ROOT")
 fi
-SOURCE_ROOT=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_root"])' \
+SOURCE_ROOT=$("$PIPELINE_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["source_root"])' \
   <<<"$SOURCE_STATE") || exit 1
-SOURCE_FILE=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_path"])' \
+SOURCE_FILE=$("$PIPELINE_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["source_path"])' \
   <<<"$SOURCE_STATE") || exit 1
-SOURCE_SHA256=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_sha256"])' \
+SOURCE_SHA256=$("$PIPELINE_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["source_sha256"])' \
   <<<"$SOURCE_STATE") || exit 1
-AST_ROOT=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["ast_root"])' \
+AST_ROOT=$("$PIPELINE_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["ast_root"])' \
   <<<"$SOURCE_STATE") || exit 1
-GENERATION_ID=$(python3 -c \
+GENERATION_ID=$("$PIPELINE_PYTHON" -c \
   'import json,sys; print(json.load(sys.stdin)["bindings"]["segmentation_generation_id"])' \
   <<<"$SOURCE_STATE") || exit 1
 
@@ -116,32 +127,32 @@ fail() { echo "BUILDFAIL $WB gate=$1 :: $2"; exit 1; }
 (
 PLAIN=0
 # ---- gate 4: versioned segmentation generation --------------------------
-python3 - "$WB" "$GENERATION_ID" <<'PY' >/dev/null 2>&1 || exit 119
+"$PIPELINE_PYTHON" - "$WB" "$GENERATION_ID" "$INPUTS_ROOT" "$SEGMENTATION_ROOT" <<'PY' >/dev/null 2>&1 || exit 119
 import sys
 from pathlib import Path
 from xl_seg.publication import validate_inputs_sidecar
-wb, generation_id = sys.argv[1:]
+wb, generation_id, inputs_root, segmentation_root = sys.argv[1:]
 validate_inputs_sidecar(
-    Path("inputs_out") / f"{wb}-inputs.xlsx",
+    Path(inputs_root) / f"{wb}-inputs.xlsx",
     expected_generation_id=generation_id,
-    generation_dir=Path("seg_out") / wb / "generations" / generation_id,
+    generation_dir=Path(segmentation_root) / wb / "generations" / generation_id,
 )
 PY
 
 # ---- gate 5: import ------------------------------------------------------
-python3 xl_variable_mcp.py import "$RUN/$WB-inputs-variable-sources.md" \
+"$PIPELINE_PYTHON" xl_variable_mcp.py import "$RUN/$WB-inputs-variable-sources.md" \
   "$RUN/draft.json" >/dev/null 2>&1 || exit 91
 
 # ---- gate 6: generate + run atomic normalizer ----------------------------
-python3 gen_normalizer.py "$WB" --source-file "$SOURCE_FILE" \
-  --source-sha256 "$SOURCE_SHA256" "${NORMALIZER_PIN_ARGS[@]}" \
+"$PIPELINE_PYTHON" gen_normalizer.py "$WB" --source-file "$SOURCE_FILE" \
+  --source-sha256 "$SOURCE_SHA256" "${NORMALIZER_PIN_ARGS[@]}" --runs-root "$RUNS_ROOT" --inputs-root "$INPUTS_ROOT" \
   2>/dev/null || exit 92
-python3 "$RUN/normalize_$WB.py" >/dev/null 2>&1 || exit 92
-cp "$RUN/normalized.json" "/tmp/build/$WB.n1.json"
-python3 "$RUN/normalize_$WB.py" >/dev/null 2>&1 || exit 92
-cmp -s "/tmp/build/$WB.n1.json" "$RUN/normalized.json" || exit 93   # not byte-stable
+"$PIPELINE_PYTHON" "$RUN/normalize_$WB.py" >/dev/null 2>&1 || exit 92
+cp "$RUN/normalized.json" "$BUILD_TMP/normalized.first.json"
+"$PIPELINE_PYTHON" "$RUN/normalize_$WB.py" >/dev/null 2>&1 || exit 92
+cmp -s "$BUILD_TMP/normalized.first.json" "$RUN/normalized.json" || exit 93   # not byte-stable
 
-python3 - "$RUN/draft.json" "$RUN/normalized.json" "$RUN/normalization_report.json" <<'PY' >/dev/null 2>&1 || exit 94
+"$PIPELINE_PYTHON" - "$RUN/draft.json" "$RUN/normalized.json" "$RUN/normalization_report.json" <<'PY' >/dev/null 2>&1 || exit 94
 import json, sys
 draft, spec, report = (json.load(open(p, encoding="utf-8")) for p in sys.argv[1:])
 draft_ids = [r["draft_id"] for r in draft["rows"]]
@@ -157,37 +168,37 @@ for row in rows:
         raise SystemExit(1)
 PY
 
-python3 plain_eligibility.py "$RUN" >/tmp/build/$WB.mode || exit 114
-MODE=$(cat /tmp/build/$WB.mode)
+"$PIPELINE_PYTHON" plain_eligibility.py "$RUN" >"$BUILD_TMP/mode" || exit 114
+MODE=$(cat "$BUILD_TMP/mode")
 if [ "$MODE" = plain ]; then
   PLAIN=1
-  python3 - "$RUN/normalized.json" <<'PY' >/dev/null 2>&1 || exit 115
+  "$PIPELINE_PYTHON" - "$RUN/normalized.json" <<'PY' >/dev/null 2>&1 || exit 115
 import json, sys
 spec = json.load(open(sys.argv[1], encoding="utf-8"))
 raise SystemExit(0 if spec.get("variables") == [] else 1)
 PY
   rm -rf "$RUN/mcp" "$RUN/mcp-build-a" "$RUN/mcp-build-b"
-  rm -f "inputs_out_mcp/$WB-inputs.xlsx"
+  rm -f "$MCP_INPUTS_ROOT/$WB-inputs.xlsx"
 fi
 
 if [ "$PLAIN" -eq 0 ]; then
 # ---- gate 7: spec validation --------------------------------------------
-python3 xl_variable_mcp.py validate-spec "$RUN/normalized.json" >/dev/null 2>&1 || exit 95
+"$PIPELINE_PYTHON" xl_variable_mcp.py validate-spec "$RUN/normalized.json" >/dev/null 2>&1 || exit 95
 
 # ---- gate 8: maskability ------------------------------------------------
 # The check is committed in-repo (it used to live at /tmp/maskability.py,
 # which vanished on reboot and was silently tamperable).
 [ -f maskability.py ] || { echo "BUILDFAIL $WB gate=8 :: maskability.py missing from repo"; exit 96; }
-python3 maskability.py "$WB" --source "$SOURCE" >/dev/null 2>&1 || exit 96
+"$PIPELINE_PYTHON" maskability.py "$WB" --source "$SOURCE_ROOT" --runs-root "$RUNS_ROOT" >/dev/null 2>&1 || exit 96
 
 # ---- gate 9: deterministic double build + validate + smoke -------------
 rm -rf "$RUN/mcp-build-a" "$RUN/mcp-build-b" "$RUN/mcp"
-python3 xl_variable_mcp.py build "$RUN/normalized.json" "$RUN/mcp-build-a" \
+"$PIPELINE_PYTHON" xl_variable_mcp.py build "$RUN/normalized.json" "$RUN/mcp-build-a" \
   --workbook "$WB" --source "$SOURCE_ROOT" >/dev/null 2>&1 || exit 97
-python3 xl_variable_mcp.py build "$RUN/normalized.json" "$RUN/mcp-build-b" \
+"$PIPELINE_PYTHON" xl_variable_mcp.py build "$RUN/normalized.json" "$RUN/mcp-build-b" \
   --workbook "$WB" --source "$SOURCE_ROOT" >/dev/null 2>&1 || exit 97
 diff -qr "$RUN/mcp-build-a" "$RUN/mcp-build-b" >/dev/null 2>&1 || exit 98
-python3 - "$RUN/mcp-build-a" <<'PY' >/dev/null 2>&1 || exit 99
+"$PIPELINE_PYTHON" - "$RUN/mcp-build-a" <<'PY' >/dev/null 2>&1 || exit 99
 import sys
 from pathlib import Path
 from mcp_env.validate import validate
@@ -195,32 +206,31 @@ r = validate(Path(sys.argv[1]))
 raise SystemExit(0 if r.get("valid") is True else 1)
 PY
 mv "$RUN/mcp-build-a" "$RUN/mcp"
-uv run --python 3.12 --with fastmcp --with openpyxl \
-  python xl_variable_mcp.py smoke "$RUN/mcp" >/dev/null 2>&1 || exit 100
+"$PIPELINE_PYTHON" xl_variable_mcp.py smoke "$RUN/mcp" >/dev/null 2>&1 || exit 100
 
 # ---- gate 10: mask MCP inputs separately -------------------------------
-BASE_SHA=$(shasum -a 256 "inputs_out/$WB-inputs.xlsx" | awk '{print $1}')
-python3 xl_input_mask.py "$WB" --source "$SOURCE_ROOT" --seg-dir "$SEGMENTATION_ROOT" \
+BASE_SHA=$(shasum -a 256 "$INPUTS_ROOT/$WB-inputs.xlsx" | awk '{print $1}')
+"$PIPELINE_PYTHON" xl_input_mask.py "$WB" --source "$SOURCE_ROOT" --seg-dir "$SEGMENTATION_ROOT" \
   --ast-dir "$AST_ROOT" --segmentation-mode strict \
   --expected-generation-id "$GENERATION_ID" \
   "${PIN_ARGS[@]}" \
-  -o inputs_out_mcp --mask-cells "$RUN/mcp/mask_cells.json" >/dev/null 2>&1 || exit 101
-NOW=$(shasum -a 256 "inputs_out/$WB-inputs.xlsx" | awk '{print $1}')
+  -o "$MCP_INPUTS_ROOT" --mask-cells "$RUN/mcp/mask_cells.json" >/dev/null 2>&1 || exit 101
+NOW=$(shasum -a 256 "$INPUTS_ROOT/$WB-inputs.xlsx" | awk '{print $1}')
 [ "$BASE_SHA" = "$NOW" ] || exit 102
-[ -f "inputs_out_mcp/$WB-inputs.xlsx" ] || exit 103
+[ -f "$MCP_INPUTS_ROOT/$WB-inputs.xlsx" ] || exit 103
 fi
 
 # ---- gate 11: package to staging ---------------------------------------
 rm -rf "$STAGED"
 if [ "$PLAIN" -eq 1 ]; then
-  python3 xl_output_task.py "$WB" --source "$SOURCE_ROOT" --seg-root "$SEGMENTATION_ROOT" \
+  "$PIPELINE_PYTHON" xl_output_task.py "$WB" --source "$SOURCE_ROOT" --seg-root "$SEGMENTATION_ROOT" \
     --ast-dir "$AST_ROOT" --segmentation-mode strict \
     "${PIN_ARGS[@]}" \
-    --inputs-root inputs_out \
-    --variable-source-audit-inputs-root inputs_out \
-    --variable-source-audit-root runs \
+    --inputs-root "$INPUTS_ROOT" \
+    --variable-source-audit-inputs-root "$INPUTS_ROOT" \
+    --variable-source-audit-root "$RUNS_ROOT" \
     --variable-source-audit-model openai/gpt-5.6-sol \
-    --no-naturalize -o tasks_outputs_mcp >/dev/null 2>&1 || exit 104
+    --no-naturalize -o "$STAGING_ROOT" >/dev/null 2>&1 || exit 104
   for f in instruction.md task.toml tests/answer_key.json tests/outputs.json \
            tests/segmentation_generation_manifest.json \
            tests/inputs_generation.json \
@@ -228,7 +238,7 @@ if [ "$PLAIN" -eq 1 ]; then
            "environment/$WB-inputs.xlsx" environment/Dockerfile; do
     [ -e "$STAGED/$f" ] || exit 105
   done
-  python3 - "$STAGED" "$WB" <<'PY' >/dev/null 2>&1 || exit 116
+  "$PIPELINE_PYTHON" - "$STAGED" "$WB" <<'PY' >/dev/null 2>&1 || exit 116
 import sys
 from pathlib import Path
 task, wb = Path(sys.argv[1]), sys.argv[2]
@@ -246,7 +256,7 @@ if "## Research data service" in text:
 if (task / "tests" / "masked_inputs.json").exists():
     raise SystemExit("masked_inputs.json leaked into plain bundle")
 PY
-  python3 - "$STAGED" "$WB" <<'PY' >/dev/null 2>&1 || exit 117
+  "$PIPELINE_PYTHON" - "$STAGED" "$WB" <<'PY' >/dev/null 2>&1 || exit 117
 import sys
 from pathlib import Path
 from plain_eligibility import check_plain_environment
@@ -254,14 +264,14 @@ report = check_plain_environment(Path(sys.argv[1]), sys.argv[2])
 raise SystemExit(0 if report.get("valid") else 1)
 PY
 else
-  python3 xl_output_task.py "$WB" --source "$SOURCE_ROOT" --seg-root "$SEGMENTATION_ROOT" \
+  "$PIPELINE_PYTHON" xl_output_task.py "$WB" --source "$SOURCE_ROOT" --seg-root "$SEGMENTATION_ROOT" \
     --ast-dir "$AST_ROOT" --segmentation-mode strict \
     "${PIN_ARGS[@]}" \
-    --inputs-root inputs_out_mcp \
-    --variable-source-audit-inputs-root inputs_out \
-    --variable-source-audit-root runs \
+    --inputs-root "$MCP_INPUTS_ROOT" \
+    --variable-source-audit-inputs-root "$INPUTS_ROOT" \
+    --variable-source-audit-root "$RUNS_ROOT" \
     --variable-source-audit-model openai/gpt-5.6-sol \
-    --mcp "$RUN/mcp" --no-naturalize -o tasks_outputs_mcp >/dev/null 2>&1 || exit 104
+    --mcp "$RUN/mcp" --no-naturalize -o "$STAGING_ROOT" >/dev/null 2>&1 || exit 104
   for f in instruction.md task.toml tests/answer_key.json tests/masked_inputs.json \
            tests/segmentation_generation_manifest.json \
            tests/inputs_generation.json \
@@ -271,17 +281,17 @@ else
 fi
 
 # ---- gate 12: unified disclosure ---------------------------------------
-python3 "$D" select --task-dir "$STAGED" --golden "$SOURCE_FILE" \
+"$PIPELINE_PYTHON" "$D" select --task-dir "$STAGED" --runs-root "$DISCLOSURE_ROOT" --golden "$SOURCE_FILE" \
   --ast-dir "$AST_ROOT" --seg-root "$SEGMENTATION_ROOT" --segmentation-mode strict \
   "${PIN_ARGS[@]}" \
   >/dev/null 2>&1 || exit 106
-python3 "$D" probe   --task-dir "$STAGED" >/dev/null 2>&1 || exit 106
-python3 "$D" roles   --task-dir "$STAGED" >/dev/null 2>&1 || exit 106
+"$PIPELINE_PYTHON" "$D" probe   --task-dir "$STAGED" --runs-root "$DISCLOSURE_ROOT" >/dev/null 2>&1 || exit 106
+"$PIPELINE_PYTHON" "$D" roles   --task-dir "$STAGED" --runs-root "$DISCLOSURE_ROOT" >/dev/null 2>&1 || exit 106
 # Collisions are fine as long as a complete Sol High resolution file covers them.
-python3 - "$WB" <<'PY' >/dev/null 2>&1 || exit 107
+"$PIPELINE_PYTHON" - "$WB" "$DISCLOSURE_ROOT" <<'PY' >/dev/null 2>&1 || exit 107
 import json, os, sys
 wb = sys.argv[1]
-d = f"runs/disclosure/{wb}-outputs"
+d = str(__import__("pathlib").Path(sys.argv[2]) / f"{wb}-outputs")
 cp = f"{d}/ambiguous_roles.json"
 cases = json.load(open(cp)) if os.path.exists(cp) else {}
 cases = cases.get("cases") if isinstance(cases, dict) else cases
@@ -303,11 +313,11 @@ have = {x["case_id"] for x in (r.get("resolutions") or [])}
 want = {c["case_id"] for c in cases}
 raise SystemExit(0 if want <= have else 1)
 PY
-python3 "$D" detect  --task-dir "$STAGED" >/dev/null 2>&1 || exit 108
-python3 "$D" context --task-dir "$STAGED" >/dev/null 2>&1 || exit 108
-python3 "$D" write   --task-dir "$STAGED" >/dev/null 2>&1 || exit 108
-python3 "$D" verify  --task-dir "$STAGED" >/dev/null 2>&1 || exit 109
-python3 - "$STAGED" <<'PY' >/dev/null 2>&1 || exit 110
+"$PIPELINE_PYTHON" "$D" detect  --task-dir "$STAGED" --runs-root "$DISCLOSURE_ROOT" >/dev/null 2>&1 || exit 108
+"$PIPELINE_PYTHON" "$D" context --task-dir "$STAGED" --runs-root "$DISCLOSURE_ROOT" >/dev/null 2>&1 || exit 108
+"$PIPELINE_PYTHON" "$D" write   --task-dir "$STAGED" --runs-root "$DISCLOSURE_ROOT" >/dev/null 2>&1 || exit 108
+"$PIPELINE_PYTHON" "$D" verify  --task-dir "$STAGED" --runs-root "$DISCLOSURE_ROOT" >/dev/null 2>&1 || exit 109
+"$PIPELINE_PYTHON" - "$STAGED" <<'PY' >/dev/null 2>&1 || exit 110
 import json, sys
 from pathlib import Path
 task = Path(sys.argv[1])
@@ -319,7 +329,7 @@ PY
 # Retain AST evidence: strict live validation and safe reruns require it.
 
 # ---- gate 13 recoverable state (naturalization applied separately) -----
-python3 .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py \
+"$PIPELINE_PYTHON" .cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py \
   init "$STAGED/instruction.md" --state-dir "$NAT_RUN" \
   --instruction "$STAGED/instruction.md" --task-toml "$STAGED/task.toml" \
   --answer-key "$STAGED/tests/answer_key.json" >/dev/null 2>&1 || exit 120
@@ -328,14 +338,15 @@ exit 121
 RC=$?
 
 case $RC in
-  0)   V=$(python3 -c "
-import json
+  0)   V=$("$PIPELINE_PYTHON" - "$RUN" "$STAGED" <<'PY'
+import json, sys
 from pathlib import Path
-s=json.load(open('$RUN/normalized.json'))
-r=json.load(open('$RUN/normalization_report.json'))
-d=json.load(open('$STAGED/tests/disclosure.json'))
+run, staged = map(Path, sys.argv[1:])
+s=json.load(open(run / 'normalized.json'))
+r=json.load(open(run / 'normalization_report.json'))
+d=json.load(open(staged / 'tests/disclosure.json'))
 elig={}
-p=Path('$RUN/plain_eligibility.json')
+p=run / 'plain_eligibility.json'
 if p.is_file():
     elig=json.loads(p.read_text())
 if elig.get('mode')=='plain':
@@ -343,11 +354,12 @@ if elig.get('mode')=='plain':
       len(d.get('agent_records') or []), r['excluded_rows'],
       elig.get('plain_reason') or elig.get('reason') or 'excluded'))
 else:
-    m=json.load(open('$RUN/mcp/mask_cells.json'))
+    m=json.load(open(run / 'mcp/mask_cells.json'))
     print('%d vars, %d masked, %d disclosure records, %d incl/%d excl'%(
       len(s['variables']),len(m),len(d.get('agent_records') or []),
       r['included_rows'],r['excluded_rows']))
-")
+PY
+)
        echo "BUILDOK $WB :: $V" ;;
   91)  fail 5  "import failed" ;;
   92)  fail 6  "normalizer generation or execution failed" ;;

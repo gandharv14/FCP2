@@ -28,6 +28,10 @@ def resolve_workbook_artifact(directory, workbook_id, pattern="%s"):
     stem = pattern % workbook_id
     for suffix in WORKBOOK_SUFFIXES:
         candidate = base / (stem + suffix)
-        if candidate.exists():
-            return candidate
+        matches = sorted(p for p in base.glob(stem + ".*")
+                         if p.stem == stem and p.suffix.lower() == suffix and p.is_file())
+        if len(matches) > 1:
+            raise ValueError("ambiguous workbook artifacts: %s" % matches)
+        if matches:
+            return matches[0]
     return base / (stem + WORKBOOK_SUFFIXES[0])

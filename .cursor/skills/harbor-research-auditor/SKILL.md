@@ -146,6 +146,28 @@ Do not use inventory-only mode as a production audit. Cache reuse is valid only
 when baseline inventory hash, model, prompt version, source generation, and
 segmentation generation all match.
 
+A completed audit may instead be revalidated through the separate
+`audit-locator-equivalence/v2` contract when only explicit generation locators
+changed. This is not a cache rewrite or a new model response.
+Use `xl_audit_equivalence.py propose` with separately bound historical and current
+contexts, then independently validate its receipt. The current source/AST,
+segmentation and baseline must pass their current gates. A changed source
+generation additionally requires exact source, nodes.csv, edges.csv, health,
+request and result bytes, unchanged builder arguments/engine/policy, and only
+the enumerated builder-code provenance and derived identity fields may differ.
+No AST columns or metadata may be discarded to establish equality. Original
+bytes, curation, ordered targets, baseline ZIP contents, every financial
+inventory row and all other metadata must remain identical. The original audit,
+raw request/response history, generator/configuration and consumed attempts remain
+immutable. Incomplete audits and transformed sources are ineligible.
+
+Bind the validated receipt as `bindings.audit_equivalence` with its file SHA-256;
+retain the original three `variable_source_*` artifacts. Publication and yield
+measurement must call `validate_audit_bindings` with the actual publication
+generation IDs, which independently replays the applicability proof. Do not invoke
+another model attempt for this path. It grants no reuse of normalization,
+disclosure, naturalization, dialogue or runtime evidence; those gates still apply.
+
 ## Gate 3: Validate complete audit evidence
 
 Require:
@@ -154,11 +176,15 @@ Require:
 - metadata `status` is `complete`;
 - metadata model is exactly `openai/gpt-5.6-sol`;
 - metadata project ID is exactly `cms6m4urm006n07z8ecxi1oi2`;
-- metadata inventory SHA-256 matches the inventory bytes;
+- metadata inventory SHA-256 matches the canonical JSON inventory hash used by
+  the audit validator; independently bind the inventory file-byte SHA-256 in
+  the tracker (these are distinct hashes);
 - artifact and pinned generation metadata match this workbook operation;
 - row-ID resolution is enabled and every citation resolves;
 - validation status is `passed` for row-ID citations, qualified cell references,
   and workbook value numbers;
+- the accepted response has `finish_reason: stop`; a complete-looking table
+  inside a truncated, filtered, or otherwise incomplete completion cannot pass;
 - output references and values originate from deterministic inventory resolution;
 - no invented reference or value, malformed table, empty sentinel outcome, or
   partial API completion exists.
@@ -172,12 +198,14 @@ Definitive authentication, account, quota, or entitlement denials are terminal
 and never retried. Semantic validation, binding, hash, and empty-audit failures
 are also terminal.
 
-Transient rate limits, timeouts, connection resets, and service-side 5xx errors
-return a handoff to `harbor-orchestrator`. Only the orchestrator may CAS-increment
-`lane_state["harbor-research-auditor"].retry_count`, apply `Retry-After` or exponential
-backoff, and dispatch again. Permit at most two retries after the initial
-attempt; a third transient result is terminal. The lane itself never sleeps or
-retries.
+The configured transport owns at most three bounded transport retries after
+the initial request, honoring `Retry-After` and capped backoff. Keep those
+attempts in its transport evidence; `retry_count` is not a field in the closed
+lane schema. Do not add an outer retry loop or reset the auditor's separate
+two-attempt semantic budget. After transport exhaustion, return the retained
+failure to `harbor-orchestrator`. An uncertain completion in the journaled
+executor cannot be replayed as a new semantic attempt. The lane never sleeps
+or redispatches a failed model operation on its own.
 
 Preserve a sanitized HTTP diagnostic without secrets, bearer material, cookies,
 full request bodies, workbook values, or private URLs. Record only:

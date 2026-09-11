@@ -29,6 +29,14 @@ def _inventory(tmp_path: Path) -> dict:
     return build_inventory_manifest(sources, workbook_ids=["0001"])
 
 
+def test_versioned_registry_preserves_every_historical_approval():
+    root = Path(__file__).resolve().parents[1] / "verification_manifests"
+    previous = json.loads((root / "approved_source_inventories.v1.json").read_text())
+    current = json.loads(xl_inventory_approval.DEFAULT_REGISTRY.read_text())
+    assert current["approvals"][:len(previous["approvals"])] == previous["approvals"]
+    xl_inventory_approval.validate_registry(current)
+
+
 def _registry(path: Path, approvals: list[dict]) -> Path:
     core = {
         "schema_version": "source-inventory-approval-registry/v1",

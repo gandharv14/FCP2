@@ -465,6 +465,9 @@ def _release_components(
         segmentation_generation_id,
         require_pass=True,
         source_generation_dir=source_dir,
+        source_path=source_dir / layout["source_workbook"],
+        ast_dir=source_dir / layout["ast_directory"],
+        validate_live_evidence=True,
     )
     if segmentation_manifest.get("schema_version") != SEGMENTATION_SCHEMA_VERSION:
         raise ReleasePublicationError("release requires segmentation-generation/v2")
@@ -654,6 +657,16 @@ def build_release_manifest(
         source_policy_version=source_policy_version,
         source_health_schema_version=source_health_schema_version,
     )
+    return _assemble_release_manifest(workbook_id, source_manifest,
+        segmentation_manifest, task_manifest, source_dir, segmentation_dir,
+        task_dir, prior_release_id, legacy_snapshot_hash,
+        source_policy_version, source_health_schema_version)
+
+
+def _assemble_release_manifest(workbook_id, source_manifest, segmentation_manifest,
+                               task_manifest, source_dir, segmentation_dir, task_dir,
+                               prior_release_id, legacy_snapshot_hash,
+                               source_policy_version, source_health_schema_version):
     source_bindings = source_manifest["bindings"]
     policy_bindings = segmentation_manifest.get("source_policy_bindings") or {}
     source_record = _manifest_record(source_dir)
@@ -769,7 +782,7 @@ def publish_release(
     with _workbook_lock(root):
         current = _current_pointer(root, absent_ok=True)
         if current is not None:
-            validate_release(
+            _validate_predecessor_release(
                 root / current["release_path"],
                 source_root=source_root,
                 segmentation_root=segmentation_root,
@@ -802,6 +815,11 @@ def publish_release(
                 raise ReleasePublicationError(
                     "first v2 release does not bind the validated legacy snapshot"
                 )
+            if snapshot_identity.get('mode')=='partial-generation-pointers':
+                for kind,path,generation in [('source',source_root,source_generation_id),('segmentation',segmentation_root,segmentation_generation_id)]:
+                    if (snapshot_identity.get(kind+'_generation_id')!=generation or
+                            snapshot_identity['pointers'][kind]['path']!=str((Path(path)/'current.json').resolve())):
+                        raise ReleasePublicationError('first release differs from frozen partial legacy tuple')
             if snapshot_identity.get("mode") == "absent":
                 expected_source_pointer = str(
                     (Path(source_root) / "current.json").resolve()
@@ -896,7 +914,7 @@ def publish_release(
         return destination, manifest
 
 
-def validate_release(
+def _release_envelope(
     release_dir: str | Path,
     *,
     source_root: str | Path,
@@ -974,6 +992,20 @@ def validate_release(
     )
     if versions not in known_versions:
         raise ReleasePublicationError("unknown, mixed, or downgraded release versions")
+    return manifest
+
+
+def validate_release(
+    release_dir: str | Path, *, source_root: str | Path,
+    segmentation_root: str | Path, task_root: str | Path,
+    expected_release_id: str | None = None,
+    expected_manifest_sha256: str | None = None,
+) -> dict:
+    manifest = _release_envelope(release_dir, source_root=source_root,
+        segmentation_root=segmentation_root, task_root=task_root,
+        expected_release_id=expected_release_id,
+        expected_manifest_sha256=expected_manifest_sha256)
+    identity, versions = manifest["identity"], manifest["versions"]
     rebuilt = build_release_manifest(
         identity["workbook_id"],
         source_root=source_root,
@@ -992,6 +1024,137 @@ def validate_release(
     if rebuilt != manifest:
         raise ReleasePublicationError("release component bytes or bindings changed")
     return manifest
+
+
+def _component_integrity(root, record, kind):
+    """Read a pinned historical component without executing its former policy."""
+    if not isinstance(record, dict):
+        raise ReleasePublicationError("historical component record is invalid")
+    generation_id = _require_hash(record.get("generation_id"), kind + " generation ID")
+    parent = Path(root) / ("task-generations" if kind == "task" else "generations")
+    directory = parent / generation_id
+    if parent.is_symlink() or directory.is_symlink() or directory.resolve().parent != parent.resolve():
+        raise ReleasePublicationError("historical component path is unsafe")
+    expected = _manifest_record(directory)
+    if kind == "task":
+        expected["task_generation_sha256"] = generation_id
+    if record != expected:
+        raise ReleasePublicationError("historical component path or manifest bytes changed")
+    manifest = _read_json(directory / "generation-manifest.json", kind + " manifest")
+    schemas = {"source": SOURCE_SCHEMA_VERSION, "segmentation": SEGMENTATION_SCHEMA_VERSION,
+               "task": TASK_SCHEMA_VERSION}
+    if manifest.get("schema_version") != schemas[kind] or manifest.get("generation_id") != generation_id:
+        raise ReleasePublicationError("historical component schema or identity changed")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ReleasePublicationError("historical component has no artifact inventory")
+    if kind == "segmentation":
+        if any(not isinstance(record, dict) or record.get("available") is not True
+               for record in artifacts.values()):
+            raise ReleasePublicationError("historical segmentation artifact unavailable")
+        checked_artifacts = {name: {key: value for key, value in record.items()
+                                    if key != "available"}
+                             for name, record in artifacts.items()}
+    else:
+        checked_artifacts = artifacts
+    _validate_artifacts(directory, checked_artifacts, "generation-manifest.json")
+    identity = manifest.get("identity")
+    if not isinstance(identity, dict):
+        raise ReleasePublicationError("historical component has no identity")
+    expected_identity_schema = {"source": "source-generation-identity/v2",
+                                "task": TASK_IDENTITY_SCHEMA_VERSION}
+    if kind in {"source", "task"}:
+        if identity.get("schema_version") != expected_identity_schema[kind]:
+            raise ReleasePublicationError("historical component identity schema changed")
+        if canonical_hash(identity) != generation_id:
+            raise ReleasePublicationError("historical component identity hash changed")
+    else:
+        evidence = manifest.get("evidence")
+        from xl_seg.diagnostics import generation_id as evidence_generation_id
+        if not isinstance(evidence, dict) or evidence_generation_id(evidence) != generation_id:
+            raise ReleasePublicationError("historical segmentation evidence hash changed")
+        if identity != {"schema_version": "segmentation-generation-identity/v2",
+                "generation_id": generation_id, "evidence_sha256": generation_id,
+                "bindings": manifest.get("bindings"),
+                "source_policy_bindings": manifest.get("source_policy_bindings")}:
+            raise ReleasePublicationError("historical segmentation identity changed")
+    if kind == "task" and (identity.get("bindings") != manifest.get("bindings")
+                            or identity.get("artifacts") != artifacts):
+        raise ReleasePublicationError("historical task identity changed")
+    return directory, manifest
+
+
+def _predecessor_components(manifest, source_root, segmentation_root, task_root):
+    source_dir, source = _component_integrity(source_root, manifest["source_generation"], "source")
+    seg_dir, seg = _component_integrity(segmentation_root, manifest["segmentation_generation"], "segmentation")
+    task_dir, task = _component_integrity(task_root, manifest["task_generation"], "task")
+    if (source.get("layout", {}).get("workbook_id") != manifest["workbook_id"]
+            or task["identity"].get("workbook_id") != manifest["workbook_id"]):
+        raise ReleasePublicationError("historical component workbook identity changed")
+    sb, pb, tb = source["bindings"], seg["source_policy_bindings"], task["bindings"]
+    bound_source = pb.get("source_generation") or {}
+    if (bound_source.get("generation_id") != source["generation_id"]
+            or bound_source.get("source_sha256") != sb.get("source_sha256")
+            or bound_source.get("health_report_sha256") != sb.get("health_report_sha256")
+            or bound_source.get("policy_version") != source["identity"].get("policy_version")):
+        raise ReleasePublicationError("historical source/segmentation tuple changed")
+    expected = {"source_generation_id": source["generation_id"],
+        "source_manifest_sha256": _sha256(source_dir / "generation-manifest.json"),
+        "source_health_sha256": sb.get("health_sha256"),
+        "source_health_report_sha256": sb.get("health_report_sha256"),
+        "segmentation_generation_id": seg["generation_id"],
+        "segmentation_manifest_sha256": _sha256(seg_dir / "generation-manifest.json"),
+        "cone_certificate_sha256": pb.get("cone_certificate_sha256")}
+    for key in ("restriction_evidence_sha256", "restriction_events_sha256",
+                "restriction_profile_sha256", "inventory_approval_sha256", "recalc_signals_sha256"):
+        if pb.get(key) != sb.get(key):
+            raise ReleasePublicationError("historical restriction tuple changed")
+        expected[key] = sb.get(key)
+    if any(tb.get(key) != value for key, value in expected.items()):
+        raise ReleasePublicationError("historical task tuple changed")
+    return source, seg, task, source_dir, seg_dir, task_dir
+
+
+def _validate_predecessor_release(release_dir, *, source_root, segmentation_root,
+                                  task_root, expected_release_id, expected_manifest_sha256):
+    """Integrity only, for an already published CAS predecessor; never qualification."""
+    manifest = _release_envelope(release_dir, source_root=source_root,
+        segmentation_root=segmentation_root, task_root=task_root,
+        expected_release_id=expected_release_id,
+        expected_manifest_sha256=expected_manifest_sha256)
+    components = _predecessor_components(manifest, source_root, segmentation_root, task_root)
+    rebuilt = _assemble_release_manifest(manifest["workbook_id"], *components,
+        manifest["prior_release_id"], manifest["legacy_snapshot_hash"],
+        manifest["versions"]["source_policy_version"],
+        manifest["versions"]["source_health_schema_version"])
+    if rebuilt != manifest:
+        raise ReleasePublicationError("historical release component bytes or tuple changed")
+    return manifest
+
+
+def resolve_current_release_integrity(publication_root, *, source_root,
+                                      segmentation_root, task_root=None,
+                                      expected_release_id):
+    """Establish preserved promotion integrity only, never current qualification.
+
+    Used for predecessor CAS and reports that subsequently validate current code.
+    The exact expected pointer is mandatory; normal readers use resolve_current_release.
+    """
+    root = Path(publication_root)
+    pointer = _current_pointer(root)
+    if pointer["release_id"] != expected_release_id:
+        raise ReleasePublicationError("current release pointer changed")
+    releases = root / "releases"
+    if releases.is_symlink():
+        raise ReleasePublicationError("releases directory is a symlink")
+    directory = releases / pointer["release_id"]
+    if directory.resolve().parent != releases.resolve():
+        raise ReleasePublicationError("release path escapes its root")
+    manifest = _validate_predecessor_release(directory, source_root=source_root,
+        segmentation_root=segmentation_root, task_root=task_root or root,
+        expected_release_id=expected_release_id,
+        expected_manifest_sha256=pointer["manifest_sha256"])
+    return directory, manifest
 
 
 def resolve_current_release(
@@ -1186,6 +1349,84 @@ def freeze_absent_legacy_snapshot(
         return directory, validate_legacy_snapshot(directory)
 
 
+
+def _partial_pointer(path,kind,generation):
+    path=Path(path)
+    if path.is_symlink():raise ReleasePublicationError('partial legacy pointer cannot be a symlink')
+    if not path.exists():return {'path':str(path.resolve()),'present':False}
+    raw=path.read_bytes();value=_read_json(path,'partial legacy pointer')
+    if (set(value)!={'schema_version','generation_id','generation_path','manifest_sha256'}
+            or value['schema_version']!=kind+'-current/v1'
+            or value['generation_id']!=generation or value['generation_path']!='generations/'+generation):
+        raise ReleasePublicationError('partial legacy pointer differs from selected generation')
+    _require_hash(generation,'selected legacy generation')
+    _require_hash(value['manifest_sha256'],'selected legacy manifest')
+    manifest=path.parent/value['generation_path']/'generation-manifest.json'
+    if manifest.is_symlink() or _sha256(manifest)!=value['manifest_sha256']:
+        raise ReleasePublicationError('partial legacy generation manifest changed')
+    return {'path':str(path.resolve()),'present':True,'sha256':hashlib.sha256(raw).hexdigest(),'value':value}
+
+
+def freeze_partial_legacy_snapshot(publication_root,workbook_id,*,source_root,
+        source_generation_id,segmentation_root,segmentation_generation_id):
+    """Freeze a real one-present/one-absent pointer tuple, never invent a pointer."""
+    root=Path(publication_root)
+    with _workbook_lock(root):
+        if (root/'current-release.json').exists():raise ReleasePublicationError('cannot freeze legacy state after v2 cutover')
+        pointers={kind:_partial_pointer(Path(path)/'current.json',kind,generation)
+                  for kind,path,generation in [('source',source_root,source_generation_id),
+                                              ('segmentation',segmentation_root,segmentation_generation_id)]}
+        if sum(v['present'] for v in pointers.values())!=1:
+            raise ReleasePublicationError('partial legacy snapshot requires exactly one existing pointer')
+        identity={'schema_version':LEGACY_SNAPSHOT_SCHEMA_VERSION,'mode':'partial-generation-pointers',
+                  'workbook_id':workbook_id,'source_generation_id':source_generation_id,
+                  'segmentation_generation_id':segmentation_generation_id,'pointers':pointers}
+        digest=canonical_hash(identity);snapshot={'schema_version':LEGACY_SNAPSHOT_SCHEMA_VERSION,
+                                                'snapshot_hash':digest,'identity':identity}
+        pointer_path=root/'legacy-snapshot.json'
+        if pointer_path.exists():
+            pointer=_read_json(pointer_path,'legacy snapshot pointer')
+            if pointer.get('snapshot_hash')!=digest:raise ReleasePublicationError('frozen partial legacy state changed')
+            return resolve_legacy_snapshot(root)
+        snapshots=root/'legacy-snapshots';snapshots.mkdir(parents=True,exist_ok=True)
+        directory=snapshots/digest
+        temporary=Path(tempfile.mkdtemp(prefix='.legacy-partial-',dir=str(root)))
+        try:
+            (temporary/'legacy-snapshot.json').write_bytes(_canonical_bytes(snapshot))
+            for kind,item in pointers.items():
+                if item['present']:(temporary/(kind+'-current.json')).write_bytes(Path(item['path']).read_bytes())
+            os.replace(temporary,directory);_fsync_directory(snapshots)
+        except BaseException:
+            if temporary.exists():shutil.rmtree(temporary)
+            raise
+        validate_legacy_snapshot(directory)
+        _atomic_write(pointer_path,_canonical_bytes({'schema_version':LEGACY_POINTER_SCHEMA_VERSION,
+            'snapshot_hash':digest,'snapshot_path':'legacy-snapshots/'+digest,
+            'manifest_sha256':_sha256(directory/'legacy-snapshot.json')}),exclusive=True)
+        return directory,validate_legacy_snapshot(directory)
+
+
+def _validate_partial_snapshot(directory,snapshot):
+    identity=snapshot['identity']
+    if set(identity)!={'schema_version','mode','workbook_id','source_generation_id','segmentation_generation_id','pointers'}:
+        raise ReleasePublicationError('closed partial legacy identity required')
+    pointers=identity['pointers']
+    if set(pointers)!={'source','segmentation'} or sum(v.get('present') is True for v in pointers.values())!=1:
+        raise ReleasePublicationError('invalid partial legacy pointer set')
+    expected={'legacy-snapshot.json'}
+    for kind,item in pointers.items():
+        path=item.get('path')
+        if not isinstance(path,str) or not Path(path).is_absolute():raise ReleasePublicationError('invalid partial legacy pointer path')
+        actual=_partial_pointer(path,kind,identity[kind+'_generation_id'])
+        if actual!=item:raise ReleasePublicationError('partial legacy live pointer changed')
+        if item['present']:
+            name=kind+'-current.json';expected.add(name)
+            if _sha256(directory/name)!=item['sha256'] or _read_json(directory/name,'frozen partial pointer')!=item['value']:
+                raise ReleasePublicationError('partial legacy archived pointer changed')
+    if {p.name for p in directory.iterdir()}!=expected:raise ReleasePublicationError('partial legacy snapshot files changed')
+    return snapshot
+
+
 def validate_legacy_snapshot(snapshot_dir: str | Path) -> dict:
     directory = Path(snapshot_dir)
     if directory.is_symlink() or not directory.is_dir():
@@ -1198,6 +1439,8 @@ def validate_legacy_snapshot(snapshot_dir: str | Path) -> dict:
         canonical_hash(identity)
     ):
         raise ReleasePublicationError("legacy snapshot identity hash mismatch")
+    if identity.get('mode')=='partial-generation-pointers':
+        return _validate_partial_snapshot(directory,snapshot)
     if identity.get("mode") == "absent":
         if {path.name for path in directory.iterdir()} != {"legacy-snapshot.json"}:
             raise ReleasePublicationError("absent legacy snapshot file set changed")
@@ -1347,6 +1590,9 @@ def resolve_build_context(
         segmentation_generation_id,
         require_pass=True,
         source_generation_dir=source_dir,
+        source_path=source_path,
+        ast_dir=ast_dir,
+        validate_live_evidence=True,
     )
     source_binding = (
         segmentation.get("source_policy_bindings") or {}

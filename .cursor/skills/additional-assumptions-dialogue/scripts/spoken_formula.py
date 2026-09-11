@@ -3,20 +3,23 @@
 
 from __future__ import annotations
 
+import ast
+import json
 import re
 
 
+QUOTED_LABEL = r'''(?:"(?:[^"\\\n]|\\[^\n])+"|'(?:[^'\\\n]|\\[^\n])+')'''
 CELL_PHRASE_RE = re.compile(
     r"(?:fixed\s+)?(?P<kind>cell|range)\s+"
-    r"(?P<sheet>'[^']+'|[A-Za-z0-9_][A-Za-z0-9_ .&-]*)!"
+    r"(?P<sheet>'(?:[^']|'')+'|[A-Za-z0-9_][A-Za-z0-9_ .&-]*)!"
     r"(?P<a>\$?[A-Z]{1,3}\$?\d{1,7})"
     r"(?::(?P<b>\$?[A-Z]{1,3}\$?\d{1,7}))?"
-    r"(?:\s+on the rows? labelled\s+(?P<label>(?:\"[^\"]+\")(?:(?:,\s*\"[^\"]+\")*(?:\s+and\s+\"[^\"]+\"))?))?",
+    rf"(?:\s+on the rows? labelled\s+(?P<label>{QUOTED_LABEL}(?:\s*(?:,\s*(?:and\s+)?|and\s+){QUOTED_LABEL})*))?",
     re.I,
 )
 ABS_REF_RE = re.compile(r"\$([A-Z]{1,3})\$?(\d{1,7})", re.I)
 A1_RE = re.compile(r"\$?([A-Z]{1,3})\$?(\d{1,7})", re.I)
-LABEL_RE = re.compile(r'"([^"]+)"')
+LABEL_RE = re.compile(QUOTED_LABEL)
 NEEDS_SPOKEN_RE = re.compile(r"\b(?:copied-column|cell |range )", re.I)
 SHOWN_FOR_RE = re.compile(r"\s*,?\s*shown for\b.*$", re.I)
 UNQUOTED_STRING_LITERALS = frozenset({"", "N/A", "#N/A", "NA"})
@@ -44,28 +47,43 @@ def parse_ref_key(text: str) -> tuple[str, str, int] | None:
     parsed = parse_a1(coord.split(":")[0])
     if not parsed:
         return None
-    return sheet.strip().strip("'"), parsed[0], parsed[1]
+    return clean_sheet(sheet), parsed[0], parsed[1]
 
 
 def clean_sheet(sheet: str) -> str:
-    return (sheet or "").strip().strip("'")
+    value = (sheet or "").strip()
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1].replace("''", "'")
+    return value
 
 
 def all_labels(raw: str) -> list[str]:
-    return [item.strip() for item in LABEL_RE.findall(raw or "") if item.strip()]
+    labels = []
+    for match in LABEL_RE.finditer(raw or ""):
+        value = ast.literal_eval(match.group(0))
+        if value.strip():
+            labels.append(value.strip())
+    return labels
+
+
+def quote_label(label: str) -> str:
+    """Keep embedded quotation marks inside one unambiguous row label."""
+    if '"' in label and "'" not in label and '\\' not in label and '\n' not in label:
+        return "'" + label + "'"
+    return json.dumps(label, ensure_ascii=False)
 
 
 def named_rows(labels: list[str]) -> str:
     if not labels:
         return "the figure"
     if len(labels) == 1:
-        return f'the row labelled "{labels[0]}"'
+        return f'the row labelled {quote_label(labels[0])}'
     if len(labels) == 2:
-        return f'the rows labelled "{labels[0]}" and "{labels[1]}"'
+        return f'the rows labelled {quote_label(labels[0])} and {quote_label(labels[1])}'
     return (
         "the rows labelled "
-        + ", ".join(f'"{item}"' for item in labels[:-1])
-        + f', and "{labels[-1]}"'
+        + ", ".join(quote_label(item) for item in labels[:-1])
+        + f', and {quote_label(labels[-1])}'
     )
 
 
@@ -583,7 +601,11 @@ def speak_steps(
     evidence: str = "",
     sheet: str = "",
     row_label: str = "",
+    scope: str = "",
 ) -> str:
+    if scope not in {"", "only for this cell", "only within the specified columns",
+                     "only within the specified rows", "only for the specified cells"}:
+        raise ValueError("unsupported spoken calculation scope")
     if not (steps or "").strip():
         return ""
     replaced = replace_phrases(steps, representative, evidence)
@@ -591,17 +613,60 @@ def speak_steps(
     spoken = SHOWN_FOR_RE.sub("", spoken).strip(" :,")
     if row_label and sheet and not re.match(r"^on\s+", spoken, re.I):
         spoken = (
-            f'On {sheet}, the row labelled "{row_label}" is copied across the forecast: {spoken}'
+            f'On {sheet}, calculate the row labelled {quote_label(row_label)}'
+            f'{" " + scope if scope else ""}: {spoken}'
         )
     if spoken and not spoken.endswith("."):
         spoken += "."
     return spoken
 
 
+def calculation_scope(record: dict) -> str:
+    """Keep the disclosed cells' geometry; it does not establish a time axis.
+
+    Direct speak_steps callers have no scope evidence and get neutral wording.
+    A representative alone is not evidence of a complete single-cell scope.
+    """
+    cells = record.get("cells") or []
+    if not cells:
+        return ""
+    if not isinstance(cells, list) or any(not isinstance(c, str) for c in cells):
+        raise ValueError("invalid disclosed calculation cells")
+    parsed = []
+    for cell in cells:
+        sheet, separator, coord = cell.rpartition("!")
+        address = parse_a1(coord)
+        if not separator or not sheet or address is None:
+            raise ValueError("calculation scope requires explicit cell identities")
+        parsed.append((clean_sheet(sheet), address[0], address[1]))
+    if len(set(parsed)) != len(parsed):
+        raise ValueError("duplicate disclosed calculation cells")
+    if len(parsed) == 1:
+        return "only for this cell"
+    if len({p[0] for p in parsed}) != 1:
+        raise ValueError("calculation scope crosses sheets")
+    if len({p[2] for p in parsed}) == 1:
+        return "only within the specified columns"
+    if len({p[1] for p in parsed}) == 1:
+        return "only within the specified rows"
+    return "only for the specified cells"
+
+
 def speak_record(record: dict) -> str:
     from aa_lib import clean_label, sheet_from_cells
 
     fields = record.get("fields") or {}
+    if record.get("entry") == "source_selection":
+        ingredient = str(fields.get("ingredient") or "")
+        match = CELL_PHRASE_RE.fullmatch(ingredient.strip())
+        if not match or not match.group("label"):
+            raise ValueError("source selection requires a complete named source reference")
+        source_sheet = clean_sheet(match.group("sheet"))
+        label = clean_label(fields.get("label") or record.get("label") or "")
+        # Column offsets across different sheets do not establish time offsets.
+        # Keep the exact source row and tab without inventing a period relation.
+        return (f'The row labelled {quote_label(label)} takes its value from '
+                f'{named_rows(all_labels(match.group("label")))} on the {source_sheet} tab.')
     cells = list(record.get("cells") or [])
     if not cells and fields.get("representative"):
         cells = [fields["representative"]]
@@ -611,4 +676,5 @@ def speak_record(record: dict) -> str:
         evidence=record_evidence(record),
         sheet=sheet_from_cells(cells),
         row_label=clean_label(fields.get("label") or record.get("label") or ""),
+        scope=calculation_scope(record),
     )

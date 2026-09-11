@@ -1,0 +1,20 @@
+{
+  "schema_version": "excel-table-quarantine-config/v1",
+  "base_config": "/etc/harbor/excel-runner.json",
+  "base_module": "/Library/Application Support/FCP2/recalc/excel_runner.py",
+  "base_module_sha256": "b9b4108be8b14a9fdeefe050836e7a661d7c91f422b14a22de0a8ddce873192b",
+  "dispatcher_sha256": "b03b0006be590d193139abae3a57c1d1934348f842c76143e4b1e78df616bafe",
+  "selected_policy_code": {
+    "trusted_producer_sha256": "b03b0006be590d193139abae3a57c1d1934348f842c76143e4b1e78df616bafe",
+    "profile_sha256": "dd202e531be65ddec122b14136002e051744905c2c181675a654cdd82b885cad",
+    "observation_sha256": "b9b4108be8b14a9fdeefe050836e7a661d7c91f422b14a22de0a8ddce873192b",
+    "snapshot_receipt_sha256": "23e831b60dc3a9d62ade726ec58e965cc49b61bb3140715614e518b771c4fd37",
+    "health_sha256": "79b1e5aab02af0e496470baf51507e9aa06347107318570092c4bfe571a0f210"
+  },
+  "journal_root": "/var/lib/harbor/table-quarantine/journal",
+  "artifact_root": "/var/lib/harbor/table-quarantine/artifacts",
+  "allowed_invoker_uid": "REPLACE_WITH_VERIFIED_DEDICATED_UID",
+  "permitted_engine_versions": [
+    "16.112.2"
+  ]
+}

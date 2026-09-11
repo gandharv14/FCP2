@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import shutil
 import signal
+import select
+import sys
 import subprocess
 import tempfile
 import time
@@ -326,10 +329,19 @@ def _terminate_process_group(
 
 
 def _process_group_rss_bytes(process_group: int) -> int | None:
-    """Return Linux process-group RSS, or None when the host cannot report it."""
+    """Return process-group RSS on Linux or macOS."""
     proc = Path("/proc")
     if not proc.is_dir():
-        return None
+        try:
+            result = subprocess.run(["/bin/ps", "-axo", "pgid=,rss="],
+                                    capture_output=True, text=True, timeout=5)
+            if result.returncode:
+                return None
+            sizes = [int(fields[1]) * 1024 for line in result.stdout.splitlines()
+                     if len(fields := line.split()) == 2 and int(fields[0]) == process_group]
+            return sum(sizes) if sizes else 0
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
     page_size = os.sysconf("SC_PAGE_SIZE")
     total = 0
     observed = False
@@ -349,6 +361,88 @@ def _process_group_rss_bytes(process_group: int) -> int | None:
     return total if observed else None
 
 
+@contextlib.contextmanager
+def _guarded_process(command, *, stdout, grace_seconds, cwd=None, env=None,
+                     guardian_lock_fds=()):
+    """Arm a separate parent-death guardian before the command can execute."""
+    helper = Path(__file__).with_name("process_guardian.py")
+    descriptors: set[int] = set()
+    process = guardian = None
+    live_write = None
+
+    def pipe():
+        pair = os.pipe()  # Non-inheritable by default; pass only exact read ends.
+        descriptors.update(pair)
+        return pair
+
+    def close(fd):
+        if fd in descriptors:
+            descriptors.remove(fd)
+            os.close(fd)
+
+    def receive(fd):
+        if not select.select([fd], [], [], 15.0)[0]:
+            raise RuntimeError("parent-death guardian startup exceeded 15 seconds")
+        return os.read(fd, 64)
+
+    try:
+        live_read, live_write = pipe()
+        ack_read, ack_write = pipe()
+        guardian = subprocess.Popen(
+            [sys.executable, "-I", str(helper), "guard", str(live_read),
+             str(ack_write), str(grace_seconds)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+            # Retain caller-owned flock descriptors until the worker has been
+            # terminated. Otherwise controller death releases its workbook lock
+            # before the guardian's grace period ends, racing an immediate resume.
+            pass_fds=(live_read, ack_write, *guardian_lock_fds),
+        )
+        close(live_read)
+        close(ack_write)
+        gate_read, gate_write = pipe()
+        error_read, error_write = pipe()
+        process = subprocess.Popen(
+            [sys.executable, "-I", str(helper), "launch", str(gate_read),
+             str(error_write), *command],
+            cwd=cwd, env=None if env is None else dict(env), stdout=stdout,
+            stderr=subprocess.STDOUT, start_new_session=True,
+            pass_fds=(gate_read, error_write),
+        )
+        close(gate_read)
+        close(error_write)
+        os.write(live_write, f"{process.pid}\n".encode("ascii"))
+        if receive(ack_read) != b"R":
+            raise RuntimeError("parent-death guardian did not arm")
+        close(ack_read)
+        os.write(gate_write, b"G")
+        close(gate_write)
+        exec_error = receive(error_read)
+        close(error_read)
+        if exec_error:
+            error_number = int(exec_error)
+            raise OSError(error_number, os.strerror(error_number), command[0])
+        yield process
+    finally:
+        # Unexpected exceptions are also bounded. Never disarm a live group.
+        if process is not None:
+            if process.poll() is None or _process_group_alive(process.pid):
+                _terminate_process_group(process, grace_seconds=grace_seconds)
+        if live_write in descriptors:
+            try:
+                os.write(live_write, b"D")
+            except BrokenPipeError:
+                pass
+        for fd in list(descriptors):
+            close(fd)
+        if guardian is not None:
+            try:
+                guardian.wait(timeout=max(grace_seconds, 0.0) + 2.0)
+            except subprocess.TimeoutExpired:
+                guardian.kill()
+                guardian.wait(timeout=2.0)
+
+
 def _run_in_process_group(
     command: Sequence[str],
     *,
@@ -359,88 +453,88 @@ def _run_in_process_group(
     metrics: dict[str, object] | None = None,
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
+    guardian_lock_fds: Sequence[int] = (),
 ) -> int:
     if memory_limit_bytes is not None and memory_limit_bytes <= 0:
         raise ValueError("memory_limit_bytes must be positive")
     started_at = time.monotonic()
-    process = subprocess.Popen(
-        list(command),
-        cwd=cwd,
-        env=None if env is None else dict(env),
-        stdout=stdout,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    peak_rss = 0
+    with _guarded_process(
+        list(command), stdout=stdout, grace_seconds=grace_seconds, cwd=cwd, env=env,
+        guardian_lock_fds=guardian_lock_fds,
+    ) as process:
+        peak_rss = 0
 
-    def observe_memory() -> None:
-        nonlocal peak_rss
+        def observe_memory() -> None:
+            nonlocal peak_rss
+            if memory_limit_bytes is None:
+                return
+            rss = _process_group_rss_bytes(process.pid)
+            if rss is None:
+                if metrics is not None:
+                    metrics["limit_reason"] = "memory_observation_unavailable"
+                _terminate_process_group(process, grace_seconds=grace_seconds)
+                raise ConversionTimeout("cannot enforce configured process-group memory cap")
+            peak_rss = max(peak_rss, rss)
+            if metrics is not None:
+                metrics["peak_rss_bytes"] = peak_rss
+            if rss > memory_limit_bytes:
+                if metrics is not None:
+                    metrics["limit_reason"] = "process_group_rss"
+                _terminate_process_group(process, grace_seconds=grace_seconds)
+                raise ConversionTimeout(
+                    f"process group exceeded {memory_limit_bytes} RSS bytes: "
+                    f"{command[0]}"
+                )
+
         if memory_limit_bytes is None:
-            return
-        rss = _process_group_rss_bytes(process.pid)
-        if rss is None:
-            return
-        peak_rss = max(peak_rss, rss)
-        if metrics is not None:
-            metrics["peak_rss_bytes"] = peak_rss
-        if rss > memory_limit_bytes:
-            if metrics is not None:
-                metrics["limit_reason"] = "process_group_rss"
-            _terminate_process_group(process, grace_seconds=grace_seconds)
-            raise ConversionTimeout(
-                f"process group exceeded {memory_limit_bytes} RSS bytes: "
-                f"{command[0]}"
-            )
-
-    if memory_limit_bytes is None:
-        try:
-            return_code = process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as error:
-            if metrics is not None:
-                metrics["limit_reason"] = "wall_time"
-            _terminate_process_group(process, grace_seconds=grace_seconds)
-            raise ConversionTimeout(
-                f"command exceeded {timeout_seconds} seconds: {command[0]}"
-            ) from error
-    else:
-        deadline = (
-            started_at + timeout_seconds
-            if timeout_seconds is not None
-            else None
-        )
-        while True:
-            observe_memory()
-            return_code = process.poll()
-            if return_code is not None:
-                break
-            if deadline is not None and time.monotonic() >= deadline:
+            try:
+                return_code = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired as error:
                 if metrics is not None:
                     metrics["limit_reason"] = "wall_time"
                 _terminate_process_group(process, grace_seconds=grace_seconds)
                 raise ConversionTimeout(
                     f"command exceeded {timeout_seconds} seconds: {command[0]}"
-                )
-            time.sleep(0.05)
+                ) from error
+        else:
+            deadline = (
+                started_at + timeout_seconds
+                if timeout_seconds is not None
+                else None
+            )
+            while True:
+                observe_memory()
+                return_code = process.poll()
+                if return_code is not None:
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    if metrics is not None:
+                        metrics["limit_reason"] = "wall_time"
+                    _terminate_process_group(process, grace_seconds=grace_seconds)
+                    raise ConversionTimeout(
+                        f"command exceeded {timeout_seconds} seconds: {command[0]}"
+                    )
+                time.sleep(0.05)
 
-    # A launcher can exit while a descendant keeps converting. Treat that as
-    # part of the same deadline, and never expose output from a lingering group.
-    if _process_group_alive(process.pid):
-        linger_seconds = (
-            max(0.0, timeout_seconds - (time.monotonic() - started_at))
-            if timeout_seconds is not None
-            else grace_seconds
-        )
-        linger_deadline = time.monotonic() + linger_seconds
-        while (
-            _process_group_alive(process.pid)
-            and time.monotonic() < linger_deadline
-        ):
-            observe_memory()
-            time.sleep(0.01)
+        # A launcher can exit while a descendant keeps converting. Treat that as
+        # part of the same deadline, and never expose output from a lingering group.
         if _process_group_alive(process.pid):
-            _terminate_process_group(process, grace_seconds=grace_seconds)
-            raise ConversionTimeout(f"descendants outlived command: {command[0]}")
-    return return_code
+            linger_seconds = (
+                max(0.0, timeout_seconds - (time.monotonic() - started_at))
+                if timeout_seconds is not None
+                else grace_seconds
+            )
+            linger_deadline = time.monotonic() + linger_seconds
+            while (
+                _process_group_alive(process.pid)
+                and time.monotonic() < linger_deadline
+            ):
+                observe_memory()
+                time.sleep(0.01)
+            if _process_group_alive(process.pid):
+                _terminate_process_group(process, grace_seconds=grace_seconds)
+                raise ConversionTimeout(f"descendants outlived command: {command[0]}")
+        return return_code
 
 
 def _atomic_publish_validated_xlsx(candidate: Path, destination: Path) -> None:
@@ -473,6 +567,7 @@ def _convert_and_publish_locked(
     libreoffice_binary: str = "libreoffice",
     timeout_seconds: float = 600,
     terminate_grace_seconds: float = 2,
+    guardian_lock_fds: Sequence[int] = (),
 ) -> ReadyRecord:
     """Convert privately, validate twice, then publish XLSX and ready record."""
 
@@ -509,6 +604,18 @@ def _convert_and_publish_locked(
         else:
             profile = private_dir / "libreoffice-profile"
             profile.mkdir(mode=0o700)
+            # A fresh profile must not inherit interactive macro/link policy.
+            user_profile = profile / "user"
+            user_profile.mkdir()
+            (user_profile / "registrymodifications.xcu").write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<oor:items xmlns:oor="http://openoffice.org/2001/registry">'
+                '<item oor:path="/org.openoffice.Office.Common/Security/Scripting">'
+                '<prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop>'
+                '<prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop>'
+                '</item><item oor:path="/org.openoffice.Office.Calc/Content/Update">'
+                '<prop oor:name="Link" oor:op="fuse"><value>0</value></prop>'
+                '</item></oor:items>', encoding="utf-8")
             log_path = private_dir / "libreoffice.log"
             command = [
                 libreoffice_binary,
@@ -530,6 +637,7 @@ def _convert_and_publish_locked(
                     stdout=log,
                     timeout_seconds=timeout_seconds,
                     grace_seconds=terminate_grace_seconds,
+                    guardian_lock_fds=guardian_lock_fds,
                 )
             generated = private_dir / f"{source.stem}.xlsx"
             if return_code != 0 or not generated.is_file():
@@ -628,6 +736,7 @@ def convert_and_publish(
             libreoffice_binary=libreoffice_binary,
             timeout_seconds=timeout_seconds,
             terminate_grace_seconds=terminate_grace_seconds,
+            guardian_lock_fds=(descriptor,),
         )
     finally:
         try:

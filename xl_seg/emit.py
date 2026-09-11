@@ -9,6 +9,7 @@ idempotent.
 from __future__ import annotations
 
 import csv
+from collections.abc import Mapping
 import json
 import re
 from pathlib import Path
@@ -259,7 +260,36 @@ def _fmt(value):
     return "" if value is None else str(value)
 
 
+class _StreamingMapping(dict):
+    """JSON encoder adapter; items are consumed without building a full dict."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def __bool__(self):
+        return bool(self._value)
+
+    def items(self):
+        return self._value.items()
+
+
+class _LineageEncoder(json.JSONEncoder):
+    def default(self, value):
+        if isinstance(value, Mapping):
+            return _StreamingMapping(value)
+        return super().default(value)
+
+
 def write_lineage(out_dir: Path, wb: str, traces, values, *, proof=None) -> None:
+    try:
+        _write_lineage(out_dir, wb, traces, values, proof=proof)
+    finally:
+        close = getattr(traces, "close", None)
+        if close is not None:
+            close()
+
+
+def _write_lineage(out_dir: Path, wb: str, traces, values, *, proof=None) -> None:
     lineage_dir = out_dir / "lineage"
     lineage_dir.mkdir(parents=True, exist_ok=True)
     for old in lineage_dir.glob("*.md"):
@@ -356,4 +386,5 @@ def write_lineage(out_dir: Path, wb: str, traces, values, *, proof=None) -> None
     }
     if proof is not None:
         payload["proof"] = proof
-    (out_dir / "lineage.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    with (out_dir / "lineage.json").open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, cls=_LineageEncoder)

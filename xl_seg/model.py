@@ -89,7 +89,7 @@ def as_number(text: str):
         return None
 
 
-@dataclass
+@dataclass(slots=True)
 class Node:
     id: str
     kind: str
@@ -130,7 +130,7 @@ class Node:
         return as_number(self.value)
 
 
-@dataclass
+@dataclass(slots=True)
 class Edge:
     source: str
     target: str
@@ -153,6 +153,22 @@ class Graph:
     capabilities: dict[str, bool] = field(default_factory=dict)
     integrity_errors: list[dict] = field(default_factory=list)
     ast_schema_version: str = ""
+    _store: object = field(default=None, repr=False, compare=False)
+
+    def close(self):
+        if self._store is not None:
+            self._store.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def iter_nodes(self, *kinds):
+        if self._store is not None:
+            return self._store.iter_nodes(kinds)
+        return (node for node in self.nodes.values() if not kinds or node.kind in kinds)
 
     def owner_of(self, node_id: str) -> str | None:
         """Resolve any node to the spreadsheet cell that owns it."""
@@ -166,7 +182,7 @@ class Graph:
         return node.id if node.is_cell else None
 
     def cells(self) -> list[Node]:
-        return [n for n in self.nodes.values() if n.is_cell]
+        return list(self.iter_nodes(*CELL_KINDS))
 
     def root_of(self, cell_id: str) -> str | None:
         """The single AST node (or referenced cell) that produces a formula's value."""
@@ -193,67 +209,54 @@ def _bool(row: dict, key: str, default: bool = False) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def load(ast_dir: Path, wb: str) -> Graph:
-    nodes: dict[str, Node] = {}
-    node_fields: set[str] = set()
-    with open(ast_dir / "nodes.csv", newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        node_fields = set(reader.fieldnames or ())
-        for row in reader:
-            nodes[row["id"]] = Node(
-                id=row["id"],
-                kind=row["kind"],
-                sheet=row["sheet"],
-                coordinate=row["coordinate"],
-                row=_int(row["row"]),
-                col=_int(row["col"]),
-                owner=row["owner"],
-                op=row["op"],
-                op_kind=row["op_kind"],
-                arity=row["arity"],
-                expr=row["expr"],
-                label=row["label"],
-                formula=row["formula"],
-                value=row["value"],
-                in_cycle=_bool(row, "in_cycle"),
-                array_formula=_bool(row, "array_formula"),
-                array_anchor=_text(row, "array_anchor"),
-                array_ref=_text(row, "array_ref"),
-                array_row=_int(row.get("array_row")),
-                array_col=_int(row.get("array_col")),
-                ast_schema_version=_text(row, "ast_schema_version"),
-                parse_status=_text(row, "parse_status"),
-                parse_error=_text(row, "parse_error"),
-                value_type=_text(row, "value_type"),
-                range_truncated=_bool(row, "range_truncated"),
-                array_span=_text(row, "array_span") or _text(row, "array_ref"),
-            )
 
-    edges: list[Edge] = []
-    edge_fields: set[str] = set()
-    with open(ast_dir / "edges.csv", newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        edge_fields = set(reader.fieldnames or ())
-        for row in reader:
-            edges.append(
-                Edge(
-                    source=row["source"],
-                    target=row["target"],
-                    role=row["role"],
-                    arg_index=_int(row["arg_index"]) or 0,
-                    op=row["op"],
-                    cell=row["cell"],
-                    ref=row["ref"],
-                    via_range=row["via_range"],
-                    cross_sheet=_bool(row, "cross_sheet"),
-                )
-            )
+def _parse_node(row):
+    return Node(
+        id=row["id"],
+        kind=row["kind"],
+        sheet=row["sheet"],
+        coordinate=row["coordinate"],
+        row=_int(row["row"]),
+        col=_int(row["col"]),
+        owner=row["owner"],
+        op=row["op"],
+        op_kind=row["op_kind"],
+        arity=row["arity"],
+        expr=row["expr"],
+        label=row["label"],
+        formula=row["formula"],
+        value=row["value"],
+        in_cycle=_bool(row, "in_cycle"),
+        array_formula=_bool(row, "array_formula"),
+        array_anchor=_text(row, "array_anchor"),
+        array_ref=_text(row, "array_ref"),
+        array_row=_int(row.get("array_row")),
+        array_col=_int(row.get("array_col")),
+        ast_schema_version=_text(row, "ast_schema_version"),
+        parse_status=_text(row, "parse_status"),
+        parse_error=_text(row, "parse_error"),
+        value_type=_text(row, "value_type"),
+        range_truncated=_bool(row, "range_truncated"),
+        array_span=_text(row, "array_span") or _text(row, "array_ref"),
+    )
 
-    schema_versions = {
-        node.ast_schema_version for node in nodes.values()
-        if node.ast_schema_version
-    }
-    capabilities = {
+
+def _parse_edge(row):
+    return Edge(
+        source=row["source"],
+        target=row["target"],
+        role=row["role"],
+        arg_index=_int(row["arg_index"]) or 0,
+        op=row["op"],
+        cell=row["cell"],
+        ref=row["ref"],
+        via_range=row["via_range"],
+        cross_sheet=_bool(row, "cross_sheet"),
+    )
+
+
+def _capabilities(node_fields, edge_fields, schema_versions):
+    return {
         "required_node_fields": REQUIRED_AST_NODE_FIELDS <= node_fields,
         "schema_version_v2": schema_versions == {"xl-ast/v2"},
         "edge_endpoints": {"source", "target"} <= edge_fields,
@@ -263,7 +266,62 @@ def load(ast_dir: Path, wb: str) -> Graph:
         } <= node_fields,
         "raw_value_type": "value_type" in node_fields,
     }
+
+
+DISK_THRESHOLD_BYTES = 128 * 1024 * 1024
+
+
+def load(ast_dir: Path, wb: str, *, storage="auto", storage_dir=None) -> Graph:
+    """Load exact CSV semantics; large graphs use a disposable disk index.
+
+    Disk graph records are read-only. Explicit ``memory`` keeps the historical
+    mutable API for small exploratory graphs. Storage mode changes no target,
+    dependency, integrity check, or numeric interpretation.
+    """
+    ast_dir = Path(ast_dir)
+    if storage not in {"auto", "memory", "disk"}:
+        raise ValueError("unknown graph storage mode")
+    if storage == "disk" or (storage == "auto" and sum(
+        (ast_dir / name).stat().st_size for name in ("nodes.csv", "edges.csv")
+    ) >= DISK_THRESHOLD_BYTES):
+        from .disk_model import load as disk_load
+        return disk_load(ast_dir, wb, storage_dir)
+    return _load_memory(ast_dir, wb)
+
+
+def _load_memory(ast_dir: Path, wb: str) -> Graph:
+    nodes: dict[str, Node] = {}
     integrity_errors: list[dict] = []
+    node_fields: set[str] = set()
+    with open(ast_dir / "nodes.csv", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        node_fields = set(reader.fieldnames or ())
+        for node_index, row in enumerate(reader):
+            if row["id"] in nodes:
+                # A graph identity has exactly one definition. Even identical
+                # repeats are malformed evidence; never silently let a later
+                # CSV row replace a formula, primitive, or ownership record.
+                integrity_errors.append({
+                    "code": "duplicate_node_id",
+                    "node": row["id"],
+                    "node_index": node_index,
+                })
+                continue
+            nodes[row["id"]] = _parse_node(row)
+
+    edges: list[Edge] = []
+    edge_fields: set[str] = set()
+    with open(ast_dir / "edges.csv", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        edge_fields = set(reader.fieldnames or ())
+        for row in reader:
+            edges.append(_parse_edge(row))
+
+    schema_versions = {
+        node.ast_schema_version for node in nodes.values()
+        if node.ast_schema_version
+    }
+    capabilities = _capabilities(node_fields, edge_fields, schema_versions)
     for edge_index, edge in enumerate(edges):
         missing = [
             endpoint for endpoint in (edge.source, edge.target)

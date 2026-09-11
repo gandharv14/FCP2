@@ -5,6 +5,16 @@ from pathlib import Path
 
 import pytest
 
+
+def test_replay_cli_writes_machine_report_separately_from_diagnostics(tmp_path, monkeypatch, capsys):
+    import replay_segmentation_verification as replay
+    report = {'case_count': 53, 'cases': [{'id': '0001', 'state': 'missing_artifacts'}]}
+    monkeypatch.setattr(replay, 'build_replay_report', lambda *args: report)
+    output = tmp_path / 'report.json'
+    assert replay.main(['--output', str(output)]) == 0
+    assert json.loads(output.read_text()) == report
+    assert json.loads(capsys.readouterr().out) == {'report': str(output), 'case_count': 53}
+
 import replay_segmentation_verification as replay
 import xl_output_task
 from replay_segmentation_verification import check_rollout_performance
@@ -604,6 +614,7 @@ def test_restricted_generation_requires_certificate_and_stays_inactive(
         "restriction_events_sha256": restriction_cone.object_hash(events),
     }
     result = {
+        "schema_version": "source-restriction-result/v2",
         "restriction": {
             "profile": profile,
             "restriction_events": events,
@@ -830,6 +841,7 @@ def test_replay_requires_expected_diagnostics_for_completion(
     }
 
     def fake_segment(wb, args):
+        assert args.no_auto_adjudication is True
         shadow_case = Path(args.out) / wb
         fingerprints, missing = publication.evidence_fingerprints(
             source,
@@ -888,6 +900,7 @@ def test_replay_requires_expected_diagnostics_for_completion(
         replay.DEFAULT_MANIFEST,
         tmp_path,
         tmp_path / "shadow",
+        workbook_ids=[case_id],
     )
     result = next(item for item in report["results"] if item["id"] == case_id)
 
@@ -906,6 +919,7 @@ def test_replay_requires_expected_diagnostics_for_completion(
     assert all(path.read_bytes() == content for path, content in frozen.items())
     assert all(
         item["state"] == "not_run"
+        and item["reason"] == "not_selected"
         for item in report["results"]
         if item["id"] != case_id
     )

@@ -1,0 +1,114 @@
+"""Exact reviewed executor upgrades for retained JSON partitions.
+
+No historical code is executed. No request, manifest, scope, UUID, call or budget
+is replaced. The owning partition validator still reconstructs all evidence.
+"""
+from pathlib import Path
+from dataclasses import asdict
+from scripts.batch.harbor_admission import read, record, require
+
+SCHEMA='normalization-partition-transport-executor-applicability/v2'
+OLD_E='3ce097194f6219538fffa37847ee7f96d134b1185394c9355cdd55d49386ac17'
+NEW_E='c5f32d45ca696a2e13bd67602b3e6b1103503ab7b69aacd18b96a692e46164dd'
+OLD_P='00a35d8c0b92cc93eb51d7dcef153a79045616214f0ebdaa98957c2c5bbb7338'
+PREVIOUS_P='40cc196c5e20baa0b2f4c516b1621481b7cfc7d9f4531a924d99faf55ca248c4'
+PREVIOUS_A='6cfb8b0e8d35667aca5118b67523bb6197f1faba0e2a05d6d1bd7c023ea244b3'
+EDITS=(
+    (b'def codes():\n    return {', b'def codes():\n    from scripts.batch import harbor_partition_code_applicability as applicability\n    return {**applicability.code_records(),'),
+    (b"    require(m['code']==codes(),'normalization partition implementation changed')", b"    from scripts.batch import harbor_partition_code_applicability as applicability\n    applicability.validate(m, codes(), s)"),
+    (b"    require(value==expected,'partition aggregate altered or stale')", b"    from scripts.batch import harbor_partition_code_applicability as applicability\n    applicability.validate_aggregate(value, expected, codes())"),
+)
+
+
+def archives():
+    home=Path(__file__).resolve().parent/'partition_code_v1'
+    e=home/'executor-before.py.txt';p=home/'partition-before.py.txt'
+    require(record(e)['sha256']==OLD_E and record(p)['sha256']==OLD_P,'historical code archive altered')
+    return e,p
+
+
+def code_records():
+    from scripts.batch import harbor_partition_transport_applicability as transport
+    e,p=archives();a=Path(__file__).resolve().parent/'partition_code_v1/applicability-before.py.txt'
+    require(record(a)['sha256']==PREVIOUS_A,'previous applicability archive changed')
+    return {**transport.code_records(),**{str(x.resolve()):record(x)['sha256'] for x in (Path(__file__),e,p,a)}}
+
+
+def profile(current):
+    from scripts.batch import harbor_partition_transport_applicability as transport
+    current=transport.previous_profile(current)
+    from scripts.batch import harbor_normalization_partitioned as P,harbor_model_executor as E
+    ep,pp=str(Path(E.__file__).resolve()),str(Path(P.__file__).resolve())
+    e,p=archives();expected=p.read_bytes()
+    for before,after in EDITS:
+        require(expected.count(before)==1,'partition upgrade does not have its exact original anchor')
+        expected=expected.replace(before,after,1)
+    require(Path(P.__file__).read_bytes()==expected and record(E.__file__)['sha256']==transport.NEW_E,'unreviewed partition/executor implementation')
+    require(current.get(pp)==record(P.__file__)['sha256'] and current.get(ep)==NEW_E,'current code profile differs from actual modules')
+    added=transport.previous_code_records();require(all(current.get(k)==v for k,v in added.items()),'applicability evidence is not exported')
+    historical={k:v for k,v in current.items() if k not in added}
+    historical[pp]=OLD_P;historical[ep]=OLD_E
+    return historical
+
+
+def validate(manifest,current,selection):
+    """Used only inside owning _current; success alone is not a valid partition."""
+    old=manifest['code']
+    if old==current:return None
+    from scripts.batch import harbor_normalization_partitioned as P,harbor_normalization_producer as N,harbor_model_executor as E
+    require(old in profiles(current).values(),'normalization partition implementation changed beyond exact reviewed profiles')
+    require(N.LANE=='harbor-normalization-engineer' and P.scope(selection).lane==N.LANE,'executor exception may be reachable from this lane')
+    require(type(selection.budget.ordinal) is int and selection.budget.ordinal==1 and selection.budget.limit==2 and manifest['logical_limit']==2,'original logical partition budget changed')
+    require(manifest['original_budget']==P.C.json_value(asdict(selection.budget)) and manifest['semantic_budget_reset'] is False and manifest['prior_attempt_submitted'] is False,'original partition budget/evidence changed')
+    for part in manifest['partitions']:
+        payload=read(part['request'])
+        require(set(payload)=={'model','reasoning_effort','messages'},'normalization request protocol changed')
+        # The owning producer's PreparedCall omits response_mode; its default
+        # must remain JSON, so neither old nor new invocation reaches text→JSON.
+        call=E.PreparedCall(part['request'],selection.policy,P.scope(selection),1,2,selection.budget.attempt_id,selection.budget.evidence)
+        require(call.response_mode=='json_object' and call.scope.lane!='harbor-dialogue-author','normalization call mode/scope differs')
+    require(bool(manifest['partitions']),'empty normalization partitions')
+    from scripts.batch.harbor_partition_transport_applicability import policy_evidence
+    return dict(schema_version=SCHEMA,original_code=old,current_code=current,original_budget=manifest['original_budget'],**policy_evidence())
+
+
+def profiles(current):
+    """Three exact historical profiles; no arbitrary intermediate implementation."""
+    from scripts.batch import harbor_normalization_partitioned as P,harbor_model_executor as E
+    from scripts.batch import harbor_partition_transport_applicability as transport
+    previous_current=transport.previous_profile(current)
+    first=profile(current)
+    pp,ep=str(Path(P.__file__).resolve()),str(Path(E.__file__).resolve())
+    _,source=archives();prior=source.read_bytes()
+    for old,new in EDITS[:2]:
+        require(prior.count(old)==1,'previous producer anchor differs')
+        prior=prior.replace(old,new,1)
+    require(E.sha(prior)==PREVIOUS_P,'previous partition producer differs')
+    prior_code=dict(previous_current);prior_code[pp]=PREVIOUS_P;prior_code[ep]=NEW_E
+    prior_code[str(Path(__file__).resolve())]=PREVIOUS_A
+    prior_code.pop(str(Path(__file__).resolve().parent/'partition_code_v1/applicability-before.py.txt'))
+    return {'original-json-partition':first,'prepared-code-applicability-v1':prior_code,
+            'completed-dialogue-code-applicability-v1':previous_current}
+
+
+def checked_files_projection(previous,current,current_codes):
+    from scripts.batch.harbor_partition_transport_applicability import policy_evidence
+    require(isinstance(previous,dict) and isinstance(current,dict),'checked-file inventories required')
+    require(all(current.get(k)==v for k,v in current_codes.items()),'current aggregate omitted implementation proof')
+    for name,old_codes in profiles(current_codes).items():
+        if {k:v for k,v in previous.items() if k in current_codes}!=old_codes:continue
+        projected={k:v for k,v in previous.items() if k not in current_codes}
+        projected.update(current_codes)
+        if projected==current:
+            return dict(schema_version=SCHEMA,profile=name,original_checked_files=previous,current_checked_files=current,
+                **policy_evidence())
+    raise ValueError('partition aggregate changed non-code evidence or an unapproved code profile')
+
+
+def validate_aggregate(previous,current,current_codes):
+    if previous==current:return None
+    require(isinstance(previous,dict) and isinstance(current,dict)
+        and set(previous)==set(current)
+        and {k:v for k,v in previous.items() if k!='checked_files'}=={k:v for k,v in current.items() if k!='checked_files'},
+        'partition aggregate altered or stale: review, calls, coverage or budgets changed')
+    return checked_files_projection(previous['checked_files'],current['checked_files'],current_codes)

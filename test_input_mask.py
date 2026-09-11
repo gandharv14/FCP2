@@ -9,6 +9,7 @@ from xl_input_mask import (
     MASKED_VALUE_NOTE,
     _assumptions_sheet_xml,
     redact_assumptions,
+    inject_assumptions,
     verify,
 )
 from xl_level_split import scrub_chart_caches
@@ -63,20 +64,22 @@ class RedactAssumptionsTests(unittest.TestCase):
         self.assertEqual(rows[0]["formula"], "")
         self.assertEqual(stripped, ["Model!B2"])
 
-    def test_benign_entry_is_untouched(self):
+    def test_intermediate_entry_keeps_input_but_withholds_derivation(self):
         rows, redacted, stripped = redact_assumptions(
             [entry()], deny={}, deny_numbers={99.5}, deny_texts=set(),
             outputs={("Model", 9, 9)})
         self.assertEqual(rows[0]["value"], 0.25)
-        self.assertEqual(rows[0]["formula"], "=Revenue*0.25")
+        self.assertEqual(rows[0]["formula"], "")
         self.assertEqual(redacted, [])
-        self.assertEqual(stripped, [])
+        self.assertEqual(stripped, ["Model!B2"])
 
 
 class AssumptionsSheetXmlTests(unittest.TestCase):
-    def test_formula_context_is_stored_as_text(self):
+    def test_formula_context_is_never_rendered_even_without_redaction(self):
         xml = _assumptions_sheet_xml([entry()]).decode("utf-8")
-        self.assertIn("'=Revenue*0.25", xml)
+        self.assertNotIn("Revenue", xml)
+        self.assertNotIn('r="E', xml)
+        self.assertIn('<c r="D2"><v>0.25</v></c>', xml)
 
     def test_redacted_rows_render_the_note_and_no_formula(self):
         rows, _, _ = redact_assumptions(
@@ -191,6 +194,54 @@ class VerifyFormulaCensusTests(unittest.TestCase):
         path = self._book(build)
         faults = self._verify(path)
         self.assertTrue(faults["formula"])
+
+    def test_embedded_intermediate_derivation_removed_literal_preserved(self):
+        source = self._book(lambda ws: setattr(ws["A1"], "value", "Input"))
+        delivered = Path(self._dir.name) / "delivered.xlsx"
+        delivered.write_bytes(source.read_bytes())
+        promoted = entry(formula="=PMT(7%,5,-550)", value=550)
+        sheet = inject_assumptions(delivered, [promoted], {"Sheet"})
+        book = openpyxl.load_workbook(delivered)
+        self.assertEqual(book[sheet]["D2"].value, 550)
+        self.assertIsNone(book[sheet]["E2"].value)
+        book.close()
+        faults = verify(delivered, source, {}, {}, {}, {}, sheet,
+                        assumption_formulas=[promoted["formula"]],
+                        expected_assumptions=[promoted])
+        self.assertTrue(all(not hits for hits in faults.values()), faults)
+
+        # Detection is independent of the renderer, including a derivation
+        # smuggled into the value column rather than the old Formula column.
+        for address in ("D2", "E2"):
+            with self.subTest(address=address):
+                book = openpyxl.load_workbook(delivered)
+                book[sheet][address] = "'" + promoted["formula"]
+                book.save(delivered)
+                book.close()
+                faults = verify(delivered, source, {}, {}, {}, {}, sheet,
+                                assumption_formulas=[promoted["formula"]],
+                                expected_assumptions=[promoted])
+                self.assertTrue(any("embedded derivation text" in hit
+                                    for hit in faults["formula"]))
+                if address == "D2":
+                    self.assertTrue(any("promoted input literal" in hit
+                                        for hit in faults["changed"]))
+                book = openpyxl.load_workbook(delivered)
+                book[sheet]["D2"] = 550
+                book[sheet]["E2"] = None
+                book.save(delivered)
+                book.close()
+
+    def test_real_formula_like_text_literal_is_preserved(self):
+        source = self._book(lambda ws: setattr(ws["A1"], "value", "Input"))
+        delivered = Path(self._dir.name) / "literal.xlsx"
+        delivered.write_bytes(source.read_bytes())
+        promoted = entry(value="=", formula='=IF(A1="=",1,0)')
+        sheet = inject_assumptions(delivered, [promoted], {"Sheet"})
+        faults = verify(delivered, source, {}, {}, {}, {}, sheet,
+                        assumption_formulas=[promoted["formula"]],
+                        expected_assumptions=[promoted])
+        self.assertTrue(all(not hits for hits in faults.values()), faults)
 
 
 if __name__ == "__main__":

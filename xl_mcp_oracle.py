@@ -828,9 +828,34 @@ def merge_profile_reports(*reports: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tool_data(result: Any) -> Any:
-    if getattr(result, "is_error", False):
+    import dataclasses
+    if getattr(result, "is_error", False) or getattr(result, "isError", False):
         raise RuntimeError("MCP tool returned an error: %s" % result)
-    return result.data if hasattr(result, "data") else result
+    structured = getattr(result, "structured_content", None)
+    if structured is None:
+        structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        # Generic list[dict] SDK models can discard every dictionary property.
+        # Use the lossless protocol payload; FastMCP wraps list results once.
+        data = (structured["result"] if isinstance(structured, dict)
+                and set(structured) == {"result"}
+                and isinstance(structured["result"], list) else structured)
+    else:
+        data = result.data if hasattr(result, "data") else result
+    # FastMCP validates structured responses into Pydantic models, including
+    # RootModel for list/dictionary schemas. Unwrap with the public serializer,
+    # which also normalizes nested models; never infer success from text blocks.
+    def plain(value):
+        if callable(getattr(value, "model_dump", None)):
+            return plain(value.model_dump(mode="json"))
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return plain(dataclasses.asdict(value))
+        if isinstance(value, dict):
+            return {key: plain(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [plain(item) for item in value]
+        return value
+    return plain(data)
 
 
 async def query_all(

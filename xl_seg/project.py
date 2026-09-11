@@ -9,9 +9,10 @@ indistinguishable but semantically inert.
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from dataclasses import dataclass, field
 
-from .model import Graph, Node, as_number, range_members
+from .model import A1_RE, Graph, Node, a1, as_number, col_number, split_ref
 
 # Cells whose cached value is one of these are unit stamps, not model values.
 UNIT_TOKENS = {
@@ -32,7 +33,7 @@ AXIS = "axis"
 BLANK = "blank"
 
 
-@dataclass
+@dataclass(slots=True)
 class CellInfo:
     node: Node
     vtype: str
@@ -52,6 +53,8 @@ class CellGraph:
     info: dict[str, CellInfo]
     adj: dict[str, set] = field(default_factory=dict)
     radj: dict[str, set] = field(default_factory=dict)
+
+    range_products: object = None
 
     def successors(self, cid: str) -> set:
         return self.adj.get(cid, set())
@@ -87,10 +90,46 @@ def _classify(node: Node) -> str:
     return NUMERIC
 
 
+def _cell_coordinate_index(info):
+    """Index only IDs the existing A1 range renderer could actually produce."""
+    by_sheet = {}
+    for cell_id in info:
+        ref = split_ref(cell_id)
+        if ref is None or a1(*ref) != cell_id:
+            continue
+        sheet, row, col = ref
+        by_sheet.setdefault(sheet, []).append((row, col, cell_id))
+    for cells in by_sheet.values():
+        cells.sort()
+    return by_sheet
+
+
+def _sparse_range_members(sheet, span, coordinate_index):
+    """Exact range_members intersection without enumerating unpopulated cells.
+
+    Keep the existing model parser's closed A1 span grammar: qualification lives
+    in ``sheet``; absolute or multi-area coordinate strings remain unsupported.
+    Reversed endpoints and row-major order match the original enumeration.
+    """
+    start, separator, end = span.partition(":")
+    if not separator:
+        return []
+    first, last = A1_RE.match(start), A1_RE.match(end)
+    if first is None or last is None:
+        return []
+    left, right = sorted((col_number(first.group(1)), col_number(last.group(1))))
+    top, bottom = sorted((int(first.group(2)), int(last.group(2))))
+    cells = coordinate_index.get(sheet, ())
+    start_index = bisect_left(cells, (top,))
+    end_index = bisect_left(cells, (bottom + 1,))
+    return [cells[index][2] for index in range(start_index, end_index)
+            if left <= cells[index][1] <= right]
+
+
 def build(graph: Graph) -> CellGraph:
-    consts = literal_index(graph)
+    consts = literal_index(graph) if graph._store is None else None
     info: dict[str, CellInfo] = {}
-    for node in graph.cells():
+    for node in graph.iter_nodes("formula", "input", "label"):
         incoming = graph.in_edges.get(node.id, ())
         is_mirror = (
             node.kind == "formula"
@@ -110,7 +149,8 @@ def build(graph: Graph) -> CellGraph:
             and not incoming
             and bool(PURE_REF_RE.match(node.formula or ""))
         )
-        literals = tuple(c.value for c in consts.get(node.id, ()))
+        literals = (tuple(c.value for c in consts.get(node.id, ())) if consts is not None
+                    else graph._store.literal_values(node.id))
         info[node.id] = CellInfo(
             node=node,
             vtype=_classify(node),
@@ -123,36 +163,41 @@ def build(graph: Graph) -> CellGraph:
     # A ``range`` node stands in for a whole span and carries no edges from its
     # members, so those dependencies have to be reinstated by hand.
     expanded: dict[str, list] = {}
-    for node in graph.nodes.values():
-        if node.kind == "range":
-            expanded[node.id] = [
-                cid for cid in range_members(node.sheet, node.coordinate)
-                if cid in info
-            ]
+    coordinate_index = None
+    for node in graph.iter_nodes("range"):
+        if coordinate_index is None:
+            coordinate_index = _cell_coordinate_index(info)
+        expanded[node.id] = _sparse_range_members(node.sheet, node.coordinate, coordinate_index)
 
-    adj: dict[str, set] = {}
-    radj: dict[str, set] = {}
-    for edge in graph.edges:
-        sources = expanded.get(edge.source)
-        if sources is None:
-            resolved = graph.owner_of(edge.source)
-            sources = [resolved] if resolved else []
-        dst = graph.owner_of(edge.target)
+    from .group_adjacency import RangeProducts
+    products = RangeProducts()
+    if graph._store is None:
+        dependencies = (
+            (edge.source if edge.source in expanded else graph.owner_of(edge.source),
+             graph.owner_of(edge.target), edge.source in expanded)
+            for edge in graph.edges
+        )
+    else:
+        dependencies = graph._store.cell_edges()
+    canonical_cells = {cell: cell for cell in info}
+    for source, dst, is_range in dependencies:
         if dst is None:
             continue
-        for src in sources:
-            if src == dst:
-                continue
-            adj.setdefault(src, set()).add(dst)
-            radj.setdefault(dst, set()).add(src)
+        dst = canonical_cells.get(dst, dst)
+        if is_range:
+            products.add_range(source, expanded[source], dst)
+        elif source:
+            products.add_edge(canonical_cells.get(source, source), dst)
 
-    return CellGraph(graph=graph, info=info, adj=adj, radj=radj)
+    adj, radj = products.seal()
+    return CellGraph(graph=graph, info=info, adj=adj, radj=radj, range_products=products)
+
 
 
 def literal_index(graph: Graph) -> dict[str, list]:
     """Map each formula cell to the literal constants baked into its formula."""
     out: dict[str, list] = {}
-    for node in graph.nodes.values():
-        if node.kind == "const" and node.owner:
+    for node in graph.iter_nodes("const"):
+        if node.owner:
             out.setdefault(node.owner, []).append(node)
     return out

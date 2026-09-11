@@ -102,9 +102,9 @@ RECOVERY_STATUSES = frozenset(
 RECOVERY_LADDER = (
     "normal path: publish a complete immutable release without recovery",
     "smallest task-local pipeline, formula, or validator fix",
-    "disclosed deterministic assumption for volatile or external cells",
-    "recurate to a smaller self-contained output cone",
-    "deterministic naturalization reconstruction",
+    "proof-bound deterministic source transformation with original provenance",
+    "repair evaluator or parser while preserving the complete curated output set",
+    "bounded naturalization retry preserving protected sections and semantic review",
     "a different strategy because the same failure repeated",
 )
 AMD_REQUIRED = (
@@ -471,7 +471,7 @@ class Config:
                     default=str(
                         baseline_repo
                         / "verification_manifests"
-                        / "approved_source_inventories.v1.json"
+                        / "approved_source_inventories.v2.json"
                     ),
                 )
             ).expanduser().resolve(strict=False),
@@ -2903,7 +2903,8 @@ changed before this lane can safely continue.
             retry_text = f"""
 This is recovery attempt {attempt_index + 1}. Inspect the preserved prior
 attempt at {prior_attempt.get('attempt_path')}. FULL_RERUN_BLOCKER: HARD from a
-prior attempt is not a stop. Use this ladder step now:
+prior attempt requires diagnosis; it does not authorize relaxing any gate.
+Use this ladder step only if the owning gate still has retry budget:
 {self._ladder_step(attempt_index)}.
 The last durable attempt record is:
 {json.dumps(dict(prior_attempt), sort_keys=True, default=str)}
@@ -2926,19 +2927,15 @@ task-local prepare/publication fix in this worktree.
         else:
             inventory_text = f"""
 No pinned approved inventory currently contains workbook {row.workbook_id}.
-That is an orchestration gap, not a reason to stop. If source health is
-`pass`, continue without restricted evidence. If the route is restricted or
-would have been `unsupported`, apply a task-local pipeline fix in this
-worktree so source/AST publication can proceed, then recurate away from
-uncomputable cells or bind a disclosed deterministic assumption. Do not
-invent an approval registry.
+If source health is `pass`, continue without restricted evidence. A restricted
+source requires a matching approved inventory; report an infrastructure blocker
+when it is absent. Never invent an approval or reinterpret an unsupported route.
 """.strip()
         return f"""
-Read {skill}. Then read {overlay} if it exists. Fail-closed "stop / impossible /
-HARD" rules in the skill are SUPERSEDED for this recovery worker. You MUST
-publish a complete immutable release and current-release.json pointer for
-workbook {row.workbook_id}. Never finish as if this workbook is impossible.
-Never treat a skill stop as success.
+Read {skill}. Then read {overlay} if it exists. Every required gate and its
+semantic retry limit remains mandatory. A valid release is success; an
+unsupported source or infrastructure blocker is a recorded stop, never success.
+Preserve every curated output, financial convention, tolerance, and claim.
 
 Process only workbook {row.workbook_id}, using the validated, private run copy
 {workbook}. Work only in the isolated worktree {repo}. The shared baseline
@@ -2951,27 +2948,26 @@ rewrite it.
 
 {retry_text}
 
-Recovery ladder (use the assigned step; escalate only with evidence):
+Recovery ladder (use only the assigned, independently justified step):
 (a) normal path
-(b) smallest task-local pipeline, formula, or validator fix
-(c) disclosed deterministic assumption for volatile/external cells
-(d) recurate to a smaller self-contained output cone
-(e) deterministic naturalization reconstruction
-(f) a different strategy if the same failure repeats
+(b) smallest reproducible parser, evaluator, or integration fix
+(c) proof-bound deterministic source transformation
+(d) recovery preserving the exact curated targets and tolerances
+(e) bounded naturalization retry with required claim coverage and review
+(f) a distinguishable strategy within the owning gate's remaining budget
 
-On `unsupported` or `insufficient_evidence`, do not stop. Implement the missing
-semantics, treat the feature as a restriction and recurate away from it, or
-bind a disclosed frozen value. On `recalc_candidate` without a macOS Excel
-runner, do not stop: recurate to a cone that does not need empty caches, or
-bind disclosed cached values already present in the source. On naturalization
-failure, reconstruct protected sections byte-for-byte and retry editable spans
-until the validator passes; two failures is not a limit.
+Never recurate to evade a failure, substitute cached calculated answers as
+supplied assumptions, seed an output cone, downgrade research requirements,
+or reset semantic-review retry counters. Volatile or external transformations
+require complete hash-bound provenance and independent reconstruction. Required
+trusted recalculation cannot be replaced by synthetic caches or local guesses.
+Unsupported semantics, missing approvals, missing dependencies, and exhausted
+quality gates must produce an explicit classified blocker with evidence.
 
-You MAY edit xl_seg implementation, xl_source_*.py, xl_inventory_approval.py,
-xl_segment.py, skill markdown, and naturalization scripts in this isolated
-worktree. You MUST NOT change source workbooks, graders, rubrics, answer keys,
-or acceptance thresholds. Do not weaken, bypass, skip, special-case, or
-fabricate gate success.
+You may repair implementation defects in this isolated worktree only when
+minimal accepted and rejected regression fixtures demonstrate correctness.
+Do not modify sources, curated selections, graders, rubrics, answer keys,
+acceptance thresholds, required validators, or required review limits.
 
 Measured AST and segmentation commands may run for at most
 {inner_timeout} seconds for this workbook.
@@ -2979,7 +2975,8 @@ Measured AST and segmentation commands may run for at most
 Success is only a complete immutable release for {row.workbook_id}. Ending the
 agent, building source/AST only, or printing FULL_RERUN_BLOCKER: HARD is not
 success. If you print that HARD line, the worker will ignore it as a completion
-signal and retry with the next ladder step.
+signal; it will retain the failure evidence. Further attempts must respect
+the existing gate budgets and preserve the same targets.
 
 If any recovery step other than (a) is used, write literal a.md at the root of
 the final {row.workbook_id}-outputs bundle. a.md must record: exact blocker,

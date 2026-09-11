@@ -1,6 +1,8 @@
 # Client workbooks and credentials must never be committed.
-*.xlsx
-*.xlsm
+*.[xX][lL][sS][xX]
+*.[xX][lL][sS][mM]
+*.[xX][lL][sS][bB]
+*.[xX][lL][sS]
 .env
 **/.env
 **/config/*sa-*.json
@@ -21,3 +23,8 @@ tasks_outputs*/
 jobs/
 runs/
 /4-10 100
+release_out/
+.corpus-runs/
+/diagnostics/
+verification_manifests/*.lock
+/.authoring-*/

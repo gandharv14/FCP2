@@ -1,0 +1,229 @@
+{
+  "workbook": "runtime",
+  "outputs": [
+    {
+      "output": "1 O'Brien!A8",
+      "label": "Repeated | \u20ac label",
+      "sheet": "1 O'Brien",
+      "file": "lineage/repeated-label.md",
+      "band_steps": 2,
+      "inputs_used": 1,
+      "middle_steps": 1,
+      "max_depth": 7,
+      "output_cells": 1
+    },
+    {
+      "output": "1 O'Brien!A5",
+      "label": "Repeated | \u20ac label",
+      "sheet": "1 O'Brien",
+      "file": "lineage/repeated-label--1-o-brien-a5.md",
+      "band_steps": 2,
+      "inputs_used": 1,
+      "middle_steps": 1,
+      "max_depth": 4,
+      "output_cells": 1
+    },
+    {
+      "output": "1 O'Brien!A7",
+      "label": "Repeated | \u20ac label",
+      "sheet": "1 O'Brien",
+      "file": "lineage/repeated-label--1-o-brien-a7.md",
+      "band_steps": 2,
+      "inputs_used": 0,
+      "middle_steps": 2,
+      "max_depth": 6,
+      "output_cells": 1
+    }
+  ],
+  "traces": [
+    {
+      "output": "1 O'Brien!A8",
+      "label": "Repeated | \u20ac label",
+      "band_steps": [
+        {
+          "order": 0,
+          "node": "1 O'Brien!A1",
+          "bucket": "input",
+          "sheet": "1 O'Brien",
+          "label": "Repeated | \u20ac label",
+          "formula": "=$A$1+1",
+          "depth": 0,
+          "inputs": [],
+          "values": []
+        },
+        {
+          "order": 1,
+          "node": "1 O'Brien!A8",
+          "bucket": "middle",
+          "sheet": "1 O'Brien",
+          "label": "Repeated | \u20ac label",
+          "formula": "=$A$1+1",
+          "depth": 7,
+          "inputs": [
+            "1 O'Brien!A1"
+          ],
+          "values": []
+        }
+      ],
+      "cell_traces": {
+        "1 O'Brien!A8": {
+          "cell": "1 O'Brien!A8",
+          "steps": [
+            {
+              "order": 0,
+              "cell": "1 O'Brien!A1",
+              "role": "input",
+              "label": "\u0394 / Unicode",
+              "formula": "=$A$1+1",
+              "kind": "formula",
+              "value": null,
+              "cached": "saved",
+              "precedents": []
+            },
+            {
+              "order": 1,
+              "cell": "1 O'Brien!A8",
+              "role": "output",
+              "label": "\u0394 / Unicode",
+              "formula": "=$A$1+1",
+              "kind": "formula",
+              "value": 8,
+              "cached": "saved",
+              "precedents": [
+                "1 O'Brien!A1"
+              ]
+            }
+          ],
+          "total_ancestors": 1,
+          "truncated": 0
+        }
+      }
+    },
+    {
+      "output": "1 O'Brien!A5",
+      "label": "Repeated | \u20ac label",
+      "band_steps": [
+        {
+          "order": 0,
+          "node": "1 O'Brien!A1",
+          "bucket": "input",
+          "sheet": "1 O'Brien",
+          "label": "Repeated | \u20ac label",
+          "formula": "=$A$1+1",
+          "depth": 0,
+          "inputs": [],
+          "values": []
+        },
+        {
+          "order": 1,
+          "node": "1 O'Brien!A5",
+          "bucket": "middle",
+          "sheet": "1 O'Brien",
+          "label": "Repeated | \u20ac label",
+          "formula": "=$A$1+1",
+          "depth": 4,
+          "inputs": [
+            "1 O'Brien!A1"
+          ],
+          "values": []
+        }
+      ],
+      "cell_traces": {
+        "1 O'Brien!A5": {
+          "cell": "1 O'Brien!A5",
+          "steps": [
+            {
+              "order": 0,
+              "cell": "1 O'Brien!A1",
+              "role": "input",
+              "label": "\u0394 / Unicode",
+              "formula": "=$A$1+1",
+              "kind": "formula",
+              "value": null,
+              "cached": "saved",
+              "precedents": []
+            },
+            {
+              "order": 1,
+              "cell": "1 O'Brien!A5",
+              "role": "output",
+              "label": "\u0394 / Unicode",
+              "formula": "=$A$1+1",
+              "kind": "formula",
+              "value": NaN,
+              "cached": "saved",
+              "precedents": [
+                "1 O'Brien!A1"
+              ]
+            }
+          ],
+          "total_ancestors": 1,
+          "truncated": 0
+        }
+      }
+    },
+    {
+      "output": "1 O'Brien!A7",
+      "label": "Repeated | \u20ac label",
+      "band_steps": [
+        {
+          "order": 0,
+          "node": "1 O'Brien!A2",
+          "bucket": "middle",
+          "sheet": "1 O'Brien",
+          "label": "Repeated | \u20ac label",
+          "formula": "=$A$1+1",
+          "depth": 1,
+          "inputs": [],
+          "values": []
+        },
+        {
+          "order": 1,
+          "node": "1 O'Brien!A7",
+          "bucket": "middle",
+          "sheet": "1 O'Brien",
+          "label": "Repeated | \u20ac label",
+          "formula": "=$A$1+1",
+          "depth": 6,
+          "inputs": [
+            "1 O'Brien!A2"
+          ],
+          "values": []
+        }
+      ],
+      "cell_traces": {
+        "1 O'Brien!A7": {
+          "cell": "1 O'Brien!A7",
+          "steps": [
+            {
+              "order": 0,
+              "cell": "1 O'Brien!A2",
+              "role": "middle",
+              "label": "\u0394 / Unicode",
+              "formula": "=$A$1+1",
+              "kind": "formula",
+              "value": false,
+              "cached": "saved",
+              "precedents": []
+            },
+            {
+              "order": 1,
+              "cell": "1 O'Brien!A7",
+              "role": "output",
+              "label": "\u0394 / Unicode",
+              "formula": "=$A$1+1",
+              "kind": "formula",
+              "value": 7,
+              "cached": "saved",
+              "precedents": [
+                "1 O'Brien!A2"
+              ]
+            }
+          ],
+          "total_ancestors": 1,
+          "truncated": 0
+        }
+      }
+    }
+  ]
+}

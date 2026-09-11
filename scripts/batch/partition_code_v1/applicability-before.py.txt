@@ -1,0 +1,64 @@
+"""Exact known executor dialogue-only upgrade for retained JSON partitions.
+
+No historical code is executed. No request, manifest, scope, UUID, call or budget
+is replaced. The owning partition validator still reconstructs all evidence.
+"""
+from pathlib import Path
+from dataclasses import asdict
+from scripts.batch.harbor_admission import read, record, require
+
+SCHEMA='normalization-partition-dialogue-executor-applicability/v1'
+OLD_E='3ce097194f6219538fffa37847ee7f96d134b1185394c9355cdd55d49386ac17'
+NEW_E='c5f32d45ca696a2e13bd67602b3e6b1103503ab7b69aacd18b96a692e46164dd'
+OLD_P='00a35d8c0b92cc93eb51d7dcef153a79045616214f0ebdaa98957c2c5bbb7338'
+EDITS=(
+    (b'def codes():\n    return {', b'def codes():\n    from scripts.batch import harbor_partition_code_applicability as applicability\n    return {**applicability.code_records(),'),
+    (b"    require(m['code']==codes(),'normalization partition implementation changed')", b"    from scripts.batch import harbor_partition_code_applicability as applicability\n    applicability.validate(m, codes(), s)"),
+)
+
+
+def archives():
+    home=Path(__file__).resolve().parent/'partition_code_v1'
+    e=home/'executor-before.py.txt';p=home/'partition-before.py.txt'
+    require(record(e)['sha256']==OLD_E and record(p)['sha256']==OLD_P,'historical code archive altered')
+    return e,p
+
+
+def code_records():
+    e,p=archives()
+    return {str(x.resolve()):record(x)['sha256'] for x in (Path(__file__),e,p)}
+
+
+def profile(current):
+    from scripts.batch import harbor_normalization_partitioned as P,harbor_model_executor as E
+    ep,pp=str(Path(E.__file__).resolve()),str(Path(P.__file__).resolve())
+    e,p=archives();expected=p.read_bytes()
+    for before,after in EDITS:
+        require(expected.count(before)==1,'partition upgrade does not have its exact original anchor')
+        expected=expected.replace(before,after,1)
+    require(Path(P.__file__).read_bytes()==expected and record(E.__file__)['sha256']==NEW_E,'unreviewed partition/executor implementation')
+    require(current.get(pp)==record(P.__file__)['sha256'] and current.get(ep)==NEW_E,'current code profile differs from actual modules')
+    added=code_records();require(all(current.get(k)==v for k,v in added.items()),'applicability evidence is not exported')
+    historical={k:v for k,v in current.items() if k not in added}
+    historical[pp]=OLD_P;historical[ep]=OLD_E
+    return historical
+
+
+def validate(manifest,current,selection):
+    """Used only inside owning _current; success alone is not a valid partition."""
+    old=manifest['code']
+    if old==current:return None
+    from scripts.batch import harbor_normalization_partitioned as P,harbor_normalization_producer as N,harbor_model_executor as E
+    require(old==profile(current),'normalization partition implementation changed beyond known dialogue-only repair')
+    require(N.LANE=='harbor-normalization-engineer' and P.scope(selection).lane==N.LANE,'executor exception may be reachable from this lane')
+    require(type(selection.budget.ordinal) is int and selection.budget.ordinal==1 and selection.budget.limit==2 and manifest['logical_limit']==2,'original logical partition budget changed')
+    require(manifest['original_budget']==P.C.json_value(asdict(selection.budget)) and manifest['semantic_budget_reset'] is False and manifest['prior_attempt_submitted'] is False,'original partition budget/evidence changed')
+    for part in manifest['partitions']:
+        payload=read(part['request'])
+        require(set(payload)=={'model','reasoning_effort','messages'},'normalization request protocol changed')
+        # The owning producer's PreparedCall omits response_mode; its default
+        # must remain JSON, so neither old nor new invocation reaches text→JSON.
+        call=E.PreparedCall(part['request'],selection.policy,P.scope(selection),1,2,selection.budget.attempt_id,selection.budget.evidence)
+        require(call.response_mode=='json_object' and call.scope.lane!='harbor-dialogue-author','normalization call mode/scope differs')
+    require(bool(manifest['partitions']),'empty normalization partitions')
+    return dict(schema_version=SCHEMA,original_code=old,current_code=current,original_budget=manifest['original_budget'],changed_executor_branch_reachable=False,historical_code_executed=False)

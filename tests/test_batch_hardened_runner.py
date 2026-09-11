@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+
 import json
+import os
+import signal
 import shutil
 import sys
 import threading
@@ -299,6 +303,7 @@ def test_process_group_rss_limit_records_timed_out_state(
 
 def test_timeout_reconciliation_reads_publication_without_rewriting_pointer(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ready = tmp_path / "ready"
     published = tmp_path / "published"
@@ -316,11 +321,41 @@ def test_timeout_reconciliation_reads_publication_without_rewriting_pointer(
             ready_dir=ready,
         )
 
+    # Wait only for these test children to reach their publication checkpoint.
+    # Yield the real Popen so production still performs the timed wait, process
+    # group termination, and reconciliation itself. Other subprocesses (including
+    # the retry below) retain their ordinary execution path.
+    checkpoint_markers: dict[tuple[str, ...], Path] = {}
+    checkpoint_processes = []
+    real_guarded_process = hardened_runner._guarded_process
+
+    @contextlib.contextmanager
+    def checkpoint_process(command, **kwargs):
+        # Wait after guardian arming and exec, before production's measured wait.
+        # Waiting inside Popen would deadlock the launch authorization handshake.
+        with real_guarded_process(command, **kwargs) as process:
+            marker = checkpoint_markers.get(tuple(command))
+            if marker is not None:
+                checkpoint_processes.append(process)
+                deadline = time.monotonic() + 10
+                while not marker.is_file():
+                    if process.poll() is not None:
+                        raise AssertionError("checkpoint child exited before declaring readiness")
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("checkpoint child did not become ready within 10 seconds")
+                    time.sleep(0.01)
+            yield process
+
+    monkeypatch.setattr(hardened_runner, "_guarded_process", checkpoint_process)
+
     def command_builder(record, _workbook):
         pointer = pointers / f"{record.workbook_id}.json"
         generation = pointers / f"{record.workbook_id}.generation"
         staging = pointers / f"{record.workbook_id}.staging"
-        script = "import pathlib,time;"
+        marker = pointers / f"{record.workbook_id}.checkpoint-ready"
+        # Deliberately exceed the measured timeout before reaching the checkpoint
+        # to prove interpreter/startup latency cannot select the tested state.
+        script = "import pathlib,time;time.sleep(0.2);"
         if record.workbook_id == "0001":
             script += (
                 f"pathlib.Path({str(generation)!r}).write_text('immutable');"
@@ -332,8 +367,10 @@ def test_timeout_reconciliation_reads_publication_without_rewriting_pointer(
             )
         elif record.workbook_id == "0003":
             script += f"pathlib.Path({str(staging)!r}).write_text('partial');"
-        script += "time.sleep(5)"
-        return [sys.executable, "-c", script]
+        script += f"pathlib.Path({str(marker)!r}).touch();\nwhile True: time.sleep(1)\n"
+        command = [sys.executable, "-c", script]
+        checkpoint_markers[tuple(command)] = marker
+        return command
 
     def reconcile(record, result):
         pointer = pointers / f"{record.workbook_id}.json"
@@ -352,6 +389,9 @@ def test_timeout_reconciliation_reads_publication_without_rewriting_pointer(
         terminal_reconciler=reconcile,
     )
 
+    assert len(checkpoint_processes) == 4
+    assert all(process.poll() is not None for process in checkpoint_processes)
+    assert all(marker.is_file() for marker in checkpoint_markers.values())
     assert ledger["counts"] == {"completed": 1, "timed_out": 3}
     assert (pointers / "0001.json").read_text() == "current-v1"
     assert (pointers / "0002.generation").read_text() == "immutable"

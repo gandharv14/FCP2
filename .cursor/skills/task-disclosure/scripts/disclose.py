@@ -24,6 +24,7 @@ import sys
 import time
 from collections import Counter, defaultdict, deque
 from pathlib import Path
+from types import SimpleNamespace
 
 try:
     import openpyxl
@@ -32,6 +33,11 @@ except ImportError:  # pragma: no cover
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from scripts.batch import harbor_method_items as indexed_methods
+from scripts.batch import harbor_method_assessments as indexed_assessments
+INDEXED_METHOD_THRESHOLD = 10_000
 DEFAULT_TASKS_ROOT = REPO_ROOT.parent / "08_12_34_samples_tasks_outputs_hinted"
 DEFAULT_RUNS_ROOT = REPO_ROOT / "runs" / "disclosure"
 OUTPUT_HEADING = "\n## Output\n"
@@ -51,7 +57,7 @@ NUMBER_RE = re.compile(
 # --------------------------------------------------------------------------- refs
 
 REF_RE = re.compile(
-    r"""(?:(?P<sheet>'(?:[^']|'')+'|[A-Za-z_\\][A-Za-z0-9_. &-]*)!)?
+    r"""(?<![A-Za-z0-9_.'!])(?:(?P<sheet>'(?:[^']|'')+'|[A-Za-z0-9_\\][A-Za-z0-9_. &-]*)!)?
         (?P<a>\$?[A-Z]{1,3}\$?[0-9]{1,7})
         (?::(?P<b>\$?[A-Z]{1,3}\$?[0-9]{1,7}))?
         (?![A-Za-z0-9_(])""",
@@ -91,7 +97,8 @@ def unquote_sheet(name: str) -> str:
 
 
 def quote_sheet(name: str) -> str:
-    return "'%s'" % name if re.search(r"[^A-Za-z0-9_.]", name) else name
+    return ("'%s'" % name.replace("'", "''")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", name) else name)
 
 
 def key(sheet: str, coord: str) -> str:
@@ -99,7 +106,7 @@ def key(sheet: str, coord: str) -> str:
 
 
 def pretty(k: str) -> str:
-    sheet, coord = k.split("!", 1)
+    sheet, coord = k.rsplit("!", 1)
     return "%s!%s" % (quote_sheet(sheet), coord)
 
 
@@ -162,7 +169,7 @@ def cells_from_band_ref(ref: str) -> set[str]:
 # A formula that is exactly one cell reference. BARE_LINK is unsigned (a plain
 # link or `=+X`); BARE_ALIAS also admits a leading minus, because a negated
 # alias still carries the source's construction up to sign.
-_BARE_REF_BODY = r"(?:(?:'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_. &-]*)!)?\$?[A-Z]{1,3}\$?[0-9]{1,7}"
+_BARE_REF_BODY = r"(?:(?:'(?:[^']|'')+'|[A-Za-z0-9_][A-Za-z0-9_. &-]*)!)?\$?[A-Z]{1,3}\$?[0-9]{1,7}"
 BARE_LINK_RE = re.compile(r"^=\s*\+?\s*%s\s*$" % _BARE_REF_BODY)
 BARE_ALIAS_RE = re.compile(r"^=\s*[+\-]?\s*%s\s*$" % _BARE_REF_BODY)
 
@@ -184,16 +191,18 @@ class Book:
             for ws in wbf.worksheets:
                 self.sheets.append(ws.title)
                 vs = wbv[ws.title]
-                for row in ws.iter_rows():
-                    for cell in row:
-                        if cell.value is None:
-                            continue
-                        k = key(ws.title, cell.coordinate)
-                        if isinstance(cell.value, str) and cell.value.startswith("="):
-                            self.formula[k] = cell.value
-                            self.value[k] = vs[cell.coordinate].value
-                        else:
-                            self.value[k] = cell.value
+                # Iterating the bounding rectangle materializes millions of blank
+                # cells when a formatting stamp reaches XFD. Only stored cells
+                # can contain evidence; retain their actual Excel data type.
+                for cell in ws._cells.values():
+                    if cell.value is None:
+                        continue
+                    k = key(ws.title, cell.coordinate)
+                    if cell.data_type == "f" and isinstance(cell.value, str):
+                        self.formula[k] = cell.value
+                        self.value[k] = vs[cell.coordinate].value
+                    else:
+                        self.value[k] = cell.value
         finally:
             wbf.close()
             wbv.close()
@@ -202,6 +211,26 @@ class Book:
         self._stamp_cols: dict[str, set] = {}
         self._marker_cache: dict[str, dict] = {}
         self._max_cols: dict[str, int] = {}
+        self._stored_rows = None
+        self._text_rows = None
+
+    def stored_row_cells(self, sheet: str, rownum: int, lo: int = 1, hi: int | None = None) -> list[str]:
+        """Ordered evidence cells only; empty coordinates cannot satisfy value filters."""
+        if self._stored_rows is None:
+            rows = defaultdict(list)
+            text_rows = defaultdict(list)
+            for cell in set(self.value) | set(self.formula):
+                name, coord = cell.rsplit('!', 1)
+                parsed = split_coord(coord)
+                if parsed:
+                    position = (col_to_num(parsed[0]), cell)
+                    rows[(name, parsed[1])].append(position)
+                    if isinstance(self.value.get(cell), str):
+                        text_rows[(name, parsed[1])].append(position)
+            self._stored_rows = {row: sorted(cells) for row, cells in rows.items()}
+            self._text_rows = {row: sorted(cells) for row, cells in text_rows.items()}
+        return [cell for col, cell in self._stored_rows.get((sheet, rownum), ())
+                if col >= lo and (hi is None or col <= hi)]
 
     def max_col(self, sheet: str) -> int:
         """Rightmost used column on a sheet, so row scans never truncate scope."""
@@ -209,7 +238,7 @@ class Book:
             return self._max_cols[sheet]
         hi = 1
         for k in list(self.value) + list(self.formula):
-            s, coord = k.split("!", 1)
+            s, coord = k.rsplit("!", 1)
             if s != sheet:
                 continue
             p = split_coord(coord)
@@ -232,7 +261,7 @@ class Book:
         text = Counter()
         numeric = Counter()
         for k, v in self.value.items():
-            s, coord = k.split("!", 1)
+            s, coord = k.rsplit("!", 1)
             if s != sheet:
                 continue
             p = split_coord(coord)
@@ -263,7 +292,7 @@ class Book:
         stamps = Counter()
         other = Counter()
         for k, v in self.value.items():
-            s, coord = k.split("!", 1)
+            s, coord = k.rsplit("!", 1)
             if s != sheet or k in self.formula:
                 continue
             if not isinstance(v, str) or not v.strip():
@@ -300,7 +329,7 @@ class Book:
                 return v if isinstance(v, str) and v.strip() else None
             if not BARE_LINK_RE.match(formula.strip()):
                 return None
-            refs = refs_in(formula, cur.split("!", 1)[0])
+            refs = refs_in(formula, cur.rsplit("!", 1)[0])
             if len(refs) != 1:
                 return None
             cur = refs[0]
@@ -315,13 +344,56 @@ class Book:
         """
         return not bool(re.fullmatch(
             r"(?:base(?: case| plus| stressed)?|downside|lender|pancake|"
-            r"optimistic|pessimistic|salary only|hourly only)",
+            r"best case|worst case|optimistic|pessimistic|salary only|hourly only)",
             text.strip(),
             re.I,
         ))
 
     def has(self, k: str) -> bool:
         return k in self.value or k in self.formula
+
+    def side_growth_parameter(self, sheet: str, row: int, label_col: int, target_col: int, text: str) -> bool:
+        """A separate scalar growth assumption does not name an annual series.
+
+        Require explicit annual-grid geometry and an earlier row name. This is
+        deliberately narrower than choosing a sheet-wide or leftmost label:
+        ordinary adjacent assumption blocks keep their nearest governing name.
+        """
+        if not re.fullmatch(r"(?:long[- ]term|terminal|perpetual) growth(?: rate)?", text, re.I):
+            return False
+        following = self.stored_row_cells(sheet, row, lo=label_col + 1, hi=label_col + 3)
+        if len(following) != 1:
+            return False
+        parameter = following[0]
+        parameter_col = col_to_num(split_coord(parameter.rsplit("!", 1)[1])[0])
+        value = self.value.get(parameter)
+        if parameter in self.formula or type(value) not in (int, float) or not (-1 < value < 1):
+            return False
+        if target_col <= parameter_col:
+            return False
+        earlier = [cell for col, cell in self._text_rows.get((sheet, row), ()) if col < label_col]
+        if not any(self.row_label(cell) for cell in earlier):
+            return False
+        def year(header, column):
+            value = self.value.get(key(sheet, f"{num_to_col(column)}{header}"))
+            return int(value) if type(value) in (int, float) and 1900 <= value <= 2200 and value == int(value) else None
+        for header in range(row - 1, max(0, row - 33), -1):
+            current = year(header, target_col)
+            if current is None:
+                continue
+            lo = hi = target_col
+            while lo > 1 and year(header, lo - 1) == current - (target_col - lo + 1):
+                lo -= 1
+            while hi < self.max_col(sheet) and year(header, hi + 1) == current + (hi - target_col + 1):
+                hi += 1
+            if hi - lo + 1 < 3 or lo <= parameter_col + 1:
+                continue
+            # A blank separator keeps the parameter's short block distinct.
+            if self.stored_row_cells(sheet, row, lo=parameter_col + 1, hi=lo - 1):
+                continue
+            if lo <= target_col <= hi:
+                return True
+        return False
 
     def row_label(self, k: str) -> str:
         """The label governing this cell: nearest real name to its left on the row.
@@ -336,7 +408,7 @@ class Book:
         """
         if k in self._labels:
             return self._labels[k]
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         label = ""
         fallback = ""
@@ -344,8 +416,11 @@ class Book:
             col, row = col_to_num(p[0]), p[1]
             # Own cell first: a label sitting in a short block (I9) is the name.
             # Then walk left. Never jump to the leftmost column on the row.
-            for c in range(col, 0, -1):
-                candidate = key(sheet, "%s%d" % (num_to_col(c), row))
+            if self._stored_rows is None:
+                self.stored_row_cells(sheet, row, hi=0)
+            for c, candidate in reversed(self._text_rows.get((sheet, row), ())):
+                if c > col:
+                    continue
                 v = self.value.get(candidate)
                 # A formula's cached numeric, error or blank display is a
                 # result, not a row name: keep walking. But a formula whose
@@ -391,6 +466,8 @@ class Book:
                 if c in self.stamp_columns(sheet):
                     continue
                 if not self.is_row_name(sheet, c, text):
+                    continue
+                if self.side_growth_parameter(sheet, row, c, col, text):
                     continue
                 label = text
                 break
@@ -601,7 +678,7 @@ def regex_closure(gold: Book, targets: list[str], limit: int = 300000) -> list[s
         formula = gold.formula.get(k)
         if not formula:
             continue
-        sheet = k.split("!", 1)[0]
+        sheet = k.rsplit("!", 1)[0]
         for ref in refs_in(formula, sheet):
             if ref not in seen:
                 queue.append(ref)
@@ -673,7 +750,11 @@ def r1c1ish(formula: str, row: int, col: int) -> str:
 
 def _mech_tokens(formula: str):
     """Split a formula into a normalized non-ref skeleton and its ref tokens."""
-    body = STRING_RE.sub('""', formula)
+    literals = []
+    def protect(match):
+        literals.append(match.group())
+        return '\x00%d\x00' % (len(literals) - 1)
+    body = STRING_RE.sub(protect, formula)
     parts, refs, last = [], [], 0
     for m in REF_RE.finditer(body):
         if m.group("a").upper() in NOT_A_REF:
@@ -682,7 +763,10 @@ def _mech_tokens(formula: str):
         refs.append(m)
         last = m.end()
     parts.append(body[last:])
-    return re.sub(r"\s+", "", "".join(parts)).upper(), refs
+    skeleton = re.sub(r"\s+", "", "".join(parts)).upper()
+    for index, literal in enumerate(literals):
+        skeleton = skeleton.replace('\x00%d\x00' % index, literal)
+    return skeleton, refs
 
 
 def _mech_coord_match(ra: str, rb: str, dcol: int, drow: int) -> bool:
@@ -727,8 +811,8 @@ def copy_equivalent(gold: Book, a: str, b: str) -> bool:
     fa, fb = gold.formula.get(a), gold.formula.get(b)
     if not fa or not fb:
         return False
-    sheet_a, ca = a.split("!", 1)
-    sheet_b, cb = b.split("!", 1)
+    sheet_a, ca = a.rsplit("!", 1)
+    sheet_b, cb = b.rsplit("!", 1)
     if sheet_a != sheet_b:
         return False
     pa, pb = split_coord(ca), split_coord(cb)
@@ -757,7 +841,7 @@ def bare_row_copy(gold: Book, k: str) -> bool:
     m = re.fullmatch(r"=\s*\+?\s*(\$?[A-Z]{1,3}\$?\d{1,7})\s*", formula)
     if not m:
         return False
-    p = split_coord(k.split("!", 1)[1])
+    p = split_coord(k.rsplit("!", 1)[1])
     rp = split_coord(m.group(1))
     return bool(p and rp and rp[1] == p[1] and col_to_num(rp[0]) < col_to_num(p[0]))
 
@@ -787,7 +871,7 @@ def _copy_lock_split(gold: Book, cells: list[str]):
     skb, refsb = _mech_tokens(fb)
     if ska != skb or len(refsa) != len(refsb):
         return [], []
-    sheet = a.split("!", 1)[0]
+    sheet = a.rsplit("!", 1)[0]
 
     def shown(m) -> str:
         s = unquote_sheet(m.group("sheet")) if m.group("sheet") else sheet
@@ -876,15 +960,15 @@ def full_copied_scope(
     """
     if not cells:
         return cells
-    sheet, coord = cells[0].split("!", 1)
+    sheet, coord = cells[0].rsplit("!", 1)
     p0 = split_coord(coord)
     if not p0:
         return list(cells)
     row = p0[1]
     cols = sorted(
-        col_to_num(split_coord(c.split("!", 1)[1])[0])
+        col_to_num(split_coord(c.rsplit("!", 1)[1])[0])
         for c in cells
-        if split_coord(c.split("!", 1)[1])
+        if split_coord(c.rsplit("!", 1)[1])
     )
     if not cols:
         return list(cells)
@@ -923,15 +1007,15 @@ def full_copied_scope_vertical(
     """
     if not cells:
         return cells
-    sheet, coord = cells[0].split("!", 1)
+    sheet, coord = cells[0].rsplit("!", 1)
     p0 = split_coord(coord)
     if not p0:
         return list(cells)
     colnum = col_to_num(p0[0])
     rows = sorted(
-        split_coord(c.split("!", 1)[1])[1]
+        split_coord(c.rsplit("!", 1)[1])[1]
         for c in cells
-        if split_coord(c.split("!", 1)[1])
+        if split_coord(c.rsplit("!", 1)[1])
     )
     if not rows:
         return list(cells)
@@ -965,7 +1049,7 @@ def bare_alias_ref(gold: Book, k: str) -> str | None:
     formula = gold.formula.get(k)
     if not formula or len(formula) > 80 or not BARE_ALIAS_RE.match(formula.strip()):
         return None
-    refs = refs_in(formula, k.split("!", 1)[0])
+    refs = refs_in(formula, k.rsplit("!", 1)[0])
     return refs[0] if len(refs) == 1 else None
 
 
@@ -989,37 +1073,31 @@ def graded_closure(gold: Book, targets) -> set[str]:
     Summary!D50 leak is the direct case).
     """
     closure = set(targets)
-    links = []
+    links = defaultdict(set)
+    formula_rows = defaultdict(list)
     for k, formula in gold.formula.items():
         ref = bare_alias_ref(gold, k)
         if ref:
-            links.append((k, ref))
-    expanded: set[str] = set()
-    for _ in range(16):
-        changed = False
-        for a, b in links:
-            if (a in closure) != (b in closure):
-                closure.update((a, b))
-                changed = True
-        for c in sorted(closure - expanded):
-            expanded.add(c)
-            if c not in gold.formula:
-                continue
-            sheet, coord = c.split("!", 1)
-            p = split_coord(coord)
-            if not p:
-                continue
-            for other in gold.row_cells(sheet, p[1]):
-                if (
-                    other != c
-                    and other not in closure
-                    and other in gold.formula
-                    and copy_compatible(gold, c, other)
-                ):
-                    closure.add(other)
-                    changed = True
-        if not changed:
-            break
+            links[k].add(ref)
+            links[ref].add(k)
+        sheet, coord = k.rsplit('!', 1)
+        parsed = split_coord(coord)
+        if parsed:
+            formula_rows[(sheet, parsed[1])].append(k)
+    pending = list(sorted(closure))
+    while pending:
+        cell = pending.pop()
+        reached = set(links.get(cell, ()))
+        if cell in gold.formula:
+            sheet, coord = cell.rsplit('!', 1)
+            parsed = split_coord(coord)
+            if parsed:
+                for other in formula_rows[(sheet, parsed[1])]:
+                    if other not in closure and copy_compatible(gold, cell, other):
+                        reached.add(other)
+        for other in sorted(reached - closure):
+            closure.add(other)
+            pending.append(other)
     return closure
 
 
@@ -1036,7 +1114,7 @@ def group_bands(gold: Book, cells: list[str], targets: set | None = None) -> lis
     targets = targets or set()
     rows: dict[tuple, list[tuple[int, str]]] = defaultdict(list)
     for k in cells:
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if not p:
             continue
@@ -1065,8 +1143,8 @@ def group_bands(gold: Book, cells: list[str], targets: set | None = None) -> lis
         for r, full in extended:
             if merged:
                 prev_run, prev_full = merged[-1]
-                prev_hi = col_to_num(split_coord(prev_full[-1].split("!", 1)[1])[0])
-                cur_lo = col_to_num(split_coord(full[0].split("!", 1)[1])[0])
+                prev_hi = col_to_num(split_coord(prev_full[-1].rsplit("!", 1)[1])[0])
+                cur_lo = col_to_num(split_coord(full[0].rsplit("!", 1)[1])[0])
                 # Merge only when the extended scopes actually overlap, which
                 # proves the walk crossed the gap on compatible mechanics.
                 # Runs that merely touch are different copy families sitting
@@ -1087,7 +1165,7 @@ def group_bands(gold: Book, cells: list[str], targets: set | None = None) -> lis
 def make_vertical_band(gold: Book, sheet: str, colnum: int, run_keys: list[str],
                        full: list[str] | None = None) -> dict:
     stated = full or run_keys
-    rows = [split_coord(k.split("!", 1)[1])[1] for k in stated]
+    rows = [split_coord(k.rsplit("!", 1)[1])[1] for k in stated]
     col = num_to_col(colnum)
     ref = (
         f"{quote_sheet(sheet)}!{col}{rows[0]}"
@@ -1095,7 +1173,7 @@ def make_vertical_band(gold: Book, sheet: str, colnum: int, run_keys: list[str],
         else f"{quote_sheet(sheet)}!{col}{rows[0]}:{col}{rows[-1]}"
     )
     formulas = list(dict.fromkeys(gold.formula.get(k, "") for k in run_keys))
-    first_row = split_coord(run_keys[0].split("!", 1)[1])[1]
+    first_row = split_coord(run_keys[0].rsplit("!", 1)[1])[1]
     return {
         "band": ref,
         "sheet": sheet,
@@ -1135,7 +1213,7 @@ def merge_vertical_singletons(gold: Book, bands: list[dict],
     by_col: dict[tuple, list] = defaultdict(list)
     for band in singles:
         k = band["cell_keys"][0]
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if not p:
             out.append(band)
@@ -1149,7 +1227,8 @@ def merge_vertical_singletons(gold: Book, bands: list[dict],
             if run and not (
                 item[0] == run[-1][0] + 1
                 and copy_equivalent(gold, run[-1][1], item[1])
-                and gold.row_label(run[-1][1]) == gold.row_label(item[1])
+                and len({gold.row_label(k) for _, k, _ in run + [item]
+                         if gold.row_label(k)}) <= 1
             ):
                 runs.append(run)
                 run = []
@@ -1170,8 +1249,8 @@ def make_band(gold: Book, sheet: str, row: int, run: list[tuple[int, str]],
               full: list[str] | None = None) -> dict:
     cells = [k for _, k in run]
     stated = full or cells
-    first_col = col_to_num(split_coord(stated[0].split("!", 1)[1])[0])
-    last_col = col_to_num(split_coord(stated[-1].split("!", 1)[1])[0])
+    first_col = col_to_num(split_coord(stated[0].rsplit("!", 1)[1])[0])
+    last_col = col_to_num(split_coord(stated[-1].rsplit("!", 1)[1])[0])
     ref = (
         f"{quote_sheet(sheet)}!{num_to_col(first_col)}{row}"
         if first_col == last_col
@@ -1500,6 +1579,21 @@ def method_roles_for_band(gold: Book, band: dict) -> tuple[list[str], list[str]]
     """
     own = band.get("label") or ""
     direct = method_roles(own)
+    # Drug reimbursement is a healthcare revenue stream when explicitly
+    # nested under a Revenue heading. The generic reimbursement debt alias
+    # must not override this observed context. Debt-labelled rows retain
+    # their original classification.
+    if (direct == ["method_debt_movement"]
+            and re.search(r"\bdrug reimbursement\b", own, re.I)
+            and not re.search(r"\b(debt|loan|repayment|drawdown)\b", own, re.I)):
+        row = int(band.get("row") or 1)
+        sheet = band.get("sheet")
+        col = int(band.get("col_lo", 1))
+        headings = [gold.row_label(key(sheet, "%s%d" % (num_to_col(col), r)))
+                    for r in range(max(1, row - 2), row)]
+        if any(re.fullmatch(r"\s*revenue[s]?\s*", h, re.I) for h in headings):
+            return ["method_revenue"], [own, *headings,
+                "drug reimbursement under explicit revenue heading"]
     if direct:
         return direct, [own]
     sheet, row = band.get("sheet"), band.get("row")
@@ -1548,47 +1642,12 @@ def role_case_id(label: str, roles: list[str], role_context: list[str]) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
 
-def prepare_method_items(gold: Book, bands: list[dict]) -> list[dict]:
-    """Assign roles with the existing neighborhood rules. No arbitration yet."""
-    prepared = []
-    for original in bands:
-        for band in method_subbands(gold, original):
-            label = band.get("label") or ""
-            if not label:
-                prepared.append({
-                    "band": band,
-                    "label": "",
-                    "roles": [],
-                    "role_context": [],
-                    "blank_label": True,
-                })
-                continue
-            roles, role_context = method_roles_for_band(gold, band)
-            prepared.append({
-                "band": band,
-                "label": label,
-                "roles": roles,
-                "role_context": role_context,
-                "blank_label": False,
-            })
-    for item in prepared:
-        if item["blank_label"] or item["roles"]:
-            continue
-        band = item["band"]
-        nearby_roles = {
-            other["roles"][0]
-            for other in prepared
-            if not other.get("blank_label")
-            and len(other["roles"]) == 1
-            and other["band"].get("sheet") == band.get("sheet")
-            and other["band"].get("pattern") == band.get("pattern")
-            and abs(int(other["band"].get("row", 0)) - int(band.get("row", 0))) <= 6
-        }
-        if len(nearby_roles) == 1:
-            item["roles"] = list(nearby_roles)
-            item["role_context"] = item["role_context"] + [
-                "role propagated from same-shape neighboring row"
-            ]
+def prepare_method_items(gold: Book, bands: list[dict]):
+    """Preserve occurrence order and roles without repeated metadata allocation."""
+    prepared = indexed_methods.prepare(SimpleNamespace(**globals()), gold, bands)
+    if len(prepared) <= INDEXED_METHOD_THRESHOLD and prepared.expanded_json_bytes(default=jsonable) <= 8 * 1024 * 1024:
+        # Preserve the legacy small-workbook list API and serialized evidence.
+        return [dict(item) for item in prepared]
     return prepared
 
 
@@ -1607,6 +1666,8 @@ def triggered_by_for_item(item: dict) -> dict:
 
 def collect_ambiguous_role_cases(prepared: list[dict]) -> list[dict]:
     """One case per unique (label, roles, role_context) with two or more roles."""
+    if isinstance(prepared, indexed_methods.Prepared):
+        return indexed_methods.role_cases(SimpleNamespace(**globals()), prepared)
     groups: dict[str, dict] = {}
     for item in prepared:
         if item.get("blank_label"):
@@ -1827,7 +1888,7 @@ def method_subbands(gold: Book, band: dict) -> list[dict]:
 
     by_row: dict[tuple[str, int, str], list[tuple[int, str]]] = defaultdict(list)
     for cell, label in zip(cells, labels):
-        sheet, coord = cell.split("!", 1)
+        sheet, coord = cell.rsplit("!", 1)
         parsed = split_coord(coord)
         if not parsed:
             return [band]
@@ -1877,7 +1938,7 @@ def formula_profile(gold: Book, band: dict) -> dict:
         profile["error"] = f"parse_error:{exc}"
         return profile
 
-    sheet = cells[0].split("!", 1)[0]
+    sheet = cells[0].rsplit("!", 1)[0]
     references = refs_in(formula, sheet)
     labels = []
     for ref in references:
@@ -1932,13 +1993,13 @@ def references_same_row(profile: dict) -> bool:
     cells = profile.get("cells") or []
     if not cells:
         return False
-    sheet, coord = cells[0].split("!", 1)
+    sheet, coord = cells[0].rsplit("!", 1)
     p = split_coord(coord)
     if not p:
         return False
     row = p[1]
     for ref in profile.get("references", []):
-        rsheet, rcoord = ref.split("!", 1)
+        rsheet, rcoord = ref.rsplit("!", 1)
         rp = split_coord(rcoord)
         if rsheet == sheet and rp and rp[1] == row:
             return True
@@ -1949,7 +2010,7 @@ def ast_ref_cell(node, profile: dict) -> str | None:
     if node.kind != "ref":
         return None
     cells = profile.get("cells") or []
-    sheet = cells[0].split("!", 1)[0] if cells else ""
+    sheet = cells[0].rsplit("!", 1)[0] if cells else ""
     refs = refs_in("=" + node.name, sheet)
     return refs[0] if len(refs) == 1 else None
 
@@ -1960,7 +2021,7 @@ def exact_prior_period_growth(profile: dict) -> bool:
     cells = profile.get("cells") or []
     if ast is None or not cells or ast.kind != "infix" or ast.name != "*" or len(ast.args) != 2:
         return False
-    sheet, coord = cells[0].split("!", 1)
+    sheet, coord = cells[0].rsplit("!", 1)
     p = split_coord(coord)
     if not p:
         return False
@@ -1970,7 +2031,7 @@ def exact_prior_period_growth(profile: dict) -> bool:
         ref = ast_ref_cell(node, profile)
         if not ref:
             return False
-        rsheet, rcoord = ref.split("!", 1)
+        rsheet, rcoord = ref.rsplit("!", 1)
         rp = split_coord(rcoord)
         return bool(
             rsheet == sheet and rp
@@ -2438,7 +2499,7 @@ def describe_ast(node, gold: Book, sheet: str, own_label: str) -> str:
 
 def custom_sentence_fields(profile: dict, gold: Book, lock_cells: list | None = None) -> dict:
     cells = profile.get("cells") or []
-    sheet = cells[0].split("!", 1)[0] if cells else ""
+    sheet = cells[0].rsplit("!", 1)[0] if cells else ""
     ast = profile.get("ast")
     steps = describe_ast(ast, gold, sheet, profile.get("label", "")) if ast is not None else ""
     if steps:
@@ -2475,14 +2536,14 @@ def expand_method_band(gold: Book, delivered: Book, band: dict) -> dict:
     cells = list(band.get("cell_keys") or [])
     if not cells:
         return band
-    first = split_coord(cells[0].split("!", 1)[1])
+    first = split_coord(cells[0].rsplit("!", 1)[1])
     if not first:
         return band
     sheet, row = band.get("sheet"), int(band.get("row") or first[1])
     pattern = band.get("pattern") or r1c1ish(
         gold.formula.get(cells[0], ""), row, col_to_num(first[0])
     )
-    cols = [col_to_num(split_coord(c.split("!", 1)[1])[0]) for c in cells]
+    cols = [col_to_num(split_coord(c.rsplit("!", 1)[1])[0]) for c in cells]
     lo, hi = min(cols), max(cols)
 
     def matches(col: int) -> bool:
@@ -2518,6 +2579,8 @@ def detect_custom_methods(
     """Run before convention detectors; only confident no-matches claim a band."""
     records, assessments, claimed = [], [], set()
     prepared = prepare_method_items(gold, bands)
+    if isinstance(prepared, indexed_methods.Prepared):
+        return indexed_methods.detect(SimpleNamespace(**globals()), gold, delivered, bands, targets, resolutions_path, prepared=prepared)
     cases = collect_ambiguous_role_cases(prepared)
     if cases and resolutions_path is not None:
         payload = require_role_resolutions(cases, resolutions_path)
@@ -2652,7 +2715,7 @@ def calibrate_legacy_custom(task_dir: Path, assessments: list[dict], selected: s
     for band in old:
         cells = cells_from_band_ref(band)
         overlaps = [
-            a for a in assessments
+            a for a, _count in indexed_assessments.weighted(assessments)
             if cells & set(a.get("cell_keys", []))
         ]
         statuses = sorted({a.get("status", "unknown") for a in overlaps})
@@ -2698,12 +2761,12 @@ def detect_discount_period(gold: Book, scope: set[str]) -> list[dict]:
         label = gold.row_label(k).lower()
         if "discount period" not in label and "discount factor period" not in label:
             continue
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if not p or (sheet, p[1]) in seen_rows:
             continue
         seen_rows.add((sheet, p[1]))
-        row = [c for c in gold.row_cells(sheet, p[1]) if c in gold.formula or c in gold.value]
+        row = gold.stored_row_cells(sheet, p[1])
         nums = [gold.value.get(c) for c in row if isinstance(gold.value.get(c), (int, float))]
         formulas = [gold.formula[c] for c in row if c in gold.formula]
         value = None
@@ -2736,12 +2799,12 @@ def detect_inert_line(gold: Book, scope: set[str]) -> list[dict]:
             label, re.I,
         ):
             continue
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if not p or (sheet, p[1]) in seen_rows:
             continue
         seen_rows.add((sheet, p[1]))
-        row = [c for c in gold.row_cells(sheet, p[1]) if c in gold.formula]
+        row = [c for c in gold.stored_row_cells(sheet, p[1]) if c in gold.formula]
         vals = [gold.value.get(c) for c in row]
         nums = [v for v in vals if isinstance(v, (int, float))]
         if not row or len(nums) < 2:
@@ -2771,12 +2834,12 @@ def detect_terminal_value(gold: Book, scope: set[str]) -> list[dict]:
         label = gold.row_label(k).lower()
         if "terminal value" not in label and "exit value" not in label:
             continue
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if not p or (sheet, p[1]) in seen_rows:
             continue
         seen_rows.add((sheet, p[1]))
-        row = [c for c in gold.row_cells(sheet, p[1]) if c in gold.formula]
+        row = [c for c in gold.stored_row_cells(sheet, p[1]) if c in gold.formula]
         row_label = gold.row_label(k)
         if not row:
             out.append(record(
@@ -2805,12 +2868,12 @@ def detect_terminal_value(gold: Book, scope: set[str]) -> list[dict]:
 
 def _row_once(gold: Book, k: str, seen_rows: set) -> tuple | None:
     """Resolve a scope cell to its sheet, row number and formula cells, once."""
-    sheet, coord = k.split("!", 1)
+    sheet, coord = k.rsplit("!", 1)
     p = split_coord(coord)
     if not p or (sheet, p[1]) in seen_rows:
         return None
     seen_rows.add((sheet, p[1]))
-    row = [c for c in gold.row_cells(sheet, p[1]) if c in gold.formula]
+    row = [c for c in gold.stored_row_cells(sheet, p[1]) if c in gold.formula]
     return (sheet, p[1], col_to_num(p[0]), row) if row else None
 
 
@@ -2940,7 +3003,7 @@ def detect_distribution_policy(gold: Book, scope: set[str],
         def dist_rank(cell: str) -> int:
             f = gold.formula[cell]
             u = f.upper()
-            c = split_coord(cell.split("!", 1)[1])
+            c = split_coord(cell.rsplit("!", 1)[1])
             labs = _ingredient_labels(
                 gold, f, sheet, rownum, col_to_num(c[0]) if c else col
             )
@@ -2973,7 +3036,7 @@ def detect_distribution_policy(gold: Book, scope: set[str],
         upper = formula.upper()
         labels = _ingredient_labels(
             gold, formula, sheet, rownum,
-            col_to_num(split_coord(cell.split("!", 1)[1])[0]),
+            col_to_num(split_coord(cell.rsplit("!", 1)[1])[0]),
         )
         # Every value needs a positive signal. There is no default: a dividend
         # row whose shape says nothing is left uncovered, because asserting a
@@ -3020,11 +3083,11 @@ def detect_distribution_policy(gold: Book, scope: set[str],
             steps = describe_ast(ast, gold, sheet, label)
             if _single_ref_cell(ast, sheet):
                 ref_cell = _single_ref_cell(ast, sheet)
-                own_p = split_coord(cell.split("!", 1)[1])
-                ref_p = split_coord(ref_cell.split("!", 1)[1])
+                own_p = split_coord(cell.rsplit("!", 1)[1])
+                ref_p = split_coord(ref_cell.rsplit("!", 1)[1])
                 same_col = bool(
                     own_p and ref_p and own_p[0] == ref_p[0]
-                    and ref_cell.split("!", 1)[0] == sheet
+                    and ref_cell.rsplit("!", 1)[0] == sheet
                 )
                 lead = (
                     "copy the same-column value from"
@@ -3089,7 +3152,7 @@ def detect_liquidation_preference(gold: Book, scope: set[str]) -> list[dict]:
         if not any(t in lowered for t in EXIT_SPLIT_LABELS):
             continue
         # Exit or cap-table block only. Elsewhere these words are commentary.
-        sheet_l = k.split("!", 1)[0].lower()
+        sheet_l = k.rsplit("!", 1)[0].lower()
         if "cap table" not in sheet_l and "exit" not in lowered and "waterfall" not in lowered:
             continue
         resolved = _row_once(gold, k, seen_rows)
@@ -3116,7 +3179,7 @@ def detect_liquidation_preference(gold: Book, scope: set[str]) -> list[dict]:
         # A product or a SUM labelled "Exit Equity Value" is not a split
         # convention. 0644's Flags row 420 is that shape. 0668 ships because
         # D43/D49 carry the solved preference (rank 1).
-        if rnk == 0 and "cap table" not in k.split("!", 1)[0].lower():
+        if rnk == 0 and "cap table" not in k.rsplit("!", 1)[0].lower():
             continue
         if rnk == 0 and "/" not in gold.formula[cell]:
             continue
@@ -3192,7 +3255,7 @@ def ingredient_phrase(gold: Book, evidence: str, cells: list[str], own_label: st
     """
     if not cells:
         return ""
-    sheet, coord = cells[0].split("!", 1)
+    sheet, coord = cells[0].rsplit("!", 1)
     p = split_coord(coord)
     if not p:
         return ""
@@ -3235,7 +3298,7 @@ def detect_projection_rule(gold: Book, delivered: Book, selected: set[str],
                            targets: set | None = None) -> list[dict]:
     rows = defaultdict(list)
     for k in selected:
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if p:
             rows[(sheet, p[1])].append((col_to_num(p[0]), k))
@@ -3301,7 +3364,7 @@ def append_projection_run(out: list[dict], gold: Book, run: list[tuple],
         return
     cells = [item[1] for item in run]
     evidence = gold.formula.get(cells[min(1, len(cells) - 1)], "")
-    sheet, coord = cells[0].split("!", 1)
+    sheet, coord = cells[0].rsplit("!", 1)
     first = split_coord(coord)
     if kind == "hold_level" and first and run[0][0] >= 3:
         row = first[1]
@@ -3347,7 +3410,7 @@ def _multiplies_ref(formula: str, ref: str) -> bool:
     equity-investment amount with no operator at all - and the old detector
     still described it as an ownership-share multiplication.
     """
-    sheet, coord = ref.split("!", 1)
+    sheet, coord = ref.rsplit("!", 1)
     p = split_coord(coord)
     if not p:
         return False
@@ -3363,6 +3426,8 @@ def _multiplies_ref(formula: str, ref: str) -> bool:
 def detect_stake_scaling(gold: Book, scope: set[str]) -> list[dict]:
     pct_cells = set()
     for k, v in gold.value.items():
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v <= 1):
+            continue
         label = gold.row_label(k)
         if not label or not re.search(r"equity investment|ownership|stake|% acquired", label, re.I):
             continue
@@ -3370,8 +3435,7 @@ def detect_stake_scaling(gold: Book, scope: set[str]) -> list[dict]:
         # AMOUNT matches the label pattern too (0666), and describing a read
         # of that amount as share scaling states mechanics the formula does
         # not have.
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v <= 1:
-            pct_cells.add(k)
+        pct_cells.add(k)
     byrow = defaultdict(list)
     for k in sorted(scope):
         formula = gold.formula.get(k)
@@ -3395,12 +3459,12 @@ def detect_stake_scaling(gold: Book, scope: set[str]) -> list[dict]:
             or any(arg.kind != "ref" for arg in ast.args)
         ):
             continue
-        references = refs_in(formula, k.split("!", 1)[0])
+        references = refs_in(formula, k.rsplit("!", 1)[0])
         hits = [ref for ref in references if ref in pct_cells]
         bases = [ref for ref in references if ref not in pct_cells]
         if len(hits) != 1 or len(bases) != 1:
             continue
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if p:
             byrow[(sheet, p[1])].append(
@@ -3437,7 +3501,7 @@ def detect_stake_scaling(gold: Book, scope: set[str]) -> list[dict]:
 
 
 def _row_key(ref: str) -> tuple[str, int] | None:
-    sheet, coord = ref.split("!", 1)
+    sheet, coord = ref.rsplit("!", 1)
     p = split_coord(coord)
     return (sheet, p[1]) if p else None
 
@@ -3480,7 +3544,7 @@ def detect_source_selection(gold: Book, scope: set[str]) -> list[dict]:
         formula = gold.formula.get(k)
         if not formula:
             continue
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if not p:
             continue
@@ -3492,7 +3556,7 @@ def detect_source_selection(gold: Book, scope: set[str]) -> list[dict]:
             continue
         if (sheet, p[1], source) in seen_links:
             continue
-        source_sheet = source.split("!", 1)[0]
+        source_sheet = source.rsplit("!", 1)[0]
         lowered = label.lower()
         purchase = any(t in lowered for t in (
             "initial investment", "purchase price", "entry", "consideration", "cv",
@@ -3532,8 +3596,7 @@ def detect_source_selection(gold: Book, scope: set[str]) -> list[dict]:
 
 
 def row_has_data(gold: Book, sheet: str, rownum: int) -> bool:
-    for c in range(1, 61):
-        k = key(sheet, "%s%d" % (num_to_col(c), rownum))
+    for k in gold.stored_row_cells(sheet, rownum):
         if k in gold.formula or isinstance(gold.value.get(k), (int, float)):
             return True
     return False
@@ -3548,11 +3611,11 @@ def rows_inside_sums(gold: Book) -> dict:
     """
     out: dict = defaultdict(set)
     for k, formula in gold.formula.items():
-        sheet = k.split("!", 1)[0]
+        sheet = k.rsplit("!", 1)[0]
         for m in re.finditer(r"SUM\(\s*(\$?[A-Z]{1,3}\$?\d+\s*:\s*\$?[A-Z]{1,3}\$?\d+)\s*\)",
                              formula, re.I):
             for cell in refs_in("=" + m.group(1), sheet):
-                csheet, coord = cell.split("!", 1)
+                csheet, coord = cell.rsplit("!", 1)
                 p = split_coord(coord)
                 if p:
                     out[csheet].add(p[1])
@@ -3562,17 +3625,17 @@ def rows_inside_sums(gold: Book) -> dict:
 def detect_row_populated(gold: Book, delivered: Book, scope: set[str], targets: list[str]) -> list[dict]:
     out = []
     summed_rows = rows_inside_sums(gold)
-    sheets = {t.split("!", 1)[0] for t in targets}
+    sheets = {t.rsplit("!", 1)[0] for t in targets}
     scope_rows = defaultdict(set)
     for k in sorted(scope):
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if p:
             scope_rows[sheet].add(p[1])
     for sheet in sorted(sheets):
         rows = defaultdict(list)
         for k in list(gold.value) + list(gold.formula):
-            s, coord = k.split("!", 1)
+            s, coord = k.rsplit("!", 1)
             if s != sheet:
                 continue
             p = split_coord(coord)
@@ -3637,7 +3700,7 @@ def detect_populated_but_unread(gold: Book, delivered: Book) -> list[dict]:
     truncated: set[str] = set()
     referenced: set[str] = set()
     for k, formula in gold.formula.items():
-        sheet = k.split("!", 1)[0]
+        sheet = k.rsplit("!", 1)[0]
         referenced.update(refs_in(formula, sheet, truncated=truncated))
     referenced_rows = set()
     for ref in referenced:
@@ -3646,7 +3709,7 @@ def detect_populated_but_unread(gold: Book, delivered: Book) -> list[dict]:
             referenced_rows.add(rk)
     out, seen = [], set()
     for k in list(gold.value) + list(gold.formula):
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if not p or (sheet, p[1]) in seen:
             continue
@@ -3660,7 +3723,9 @@ def detect_populated_but_unread(gold: Book, delivered: Book) -> list[dict]:
             continue
         if not ASSUMPTION_LABEL_RE.search(label):
             continue
-        row_cells = gold.row_cells(sheet, p[1])
+        row_cells = sorted(set(gold.stored_row_cells(sheet, p[1])) |
+                           set(delivered.stored_row_cells(sheet, p[1], hi=gold.max_col(sheet))),
+                           key=lambda cell: col_to_num(split_coord(cell.rsplit('!', 1)[1])[0]))
         surviving = [
             c for c in row_cells
             if c in delivered.formula
@@ -3699,27 +3764,27 @@ def detect_aggregate_scope(gold: Book, delivered: Book, targets: list[str]) -> l
                      formula.strip(), re.I)
         if not m:
             continue
-        sheet = k.split("!", 1)[0]
+        sheet = k.rsplit("!", 1)[0]
         spanned = refs_in("=" + m.group(1).strip(), sheet)
         # Vertical only: a same-row horizontal SUM names one row and renders as
         # "the total labelled X is the sum of the row labelled X".
-        member_rows = {split_coord(c.split("!", 1)[1])[1] for c in spanned
-                       if split_coord(c.split("!", 1)[1])}
+        member_rows = {split_coord(c.rsplit("!", 1)[1])[1] for c in spanned
+                       if split_coord(c.rsplit("!", 1)[1])}
         if len(member_rows) < 2:
             continue
         named = [gold.row_label(c) for c in spanned]
         if not all(named):
             continue
-        if not all(row_has_data(gold, *c.split("!", 1)[0:1], split_coord(c.split("!", 1)[1])[1])
+        if not all(row_has_data(gold, *c.rsplit("!", 1)[0:1], split_coord(c.rsplit("!", 1)[1])[1])
                    for c in spanned):
             continue
         labels = list(dict.fromkeys(named))
         members = [c for c in spanned if not delivered.has(c)]
         if not members or not labels:
             continue
-        first = split_coord(spanned[0].split("!", 1)[1])
-        last = split_coord(spanned[-1].split("!", 1)[1])
-        target = split_coord(k.split("!", 1)[1])
+        first = split_coord(spanned[0].rsplit("!", 1)[1])
+        last = split_coord(spanned[-1].rsplit("!", 1)[1])
+        target = split_coord(k.rsplit("!", 1)[1])
         if not first or not last or not target:
             continue
         group_key = (sheet, first[1], last[1], tuple(labels), gold.row_label(k))
@@ -3848,7 +3913,7 @@ def _ingredients(evidence: str, sheet: str, row: int, col: int) -> list[tuple[st
     """Referenced cells other than the immediately-prior column on the same row."""
     out = []
     for ref in refs_in(evidence, sheet):
-        rsheet, coord = ref.split("!", 1)
+        rsheet, coord = ref.rsplit("!", 1)
         p = split_coord(coord)
         if not p:
             continue
@@ -3883,7 +3948,7 @@ def ship_projection_rule(rec: dict, ctx: dict) -> bool:
             "only a literal hold-level convention is safe for agent-facing disclosure"
         )
         return False
-    sheet, coord = cells[0].split("!", 1)
+    sheet, coord = cells[0].rsplit("!", 1)
     p = split_coord(coord)
     if not p:
         return False
@@ -3969,7 +4034,7 @@ def ship_source_selection(rec: dict, ctx: dict) -> bool:
             "exactly; this shape stays reviewer-only"
         )
         return False
-    if src.split("!", 1)[0] == cells[0].split("!", 1)[0]:
+    if src.rsplit("!", 1)[0] == cells[0].rsplit("!", 1)[0]:
         rec["declined_reason"] = "same-sheet mirror is ordinary spreadsheet reasoning"
         return False
     if any(c in ctx["targets"] for c in cells) or src in ctx["targets"]:
@@ -4090,7 +4155,7 @@ def _origin(rec: dict):
     cells = rec.get("cell_keys") or []
     if not cells:
         return "", 0, 0
-    sheet, coord = cells[0].split("!", 1)
+    sheet, coord = cells[0].rsplit("!", 1)
     p = split_coord(coord)
     return (sheet, p[1], col_to_num(p[0])) if p else (sheet, 0, 0)
 
@@ -4231,7 +4296,7 @@ def detect_defects(gold: Book, targets: list[str], scope: set[str]) -> list[dict
         m = re.search(r"\*\s*\(\s*1\s*\+\s*([^)]+)\)", formula)
         if not m:
             continue
-        sheet, coord = k.split("!", 1)
+        sheet, coord = k.rsplit("!", 1)
         p = split_coord(coord)
         if not p or (sheet, p[1]) in seen_rows:
             continue
@@ -4245,7 +4310,7 @@ def detect_defects(gold: Book, targets: list[str], scope: set[str]) -> list[dict
         formula = gold.formula.get(k)
         val = gold.value.get(k)
         if formula and isinstance(val, (int, float)) and abs(val) < 1e-12:
-            empty = [r for r in refs_in(formula, k.split("!", 1)[0]) if not gold.has(r)]
+            empty = [r for r in refs_in(formula, k.rsplit("!", 1)[0]) if not gold.has(r)]
             if empty:
                 out.append({"kind": "empty_operand_zero_target", "cell": pretty(k), "detail": f"Target is zero because {_fmt(empty, 2)} is empty: {formula}"})
     return out
@@ -4492,9 +4557,7 @@ def detect_records(args) -> dict:
             "unexplained_cells": len(scope - claimed),
             "graded_closure_cells": len(closure),
             "leak_flags": sum(1 for r in unique if r.get("leak_flag")),
-            "method_assessments": dict(Counter(
-                a.get("status", "unknown") for a in method_assessments
-            )),
+            "method_assessments": dict(indexed_assessments.status_counts(method_assessments)),
             "custom_claimed_cells": len(custom_claimed),
             "legacy_custom_calibration": custom_calibration.get("outcomes", {}),
         },
@@ -4680,7 +4743,15 @@ def render_sentence(rec: dict) -> str:
     template = entry.get("sentences", {}).get(rec.get("value") or "")
     if not template:
         return ""
-    fields = rec.get("fields") or {}
+    fields = dict(rec.get("fields") or {})
+    if "{calculation_kind}" in template:
+        fields["calculation_kind"] = {
+            "single": "single-cell calculation",
+            "row": "copied-column calculation",
+            "column": "calculation copied down the rows",
+            "mixed": "calculation",
+            "none": fields.get("calculation_kind", ""),
+        }[stated_orientation(rec)]
     # An empty field means the detector could not name the thing cleanly. Render
     # nothing rather than a sentence with a hole in it. A quoted empty label
     # ('""') is the same hole wearing quotes: 0666 shipped a sentence claiming
@@ -4693,6 +4764,8 @@ def render_sentence(rec: dict) -> str:
         return ""
     if "{" in text:
         return ""
+    if stated_orientation(rec) == "single" and fields.get("representative"):
+        text = text.replace(", shown for %s:" % fields["representative"], ":")
     # The registry method template says "copied-column calculation". For a
     # single-cell stated scope that claim is false (0248, 0462, 0518, 0537,
     # 0605), and for a copied-DOWN family the direction is wrong. Rewrite the
@@ -4739,7 +4812,7 @@ def render_section(records: list[dict]) -> str:
             sheet = ""
             first = (by_band[band][0].get("cells") or [""])[0]
             if isinstance(first, str) and "!" in first:
-                sheet = first.split("!", 1)[0].strip("`'\"")
+                sheet = first.rsplit("!", 1)[0].strip("`'\"")
             candidates = []
             if sheet:
                 candidates.append("On the %s sheet, %s%s" % (
@@ -4830,7 +4903,7 @@ def trusted_formula_literal_counts(records: list[dict], task_dir: Path) -> Count
 
 
 def trusted_row_label_literal_counts(
-    records: list[dict], task_dir: Path
+    records: list[dict], task_dir: Path, gold: Book | None = None
 ) -> Counter:
     """License numeric text in verified row labels on ungraded cells.
 
@@ -4839,6 +4912,8 @@ def trusted_row_label_literal_counts(
     ``Adjusted EBITDA (FY 2013)`` from being mistaken for an unrelated graded
     numeric value that happens to equal the year.
     """
+    if gold is None:
+        return Counter()
     targets, _ = load_key(task_dir)
     target_cells = {
         parse_ref(ref, "")
@@ -4856,13 +4931,26 @@ def trusted_row_label_literal_counts(
             or cells & target_cells
             or not label
             or label not in render_sentence(rec)
+            or any(gold.row_label(cell) != label for cell in cells)
         ):
             continue
-        for raw in NUMBER_RE.findall(label):
-            try:
-                allowed[float(raw.replace(",", ""))] += 1
-            except ValueError:
-                continue
+        labels = [label]
+        source = rec.get('source_cell')
+        if rec.get('entry') == 'source_selection' and source and len(cells) == 1 and source not in target_cells:
+            target = next(iter(cells))
+            formula = gold.formula.get(target, '')
+            expected = describe_ref(gold, pretty(source), target.rsplit('!', 1)[0], label)
+            if (BARE_LINK_RE.fullmatch(formula.strip()) and bare_alias_ref(gold, target) == source
+                    and (rec.get('fields') or {}).get('ingredient') == expected):
+                source_label = gold.row_label(source)
+                if source_label and source_label in expected:
+                    labels.append(source_label)
+        for verified_label in labels:
+            for raw in NUMBER_RE.findall(verified_label):
+                try:
+                    allowed[float(raw.replace(",", ""))] += 1
+                except ValueError:
+                    continue
     return allowed
 
 
@@ -4873,8 +4961,99 @@ def significant_digits(raw: str) -> int:
     return len(digits)
 
 
+def verified_header_numeric_offsets(section: str, records: list[dict], gold: Book | None) -> dict[int, dict]:
+    """Locate numeric metadata only in exact, independently checked cell headers.
+
+    A digit in a real sheet name such as Cut #1 is not a disclosed answer.
+    Exemptions never extend beyond the canonical bullet locator into its prose.
+    Unknown/range/whole-row record identities remain subject to ordinary audit.
+    """
+    if gold is None:
+        return {}
+    headers = {}
+    for rec in records:
+        cells = rec.get("cells") or []
+        keys = _stated_keys(rec)
+        if not cells or len(keys) != len(cells) or set(keys) != set(rec.get("cell_keys") or []):
+            continue
+        if any(k not in gold.value or k.rsplit("!", 1)[0] not in gold.sheets for k in keys):
+            continue
+        locator = compact_cells(cells)
+        headers["- " + locator + ": "] = locator
+    offsets = {}
+    for header, locator in headers.items():
+        for found in re.finditer("^" + re.escape(header), section, flags=re.MULTILINE):
+            for number in NUMBER_RE.finditer(header):
+                offset = found.start() + number.start()
+                offsets[offset] = {"kind": "verified_cell_locator", "literal": number.group(),
+                                   "locator": locator, "offset": offset}
+    return offsets
+
+
+def verified_source_label_numeric_offsets(section: str, task_dir: Path, records: list[dict],
+                                          gold: Book | None, closure: set[str] | None = None) -> dict[int, dict]:
+    """Budget only the verified source-row label span, including re-anchored prose."""
+    if gold is None:
+        return {}
+    targets, _ = load_key(task_dir)
+    target_cells = {parse_ref(ref, "") for ref in targets if "!" in ref}
+    offsets = {}
+    for rec in records:
+        cells = _stated_keys(rec)
+        source = rec.get("source_cell")
+        fields = rec.get("fields") or {}
+        if (rec.get("entry") != "source_selection" or rec.get("disposition") != "disclosed"
+                or rec.get("leak_flag") or len(cells) != 1 or set(cells) != set(rec.get("cell_keys") or [])
+                or not source or source in target_cells or cells[0] in target_cells
+                or (closure and record_reach(rec) & set(closure))):
+            continue
+        target = cells[0]
+        target_label = _unquote_label(fields.get("label"))
+        source_label = gold.row_label(source)
+        if not source_label or gold.row_label(target) != target_label:
+            continue
+        expected = describe_ref(gold, pretty(source), target.rsplit("!", 1)[0], target_label)
+        suffix = "on the row labelled " + q(source_label)
+        if (not BARE_LINK_RE.fullmatch(gold.formula.get(target, "").strip())
+                or bare_alias_ref(gold, target) != source or fields.get("ingredient") != expected
+                or not expected.endswith(suffix)):
+            continue
+        sentence = render_sentence(rec)
+        if not sentence:
+            continue
+        header = "- " + compact_cells(rec.get("cells") or []) + ": "
+        # render_section may add a verified collision scope and lowercase only
+        # the first character. Match that exact spelling, not arbitrary prose.
+        for line in re.finditer("^" + re.escape(header) + r"[^\n]*", section, flags=re.MULTILINE):
+            body = line.group()[len(header):]
+            for variant in dict.fromkeys((sentence, sentence[0].lower() + sentence[1:])):
+                position = body.find(variant)
+                if position < 0:
+                    continue
+                ingredient_at = variant.find(expected)
+                if ingredient_at < 0:
+                    continue
+                label_at = ingredient_at + len(expected) - len(q(source_label))
+                for number in NUMBER_RE.finditer(q(source_label)):
+                    offset = line.start() + len(header) + position + label_at + number.start()
+                    offsets[offset] = {"kind": "verified_source_row_label", "literal": number.group(),
+                                       "source_cell": source, "label": source_label, "offset": offset}
+                break
+    return offsets
+
+
+def metadata_literal_warnings(section: str, task_dir: Path, records: list[dict],
+                              gold: Book | None) -> list[dict]:
+    targets = numeric_targets(task_dir)
+    metadata = verified_header_numeric_offsets(section, records, gold)
+    metadata.update(verified_source_label_numeric_offsets(section, task_dir, records, gold))
+    return [dict(item, warning="numeric target coincidence occurs only in verified workbook metadata")
+            for item in sorted(metadata.values(), key=lambda item: item["offset"])
+            if any(same_number(float(item["literal"].replace(",", "")), target) for target in targets)]
+
+
 def audit_text(section: str, task_dir: Path, records: list[dict] | None = None,
-               closure: set[str] | None = None) -> list[str]:
+               closure: set[str] | None = None, gold: Book | None = None) -> list[str]:
     faults = []
     formula_lines = [line for line in section.splitlines() if FORMULA_RE.search(line)]
     if formula_lines:
@@ -4883,22 +5062,34 @@ def audit_text(section: str, task_dir: Path, records: list[dict] | None = None,
     if leaked:
         faults.append(f"internal taxonomy token(s) in agent text: {leaked[:5]}")
     targets = numeric_targets(task_dir)
-    allowed = trusted_formula_literal_counts(records or [], task_dir)
-    allowed.update(trusted_row_label_literal_counts(records or [], task_dir))
-    # Numeric-collision policy (0469). Two tiers:
-    #
-    # (a) Provenance. A literal rendered from a record that reaches the
-    #     graded-output closure is answer material however it is spelled, so
-    #     any target match refuses with no specificity floor. Records that
-    #     reach the closure are already suppressed upstream; this is the
-    #     fail-closed net for one that slips through.
-    # (b) Pure value coincidence. Refuse only high-specificity matches: the
-    #     literal must carry at least four significant digits. A small round
-    #     integer such as the divisor 6 colliding with a graded 6.0 is a
-    #     spurious collision (0469's refusal), not a leak - low-specificity
-    #     constants are ordinary formula plumbing, and tier (a) has already
-    #     proven the record they came from does not reach the closure.
-    #     Zero and +/-1 targets stay exempt as control literals.
+    # Bind exemptions to the actual rendered sentence, not a global value
+    # counter that an unrelated sentence can spend before the real claim.
+    permitted_offsets = set(verified_header_numeric_offsets(section, records or [], gold))
+    permitted_offsets.update(verified_source_label_numeric_offsets(section, task_dir, records or [], gold, closure))
+    used_sentences = set()
+    for rec in records or []:
+        if closure and record_reach(rec) & set(closure):
+            continue
+        sentence = render_sentence(rec)
+        if not sentence:
+            continue
+        start = section.find(sentence)
+        while start >= 0 and (start, len(sentence)) in used_sentences:
+            start = section.find(sentence, start + 1)
+        if start < 0:
+            continue
+        used_sentences.add((start, len(sentence)))
+        budget = trusted_formula_literal_counts([rec], task_dir)
+        budget.update(trusted_row_label_literal_counts([rec], task_dir, gold))
+        for match in NUMBER_RE.finditer(sentence):
+            number = float(match.group().replace(",", ""))
+            permitted = next((n for n, count in budget.items()
+                              if count and same_number(number, n)), None)
+            if permitted is not None:
+                budget[permitted] -= 1
+                permitted_offsets.add(start + match.start())
+    # Coincidences require a finite, provenance-bound occurrence budget above.
+    # Digit count is not evidence: "the answer is 6" leaks a graded 6.0 too.
     closure_literals: set[float] = set()
     if records and closure:
         for rec in records:
@@ -4908,36 +5099,27 @@ def audit_text(section: str, task_dir: Path, records: list[dict] | None = None,
                         closure_literals.add(float(number))
                     except (TypeError, ValueError):
                         continue
-    for raw in NUMBER_RE.findall(section):
+    for number_match in NUMBER_RE.finditer(section):
+        raw = number_match.group()
         try:
             val = float(raw.replace(",", ""))
         except ValueError:
             continue
         matched_target = None
         for target in targets:
-            if abs(float(target)) <= 1e-12 or (
-                float(target).is_integer() and abs(target) <= 1
-            ):
-                continue
             if same_number(val, float(target)):
                 matched_target = target
                 break
         if matched_target is None:
             continue
-        permitted = next(
-            (number for number, count in allowed.items()
-             if count and same_number(val, number)),
-            None,
-        )
-        if permitted is not None:
-            allowed[permitted] -= 1
+        if number_match.start() in permitted_offsets:
             continue
         if any(same_number(val, lit) for lit in closure_literals):
             faults.append(
                 f"numeric literal {raw} matches target {matched_target} and its "
                 "provenance record reaches the graded-output closure"
             )
-        elif significant_digits(raw) >= 4:
+        else:
             faults.append(f"numeric literal {raw} matches target {matched_target}")
     return faults
 
@@ -4955,20 +5137,18 @@ def write_disclosure(args) -> dict:
     records_payload = read_stage(source_task, "records", Path(args.runs_root))
     safe = agent_records(records_payload.get("records", []))
     section = render_section(safe)
-    closure = None
     try:
         selection = read_stage(source_task, "bands", Path(args.runs_root))
-        closure = graded_closure(
-            Book(Path(selection["golden"])), set(selection["target_keys"])
-        )
-    except Exception:
-        closure = None
+        gold = Book(Path(selection["golden"]))
+        closure = graded_closure(gold, set(selection["target_keys"]))
+    except Exception as exc:
+        raise ValueError('cannot audit disclosure without original-workbook closure evidence') from exc
     disclosed = [
         r for r in records_payload.get("records", [])
         if r.get("disposition") == "disclosed"
     ]
     faults = audit_text(
-        section, source_task, records=disclosed or safe, closure=closure
+        section, source_task, records=disclosed or safe, closure=closure, gold=gold
     )
     if faults and not args.force:
         raise SystemExit("refusing to write disclosure: " + "; ".join(faults[:5]))
@@ -4983,10 +5163,14 @@ def write_disclosure(args) -> dict:
     text = text.replace(OUTPUT_HEADING, "\n" + section + "\n## Output\n", 1)
     if not args.dry_run:
         instruction_path.write_text(text, encoding="utf-8")
+        audit = {"faults": faults, "written_records": len(safe)}
+        warnings = metadata_literal_warnings(section, source_task, disclosed or safe, gold)
+        if warnings:
+            audit["warnings"] = warnings
         reviewer = {
             **records_payload,
             "agent_records": safe,
-            "audit": {"faults": faults, "written_records": len(safe)},
+            "audit": audit,
         }
         write_json(dst / "tests" / "disclosure.json", reviewer)
     return {"task": source_task.name, "out": str(dst), "written_records": len(safe), "faults": faults}
@@ -5056,18 +5240,35 @@ def _heterogeneous_scope_partitioned(
     disclosed: list[dict],
     entry: str,
 ) -> bool:
-    """Accept a copied family split into exact, per-row-labelled records."""
+    """Accept only an exact, nonoverlapping partition of a heterogeneous family.
+
+    The caller derives ``span`` from the complete golden copy geometry. Every
+    intersecting claim must stay inside that family and identify each of its
+    cells with the independently resolved row label. Unrelated records cannot
+    contribute coverage, and duplicate or overbroad claims fail closed.
+    """
+    expected = set(span)
+    if len(expected) != len(span) or len(expected) < 2:
+        return False
     if len({gold.row_label(cell) for cell in span}) <= 1:
         return False
-    covered = set()
+    covered = Counter()
     for candidate in disclosed:
         if candidate.get("entry") != entry:
             continue
+        keys = _stated_keys(candidate) or candidate.get("cell_keys") or []
+        if not expected.intersection(keys):
+            continue
+        if set(keys) - expected or len(set(keys)) != len(keys):
+            return False
+        if candidate.get("cell_keys") is not None and set(candidate["cell_keys"]) != set(keys):
+            return False
         claimed = _unquote_label((candidate.get("fields") or {}).get("label"))
-        for cell in _stated_keys(candidate) or candidate.get("cell_keys") or []:
-            if claimed and claimed == gold.row_label(cell):
-                covered.add(cell)
-    return set(span) <= covered
+        if not claimed or any(claimed != gold.row_label(cell) for cell in keys):
+            return False
+        covered.update(keys)
+    return covered == Counter({cell: 1 for cell in span})
+
 
 
 def _claimed_rows(rec: dict) -> set[tuple]:
@@ -5081,6 +5282,34 @@ def _claimed_rows(rec: dict) -> set[tuple]:
         if m:
             rows.add((unquote_sheet(m.group(1)), int(m.group(2))))
     return rows
+
+
+def independent_references(formula: str, sheet: str) -> set[str]:
+    """Resolve A1 operands independently of the disclosure parser/renderer."""
+    from openpyxl.formula import Tokenizer
+    from openpyxl.utils.cell import range_boundaries, get_column_letter
+    found = set()
+    for token in Tokenizer(formula).items:
+        if token.type != "OPERAND" or token.subtype != "RANGE":
+            continue
+        value = token.value
+        if "!" in value:
+            name, coordinates = value.rsplit("!", 1)
+            if name.startswith("'") and name.endswith("'"):
+                name = name[1:-1].replace("''", "'")
+        else:
+            name, coordinates = sheet, value
+        try:
+            c1, r1, c2, r2 = range_boundaries(coordinates)
+        except ValueError:
+            continue  # Named operands are checked by the existing AST proof.
+        if None in (c1, r1, c2, r2):
+            continue
+        if (c2 - c1 + 1) * (r2 - r1 + 1) > 50000:
+            raise ValueError("reference exceeds independent coverage budget")
+        found.update(f"{name}!{get_column_letter(c)}{r}"
+                     for c in range(c1, c2 + 1) for r in range(r1, r2 + 1))
+    return found
 
 
 def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
@@ -5117,7 +5346,6 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
         rec for rec in payload.get("records", [])
         if rec.get("disposition") == "disclosed"
         and rec.get("entry")
-        and render_sentence(rec)
     ]
 
     faults: list[dict] = []
@@ -5126,13 +5354,16 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
     referenced_rows: set[tuple] = set()
     if any(rec.get("entry") == "row_populated" for rec in disclosed):
         for k, formula in gold.formula.items():
-            for ref in refs_in(formula, k.split("!", 1)[0], truncated=truncated):
+            for ref in refs_in(formula, k.rsplit("!", 1)[0], truncated=truncated):
                 rk = _row_key(ref)
                 if rk:
                     referenced_rows.add(rk)
 
     for rec in disclosed:
         sentence = render_sentence(rec)
+        if not sentence:
+            _fault(faults, rec, "render", "disclosed record has missing rendering fields",
+                   expected="complete sentence", found="empty rendering")
         entry = rec.get("entry")
         fields = rec.get("fields") or {}
         cells = list(rec.get("cell_keys") or [])
@@ -5153,6 +5384,26 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
         # ------------------- (a)/(c) operand labels, references, literals
         steps = str(fields.get("steps") or "")
         if steps and cells:
+            sheet = cells[0].rsplit("!", 1)[0]
+            formula = gold.formula.get(cells[0], "")
+            try:
+                independent = independent_references(formula, sheet)
+                parsed = set(refs_in(formula, sheet))
+                if independent != parsed or any(r.rsplit("!", 1)[0] not in gold.sheets for r in independent):
+                    _fault(faults, rec, "reference", "independent workbook reference check disagrees",
+                           expected=sorted(independent), found=sorted(parsed))
+                # Read coordinates from the actual emitted mechanics, without
+                # invoking describe_ref or trusting its own expected sentence.
+                rendered_refs = set()
+                location = r"(?:cell|range)\s+((?:'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_.]*)!\$?[A-Z]{1,3}\$?[0-9]+(?::\$?[A-Z]{1,3}\$?[0-9]+)?)"
+                for match in re.finditer(location, steps):
+                    rendered_refs.update(independent_references("=" + match.group(1), sheet))
+                if not independent.issubset(rendered_refs):
+                    _fault(faults, rec, "reference", "rendered coordinates omit or corrupt workbook operands",
+                           expected=sorted(independent), found=sorted(rendered_refs))
+            except ValueError as exc:
+                _fault(faults, rec, "reference", "independent reference check failed",
+                       expected="verified workbook references", found=str(exc))
             profile = formula_profile(gold, {
                 "band": rec.get("band"),
                 "cell_keys": cells,
@@ -5166,7 +5417,7 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
                     expected="parseable formula", found=str(profile.get("error")),
                 )
             else:
-                sheet0 = cells[0].split("!", 1)[0]
+                sheet0 = cells[0].rsplit("!", 1)[0]
                 for raw in profile.get("raw_references") or []:
                     rendered = describe_ref(gold, raw, sheet0, profile.get("label", ""))
                     if rendered not in steps:
@@ -5220,7 +5471,10 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
                     expected="single-cell phrasing",
                     found="copied-column claim over %s" % rec.get("band"),
                 )
-            if "single-cell calculation" in sentence and len(span) > 1:
+            partitioned = _heterogeneous_scope_partitioned(
+                gold, span, disclosed, entry
+            ) if len(span) > 1 else False
+            if "single-cell calculation" in sentence and len(span) > 1 and not partitioned:
                 _fault(
                     faults, rec, "scope",
                     "copied family phrased as a single-cell calculation",
@@ -5228,8 +5482,8 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
                     found=str(rec.get("band")),
                 )
             if stated_multi:
-                rows = {split_coord(c.split("!", 1)[1])[1] for c in anchor_cells}
-                colsn = {col_to_num(split_coord(c.split("!", 1)[1])[0]) for c in anchor_cells}
+                rows = {split_coord(c.rsplit("!", 1)[1])[1] for c in anchor_cells}
+                colsn = {col_to_num(split_coord(c.rsplit("!", 1)[1])[0]) for c in anchor_cells}
                 if len(rows) == 1:
                     expected_span = full_copied_scope(gold, anchor_cells, closure)
                 elif len(colsn) == 1:
@@ -5252,9 +5506,7 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
                             found="%s against %s" % (pretty(a), pretty(b)),
                         )
                         break
-            elif len(span) > 1 and not _heterogeneous_scope_partitioned(
-                gold, span, disclosed, entry
-            ):
+            elif len(span) > 1 and not partitioned:
                 _fault(
                     faults, rec, "scope",
                     "stated scope is a fragment of a copied family",
@@ -5285,7 +5537,7 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
                 if rec.get("value") == "unused":
                     if any(
                         k in gold.formula or isinstance(gold.value.get(k), (int, float))
-                        for k in gold.row_cells(sheet, rownum)
+                        for k in gold.stored_row_cells(sheet, rownum)
                     ):
                         _fault(
                             faults, rec, "scope",
@@ -5323,7 +5575,7 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
             if not formula or not BARE_LINK_RE.match(formula):
                 continue
             src = bare_alias_ref(gold, k)
-            if not src or src.split("!", 1)[0] == k.split("!", 1)[0]:
+            if not src or src.rsplit("!", 1)[0] == k.rsplit("!", 1)[0]:
                 continue
             if k in closure or src in closure:
                 continue
@@ -5375,12 +5627,13 @@ def verify_task(task_dir: Path) -> dict:
     payload = json.loads(disclosure_path.read_text(encoding="utf-8"))
     golden_path = Path(payload.get("golden", ""))
     expected_golden_hash = payload.get("golden_sha256")
-    if (
-        not golden_path.is_file()
-        or not isinstance(expected_golden_hash, str)
-        or hashlib.sha256(golden_path.read_bytes()).hexdigest()
-        != expected_golden_hash
-    ):
+    golden_binding_valid = (
+        golden_path.is_file()
+        and isinstance(expected_golden_hash, str)
+        and hashlib.sha256(golden_path.read_bytes()).hexdigest()
+        == expected_golden_hash
+    )
+    if not golden_binding_valid:
         faults.append("disclosure golden binding is missing or changed")
     if payload.get("segmentation_mode") != "strict":
         faults.append("production disclosure requires strict segmentation provenance")
@@ -5497,25 +5750,16 @@ def verify_task(task_dir: Path) -> dict:
         faults.append(f"{len(missing_render)} custom record(s) did not render: {missing_render[:5]}")
 
     gold_book = None
-    try:
-        gold_book = Book(find_golden(task_dir))
-    except Exception:
-        gold_book = None
+    if golden_binding_valid:
+        try:
+            gold_book = Book(golden_path)
+        except Exception as exc:
+            faults.append(f"disclosure golden workbook cannot be read: {exc}")
     if custom:
         try:
-            golden_path = Path(payload.get("golden", ""))
-            expected_golden_hash = payload.get("golden_sha256")
-            if (
-                golden_path.is_file()
-                and isinstance(expected_golden_hash, str)
-                and hashlib.sha256(golden_path.read_bytes()).hexdigest()
-                == expected_golden_hash
-            ):
-                gold = Book(golden_path)
-            elif gold_book is not None:
-                gold = gold_book
-            else:
+            if gold_book is None:
                 raise ValueError("disclosure golden binding is missing or changed")
+            gold = gold_book
             structural = []
             for rec in custom:
                 profile = formula_profile(gold, {
@@ -5540,14 +5784,14 @@ def verify_task(task_dir: Path) -> dict:
             closure = graded_closure(
                 gold_book, {parse_ref(t, default_sheet) for t in targets_map}
             )
-        except Exception:
-            closure = None
+        except Exception as exc:
+            faults.append(f'graded closure verification failed: {exc}')
     disclosed_records = [
         r for r in payload.get("records", [])
         if r.get("disposition") == "disclosed"
     ]
     faults.extend(audit_text(
-        section, task_dir, records=disclosed_records or shipped, closure=closure
+        section, task_dir, records=disclosed_records or shipped, closure=closure, gold=gold_book
     ))
     return {"task": task_dir.name, "passed": not faults, "faults": faults}
 
@@ -5808,4 +6052,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-

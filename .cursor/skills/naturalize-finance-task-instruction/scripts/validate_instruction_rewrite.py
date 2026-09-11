@@ -349,6 +349,13 @@ def validate(
     candidate_bytes = (
         candidate.encode("utf-8") if isinstance(candidate, str) else candidate
     )
+    # Frozen spans are writer-only transport syntax. Even a lossless marked
+    # rewrite must pass the supported restore step before it can be delivered.
+    if re.search(rb"\[\[/?F[0-9]+", candidate_bytes):
+        raise RewriteValidationError(
+            "candidate contains frozen-span marker residue; restore protected spans before validation",
+            "frozen_span_marker_residue",
+        )
     try:
         source_span_map = scan_instruction(source_bytes)
     except InstructionSpanError as exc:
@@ -657,7 +664,9 @@ def atomic_write(path: Path, text: str) -> Path:
     return temp
 
 
-def updated_task_toml(text: str, report: dict, attempts: int) -> str:
+def updated_task_toml(text: str, report: dict, attempts: int, *, endpoint="cursor-subagent") -> str:
+    if endpoint not in {"cursor-subagent", "https://litellm.labelbox.com"}:
+        raise RewriteValidationError("unsupported naturalizer endpoint")
     table_re = re.compile(
         r"(?ms)^\[metadata\.naturalizer\]\n.*?(?=^\[|\Z)"
     )
@@ -667,7 +676,7 @@ def updated_task_toml(text: str, report: dict, attempts: int) -> str:
         [
             "[metadata.naturalizer]",
             'model = "%s"' % MODEL,
-            'endpoint = "cursor-subagent"',
+            'endpoint = "%s"' % endpoint,
             "attempts = %d" % attempts,
             "naturalized = true",
             'fallback_reason = ""',

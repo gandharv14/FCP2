@@ -20,9 +20,6 @@ NAT_RUN="runs/$WB-instruction-naturalization"
 SOURCE="$NAT_RUN/source.snapshot.md"
 WRITER_SOURCE="$NAT_RUN/writer_source.md"
 SPAN_MAP="$NAT_RUN/frozen_spans.json"
-MARKED="$NAT_RUN/candidate.marked.md"
-CANDIDATE="$NAT_RUN/candidate.md"
-REPORT="$NAT_RUN/validation.json"
 RECOVERY=.cursor/skills/naturalize-finance-task-instruction/scripts/naturalize_recovery.py
 ```
 
@@ -42,6 +39,23 @@ python3 "$RECOVERY" init "$STAGED/instruction.md" \
 ```
 
 ## Freeze protected anchors and tokens
+
+Completed instructions must never contain `[[Fnn]]` transport markers. For a
+retained historical submission affected by the old assembly defect, the
+orchestrator may use `scripts/span_restoration.py` with the supported recovery
+module. `restore` requires an exact state hash, original independent review
+request/response, unchanged submitted bodies and regenerated span map. It
+publishes a separate immutable candidate only when restoration removes wrappers
+alone, reports zero drift and passes current full validation. It does not reset
+or extend the writer budget.
+
+The orchestrator independently reviews whether the original clause review still
+applies and writes the exact hash-bound
+`naturalization-span-review-applicability/v1` record. `accept_review` validates
+that record before ordinary `apply` and `verify-applied`. This is an explicit
+prior-review applicability decision, not a new model response. Preserve original
+attempt artifacts and rerun all affected downstream gates. Missing or changed
+evidence, altered prose and noncanonical spans remain failures.
 
 Before launching the rewriter, structurally exclude validator-protected text
 from what it may touch. The freeze step extracts every phrase the
@@ -71,6 +85,32 @@ and `frozen_spans.json` (the canonical text of every span). If freeze fails,
 stop; do not hand the raw source to the rewriter.
 
 ## Rewrite
+
+When the authorized model invocation uses the configured Labelbox proxy,
+record the actual endpoint with
+`python3 "$RECOVERY" bind-endpoint "$NAT_RUN" --endpoint https://litellm.labelbox.com`
+before applying. This preserves submitted attempts and accepted semantic
+review; it does not reset either budget. Save the independent writer and
+reviewer request/response evidence and use `openai/gpt-5.6-sol` with high
+reasoning effort. Legacy Cursor subagent runs retain `cursor-subagent` metadata.
+
+If an authorized upstream correction changes the immutable instruction source,
+initialize a fresh recovery directory and carry forward the consumed writer
+budget before making another model call:
+
+```bash
+python3 "$RECOVERY" inherit-budget "$NAT_RUN" \
+  --previous-state-dir "$PREVIOUS_NAT_RUN" \
+  --previous-state-sha256 "$RECORDED_PREVIOUS_STATE_SHA256" \
+  --reason "Describe the reviewed upstream correction"
+```
+
+Use the previous state digest already recorded in the tracker or handoff. The
+operation verifies and archives the prior evidence unchanged, including chained
+inheritance. Read `next_attempt`; one previously consumed attempt leaves only
+attempt two, and two consumed attempts leave the new run exhausted. Old prose
+and semantic decisions are not reused for the corrected source. Do not simulate
+a semantic rejection or initialize a new budget to bypass this ceiling.
 
 Use at most two total attempts. Each attempt launches a fresh `generalPurpose`
 subagent with model `gpt-5.6-sol-high`. Give it the frozen writer source
@@ -139,40 +179,32 @@ source wording.
 Do not ask the subagent to classify formulas, inspect the golden workbook, or
 infer workbook facts. Its only input is the marker-annotated instruction.
 
-## Restore frozen spans
+## Restore, validate and apply
 
-Reinsert the canonical protected text and strip the markers before validation:
-
-```bash
-python3 .cursor/skills/naturalize-finance-task-instruction/scripts/freeze_protected_spans.py restore \
-  "$MARKED" \
-  --span-map "$SPAN_MAP" \
-  --output "$CANDIDATE" \
-  --report "$NAT_RUN/restore.json"
-```
-
-Restore replaces every `[[Fnn]]…[[/Fnn]]` block with the canonical span text
-from `frozen_spans.json` (so a span edited inside its markers is repaired, and
-the drift is reported), then fails closed if any span is missing, duplicated,
-unknown, or if marker residue remains. Each restore error names the span id,
-the exact literal block that was expected, and the validator checks it
-protects. If restore fails, re-launch the rewrite subagent once, appending the
-restore error messages to the prompt; if it fails again, stop and keep the
-diagnostics.
-
-## Validate and apply
-
-Submit the two bodies. Code reconstructs the full document from untouched source
-bytes, preserving the BOM, newline style, headings, and protected sections.
-The deterministic validator still runs in full — freezing makes compliance
-easier, not the checks weaker:
+Submit the exact two marked writer bodies through the frozen submission path:
 
 ```bash
-python3 "$RECOVERY" submit "$NAT_RUN" \
+python3 "$RECOVERY" submit-frozen "$NAT_RUN" \
   --preamble "$PREAMBLE" --input "$INPUT_BODY"
 ```
 
-Read the attempt candidate and validation report. Perform clause-by-clause
+This command reads `$NAT_RUN/writer_source.md` and
+`$NAT_RUN/frozen_spans.json` and independently regenerates both from the immutable
+source snapshot. It retains the exact writer bodies, assembles the complete
+marked document from untouched source bytes, and restores canonical wrappers.
+The attempt directory retains `candidate.marked.md`, `candidate.restored.md`,
+`restore.json`, and the exact authoring inputs. It selects `candidate.md` only
+when restoration has zero errors and zero drift, then runs the full deterministic
+validator. BOM, newline style, headings, and protected sections are preserved.
+
+Missing, duplicated, unknown, malformed, or edited spans fail the same bounded
+writer attempt. Never repair a writer's raw bodies, run an unbound full-document
+restore, switch submission modes to retry an attempt, or review a marked
+candidate. Resuming the same staged submission requires identical raw bodies,
+mode and frozen authoring inputs. Ordinary `submit` remains available only for
+unmarked authoring workflows and does not reinterpret historical attempts.
+
+Read the attempt candidate and validation report. Only after `valid: true`, perform a fresh independent clause-by-clause
 semantic review of the two editable regions. If attempt one passed mechanically
 but failed semantic review, record the rejection:
 
@@ -207,7 +239,7 @@ or reconcile before continuing.
 If generation, restore, deterministic validation, or semantic review fails,
 stop. Retain the immutable source snapshot, both attempt directories, state,
 reports, apply journal, `writer_source.md`, `frozen_spans.json`,
-`candidate.marked.md`, `restore.json`, and `validation.json` as diagnostics
+the attempt-local marked/restored candidates, `restore.json`, and `validation.json` as diagnostics
 and leave the staged instruction unchanged. Validator failure messages state
 the check name, the expected text, and what was found — quote them verbatim
 when reporting a blocker. Do not fall back to an earlier naturalizer and do

@@ -687,7 +687,7 @@ def test_same_label_factors_remain_distinct() -> None:
     _ok("factor-requires-second", "second locked input" in blob, str(atoms))
 
 
-def test_pasted_spoken_fails() -> None:
+def test_pasted_spoken_warns() -> None:
     spoken = speak_steps(
         RCF_STEPS,
         representative="LBO!O151",
@@ -718,12 +718,11 @@ def test_pasted_spoken_fails() -> None:
         f"**VP:** {spoken}\n"
     )
     report = check_draft(pasted, claims, TASK)
-    blob = " ".join(report["accuracy_faults"])
-    _ok(
-        "pasted-spoken-blocked",
-        "copied-across-forecast" in blob or "near-copy of spoken" in blob,
-        blob,
-    )
+    # Exact coverage and meaning permit near-copy prose as a style warning.
+    _ok("pasted-spoken-passes-with-complete-meaning", report["passed"], str(report))
+    _ok("pasted-spoken-style-warning", any(
+        "near-copy of spoken" in warning for warning in report["style_warnings"]
+    ), str(report))
 
     paraphrased = (
         "<!-- claim:method_debt_movement::LBO::RCF::001 -->\n"
@@ -930,18 +929,18 @@ def test_compose_draft_structure() -> None:
     )
     _ok(
         "compose-first-mention-leadin",
-        "**VP:** This one lives on the CalcA tab." in template,
+        "**Analyst:** CalcA:" in template,
         template,
     )
     _ok(
         "compose-calca-leadin-once",
-        template.count("lives on the CalcA tab") == 1,
+        template.count("**Analyst:** CalcA:") == 1 and "This one lives" not in template,
         template,
     )
     _ok("compose-second-claim-bare-senior", "\n**Director:**\n" in template, template)
     _ok(
         "compose-summary-leadin",
-        "**Managing Director:** This one lives on the Summary tab." in template,
+        "Summary:" in template and "**Managing Director:**\n" in template,
         template,
     )
     _ok(
@@ -1013,13 +1012,13 @@ def test_fill_check_valid_and_rejects() -> None:
     )
 
     edited = filled.replace(
-        "**VP:** This one lives on the CalcA tab.",
-        "**VP:** On CalcA, here you go.",
+        "**Analyst:** CalcA:",
+        "**Analyst:** Changed tab:",
     )
     faults = fill_faults(template, edited)
     _ok(
         "fill-edited-leadin-rejected",
-        faults and "This one lives on the CalcA tab." in faults[0],
+        faults and "CalcA:" in faults[0],
         str(faults),
     )
 
@@ -1198,7 +1197,7 @@ def main() -> int:
         test_same_label_locked_inputs_keep_distinct_roles()
         test_locked_ranges_preserve_cardinality_and_operand_identity()
         test_same_label_factors_remain_distinct()
-        test_pasted_spoken_fails()
+        test_pasted_spoken_warns()
         test_sheet_only_when_unclear()
         test_paren_ast_draft_fails()
         test_compose_draft_structure()

@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import decimal
+import re
 import contextlib
 import hashlib
 import json
@@ -444,7 +446,306 @@ def _formula_cells(root: ElementTree.Element) -> dict[str, ElementTree.Element]:
     return cells
 
 
-def _replace_candidate_from_staging(staged: Path, candidate: Path) -> None:
+def _formula_attributes(formula: ElementTree.Element) -> dict[str, str]:
+    """Compare formula semantics after a completed full recalculation.
+
+    Excel may clear the OOXML calculate-cell request flag on save. The original
+    flag is retained in the destination; all other attributes, including array
+    and shared-formula geometry, must still agree exactly.
+    """
+    attributes = dict(formula.attrib)
+    calculate = attributes.pop("ca", None)
+    if calculate not in (None, "0", "1", "false", "true"):
+        raise RunnerError("invalid formula calculate-cell flag")
+    return attributes
+
+
+_DATA_TABLE_LIMIT = 100000
+_DATA_TABLE_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+
+def _table_coordinate(value: str) -> tuple[int, int]:
+    match = re.fullmatch(r"\$?([A-Z]{1,3})\$?([1-9][0-9]{0,6})", value or "")
+    if not match:
+        raise RunnerError("data table has an invalid cell reference")
+    column = 0
+    for char in match.group(1):
+        column = column * 26 + ord(char) - ord("A") + 1
+    row = int(match.group(2))
+    if column > 16384 or row > 1048576:
+        raise RunnerError("data table cell reference exceeds worksheet bounds")
+    return column, row
+
+
+def _table_cell_name(column: int, row: int) -> str:
+    name = ""
+    while column:
+        column, digit = divmod(column - 1, 26)
+        name = chr(65 + digit) + name
+    return f"{name}{row}"
+
+
+def _observed_string(element):
+    children = list(element)
+    tags = [child.tag for child in children]
+    if tags == [_DATA_TABLE_NS + "t"]:
+        return element[0].text or "", False
+    if children and all(tag == _DATA_TABLE_NS + "r" for tag in tags):
+        values = []
+        for run in children:
+            text = run.findall(_DATA_TABLE_NS + "t")
+            if (len(text) != 1 or len(run.findall(_DATA_TABLE_NS + "rPr")) > 1
+                    or any(n.tag not in {_DATA_TABLE_NS + "t", _DATA_TABLE_NS + "rPr"} for n in run)):
+                raise RunnerError("unobservable rich string encoding")
+            values.append(text[0].text or "")
+        return "".join(values), True
+    if not children:
+        return "", False
+    raise RunnerError("unobservable string or phonetic encoding")
+
+
+def _observed_typed_value(cell, shared, *, required=False):
+    values, inlines = cell.findall("{*}v"), cell.findall("{*}is")
+    if len(values) > 1 or len(inlines) > 1 or values and inlines:
+        raise RunnerError("ambiguous observed cell value")
+    kind = cell.get("t", "n")
+    if not values and not inlines:
+        if required:
+            raise RunnerError("data table result is missing")
+        return None
+    text = values[0].text or "" if values else None
+    if kind == "s":
+        if not values or not re.fullmatch(r"[0-9]+", text or ""):
+            raise RunnerError("invalid observed shared string index")
+        index = int(text)
+        if index >= len(shared):
+            raise RunnerError("observed shared string is missing")
+        text, rich = shared[index]
+        if required and rich:
+            raise RunnerError("rich data table result is outside the observation profile")
+        return ["string", text]
+    if kind == "inlineStr":
+        if not inlines:
+            raise RunnerError("invalid observed inline string")
+        text, rich = _observed_string(inlines[0])
+        if required and rich:
+            raise RunnerError("rich data table result is outside the observation profile")
+        return ["string", text]
+    if inlines:
+        raise RunnerError("observed value type conflicts with inline string")
+    if kind == "str":
+        return ["string", text]
+    if kind == "b":
+        if text not in {"0", "1"}:
+            raise RunnerError("invalid observed boolean")
+        return ["boolean", text == "1"]
+    if kind == "e":
+        if text not in {"#NULL!", "#DIV/0!", "#VALUE!", "#REF!", "#NAME?",
+                        "#NUM!", "#N/A", "#GETTING_DATA", "#SPILL!", "#CALC!",
+                        "#FIELD!", "#BLOCKED!", "#UNKNOWN!", "#CONNECT!"}:
+            raise RunnerError("invalid observed error value")
+        return ["error", text]
+    if kind == "n":
+        if text == "" and not required:
+            return None
+        if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[Ee][+-]?[0-9]+)?", text or ""):
+            raise RunnerError("invalid or incomplete observed numeric value")
+        try:
+            value = decimal.Decimal(text)
+        except decimal.InvalidOperation as exc:
+            raise RunnerError("invalid observed decimal") from exc
+        # Canonical exact decimal tuple; no float rounding or Decimal context.
+        sign, digits, exponent = value.as_tuple()
+        digits = list(digits)
+        while len(digits) > 1 and digits[-1] == 0:
+            digits.pop(); exponent += 1
+        if not any(digits):
+            sign, digits, exponent = 0, [0], 0
+        return ["number", [sign, digits, exponent]]
+    raise RunnerError("unsupported observed cell type")
+
+
+def observe_data_tables(path: Path) -> dict:
+    """Observe complete table caches; never authorize recalculation or a source.
+
+    This stdlib-only observation is private producer evidence. It is not a
+    claim that the supplied workbook was calculated by Excel. The future signed
+    profile must bind an observation made on the actual isolated staging copy.
+    """
+    path = Path(path)
+    _regular_nofollow(path)
+    source_hash = sha256_file(path)
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        if len(names) != len(set(names)):
+            raise RunnerError("ambiguous workbook package members")
+        # Avoid any new semantics/encoding restrictions for non-table files.
+        roots = {name: ElementTree.fromstring(archive.read(name)) for name in names
+                 if name.startswith("xl/worksheets/") and name.endswith(".xml")
+                 and "/_rels/" not in name}
+        if not any(f.get("t") == "dataTable" for root in roots.values()
+                   for f in root.findall(".//{*}sheetData/{*}row/{*}c/{*}f")):
+            return {"schema_version": "excel-data-table-observation/v1",
+                    "source_sha256": source_hash, "tables": []}
+        workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        relations = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        targets = {}
+        for relation in relations:
+            key = relation.get("Id")
+            if not key or key in targets:
+                raise RunnerError("ambiguous worksheet relationship")
+            targets[key] = relation
+        layout = []
+        for sheet in workbook.findall("{*}sheets/{*}sheet"):
+            relation = targets.get(sheet.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"))
+            if relation is None or relation.get("TargetMode") == "External":
+                raise RunnerError("missing or external worksheet relationship")
+            target = relation.get("Target", "")
+            if not target or "\\" in target or ".." in target.split("/"):
+                raise RunnerError("unsafe worksheet relationship")
+            part = target.lstrip("/") if target.startswith("/") else "xl/" + target
+            if not relation.get("Type", "").endswith("/worksheet") or part not in roots:
+                raise RunnerError("unsupported or missing sheet in table profile")
+            name = sheet.get("name")
+            if not name or any(s["name"].casefold() == name.casefold() or s["part"] == part for s in layout):
+                raise RunnerError("ambiguous worksheet identity")
+            if sheet.get("state", "visible") not in {"visible", "hidden", "veryHidden"}:
+                raise RunnerError("invalid worksheet visibility")
+            layout.append({"name": name, "part": part,
+                           "state": sheet.get("state", "visible")})
+        if {s["part"] for s in layout} != set(roots):
+            raise RunnerError("unbound worksheet parts")
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            strings = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+            shared = [_observed_string(item) for item in strings.findall("{*}si")]
+        tables, primitives, formulas = [], [], []
+        total = 0
+        for sheet in layout:
+            root = roots[sheet["part"]]
+            cells = {}
+            rows = root.findall("{*}sheetData/{*}row")
+            seen_rows = set()
+            for row in rows:
+                row_number = row.get("r", "")
+                if (not re.fullmatch(r"[1-9][0-9]{0,6}", row_number)
+                        or int(row_number) > 1048576 or row_number in seen_rows):
+                    raise RunnerError("ambiguous worksheet row coordinate")
+                seen_rows.add(row_number)
+                if any(_table_coordinate(c.get("r", ""))[1] != int(row_number)
+                       for c in row.findall("{*}c")):
+                    raise RunnerError("cell coordinate disagrees with worksheet row")
+            stored = root.findall("{*}sheetData/{*}row/{*}c")
+            if len(stored) != len(root.findall(".//" + _DATA_TABLE_NS + "c")):
+                raise RunnerError("unbound worksheet cell elements")
+            for cell in stored:
+                coord = cell.get("r", "")
+                c, r = _table_coordinate(coord)
+                if coord != _table_cell_name(c, r) or coord in cells:
+                    raise RunnerError("ambiguous worksheet cell coordinate")
+                if len(cell.findall("{*}f")) > 1:
+                    raise RunnerError("ambiguous formula identity")
+                cells[coord] = cell
+            covered = set()
+            inputs = []
+            rectangles = []
+            for anchor, cell in sorted(cells.items(), key=lambda item: tuple(reversed(_table_coordinate(item[0])))):
+                formula = cell.find("{*}f")
+                if formula is None or formula.get("t") != "dataTable":
+                    continue
+                attributes = _formula_attributes(formula)
+                if set(attributes) - {"t", "ref", "dt2D", "dtr", "r1", "r2", "del1", "del2"} or formula.text:
+                    raise RunnerError("unsupported data table formula attributes")
+                for key in ("dt2D", "dtr", "del1", "del2"):
+                    if attributes.get(key) not in {None, "0", "1", "false", "true"}:
+                        raise RunnerError("invalid data table flag")
+                if any(attributes.get(k) in {"1", "true"} for k in ("del1", "del2")):
+                    raise RunnerError("deleted data table input")
+                refs = attributes.get("ref", "").split(":")
+                if len(refs) != 2:
+                    raise RunnerError("data table requires a bounded result rectangle")
+                c1, r1 = _table_coordinate(refs[0]); c2, r2 = _table_coordinate(refs[1])
+                if c1 > c2 or r1 > r2 or anchor != _table_cell_name(c1, r1):
+                    raise RunnerError("invalid data table anchor or rectangle order")
+                count = (c2-c1+1)*(r2-r1+1)
+                total += count
+                if total > _DATA_TABLE_LIMIT:
+                    raise RunnerError("data table observation exceeds result budget")
+                is_two = attributes.get("dt2D") in {"1", "true"}
+                if not attributes.get("r1") or is_two != bool(attributes.get("r2")):
+                    raise RunnerError("incomplete data table input references")
+                for key in ("r1", "r2"):
+                    if attributes.get(key):
+                        c, r = _table_coordinate(attributes[key])
+                        inputs.append(_table_cell_name(c, r))
+                rectangles.append((c1,r1,c2,r2))
+                results = []
+                for row in range(r1, r2+1):
+                    for column in range(c1, c2+1):
+                        coord = _table_cell_name(column, row)
+                        if coord in covered:
+                            raise RunnerError("overlapping data table result rectangles")
+                        covered.add(coord)
+                        observed = cells.get(coord)
+                        if observed is None:
+                            raise RunnerError("data table result cell is missing")
+                        if coord != anchor and observed.find("{*}f") is not None:
+                            raise RunnerError("data table body collides with a formula")
+                        results.append({"coordinate": coord,
+                                        "value": _observed_typed_value(observed, shared, required=True)})
+                tables.append({"sheet": sheet["name"], "part": sheet["part"],
+                               "anchor": anchor, "attributes": [[k,v] for k,v in sorted(attributes.items())],
+                               "bounds": [c1,r1,c2,r2], "results": results})
+            if any(coord in covered or coord not in cells for coord in inputs):
+                raise RunnerError("data table input is missing or inside a result rectangle")
+            # Array/shared-formula followers may lack their own <f>; reject
+            # any declared formula range or merge overlapping table results.
+            protected_ranges = [m.get("ref", "") for m in root.findall("{*}mergeCells/{*}mergeCell")]
+            protected_ranges += [f.get("ref") for cell in cells.values()
+                                 for f in cell.findall("{*}f")
+                                 if f.get("t") in {"array", "shared"} and f.get("ref")]
+            for reference in protected_ranges:
+                ends = reference.split(":")
+                if len(ends) not in {1,2}:
+                    raise RunnerError("unobservable formula or merge geometry")
+                a,b = _table_coordinate(ends[0]); c,d = _table_coordinate(ends[-1])
+                if a > c or b > d:
+                    raise RunnerError("invalid formula or merge geometry")
+                if any(a <= c2 and c >= c1 and b <= r2 and d >= r1
+                       for c1,r1,c2,r2 in rectangles):
+                    raise RunnerError("data table collides with array/shared formula or merge")
+            for coord, cell in cells.items():
+                formula = cell.find("{*}f")
+                if formula is not None:
+                    formulas.append([sheet["name"],coord,formula.text or "",
+                                     sorted(_formula_attributes(formula).items())])
+                elif coord not in covered:
+                    value = _observed_typed_value(cell, shared)
+                    if value is not None:
+                        primitives.append([sheet["name"],coord,value])
+        geometry = [{k:v for k,v in table.items() if k != "results"} for table in tables]
+        result_inventory = [{"sheet": t["sheet"], "anchor": t["anchor"], "results": t["results"]} for t in tables]
+    if sha256_file(path) != source_hash:
+        raise RunnerError("workbook changed during table observation")
+    return {"schema_version": "excel-data-table-observation/v1", "source_sha256": source_hash,
+            "sheet_layout": layout, "tables": tables,
+            "geometry_sha256": sha256_bytes(canonical_json([layout, geometry])),
+            "results_sha256": sha256_bytes(canonical_json(result_inventory)),
+            "primitive_inputs_sha256": sha256_bytes(canonical_json(sorted(primitives))),
+            "formula_identity_sha256": sha256_bytes(canonical_json(sorted(formulas)))}
+
+
+def graft_observed_data_tables(staged: Path, candidate: Path) -> dict:
+    """Observation-only prerequisite: no request, signature, or source approval.
+
+    Production must select this helper only through a separately validated,
+    versioned table-capable profile. The ordinary runner never selects it.
+    """
+    _replace_candidate_from_staging(staged, candidate, _table_observation_only=True)
+    return observe_data_tables(candidate)
+
+
+def _replace_candidate_from_staging(staged: Path, candidate: Path, *, _table_observation_only: bool = False) -> None:
     """Atomically graft Excel's formula caches into the original package.
 
     A normal Excel save reserializes drawings, relationships, comments/person
@@ -454,6 +755,8 @@ def _replace_candidate_from_staging(staged: Path, candidate: Path) -> None:
     ``<v>`` cache nodes from Excel's private calculated copy.
     """
     validate_xlsx(staged)
+    original_tables = staged_tables = None
+    table_values = {}
     metadata = _regular_nofollow(candidate)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{candidate.name}.",
@@ -490,6 +793,21 @@ def _replace_candidate_from_staging(staged: Path, candidate: Path) -> None:
                     calculated_cells = _formula_cells(calculated_root)
                     if set(original_cells) != set(calculated_cells):
                         raise RunnerError("Excel changed the formula cell set")
+                    if any(c.find("{*}f").get("t") == "dataTable"
+                           for c in [*original_cells.values(), *calculated_cells.values()]):
+                        if not _table_observation_only:
+                            raise RunnerError("data tables require a separately authorized producer profile")
+                        if original_tables is None:
+                            original_tables = observe_data_tables(candidate)
+                            staged_tables = observe_data_tables(staged)
+                            if not original_tables["tables"] or not staged_tables["tables"]:
+                                raise RunnerError("table observation graft requires matching table geometry")
+                            for key in ("geometry_sha256", "primitive_inputs_sha256", "formula_identity_sha256"):
+                                if original_tables[key] != staged_tables[key]:
+                                    raise RunnerError(f"Excel changed table profile evidence: {key}")
+                            for table in staged_tables["tables"]:
+                                table_values.setdefault(table["part"], {}).update(
+                                    {cell["coordinate"]: cell["value"] for cell in table["results"]})
                     for coordinate, original_cell in original_cells.items():
                         calculated_cell = calculated_cells[coordinate]
                         original_formula = original_cell.find("{*}f")
@@ -499,10 +817,14 @@ def _replace_candidate_from_staging(staged: Path, candidate: Path) -> None:
                             or calculated_formula is None
                             or (original_formula.text or "")
                             != (calculated_formula.text or "")
-                            or original_formula.attrib != calculated_formula.attrib
+                            or _formula_attributes(original_formula)
+                            != _formula_attributes(calculated_formula)
                         ):
                             raise RunnerError(
-                                f"Excel changed formula encoding at {coordinate}"
+                                f"Excel changed formula encoding at {name}!{coordinate}; "
+                                f"text_equal={original_formula is not None and calculated_formula is not None and (original_formula.text or '') == (calculated_formula.text or '')}; "
+                                f"original_attributes={original_formula.attrib if original_formula is not None else None}; "
+                                f"calculated_attributes={calculated_formula.attrib if calculated_formula is not None else None}"
                             )
                         if "t" in calculated_cell.attrib:
                             original_cell.attrib["t"] = calculated_cell.attrib["t"]
@@ -518,6 +840,38 @@ def _replace_candidate_from_staging(staged: Path, candidate: Path) -> None:
                                 formula_index + 1,
                                 copy.deepcopy(calculated_value),
                             )
+                    if name in table_values:
+                        all_original = {c.get("r"): c for c in original_root.findall(".//{*}sheetData/{*}row/{*}c")}
+                        all_calculated = {c.get("r"): c for c in calculated_root.findall(".//{*}sheetData/{*}row/{*}c")}
+                        for coordinate, typed_value in table_values[name].items():
+                            original_cell = all_original[coordinate]
+                            calculated_cell = all_calculated[coordinate]
+                            for child in list(original_cell):
+                                if child.tag.rsplit("}", 1)[-1] in {"v", "is"}:
+                                    original_cell.remove(child)
+                            if typed_value[0] == "string":
+                                # Resolve staging shared-string indices; they do
+                                # not refer to the preserved original package.
+                                if original_cell.find("{*}f") is not None:
+                                    original_cell.set("t", "str")
+                                    value = ElementTree.Element(_DATA_TABLE_NS + "v")
+                                    value.text = typed_value[1]
+                                    original_cell.insert(list(original_cell).index(original_cell.find("{*}f")) + 1, value)
+                                else:
+                                    original_cell.set("t", "inlineStr")
+                                    inline = ElementTree.Element(_DATA_TABLE_NS + "is")
+                                    original_cell.insert(0, inline)
+                                    text = ElementTree.SubElement(inline, _DATA_TABLE_NS + "t")
+                                    text.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                                    text.text = typed_value[1]
+                            else:
+                                if "t" in calculated_cell.attrib:
+                                    original_cell.set("t", calculated_cell.get("t"))
+                                else:
+                                    original_cell.attrib.pop("t", None)
+                                formula = original_cell.find("{*}f")
+                                index = list(original_cell).index(formula) + 1 if formula is not None else 0
+                                original_cell.insert(index, copy.deepcopy(calculated_cell.find("{*}v")))
                     replacements[name] = ElementTree.tostring(
                         original_root,
                         encoding="utf-8",
@@ -532,6 +886,17 @@ def _replace_candidate_from_staging(staged: Path, candidate: Path) -> None:
         except (KeyError, OSError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
             raise RunnerError(f"cannot graft Excel formula caches: {exc}") from exc
         validate_xlsx(temporary)
+        if _table_observation_only and not table_values:
+            raise RunnerError("table observation graft requires original table geometry")
+        if table_values:
+            result_tables = observe_data_tables(temporary)
+            for key in ("geometry_sha256", "primitive_inputs_sha256", "formula_identity_sha256", "results_sha256"):
+                if result_tables.get(key) != staged_tables.get(key):
+                    raise RunnerError(f"grafted table observation does not match staging: {key}")
+            if sha256_file(staged) != staged_tables["source_sha256"]:
+                raise RunnerError("staging changed during table graft")
+            if sha256_file(candidate) != original_tables["source_sha256"]:
+                raise RunnerError("original changed during table graft")
         os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
         if os.geteuid() == 0:
             os.chown(temporary, metadata.st_uid, metadata.st_gid)

@@ -23,6 +23,8 @@ import argparse
 import bisect
 import csv
 import datetime as _dt
+import gc
+import heapq
 import json
 import re
 import shutil
@@ -37,8 +39,9 @@ warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 try:
     import openpyxl
     from openpyxl.formula import Tokenizer
+    from openpyxl.formula.tokenizer import Token
     from openpyxl.utils import get_column_letter, range_boundaries
-    from openpyxl.worksheet.formula import ArrayFormula
+    from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
 except ImportError:  # pragma: no cover
     sys.exit("openpyxl is required:  python3 -m pip install openpyxl")
 
@@ -443,10 +446,64 @@ class _Frame:
         self.seen_sep = False
 
 
+def _static_signed_offset_range(name, args):
+    """Preserve an exact same-sheet cell:OFFSET(cell,literal,literal) range.
+
+    This tokenizer repair accepts one optional unary sign on finite integer
+    literals only. Endpoint arithmetic reads coordinates, never cell values.
+    """
+    match = re.fullmatch(r"(\$?[A-Z]{1,3}\$?[1-9][0-9]*):OFFSET", name)
+    if not match or len(args) != 3 or args[0].kind != "ref":
+        return None
+    if not re.fullmatch(r"\$?[A-Za-z]{1,3}\$?[1-9][0-9]*", args[0].name):
+        return None
+
+    def integer(arg):
+        sign = 1
+        if arg.kind == "prefix" and arg.name in {"+", "-"} and len(arg.args) == 1:
+            sign = -1 if arg.name == "-" else 1
+            arg = arg.args[0]
+        if arg.kind != "const" or arg.name != "number":
+            return None
+        value = arg.shape
+        if type(value) not in {int, float} or not (-EXCEL_MAX_ROW <= value <= EXCEL_MAX_ROW):
+            return None
+        return sign * int(value) if value == int(value) else None
+
+    rows, cols = integer(args[1]), integer(args[2])
+    if rows is None or cols is None:
+        return None
+    left_col, left_row, _, _ = range_boundaries(match.group(1))
+    base_col, base_row, _, _ = range_boundaries(args[0].name)
+    end_row, end_col = base_row + rows, base_col + cols
+    if not all(1 <= row <= EXCEL_MAX_ROW and 1 <= col <= EXCEL_MAX_COL
+               for row, col in [(left_row, left_col), (base_row, base_col), (end_row, end_col)]):
+        return None
+    return Ast("infix", ":", [Ast("ref", match.group(1)), Ast("func", "OFFSET", args)])
+
+
+def _reference_constructor_tokens(tokens):
+    """Repair openpyxl's two tokenizations of a colon before INDEX.
+
+    Work on tokens, never formula text: strings, quoted sheet names and normal
+    A1 spans remain untouched. Unsupported endpoint ASTs stay unsupported in
+    the evaluator; this does not resolve a reference from any saved value.
+    """
+    result = []
+    for token in tokens:
+        if token.type == "OPERAND" and token.subtype == "RANGE" and token.value == ":":
+            result.append(Token(":", "OPERATOR-INFIX", ""))
+        elif token.type == "FUNC" and token.subtype == "OPEN" and token.value.upper() == ":INDEX(":
+            result.extend((Token(":", "OPERATOR-INFIX", ""), Token("INDEX(", "FUNC", "OPEN")))
+        else:
+            result.append(token)
+    return result
+
+
 def parse_formula(text):
     """Shunting-yard over openpyxl's tokens -> Ast. Raises FormulaError."""
     try:
-        tokens = Tokenizer(text).items
+        tokens = _reference_constructor_tokens(Tokenizer(text).items)
     except Exception as exc:  # openpyxl raises bare Exception on malformed input
         raise FormulaError(str(exc))
 
@@ -542,7 +599,8 @@ def parse_formula(text):
             if frame.kind == "func":
                 if len(args) == 1 and args[0].kind == "missing" and not frame.seen_sep:
                     args = []
-                out.append(Ast("func", frame.name, args))
+                static_range = _static_signed_offset_range(frame.name, args)
+                out.append(static_range or Ast("func", frame.name, args))
             elif frame.kind == "array":
                 frame.rows.append(len(frame.args))
                 out.append(Ast("array", "{}", args, shape=max(1, len(frame.rows))))
@@ -581,15 +639,90 @@ def parse_formula(text):
 # workbook -> expression DAG
 # ---------------------------------------------------------------------------
 
+def _validate_array_member_records(path, sheet, formulas):
+    """Reject conflicting raw formula records before accepting array followers."""
+    import posixpath
+    import zipfile
+    from xml.etree import ElementTree
+
+    main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    office = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    relations = "http://schemas.openxmlformats.org/package/2006/relationships"
+    with zipfile.ZipFile(path) as archive:
+        if any(archive.namelist().count(part) != 1 for part in
+               ("xl/workbook.xml", "xl/_rels/workbook.xml.rels")):
+            raise FormulaError("array workbook or relationship part is ambiguous")
+        workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        links = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        selected = [node for node in workbook.findall(f"{{{main}}}sheets/{{{main}}}sheet")
+                    if node.get("name") == sheet]
+        if len(selected) != 1:
+            raise FormulaError("array worksheet identity is ambiguous")
+        identity = selected[0].get(f"{{{office}}}id")
+        matches = [node for node in links.findall(f"{{{relations}}}Relationship")
+                   if node.get("Id") == identity]
+        if (len(matches) != 1 or matches[0].get("TargetMode", "Internal") != "Internal"
+                or matches[0].get("Type") != office + "/worksheet"):
+            raise FormulaError("array worksheet relationship is ambiguous")
+        target = matches[0].get("Target", "")
+        part = posixpath.normpath(target.lstrip("/") if target.startswith("/") else "xl/" + target)
+        if not target or part == ".." or part.startswith("../") or archive.namelist().count(part) != 1:
+            raise FormulaError("array worksheet part is ambiguous")
+        expected = {get_column_letter(col) + str(row): value
+                    for (row, col), value in formulas.items()}
+        seen = set()
+        with archive.open(part) as stream:
+            for _, cell in ElementTree.iterparse(stream, events=("end",)):
+                if cell.tag != f"{{{main}}}c":
+                    continue
+                coordinate = cell.get("r", "")
+                claim = expected.get(coordinate)
+                if claim is not None:
+                    if coordinate in seen:
+                        raise FormulaError("duplicate array member cell record")
+                    seen.add(coordinate)
+                    records = cell.findall(f"{{{main}}}f")
+                    if len(records) > 1:
+                        raise FormulaError("duplicate array member formula record")
+                    is_anchor = claim["array_anchor"] == sheet + "!" + coordinate
+                    if is_anchor:
+                        if (len(records) != 1 or records[0].get("t") != "array"
+                                or "=" + (records[0].text or "") != claim["text"]
+                                or records[0].get("ref", coordinate) != claim["array_ref"]):
+                            raise FormulaError("array anchor formula record disagrees")
+                    elif records:
+                        record = records[0]
+                        if (record.text not in (None, "")
+                                or record.get("t", "normal") != "normal"
+                                or set(record.attrib) - {"t", "ca"}
+                                or record.get("ca", "0") not in {"0", "1", "true", "false"}):
+                            raise FormulaError("array member has a conflicting actual formula")
+                cell.clear()
+        anchors = {value["array_anchor"] for value in formulas.values()}
+        if any(anchor.rsplit("!", 1)[1] not in seen for anchor in anchors):
+            raise FormulaError("array anchor record is missing")
+
+
+# Auto storage also follows actual graph growth: a few complex formulas can
+# exceed the formula-count heuristic. Spill only between complete formulas so
+# no caller holds a mutable in-memory node alias across the storage transition.
+AUTO_EDGE_THRESHOLD = 250_000
+
+
 class AstGraph:
     def __init__(self, path, max_range_expand=100, sheets=None, read_values=True,
-                 consts=True, verbose=True):
+                 consts=True, verbose=True, graph_storage="auto", storage_dir=None):
         self.path = Path(path)
         self.max_range_expand = max_range_expand
         self.sheet_filter = set(sheets) if sheets else None
         self.read_values = read_values
         self.consts = consts
         self.verbose = verbose
+        if graph_storage not in ("auto", "memory", "disk"):
+            raise ValueError("graph_storage must be auto, memory, or disk")
+        self.graph_storage = graph_storage
+        self.storage_dir = storage_dir
+        self._storage = None
 
         self.sheet_names = []
         self.index = {}
@@ -620,63 +753,156 @@ class AstGraph:
 
     # -- build -----------------------------------------------------------
     def build(self):
+        try:
+            return self._build()
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        self._release_workbook()
+        if self._storage is not None:
+            self._storage.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def __del__(self):
+        storage = getattr(self, "_storage", None)
+        if storage is not None:
+            storage.close()
+
+    def _build(self):
         started = time.time()
-        self._load()
-        self._collect_names()
-        self._walk()
-        self._adopt_static_cells()
+        try:
+            self._load()
+            self._collect_names()
+        finally:
+            self._release_workbook()
+        from xl_graph_store import AUTO_FORMULA_THRESHOLD, GraphStore
+        formula_count = sum(len(rows) for rows in self.formulas.values())
+        if self.graph_storage == "disk" or (self.graph_storage == "auto" and formula_count >= AUTO_FORMULA_THRESHOLD):
+            self.log("using disk-backed AST graph storage...")
+            self._storage = GraphStore(self.storage_dir)
+            self.nodes, self.edges = self._storage.nodes, self._storage.edges
+        try:
+            self._walk()
+            self._spill_if_needed()
+            self._adopt_static_cells()
+        finally:
+            # No edges are added by degree/SCC computation or the writers.
+            # Do not retain a second tuple index of every edge at their peak.
+            self._edge_seen = None
         self._postprocess()
         self.elapsed = time.time() - started
         return self
 
+    def _spill_if_needed(self):
+        if self.graph_storage != "auto" or self._storage is not None or len(self.edges) < AUTO_EDGE_THRESHOLD:
+            return
+        from xl_graph_store import GraphStore
+        storage = GraphStore(self.storage_dir)
+        try:
+            for node_id, node in self.nodes.items():
+                storage.nodes[node_id] = node
+            for edge in self.edges:
+                storage.add_edge(edge)
+        except BaseException:
+            storage.close()
+            raise
+        self._storage = storage
+        self.nodes, self.edges = storage.nodes, storage.edges
+        self._edge_seen = None
+        self.log("spilled growing AST graph to disk storage...")
+
+    def _release_workbook(self):
+        """Names, formulas, indexes and cached values now own all needed data."""
+        workbook = self.__dict__.pop("_wb", None)
+        if workbook is not None:
+            try:
+                workbook.close()
+            finally:
+                del workbook
+                # openpyxl cells/worksheets/workbooks contain reference cycles.
+                # Collect them at this phase boundary before allocating ASTs.
+                gc.collect()
+
     def _load(self):
         self.log("reading formulas...")
         wb = openpyxl.load_workbook(self.path, data_only=False)
+        self._wb = wb  # Also release the workbook if extraction later fails.
         self.sheet_names = list(wb.sheetnames)
 
         for ws in wb.worksheets:
             idx = SheetIndex()
             formulas = {}
+            # Register owners before visiting cells: some producers write empty
+            # <f ca="1"/> records on followers, which openpyxl exposes as "=".
+            # They must not overwrite the owner's formula/positional metadata.
+            for anchor_cell in iter_cells(ws):
+                value = anchor_cell.value
+                if not isinstance(value, ArrayFormula):
+                    continue
+                text = value.text
+                ref = str(getattr(value, "ref", "") or anchor_cell.coordinate)
+                if not isinstance(text, str) or not text.startswith("=") or not text[1:].strip():
+                    raise FormulaError("array anchor has no formula")
+                try:
+                    min_col, min_row, max_col, max_row = range_boundaries(ref)
+                    valid = (all(type(v) is int for v in (min_col, min_row, max_col, max_row))
+                             and 1 <= min_col <= max_col <= 16384
+                             and 1 <= min_row <= max_row <= 1048576
+                             and (anchor_cell.row, anchor_cell.column) == (min_row, min_col))
+                except (TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    raise FormulaError("array anchor bounds are invalid")
+                anchor = self.cell_id(ws.title, anchor_cell.row, anchor_cell.column)
+                for member_row in range(min_row, max_row + 1):
+                    for member_col in range(min_col, max_col + 1):
+                        spot = (member_row, member_col)
+                        if spot in formulas:
+                            raise FormulaError("array anchor extents overlap")
+                        idx.add(member_row, member_col)
+                        formulas[spot] = {"text": text, "array_formula": True,
+                                          "array_anchor": anchor, "array_ref": ref,
+                                          "array_row": member_row - min_row,
+                                          "array_col": member_col - min_col}
+            if formulas:
+                _validate_array_member_records(self.path, ws.title, formulas)
             for cell in iter_cells(ws):
                 value = cell.value
                 if value is None:
                     continue
                 idx.add(cell.row, cell.column)
-                if isinstance(value, ArrayFormula):
-                    text = value.text
-                    if isinstance(text, str) and text.startswith("="):
-                        # A multi-cell array (CSE or spill) formula lives only
-                        # on its master cell; the member cells it fills carry
-                        # nothing but a cached value in the file, and would
-                        # otherwise be classified as hand-typed inputs -- a
-                        # computed value handed to the rebuild as a given.
-                        # Register every member as owning the same formula so
-                        # it is a formula cell with real precedent edges, and
-                        # record the span so the evaluator can hand each
-                        # member its own positional element of the result.
-                        ref = str(getattr(value, "ref", "") or cell.coordinate)
-                        try:
-                            min_col, min_row, max_col, max_row = range_boundaries(
-                                ref.replace("$", "")
-                            )
-                        except Exception:
-                            min_col = max_col = cell.column
-                            min_row = max_row = cell.row
-                            ref = cell.coordinate
-                        anchor = self.cell_id(ws.title, cell.row, cell.column)
-                        for member_row in range(min_row, max_row + 1):
-                            for member_col in range(min_col, max_col + 1):
-                                spot = (member_row, member_col)
-                                idx.add(member_row, member_col)
-                                formulas.setdefault(spot, {
-                                    "text": text,
-                                    "array_formula": True,
-                                    "array_anchor": anchor,
-                                    "array_ref": ref,
-                                    "array_row": member_row - min_row,
-                                    "array_col": member_col - min_col,
-                                })
+                if isinstance(value, DataTableFormula):
+                    if (cell.row, cell.column) in formulas:
+                        raise FormulaError("data table and array formula overlap")
+                    # Sensitivity results are calculated cells, even though
+                    # OOXML stores an expression only on their anchor. Never
+                    # let their cached answers enter the proof as inputs.
+                    min_col, min_row, max_col, max_row = range_boundaries(value.ref)
+                    for member_row in range(min_row, max_row + 1):
+                        for member_col in range(min_col, max_col + 1):
+                            idx.add(member_row, member_col)
+                            if (member_row, member_col) in formulas and formulas[(member_row, member_col)]["array_formula"]:
+                                raise FormulaError("data table and array formula overlap")
+                            formulas[(member_row, member_col)] = {
+                                "text": "=_FCP_UNSUPPORTED_DATA_TABLE()",
+                                "array_formula": False, "array_anchor": "", "array_ref": "",
+                                "array_row": None, "array_col": None,
+                            }
+                elif isinstance(value, ArrayFormula):
+                    pass  # Validated array owners and members were registered first.
                 elif cell.data_type == "f" and isinstance(value, str) and value.startswith("="):
+                    existing = formulas.get((cell.row, cell.column))
+                    if existing and existing["array_formula"]:
+                        if value != "=":
+                            raise FormulaError("array member has a conflicting actual formula")
+                        continue
                     formulas[(cell.row, cell.column)] = {
                         "text": value,
                         "array_formula": False,
@@ -688,8 +914,6 @@ class AstGraph:
             idx.finalise()
             self.index[ws.title] = idx
             self.formulas[ws.title] = formulas
-
-        self._wb = wb
 
         if not self.read_values:
             return
@@ -922,7 +1146,7 @@ class AstGraph:
             "range_truncated": False,
         }
         self.nodes[node_id] = node
-        return node
+        return self.nodes[node_id] if self._storage is not None else node
 
     def _cell_node(self, sheet, row, col):
         node_id = self.cell_id(sheet, row, col)
@@ -988,7 +1212,19 @@ class AstGraph:
         return " / ".join(parts)[:160]
 
     def _add_edge(self, source, target, role, arg_index, op, ref, via_range, cell, sheet):
+        if self._storage is not None:
+            src_sheet = self.nodes[source].get("sheet") or ""
+            self._storage.add_edge(dict(source=source,target=target,role=role,arg_index=arg_index,
+                op=op,cell=cell,ref=ref,via_range=via_range,cross_sheet=bool(src_sheet) and src_sheet != sheet))
+            return
         key = (source, target, role, arg_index, ref)
+        if self._edge_seen is None:
+            # Preserve duplicate protection for callers extending a built graph.
+            # The ordinary build path never recreates this construction index.
+            self._edge_seen = {
+                (edge["source"], edge["target"], edge["role"], edge["arg_index"], edge["ref"])
+                for edge in self.edges
+            }
         if key in self._edge_seen:
             return
         self._edge_seen.add(key)
@@ -1019,6 +1255,7 @@ class AstGraph:
             if self.sheet_filter and sheet not in self.sheet_filter:
                 continue
             for (row, col), entry in self.formulas.get(sheet, {}).items():
+                self._spill_if_needed()
                 formula = entry["text"]
                 cell_id = self.cell_id(sheet, row, col)
                 cell_node = self._cell_node(sheet, row, col)
@@ -1268,6 +1505,9 @@ class AstGraph:
     # -- post-processing ----------------------------------------------------
     def _postprocess(self):
         self.log("computing degrees and cycles...")
+        if self._storage is not None:
+            self.cycles, self.cyclic_nodes = self._storage.postprocess()
+            return
         for node in self.nodes.values():
             node["in_degree"] = 0
             node["out_degree"] = 0
@@ -1411,7 +1651,11 @@ class AstGraph:
         for node in nodes.values():
             if node["kind"] == "op":
                 by_op[node["op"]] += 1
-        cycles = [g for g in self.cycles if any(k in nodes for k in g)]
+        cycle_count = largest_cycle = 0
+        for group in self.cycles:
+            if any(k in nodes for k in group):
+                cycle_count += 1
+                largest_cycle = max(largest_cycle, len(group))
         return {
             "workbook": self.path.name,
             "sheets": self.sheet_names,
@@ -1423,8 +1667,8 @@ class AstGraph:
             "edges_by_role": dict(sorted(by_role.items(), key=lambda kv: -kv[1])),
             "top_operators": dict(sorted(by_op.items(), key=lambda kv: -kv[1])[:15]),
             "cross_sheet_edges": cross,
-            "cycles": len(cycles),
-            "largest_cycle": max((len(g) for g in cycles), default=0),
+            "cycles": cycle_count,
+            "largest_cycle": largest_cycle,
             "cyclic_nodes": sum(1 for n in nodes.values() if n.get("in_cycle")),
             "max_range_expand": self.max_range_expand,
             "warnings": self.warnings,
@@ -1449,19 +1693,39 @@ def write_csv(out_dir, nodes, edges):
     with open(out_dir / "nodes.csv", "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=NODE_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        for node in nodes.values():
+        for node in nodes.iter_records() if hasattr(nodes, "iter_records") else nodes.values():
             writer.writerow(node)
     with open(out_dir / "edges.csv", "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=EDGE_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        for edge in edges:
+        for edge in edges.iter_records() if hasattr(edges, "iter_records") else edges:
             writer.writerow(edge)
 
 
 def write_json(out_dir, nodes, edges, stats):
-    payload = {"stats": stats, "nodes": list(nodes.values()), "edges": edges}
+    # Match the existing indent=1 document bytes without a list of every node
+    # or a JSON encoder retaining the complete disk-backed graph.
+    encoder = json.JSONEncoder(indent=1, default=str)
+    def encoded(fh, value, depth):
+        prefix = " " * depth
+        for fragment in encoder.iterencode(value):
+            fh.write(fragment.replace("\n", "\n" + prefix))
+    def array(fh, values):
+        first = True
+        fh.write("[")
+        for value in values:
+            fh.write("\n  " if first else ",\n  ")
+            encoded(fh, value, 2)
+            first = False
+        fh.write("\n ]" if not first else "]")
     with open(out_dir / "graph.json", "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=1, default=str)
+        fh.write('{\n "stats": ')
+        encoded(fh, stats, 1)
+        fh.write(',\n "nodes": ')
+        array(fh, nodes.iter_records() if hasattr(nodes, "iter_records") else nodes.values())
+        fh.write(',\n "edges": ')
+        array(fh, edges.iter_records() if hasattr(edges, "iter_records") else edges)
+        fh.write("\n}")
 
 
 _GRAPHML_NODE_TYPES = {
@@ -1537,13 +1801,16 @@ def write_graphml(out_dir, nodes, edges):
 
 def pick_default_focus(nodes, edges):
     """A formula cell with a big tree makes the most useful first screen."""
+    if getattr(nodes, "store", None) is not None and getattr(edges, "store", None) is nodes.store:
+        return nodes.store.default_focus()
     size = defaultdict(int)
     for edge in edges:
         if edge["cell"]:
             size[edge["cell"]] += 1
-    for cell, _ in sorted(size.items(), key=lambda kv: (-kv[1], kv[0])):
-        if cell in nodes:
-            return cell
+    best = min(((cell, count) for cell, count in size.items() if cell in nodes),
+               key=lambda item: (-item[1], item[0]), default=None)
+    if best is not None:
+        return best[0]
     for node_id, node in nodes.items():
         if node["kind"] == "formula":
             return node_id
@@ -3318,6 +3585,13 @@ def human_size(num_bytes):
         n /= 1024.0
 
 
+def cycle_previews(cycles, nodes):
+    """Keep the existing three-largest/four-sorted-members diagnostic bounded."""
+    present = (group for group in cycles if any(member in nodes for member in group))
+    for group in heapq.nlargest(3, present, key=len):
+        yield len(group), heapq.nsmallest(4, group)
+
+
 def process(path, args):
     print("%s" % path.name, flush=True)
     if path.suffix.lower() == ".xls":
@@ -3333,89 +3607,90 @@ def process(path, args):
         read_values=not args.no_values,
         consts=not args.no_consts,
         verbose=not args.quiet,
+        graph_storage=getattr(args, "graph_storage", "auto"),
+        storage_dir=getattr(args, "graph_storage_dir", None),
     )
-    try:
-        graph.build()
-    except Exception as exc:
-        print("    failed: %s: %s" % (type(exc).__name__, exc))
-        return None
-
-    nodes, edges = graph.nodes, graph.edges
-    focus = ""
-    filtered = False
-    if args.focus:
+    with graph:
         try:
-            focus, nodes, edges = graph.focus(args.focus, args.depth, args.direction)
-        except KeyError:
-            print("    focus node %r not found in this workbook; keeping the whole graph"
-                  % args.focus)
-            focus = ""
-        else:
-            filtered = True
-            print("    focus %s depth %d (%s) -> %d nodes, %d edges"
-                  % (focus, args.depth, args.direction, len(nodes), len(edges)))
-    if not focus:
-        focus = pick_default_focus(nodes, edges)
+            graph.build()
+        except Exception as exc:
+            print("    failed: %s: %s" % (type(exc).__name__, exc))
+            return None
 
-    stats = graph.stats(nodes, edges)
-    stats["elapsed_sec"] = round(graph.elapsed, 2)
-    stats["focus"] = focus
-
-    out_dir = Path(args.out) / path.stem
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if getattr(args, "production", False):
-        # Production is a closed two-file contract even when this directory
-        # previously held debug output from a development run.
-        for old in out_dir.iterdir():
-            if old.is_dir() and not old.is_symlink():
-                shutil.rmtree(old)
+        nodes, edges = graph.nodes, graph.edges
+        focus = ""
+        filtered = False
+        if args.focus:
+            try:
+                focus, nodes, edges = graph.focus(args.focus, args.depth, args.direction)
+            except KeyError:
+                print("    focus node %r not found in this workbook; keeping the whole graph"
+                      % args.focus)
+                focus = ""
             else:
-                old.unlink()
+                filtered = True
+                print("    focus %s depth %d (%s) -> %d nodes, %d edges"
+                      % (focus, args.depth, args.direction, len(nodes), len(edges)))
+        if not focus:
+            focus = pick_default_focus(nodes, edges)
 
-    if not args.no_csv:
-        write_csv(out_dir, nodes, edges)
-    if not args.no_json:
-        write_json(out_dir, nodes, edges, stats)
-    if not args.no_graphml:
-        write_graphml(out_dir, nodes, edges)
-    if not args.no_html:
-        if len(nodes) > args.html_max_nodes:
-            print("    skipping graph.html: %d nodes is past --html-max-nodes (%d). "
-                  "Narrow it with --sheet or --focus."
-                  % (len(nodes), args.html_max_nodes))
+        stats = graph.stats(nodes, edges)
+        stats["elapsed_sec"] = round(graph.elapsed, 2)
+        stats["focus"] = focus
+
+        out_dir = Path(args.out) / path.stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if getattr(args, "production", False):
+            # Production is a closed two-file contract even when this directory
+            # previously held debug output from a development run.
+            for old in out_dir.iterdir():
+                if old.is_dir() and not old.is_symlink():
+                    shutil.rmtree(old)
+                else:
+                    old.unlink()
+
+        if not args.no_csv:
+            write_csv(out_dir, nodes, edges)
+        if not args.no_json:
+            write_json(out_dir, nodes, edges, stats)
+        if not args.no_graphml:
+            write_graphml(out_dir, nodes, edges)
+        if not args.no_html:
+            if len(nodes) > args.html_max_nodes:
+                print("    skipping graph.html: %d nodes is past --html-max-nodes (%d). "
+                      "Narrow it with --sheet or --focus."
+                      % (len(nodes), args.html_max_nodes))
+            else:
+                write_html(out_dir, graph, nodes, edges, stats, focus, args.depth,
+                           args.html_text_limit, filtered)
+                if filtered:
+                    print("    note: graph.html holds only the focused subgraph; run without "
+                          "--focus for the whole-workbook map")
+
+        print("    %d nodes, %d edges from %d formulas in %.1fs"
+              % (stats["nodes"], stats["edges"], stats["formulas_parsed"], graph.elapsed))
+        kinds = stats["nodes_by_kind"]
+        print("    %s" % ", ".join("%s %d" % (k, kinds[k]) for k in NODE_KINDS if k in kinds))
+        if stats["cycles"]:
+            print("    %d circular reference%s over %d node(s); largest loops through %d"
+                  % (stats["cycles"], "" if stats["cycles"] == 1 else "s",
+                     stats["cyclic_nodes"], stats["largest_cycle"]))
+            for count, members in cycle_previews(graph.cycles, nodes):
+                shown = ", ".join(members)
+                print("      %d nodes: %s%s"
+                      % (count, shown, ", ..." if count > 4 else ""))
         else:
-            write_html(out_dir, graph, nodes, edges, stats, focus, args.depth,
-                       args.html_text_limit, filtered)
-            if filtered:
-                print("    note: graph.html holds only the focused subgraph; run without "
-                      "--focus for the whole-workbook map")
-
-    print("    %d nodes, %d edges from %d formulas in %.1fs"
-          % (stats["nodes"], stats["edges"], stats["formulas_parsed"], graph.elapsed))
-    kinds = stats["nodes_by_kind"]
-    print("    %s" % ", ".join("%s %d" % (k, kinds[k]) for k in NODE_KINDS if k in kinds))
-    if stats["cycles"]:
-        print("    %d circular reference%s over %d node(s); largest loops through %d"
-              % (stats["cycles"], "" if stats["cycles"] == 1 else "s",
-                 stats["cyclic_nodes"], stats["largest_cycle"]))
-        present = [g for g in graph.cycles if any(k in nodes for k in g)]
-        for group in sorted(present, key=len, reverse=True)[:3]:
-            members = sorted(group)
-            shown = ", ".join(members[:4])
-            print("      %d nodes: %s%s"
-                  % (len(group), shown, ", ..." if len(members) > 4 else ""))
-    else:
-        print("    no circular references")
-    for warning in stats["warnings"]:
-        print("    note: %s" % warning)
-    written = sum(p.stat().st_size for p in out_dir.iterdir() if p.is_file())
-    stats["output_bytes"] = written
-    if written > 100 * 1024 * 1024:
-        print("    warning: wrote %s. Lower --max-range-expand, add --focus, or drop "
-              "formats with --no-graphml/--no-json to shrink this." % human_size(written))
-    print("    -> %s (%s)" % (out_dir, human_size(written)))
-    stats["output"] = str(out_dir)
-    return stats
+            print("    no circular references")
+        for warning in stats["warnings"]:
+            print("    note: %s" % warning)
+        written = sum(p.stat().st_size for p in out_dir.iterdir() if p.is_file())
+        stats["output_bytes"] = written
+        if written > 100 * 1024 * 1024:
+            print("    warning: wrote %s. Lower --max-range-expand, add --focus, or drop "
+                  "formats with --no-graphml/--no-json to shrink this." % human_size(written))
+        print("    -> %s (%s)" % (out_dir, human_size(written)))
+        stats["output"] = str(out_dir)
+        return stats
 
 
 def main(argv=None):
@@ -3449,6 +3724,9 @@ def main(argv=None):
                         help="drop literal numbers and strings instead of giving them nodes")
     parser.add_argument("--no-values", action="store_true",
                         help="skip the cached-value pass (faster, but no labels)")
+    parser.add_argument("--graph-storage", choices=("auto", "memory", "disk"), default="auto",
+                        help="graph storage backend; auto uses disk for at least 100,000 formulas")
+    parser.add_argument("--graph-storage-dir", help="existing parent directory for temporary graph storage")
     parser.add_argument("--production", action="store_true",
                         help="Harbor pipeline output: write only nodes.csv and "
                              "edges.csv (equivalent to --no-json --no-graphml "

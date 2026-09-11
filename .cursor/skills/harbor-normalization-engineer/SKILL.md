@@ -144,6 +144,22 @@ row to begin as `needs_review`.
 
 ### Gate 1B: Generate, run twice, and verify dispositions
 
+Assess duplicate masking per referenced cell before aggregating draft-row
+dispositions. A rejected sibling must not discard independent typed inputs.
+For any surviving maskable cells, create `normalization-review.json` through
+an independent semantic review before emission. Use schema
+`normalization-review/v1`, bind `draft_sha256`, `source_sha256`, and
+`baseline_sha256` to file bytes, identify `reviewer`, and provide a `cells`
+mapping keyed by exact `Sheet!A1`. Every candidate needs boolean `eligible`, a
+nonempty `reason`, and specific `evidence_refs`; eligible cells also require
+grounded `entity`, `period`, `scenario`, and `basis`. Internal projections or
+uncertain provenance are not automatically research inputs. Preserve the
+audit's source notes and URLs and distinguish supplied workbook evidence from
+verified real-world provenance. Retain every excluded cell in
+`cell_exclusions`, including partial draft rows. Semantic exclusions rerun
+duplicate closure. The generated normalizer revalidates all four evidence
+files on each execution; changed evidence requires a new reviewed attempt.
+
 ```bash
 python3 gen_normalizer.py "$WB" \
   --source-file "$SOURCE_FILE" --source-sha256 "$SOURCE_SHA256" \

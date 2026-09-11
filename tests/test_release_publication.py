@@ -308,6 +308,11 @@ def _fixture(
         "source_manifest": source_manifest,
         "segmentation_manifest": segmentation_manifest,
     }
+    monkeypatch.setattr(release, "_predecessor_components", lambda manifest, sr, gr, tr:
+        release._release_components(manifest["workbook_id"], sr,
+            manifest["source_generation"]["generation_id"], gr,
+            manifest["segmentation_generation"]["generation_id"], tr,
+            manifest["task_generation"]["generation_id"]))
     if freeze_legacy:
         case["legacy_snapshot_hash"] = _freeze_fixture_legacy(case)
     return case
@@ -659,7 +664,7 @@ def test_absent_legacy_snapshot_rejects_partial_legacy_tuple(
         )
 
 
-def test_end_to_end_release_uses_real_source_and_segmentation_resolvers(tmp_path):
+def _real_release_fixture(tmp_path, *, builder_code_paths=None, prior_release_id=None):
     workbook_id = "real-case"
     source = tmp_path / f"{workbook_id}.xlsx"
     book = Workbook()
@@ -668,7 +673,7 @@ def test_end_to_end_release_uses_real_source_and_segmentation_resolvers(tmp_path
     book.active["B1"] = 2
     book.save(source)
     ast = tmp_path / "ast"
-    ast.mkdir()
+    ast.mkdir(exist_ok=True)
     (ast / "nodes.csv").write_text("id\nSheet!B1\n")
     (ast / "edges.csv").write_text("source,target\n")
     request, result = create_identity_documents(source)
@@ -681,13 +686,14 @@ def test_end_to_end_release_uses_real_source_and_segmentation_resolvers(tmp_path
         result=result,
         health=inspect_workbook(source),
         builder_args=["--production"],
+        builder_code_paths=builder_code_paths,
         activate=False,
     )
     source_path = source_dir / source_manifest["layout"]["source_workbook"]
     ast_dir = source_dir / source_manifest["layout"]["ast_directory"]
 
     segmentation_root = tmp_path / "real-segmentation"
-    segmentation_root.mkdir()
+    segmentation_root.mkdir(exist_ok=True)
     curation = segmentation_root / "curation.toml"
     curation.write_text(
         '[[output]]\nband = "out"\nsheet = "Sheet"\n'
@@ -772,7 +778,7 @@ def test_end_to_end_release_uses_real_source_and_segmentation_resolvers(tmp_path
         ),
     }
     task_stage = tmp_path / "real-task-stage"
-    (task_stage / "environment").mkdir(parents=True)
+    (task_stage / "environment").mkdir(parents=True, exist_ok=True)
     _xlsx(task_stage / "environment" / f"{workbook_id}-inputs.xlsx")
     (task_stage / "instruction.md").write_text("Build it.\n")
     release_root = tmp_path / "real-release"
@@ -783,24 +789,26 @@ def test_end_to_end_release_uses_real_source_and_segmentation_resolvers(tmp_path
         bindings=task_bindings,
     )
 
-    (source_root / "current.json").write_text(json.dumps({
-        "schema_version": "source-current/v1",
-        "generation_id": source_manifest["generation_id"],
-    }))
-    (segmentation_root / "current.json").write_text(json.dumps({
-        "schema_version": "segmentation-current/v1",
-        "generation_id": segmentation_manifest["generation_id"],
-    }))
-    legacy_task = tmp_path / "real-legacy-task"
-    legacy_task.mkdir()
-    (legacy_task / "instruction.md").write_text("legacy\n")
-    _, snapshot = release.freeze_legacy_snapshot(
-        release_root,
-        workbook_id,
-        source_root=source_root,
-        segmentation_root=segmentation_root,
-        task_dir=legacy_task,
-    )
+    snapshot = None
+    if prior_release_id is None:
+        (source_root / "current.json").write_text(json.dumps({
+            "schema_version": "source-current/v1",
+            "generation_id": source_manifest["generation_id"],
+        }))
+        (segmentation_root / "current.json").write_text(json.dumps({
+            "schema_version": "segmentation-current/v1",
+            "generation_id": segmentation_manifest["generation_id"],
+        }))
+        legacy_task = tmp_path / "real-legacy-task"
+        legacy_task.mkdir(exist_ok=True)
+        (legacy_task / "instruction.md").write_text("legacy\n")
+        _, snapshot = release.freeze_legacy_snapshot(
+            release_root,
+            workbook_id,
+            source_root=source_root,
+            segmentation_root=segmentation_root,
+            task_dir=legacy_task,
+        )
 
     directory, manifest = release.publish_release(
         release_root,
@@ -810,8 +818,8 @@ def test_end_to_end_release_uses_real_source_and_segmentation_resolvers(tmp_path
         segmentation_root=segmentation_root,
         segmentation_generation_id=segmentation_manifest["generation_id"],
         task_generation_id=task_manifest["generation_id"],
-        expected_current_release_id=None,
-        legacy_snapshot_hash=snapshot["snapshot_hash"],
+        expected_current_release_id=prior_release_id,
+        legacy_snapshot_hash=snapshot["snapshot_hash"] if snapshot else None,
     )
     resolved, observed = release.resolve_current_release(
         release_root,
@@ -820,6 +828,18 @@ def test_end_to_end_release_uses_real_source_and_segmentation_resolvers(tmp_path
     )
     assert resolved == directory
     assert observed == manifest
+
+    return {"workbook": workbook_id, "release_root": release_root,
+            "source_root": source_root, "segmentation_root": segmentation_root,
+            "source_id": source_manifest["generation_id"],
+            "segmentation_id": segmentation_manifest["generation_id"],
+            "task_id": task_manifest["generation_id"], "source_dir": source_dir,
+            "segmentation_dir": segmentation_dir, "release_dir": directory,
+            "release": manifest}
+
+
+def test_end_to_end_release_uses_real_source_and_segmentation_resolvers(tmp_path):
+    _real_release_fixture(tmp_path)
 
 
 def test_end_to_end_restricted_release_uses_real_validators_and_resolvers(
@@ -1472,3 +1492,97 @@ def test_legacy_snapshot_is_immutable_and_never_used_after_cas(
     _publish(case, legacy_snapshot_hash=snapshot["snapshot_hash"])
     with pytest.raises(release.ReleasePublicationError, match="disabled"):
         release.resolve_legacy_snapshot(case["release_root"])
+
+
+def test_real_stale_builder_predecessor_allows_fresh_successor(tmp_path):
+    builder = tmp_path / 'builder.py'
+    builder.write_text('version = 1\n')
+    prior = _real_release_fixture(tmp_path, builder_code_paths=[builder])
+    builder.write_text('version = 2\n')
+    roots = dict(source_root=prior['source_root'], segmentation_root=prior['segmentation_root'])
+    with pytest.raises(source_publication.SourcePublicationError, match='ast_provenance'):
+        release.resolve_current_release(prior['release_root'], **roots)
+    _, intact = release.resolve_current_release_integrity(prior['release_root'],
+        expected_release_id=prior['release']['release_id'], **roots)
+    assert intact == prior['release']
+    fresh = _real_release_fixture(tmp_path, builder_code_paths=[builder],
+                                  prior_release_id=intact['release_id'])
+    assert fresh['source_id'] != prior['source_id']
+    assert fresh['release']['prior_release_id'] == intact['release_id']
+    assert release.resolve_current_release(fresh['release_root'], **roots)[1] == fresh['release']
+
+
+@pytest.mark.parametrize('damage', ['source', 'segmentation', 'task', 'manifest', 'pointer', 'conflict', 'symlink'])
+def test_real_historical_integrity_rejects_damage(tmp_path, damage):
+    builder = tmp_path / 'builder.py'; builder.write_text('version = 1\n')
+    prior = _real_release_fixture(tmp_path, builder_code_paths=[builder])
+    builder.write_text('version = 2\n')
+    if damage in {'source', 'segmentation', 'task'}:
+        kind = damage + '_generation'
+        record = prior['release'][kind]
+        directory = Path(record['generation_path'])
+        manifest = json.loads((directory / 'generation-manifest.json').read_text())
+        path = directory / next(iter(manifest['artifacts']))
+        path.chmod(0o600); path.write_bytes(path.read_bytes() + b'changed')
+    elif damage == 'manifest':
+        p = prior['source_dir'] / 'generation-manifest.json'; p.chmod(0o600); p.write_bytes(p.read_bytes()+b' ')
+    elif damage == 'pointer':
+        p = prior['release_root']/'current-release.json'; v=json.loads(p.read_text());v['manifest_sha256']='f'*64;p.write_text(json.dumps(v))
+    elif damage == 'symlink':
+        p=prior['source_dir']/'generation-manifest.json';data=p.read_bytes();p.unlink();target=tmp_path/'redirect.json';target.write_bytes(data);p.symlink_to(target)
+    expected = 'f'*64 if damage == 'conflict' else prior['release']['release_id']
+    pointer_before=(prior['release_root']/'current-release.json').read_bytes()
+    with pytest.raises(release.ReleasePublicationError):
+        release.resolve_current_release_integrity(prior['release_root'],
+            source_root=prior['source_root'], segmentation_root=prior['segmentation_root'],
+            expected_release_id=expected)
+    assert (prior['release_root']/'current-release.json').read_bytes()==pointer_before
+
+
+def test_real_stale_candidate_and_post_cas_resume_remain_strict(tmp_path):
+    from scripts.qualified_publication import publish_or_resume, stable_source_root
+    builder=tmp_path/'builder.py';builder.write_text('version = 1\n')
+    prior=_real_release_fixture(tmp_path,builder_code_paths=[builder])
+    builder.write_text('version = 2\n')
+    roots=dict(source_root=prior['source_root'],segmentation_root=prior['segmentation_root'])
+    pointer=(prior['release_root']/'current-release.json').read_bytes()
+    with pytest.raises(source_publication.SourcePublicationError,match='ast_provenance'):
+        publish_or_resume(prior['release_root'],prior['workbook'],**roots,
+            source_generation_id=prior['source_id'],segmentation_generation_id=prior['segmentation_id'],
+            task_generation_id=prior['task_id'],expected_current_release_id=prior['release']['release_id'],
+            output_path=tmp_path/'output')
+    assert (prior['release_root']/'current-release.json').read_bytes()==pointer
+    fresh=_real_release_fixture(tmp_path,builder_code_paths=[builder],prior_release_id=prior['release']['release_id'])
+    assert stable_source_root(fresh['release_root'],fresh['source_root'],fresh['source_id'],
+        segmentation_root=fresh['segmentation_root'],expected_current_release_id=prior['release']['release_id'])==fresh['source_root']
+    builder.write_text('version = 3\n')
+    with pytest.raises(source_publication.SourcePublicationError,match='ast_provenance'):
+        publish_or_resume(fresh['release_root'],fresh['workbook'],**roots,
+            source_generation_id=fresh['source_id'],segmentation_generation_id=fresh['segmentation_id'],
+            task_generation_id=fresh['task_id'],expected_current_release_id=prior['release']['release_id'],
+            output_path=tmp_path/'output',resuming=True)
+    with pytest.raises(source_publication.SourcePublicationError,match='ast_provenance'):
+        stable_source_root(fresh['release_root'],fresh['source_root'],fresh['source_id'],
+            segmentation_root=fresh['segmentation_root'],expected_current_release_id=prior['release']['release_id'])
+
+
+def test_direct_publication_rejects_stale_verifier_only(tmp_path, monkeypatch):
+    from scripts.qualified_publication import publish_or_resume
+    verifier=tmp_path/'verifier.py';verifier.write_text('version = 1\n')
+    monkeypatch.setattr(segmentation_publication, 'verifier_paths', lambda: (verifier,))
+    prior=_real_release_fixture(tmp_path)
+    verifier.write_text('version = 2\n')
+    source_publication.validate_source_generation(prior['source_dir'])
+    roots=dict(source_root=prior['source_root'],segmentation_root=prior['segmentation_root'])
+    assert release.resolve_current_release_integrity(prior['release_root'],
+        expected_release_id=prior['release']['release_id'],**roots)[1]==prior['release']
+    pointer=(prior['release_root']/'current-release.json').read_bytes()
+    with pytest.raises(segmentation_publication.GenerationValidationError,match='verifier_code'):
+        release.resolve_current_release(prior['release_root'],**roots)
+    for publish in (release.publish_release, publish_or_resume):
+        extra={} if publish is release.publish_release else {'output_path':tmp_path/'output'}
+        with pytest.raises(segmentation_publication.GenerationValidationError,match='verifier_code'):
+            publish(prior['release_root'],prior['workbook'],**roots,
+                source_generation_id=prior['source_id'],segmentation_generation_id=prior['segmentation_id'],
+                task_generation_id=prior['task_id'],expected_current_release_id=prior['release']['release_id'],**extra)
+        assert (prior['release_root']/'current-release.json').read_bytes()==pointer

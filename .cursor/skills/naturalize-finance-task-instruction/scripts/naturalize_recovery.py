@@ -12,7 +12,7 @@ import shutil
 import sys
 import time
 import tomllib
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -33,6 +33,7 @@ RECOVERY_VERSION = "naturalize-recovery-v1"
 MAX_ATTEMPTS = 2
 RETRYABLE_REASON_CODES = frozenset(
     {
+        "frozen_span_invalid",
         "answer_value_leak",
         "candidate_structure_invalid",
         "final_newline_changed",
@@ -454,6 +455,7 @@ def _read_state(root: Path) -> dict[str, Any]:
 
 
 def _verified_snapshot(root: Path, state: dict[str, Any]) -> bytes:
+    _verified_budget(root, state)
     source = _source_path(root).read_bytes()
     actual = sha256_bytes(source)
     if actual != state["source_sha256"]:
@@ -468,6 +470,155 @@ def _verified_snapshot(root: Path, state: dict[str, Any]) -> bytes:
     if spans.as_dict() != stored_spans:
         raise RecoveryError("span_hash_mismatch", "stored spans do not match the source snapshot")
     return source
+
+
+def _attempts_used(state: dict[str, Any]) -> int:
+    return state.get("inherited_attempts", 0) + len(state.get("attempts", []))
+
+
+def _submission_engine(mode):
+    if mode == "frozen-boundary-v1":
+        import boundary_submission
+        return boundary_submission
+    import frozen_submission
+    return frozen_submission
+
+
+def _verified_budget(root: Path, state: dict[str, Any], depth: int = 0) -> None:
+    import span_restoration
+    span_restoration.validate(sys.modules[__name__], root, state)
+    if state.get("boundary_recovery") or state.get("final_candidate", "").startswith("boundary-recovery-v1/"):
+        repository = SCRIPT_DIR.parents[3]
+        if str(repository) not in sys.path:
+            sys.path.insert(0, str(repository))
+        from scripts.batch import harbor_nat_boundary_recovery
+        harbor_nat_boundary_recovery.validate(root, state, api=sys.modules[__name__])
+    import frozen_submission
+    for item in state.get("attempts", []):
+        _submission_engine(item.get("submission_mode", "plain")).validate_attempt(sys.modules[__name__], root, state, item)
+    inherited = state.get("inherited_attempts", 0)
+    attempts = state.get("attempts", [])
+    if (type(inherited) is not int or inherited < 0 or not isinstance(attempts, list)
+            or inherited + len(attempts) > MAX_ATTEMPTS or depth > 32
+            or [item.get("attempt") for item in attempts]
+            != list(range(inherited + 1, inherited + len(attempts) + 1))):
+        raise RecoveryError("invalid_attempt_budget", "naturalization attempt budget is inconsistent")
+    recorded = {item["attempt"] for item in attempts}
+    for number in range(inherited + 1, MAX_ATTEMPTS + 1):
+        if ((root / ("attempt-%02d" % number) / "validation.json").is_file()
+                and number not in recorded and (state.get("staged_attempt") or {}).get("attempt") != number):
+            raise RecoveryError("invalid_attempt_budget", "completed attempt is missing from the budget record")
+    binding = state.get("budget_inheritance")
+    if not binding:
+        if inherited:
+            raise RecoveryError("invalid_attempt_budget", "inherited budget lacks bound evidence")
+        return
+    archive = root / "inherited-budget" / "previous"
+    files = binding.get("files")
+    if not isinstance(files, dict) or not files:
+        raise RecoveryError("inherited_evidence_changed", "prior evidence manifest is missing")
+    for relative, expected in files.items():
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            raise RecoveryError("inherited_evidence_changed", "unsafe inherited evidence path")
+        artifact = archive / path
+        if artifact.is_symlink() or not artifact.is_file() or sha256_bytes(artifact.read_bytes()) != expected:
+            raise RecoveryError("inherited_evidence_changed", "prior naturalization evidence changed", artifact=relative)
+    state_path = archive / "state.json"
+    if sha256_bytes(state_path.read_bytes()) != binding.get("previous_state_sha256"):
+        raise RecoveryError("inherited_evidence_changed", "prior state digest changed")
+    previous = _read_state(archive)
+    _verified_budget(archive, previous, depth + 1)
+    if inherited != _attempts_used(previous) or inherited != binding.get("attempts_used"):
+        raise RecoveryError("invalid_attempt_budget", "inherited attempt count differs from prior evidence")
+
+
+def _verify_attempt_evidence(root: Path, state: dict[str, Any]) -> None:
+    import frozen_submission
+    for item in state.get("attempts", []):
+        _submission_engine(item.get("submission_mode", "plain")).validate_attempt(sys.modules[__name__], root, state, item)
+        attempt = root / ("attempt-%02d" % item["attempt"])
+        report = _load_json(attempt / "validation.json")
+        for field in ("attempt", "valid", "reason_codes", "preamble_submission_sha256", "input_submission_sha256"):
+            if report.get(field) != item.get(field):
+                raise RecoveryError("prior_attempt_evidence_changed", "prior attempt record differs from its validation", field=field)
+        for filename, field in (("preamble_body.md", "preamble_submission_sha256"),
+                                ("input_body.md", "input_submission_sha256"),
+                                ("candidate.md", "candidate_sha256")):
+            if item.get(field) and sha256_bytes((attempt / filename).read_bytes()) != item[field]:
+                raise RecoveryError("prior_attempt_evidence_changed", "prior submitted artifact changed", artifact=filename)
+        if (report.get("source_sha256") != state.get("source_sha256")
+                or sha256_bytes((attempt / "source.snapshot.md").read_bytes()) != report.get("source_sha256")):
+            raise RecoveryError("prior_attempt_evidence_changed", "prior attempt source differs from its snapshot")
+
+
+def inherit_attempt_budget(recovery_root: Path, previous_root: Path, *,
+                           previous_state_sha256: str, reason: str) -> dict[str, Any]:
+    """Carry consumed attempts across a corrected source without reusing prose.
+
+    The caller supplies its already recorded prior-state digest. Only a fresh
+    initialized run may inherit. Complete prior evidence is archived unchanged;
+    chained inheritance preserves the cumulative two-attempt ceiling.
+    """
+    recovery_root, previous_root = recovery_root.resolve(), previous_root.resolve()
+    if recovery_root == previous_root or not reason.strip():
+        raise RecoveryError("invalid_budget_inheritance", "distinct runs and an explicit reason are required")
+    if recovery_root in previous_root.parents or previous_root in recovery_root.parents:
+        raise RecoveryError("invalid_budget_inheritance", "recovery runs must not contain one another")
+    with ExitStack() as stack:
+        for path in sorted((recovery_root, previous_root)):
+            stack.enter_context(recovery_lock(path))
+        state, previous = _read_state(recovery_root), _read_state(previous_root)
+        if sha256_bytes(_state_path(previous_root).read_bytes()) != previous_state_sha256:
+            raise RecoveryError("prior_state_changed", "prior state differs from the recorded digest")
+        _verified_snapshot(previous_root, previous)
+        _verified_answer_key(previous_root, previous)
+        _verify_attempt_evidence(previous_root, previous)
+        _verified_snapshot(recovery_root, state)
+        _verified_answer_key(recovery_root, state)
+        used = _attempts_used(previous)
+        if used < 1 or previous.get("attempt_limit") != MAX_ATTEMPTS:
+            raise RecoveryError("invalid_budget_inheritance", "prior run has no valid consumed attempt budget")
+        existing = state.get("budget_inheritance")
+        if existing:
+            if existing.get("previous_state_sha256") == previous_state_sha256 and existing.get("reason") == reason:
+                return state
+            raise RecoveryError("budget_already_inherited", "this run already inherits another budget")
+        if state.get("status") != "initialized" or state.get("attempts"):
+            raise RecoveryError("budget_target_not_fresh", "budget inheritance requires a fresh initialized run")
+        if previous.get("staged_attempt"):
+            raise RecoveryError("prior_attempt_incomplete", "finish or resolve the interrupted prior submission first")
+        archive_parent = recovery_root / "inherited-budget"
+        archive = archive_parent / "previous"
+        files = {}
+        for path in previous_root.rglob("*"):
+            if path.is_symlink():
+                raise RecoveryError("invalid_budget_inheritance", "prior evidence contains a symlink")
+            if path.is_file() and not path.name.endswith(".lock"):
+                relative = str(path.relative_to(previous_root))
+                files[relative] = sha256_bytes(path.read_bytes())
+        archive_parent.mkdir(parents=True, exist_ok=True)
+        temporary = archive_parent / "previous.pending"
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        if not archive.exists():
+            temporary.mkdir()
+            for relative in sorted(files):
+                destination = temporary / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_bytes(destination, (previous_root / relative).read_bytes(), mode=0o400)
+            os.replace(temporary, archive)
+            _fsync_directory(archive_parent)
+        binding = {"schema_version": "naturalization-budget-inheritance/v1",
+                   "previous_root": str(previous_root), "previous_state_sha256": previous_state_sha256,
+                   "attempts_used": used, "reason": reason, "files": files}
+        next_state = {**state, "inherited_attempts": used, "budget_inheritance": binding,
+                      "next_attempt": used + 1 if used < MAX_ATTEMPTS else None,
+                      "status": "initialized" if used < MAX_ATTEMPTS else "exhausted",
+                      "updated_at_ns": time.time_ns()}
+        _verified_budget(recovery_root, next_state)
+        atomic_write_json(_state_path(recovery_root), next_state)
+        return next_state
 
 
 def _verified_answer_key(root: Path, state: dict[str, Any]) -> dict | None:
@@ -562,13 +713,14 @@ def verify_naturalizer_metadata(
     instruction_hash = sha256_bytes(instruction)
     required = {
         "model": "gpt-5.6-sol-high",
-        "endpoint": "cursor-subagent",
         "prompt_version": "finance-instruction-naturalizer-v3",
         "naturalized": True,
     }
     failures = [
         key for key, expected in required.items() if metadata.get(key) != expected
     ]
+    if metadata.get("endpoint") not in {"cursor-subagent", "https://litellm.labelbox.com"}:
+        failures.append("endpoint")
     attempts = metadata.get("attempts")
     if not isinstance(attempts, int) or not 1 <= attempts <= MAX_ATTEMPTS:
         failures.append("attempts")
@@ -615,6 +767,24 @@ def _reconcile_applied_report(
     }
     atomic_write_json(recovery_root / "validation.json", final_report)
     return final_report
+
+
+def bind_endpoint(recovery_root: Path, endpoint: str) -> dict[str, Any]:
+    """Bind actual invocation provenance without changing candidates or budgets."""
+    if endpoint not in {"cursor-subagent", "https://litellm.labelbox.com"}:
+        raise RecoveryError("unsupported_endpoint", "unsupported naturalizer endpoint")
+    with recovery_lock(recovery_root):
+        state = _read_state(recovery_root)
+        if state["status"] == "applied":
+            raise RecoveryError("already_applied", "cannot change applied provenance")
+        if state.get("endpoint") not in {None, endpoint}:
+            raise RecoveryError("endpoint_drift", "invocation endpoint is already bound")
+        _verified_snapshot(recovery_root, state)
+        _check_live_source(state)
+        state["endpoint"] = endpoint
+        state.setdefault("endpoint_bound_at_ns", time.time_ns())
+        atomic_write_json(_state_path(recovery_root), state)
+        return state
 
 
 def init_recovery(
@@ -722,9 +892,36 @@ def submit_attempt(
     recovery_root: Path,
     preamble_body: bytes | str,
     input_body: bytes | str,
+    *,
+    submission_mode: str = "plain",
+    expected_attempt: int | None = None,
+    failpoint: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    if submission_mode not in {"plain", "frozen", "frozen-boundary-v1"}:
+        raise RecoveryError("invalid_submission_mode", "unsupported writer submission mode")
+    frozen_submission = _submission_engine(submission_mode)
     with recovery_lock(recovery_root):
         state = _read_state(recovery_root)
+        _verified_budget(recovery_root, state)
+        # The journaled producer supplies its validated ordinal. This separates
+        # replay of one invocation from a new invocation returning identical text.
+        # Callers that omit it keep the existing body-based idempotence contract.
+        used = _attempts_used(state)
+        if expected_attempt is not None:
+            if (
+                type(expected_attempt) is not int
+                or not 1 <= expected_attempt <= MAX_ATTEMPTS
+                or expected_attempt not in (used, used + 1)
+                or (
+                    expected_attempt == used
+                    and (not state["attempts"] or state["attempts"][-1]["attempt"] != used)
+                )
+            ):
+                raise RecoveryError(
+                    "attempt_identity_mismatch",
+                    "explicit writer ordinal is not the next or exact retained attempt",
+                )
+
         preamble_bytes = (
             preamble_body.encode("utf-8")
             if isinstance(preamble_body, str)
@@ -733,10 +930,14 @@ def submit_attempt(
         input_bytes = (
             input_body.encode("utf-8") if isinstance(input_body, str) else input_body
         )
+        freeze_inputs = frozen_submission.read_inputs(recovery_root) if submission_mode in {"frozen", "frozen-boundary-v1"} else {}
+        freeze_identity = frozen_submission.input_identity(freeze_inputs)
         preamble_hash = sha256_bytes(preamble_bytes)
         input_hash = sha256_bytes(input_bytes)
         if state["attempts"] and state["status"] != "applied" and (
-            state["status"] != "retry_ready" or not state.get("semantic_reviews")
+            (expected_attempt is None and (
+                state["status"] != "retry_ready" or not state.get("semantic_reviews")))
+            or expected_attempt == used
         ):
             previous_number = state["attempts"][-1]["attempt"]
             previous_report_path = (
@@ -749,9 +950,20 @@ def submit_attempt(
                 previous_report.get("preamble_submission_sha256") == preamble_hash
                 and previous_report.get("input_submission_sha256") == input_hash
             ):
+                if previous_report.get("submission_mode", "plain") != submission_mode:
+                    raise RecoveryError("submission_mode_mismatch", "same bodies were submitted in a different mode")
+                if submission_mode in {"frozen", "frozen-boundary-v1"}:
+                    retained = frozen_submission.read_inputs(previous_report_path.parent)
+                    if frozen_submission.input_identity(retained) != freeze_identity:
+                        raise RecoveryError("staged_attempt_mismatch", "frozen authoring inputs changed")
                 previous_report["state"] = state["status"]
                 previous_report["idempotent"] = True
                 return previous_report
+            if expected_attempt == used:
+                raise RecoveryError(
+                    "attempt_identity_mismatch",
+                    "retained writer ordinal has different submitted bodies",
+                )
         if state["status"] == "applied":
             raise RecoveryError("already_applied", "naturalization is already applied")
         if state["status"] in {"exhausted", "failed"}:
@@ -763,7 +975,7 @@ def submit_attempt(
             raise RecoveryError("already_validated", "a valid candidate already exists")
         _check_live_source(state)
         source = _verified_snapshot(recovery_root, state)
-        attempt_number = len(state["attempts"]) + 1
+        attempt_number = _attempts_used(state) + 1
         if attempt_number > MAX_ATTEMPTS:
             state["status"] = "exhausted"
             state["next_attempt"] = None
@@ -776,24 +988,47 @@ def submit_attempt(
             staged.get("attempt") != attempt_number
             or staged.get("preamble_submission_sha256") != preamble_hash
             or staged.get("input_submission_sha256") != input_hash
+            or staged.get("submission_mode", "plain") != submission_mode
+            or staged.get("freeze_input_sha256", {}) != freeze_identity
         ):
             raise RecoveryError(
                 "staged_attempt_mismatch",
                 "a different submission is already staged for this attempt",
             )
-        atomic_write_bytes(attempt_dir / "preamble_body.md", preamble_bytes)
-        atomic_write_bytes(attempt_dir / "input_body.md", input_bytes)
         state["status"] = "staged"
         state["staged_attempt"] = {
             "attempt": attempt_number,
             "source_sha256": state["source_sha256"],
             "preamble_submission_sha256": preamble_hash,
             "input_submission_sha256": input_hash,
+            "submission_mode": submission_mode,
+            "freeze_input_sha256": freeze_identity,
         }
         atomic_write_json(_state_path(recovery_root), state)
+        _failpoint("after_submission_staged", failpoint)
+        def retain(name, raw):
+            path = attempt_dir / name
+            if path.exists() and path.read_bytes() != raw:
+                raise RecoveryError("staged_attempt_mismatch", "retained submission artifact differs", artifact=name)
+            if not path.exists():
+                atomic_write_bytes(path, raw)
+        retain("preamble_body.md", preamble_bytes)
+        retain("input_body.md", input_bytes)
+        frozen_binding = None
         try:
             spans = scan_instruction(source)
-            candidate = assemble_instruction(source, spans, preamble_body, input_body)
+            if submission_mode in {"frozen", "frozen-boundary-v1"}:
+                files, restoration, candidate = frozen_submission.derive(source, preamble_bytes, input_bytes, freeze_inputs)
+                for name, raw in files.items():
+                    retain(name, raw)
+                restore_raw = _json_bytes(restoration)
+                retain("restore.json", restore_raw)
+                frozen_binding = {"schema_version": frozen_submission.SCHEMA, "restore_sha256": sha256_bytes(restore_raw)}
+                _failpoint("after_frozen_restoration", failpoint)
+                if not restoration["restored"]:
+                    raise InstructionSpanError("frozen_span_invalid", "frozen span restoration failed", errors=restoration["errors"], drift=restoration["drift"])
+            else:
+                candidate = assemble_instruction(source, spans, preamble_body, input_body)
             validator = _load_validator()
             answer_key = _verified_answer_key(recovery_root, state)
             report = validator.validate(source, candidate, answer_key)
@@ -824,12 +1059,16 @@ def submit_attempt(
                 "input_submission_sha256": input_hash,
             }
         )
+        report["submission_mode"] = submission_mode
+        if frozen_binding is not None:
+            report["frozen_submission"] = frozen_binding
         report.setdefault(
             "source_spans",
             _load_json(recovery_root / "spans.json").get("spans"),
         )
         atomic_write_json(attempt_dir / "validation.json", report)
         atomic_write_json(recovery_root / "validation.json", report)
+        _failpoint("after_submission_validation", failpoint)
         state["attempts"].append(
             {
                 "attempt": attempt_number,
@@ -840,6 +1079,8 @@ def submit_attempt(
                 "candidate_sha256": (
                     sha256_bytes(candidate) if candidate else None
                 ),
+                "submission_mode": submission_mode,
+                **({"frozen_submission": frozen_binding, "validation_sha256": sha256_bytes(_json_bytes(report))} if frozen_binding else {}),
             }
         )
         state.pop("staged_attempt", None)
@@ -884,6 +1125,7 @@ def reject_semantic_review(
         )
     with recovery_lock(recovery_root):
         state = _read_state(recovery_root)
+        _verified_budget(recovery_root, state)
         if state["status"] != "validated":
             raise RecoveryError(
                 "candidate_not_validated",
@@ -936,6 +1178,9 @@ def accept_semantic_review(
     """Bind an explicit clause-by-clause approval to the selected candidate."""
     with recovery_lock(recovery_root):
         state = _read_state(recovery_root)
+        _verified_budget(recovery_root, state)
+        if state.get("span_restoration"):
+            raise RecoveryError("restoration_semantic_applicability_required", "use explicit prior-review applicability for a restored candidate")
         if state["status"] != "validated":
             raise RecoveryError(
                 "candidate_not_validated",
@@ -1075,7 +1320,8 @@ def _apply_recovery_without_target_lock(
         task_bytes = task_toml.read_bytes()
         task_text = task_bytes.decode("utf-8")
         new_task = validator.updated_task_toml(
-            task_text, report, len(state["attempts"])
+            task_text, report, _attempts_used(state),
+            endpoint=state.get("endpoint", "cursor-subagent"),
         ).encode("utf-8")
         applied = journaled_apply_bytes(
             instruction,
@@ -1182,6 +1428,7 @@ def verify_applied_recovery(recovery_root: Path) -> dict[str, Any]:
             if (
                 metadata["source_sha256"] != state["source_sha256"]
                 or metadata["task_toml_sha256"] != state.get("task_toml_sha256")
+                or metadata["endpoint"] != state.get("endpoint", "cursor-subagent")
             ):
                 raise RecoveryError(
                     "applied_metadata_drift",
@@ -1227,6 +1474,10 @@ def recovery_status(recovery_root: Path) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Recoverable instruction naturalization")
     commands = parser.add_subparsers(dest="command", required=True)
+    endpoint_parser = commands.add_parser("bind-endpoint")
+    endpoint_parser.add_argument("state_dir", type=Path)
+    endpoint_parser.add_argument("--endpoint", required=True,
+                                 choices=("cursor-subagent", "https://litellm.labelbox.com"))
 
     init_parser = commands.add_parser("init")
     init_parser.add_argument("source", type=Path)
@@ -1235,10 +1486,17 @@ def main() -> int:
     init_parser.add_argument("--task-toml", type=Path)
     init_parser.add_argument("--answer-key", type=Path)
 
-    submit_parser = commands.add_parser("submit")
-    submit_parser.add_argument("state_dir", type=Path)
-    submit_parser.add_argument("--preamble", type=Path, required=True)
-    submit_parser.add_argument("--input", dest="input_body", type=Path, required=True)
+    for name in ("submit", "submit-frozen", "submit-frozen-boundary"):
+        submit_parser = commands.add_parser(name)
+        submit_parser.add_argument("state_dir", type=Path)
+        submit_parser.add_argument("--preamble", type=Path, required=True)
+        submit_parser.add_argument("--input", dest="input_body", type=Path, required=True)
+
+    inherit_parser = commands.add_parser("inherit-budget")
+    inherit_parser.add_argument("state_dir", type=Path)
+    inherit_parser.add_argument("--previous-state-dir", type=Path, required=True)
+    inherit_parser.add_argument("--previous-state-sha256", required=True)
+    inherit_parser.add_argument("--reason", required=True)
 
     apply_parser = commands.add_parser("apply")
     apply_parser.add_argument("state_dir", type=Path)
@@ -1265,7 +1523,9 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        if args.command == "init":
+        if args.command == "bind-endpoint":
+            result = bind_endpoint(args.state_dir, args.endpoint)
+        elif args.command == "init":
             result = init_recovery(
                 args.source,
                 args.state_dir,
@@ -1273,11 +1533,17 @@ def main() -> int:
                 task_toml_path=args.task_toml,
                 answer_key_path=args.answer_key,
             )
-        elif args.command == "submit":
+        elif args.command in {"submit", "submit-frozen", "submit-frozen-boundary"}:
             result = submit_attempt(
                 args.state_dir,
                 args.preamble.read_bytes(),
                 args.input_body.read_bytes(),
+                submission_mode={"submit":"plain", "submit-frozen":"frozen", "submit-frozen-boundary":"frozen-boundary-v1"}[args.command],
+            )
+        elif args.command == "inherit-budget":
+            result = inherit_attempt_budget(
+                args.state_dir, args.previous_state_dir,
+                previous_state_sha256=args.previous_state_sha256, reason=args.reason,
             )
         elif args.command == "apply":
             result = apply_recovery(
@@ -1316,7 +1582,7 @@ def main() -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 1
     print(json.dumps(result, indent=2, sort_keys=True))
-    if args.command == "submit" and not result.get("valid"):
+    if args.command in {"submit", "submit-frozen", "submit-frozen-boundary"} and not result.get("valid"):
         return 2
     return 0
 

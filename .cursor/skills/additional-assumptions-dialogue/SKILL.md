@@ -24,7 +24,8 @@ Seniors name the **row label**. They name the **sheet/tab** only when it is
 unclear from the thread — if a junior already said the tab, or earlier turns
 already fixed it, do not start the answer with `On LBO` / `For Operations`.
 They never mention cell or range addresses (`J15`, `J15:S15`,
-`'NPV IRR'!J15:S15`). Juniors should not mention them either.
+`'NPV IRR'!J15:S15`). The assembler supplies the exact disclosed cell scope
+in frozen junior headers; keep those headers without adding other addresses.
 
 The first turn may be a junior asking, or a senior asking how the new model is
 coming. Fillers and clarifiers are scattered where they sound natural. Do not
@@ -58,18 +59,74 @@ python3 $S/extract_claims.py --task-dir "$TASK" --out "$RUN"
 python3 $S/compose_draft.py --claims "$CLAIMS" --pack "$PACK" --out "$RUN"
 ```
 
+Repeated direct source links may share an exchange only through the supported
+`extract_claims.py --source-workbook SOURCE --scope-evidence EVIDENCE` path.
+The evidence binds source and disclosure hashes and every original claim's
+target/source references, exact original formula, and matching typed date headers.
+The extractor independently checks those bytes and cells, then groups only
+identical source-row rules. Every original claim ID remains present, with a
+mandatory matching-period atom. Consecutive claim comments map the shared
+exchange to each member. Independent review still requires one result per
+original claim in its original order; neither coverage nor review budgets shrink.
+Keep earlier extraction artifacts and run the same complete mechanical and
+semantic gates on the new grouped artifact. Missing or altered proof rejects
+grouping rather than inferring period relationships from column positions.
+
+For mixed claims, `dialogue-source-link-scope/v2` evidence binds `claim_ids`
+to the complete original ID list in its exact order. Each proved row also names
+its `claim_id` and explicit `period_kind` (`date` or `year`); omitted rows leave
+those claims as individual exchanges. Duplicate, foreign or mismatched rows
+fail closed. Every original claim remains covered exactly once.
+
+Numeric year evidence must name `target_period_label` and
+`source_period_label`: original literal `Year`, `Fiscal Year`, or `Calendar Year`
+labels to the left on the corresponding header row. Each side also names its
+`target_year_axis_start` or `source_year_axis_start`; at least three consecutive
+calendar years and every intervening axis cell must be independently derived.
+Intervening literal labels or nonyear axis values reject that scope.
+`year_evidence_cells` names any original
+cells needed to derive the header; only typed integral calendar years, exact
+bare-reference links, and a prior year plus one are supported. Missing or
+cyclic dependencies, arbitrary formulas and cached answers cannot certify a
+year. Integer equality without this independent period evidence is insufficient.
+Other claims and unproved source links stay individual and unchanged.
+
 If `claims.json` reports `"empty": true`, stop before `compose_draft.py`.
 
 `compose_draft.py` deterministically renders `$TEMPLATE` (`draft_template.md`)
 and `$SLOTS` (`slots.json`) once per task, before round 1. The template fixes
 every structural line of the draft: every `<!-- claim:RECORD_ID -->` comment
-with the real record id, every `**Title:**` speaker line, the sheet sentence
-at each tab's **first mention** (later claims on that tab get a bare speaker
-line, so a redundant lead-in cannot be rendered), and the blank-line layout.
+with the real record id, every `**Title:**` speaker line, the sheet context
+on the junior's header at each tab's **first mention**, and the blank-line
+layout. Later mentions use a bare header. Clean delivery joins each header
+with its slot prose; repeated stock locator sentences are not inserted.
 The only writable lines are the `{{SLOT:<id>}}` lines — one prose slot per
 turn. Each slot's required must_say facts and sheet context sit in the
 adjacent `<!-- slot:... -->` comment and in `slots.json` (slot id →
 `must_say`, `sheet`, `sheet_context`, `claim_ids`, `speaker`, `guidance`).
+
+After a demonstrated scaffold code defect, `compose_draft.py` supports
+`--previous-template`, `--previous-filled`, `--previous-slots`,
+`--previous-claims`, and `--previous-pack` together. It validates the original
+fill, requires byte-identical claim/pack inputs and unchanged semantic slot
+fields, and copies authored slot bytes into the repaired scaffold. The
+hash-bound `scaffold-migration.json` does not establish semantic approval:
+rerun fill-check, draft-check, and independent review. Migration never resets
+the two writer rounds or any structural retry budget.
+
+For new writer/paraphraser calls, prefer structured slot authoring to avoid
+transport-dependent trailing whitespace. Keep the complete prompts and claim
+cards below, replacing only the response-format instruction with: return one
+JSON object `{"schema_version":"dialogue-slot-prose/v1","slots":{...}}`,
+with each slot ID exactly once and its prose as a string. No extra fields,
+turns, headers, comments, or modelling facts are permitted. The paraphraser
+must copy every junior slot string byte-for-byte; check that independently.
+Run `compose_draft.py --claims "$CLAIMS" --pack "$PACK" --out "$ROUND_DIR"
+--slot-values "$SLOT_VALUES"` to produce `assembled.filled.md` and a hash-bound
+assembly record. Then run the same fill-check, draft check, paraphrase, and
+independent semantic review. The existing writer-round and structural-retry
+limits apply equally to JSON responses. The assembler supplies structural
+bytes; it never supplies or revises authored prose.
 
 ## Loop (hard cap = 2)
 
@@ -143,9 +200,11 @@ Use `--round 2` on the second apply. Full review still must pass. These block
 in both rounds: missing `must_say`, missing
 row label, missing sheet when the thread has not already named the tab,
 unknown or leftover speaker titles, empty/stale review coverage,
-**any cell/range token in a senior turn, and any whole-column (`A:A`,
+**any actual cell/range reference in a senior turn, and any whole-column (`A:A`,
 `$V:$V`, `'Op Loan 1'!$D:$D`) or whole-row (`3:3`) reference in a senior
-turn**. Do not replace working
+turn**. An address-shaped text label requires the exact source-backed,
+occurrence-specific proof described below. This does not exempt numeric answers
+or any additional occurrence. Do not replace working
 disclosure bullets with a leaking or incomplete Q&A file. If apply fails, the
 scripts roll back `instruction.md`, `Dockerfile`, `task.toml`, the notes file,
 and `tests/dialogue-applied.json`.
@@ -207,9 +266,14 @@ HARD RULES for the prose inside the slots
    calculation"; paren-AST ("multiply (take the").
 3. Seniors MUST NOT mention cell or range addresses (J15, J15:S15, Sheet!A1,
    'NPV IRR'!J15:S15) or whole-column / whole-row references (A:A, $V:$V,
-   'Op Loan 1'!$D:$D, 3:3). Juniors should not mention them either. Location
-   is the tab name plus the visible row label. Never write A1, `cell`,
-   `column letters`, or `range`.
+   'Op Loan 1'!$D:$D, 3:3). Keep the assembler's frozen junior_scope prefixes;
+   do not introduce other addresses. Seniors may describe the required
+   calculation scope (for example, only this cell) without its address.
+   Preserve named ranges as named ranges, distinct from worksheet row labels.
+   A required text-literal atom may resemble an address, such as B3. Render
+   it once as an explicitly typed JSON-quoted text literal, never as a cell
+   location. Include only literals required by that claim; an additional
+   occurrence is forbidden. No numeric-answer exemption is granted.
 4. Do not print catalogue ids, underscored tokens, or graded numbers.
 5. Alternatives are unspoken unless the senior immediately closes them.
 6. Do not add modelling facts that are not on a claim card.
@@ -225,7 +289,8 @@ HARD RULES for the prose inside the slots
    and fix every accuracy and naturalness issue they named — still by
    filling a fresh copy of the template.
 
-Output only the filled Markdown conversation. End with one newline.
+Output only the filled Markdown conversation. Preserve every non-slot byte,
+including the template's exact trailing newlines and final blank lines.
 ```
 
 ## Pass 1b — paraphrase seniors
@@ -270,6 +335,12 @@ HARD RULES
    - A1 / cell / range addresses
    - whole-column or whole-row references (A:A, $V:$V, 'Op Loan 1'!$D:$D, 3:3)
    - rebuild, restore, original model, original logic
+   Preserve the assembler's exact junior_scope headers and junior slot
+   strings. Seniors may describe the required scope without its address.
+   Preserve named ranges distinctly from row labels. A required text-literal
+   atom that resembles an address must remain one explicitly typed
+   JSON-quoted text literal in its owning claim. Do not add occurrences or
+   interpret it as a cell location; numeric-answer checks still apply.
 4. If the card says last period / this period / locked input / floor / flip,
    those words (or close equivalents) must remain. Lower-bound, upper-bound,
    and result locked inputs must remain three distinct roles. First and second
@@ -279,7 +350,8 @@ HARD RULES
 6. Slack: contractions, short sentences. Prose may span several lines within
    its slot, but you cannot add turns. Do not make juniors ask again.
 
-Output only the filled Markdown conversation. End with one newline.
+Output only the filled Markdown conversation. Preserve every non-slot byte,
+including the template's exact trailing newlines and final blank lines.
 ```
 
 ## Pass 2 — independent reviewer
@@ -292,8 +364,9 @@ Inputs (and nothing else): `$CLAIMS` (full file, including `reviewer_only`),
 the `disclosure_body` from `claims.json`, the current `draft.md`, and the
 rubric below.
 
-Do not give this agent the golden workbook, formulas, evidence, graded targets,
-or the writer's prompt.
+Use the formula and provenance evidence included in the full claims and the
+maintained reviewer context to check the claimed financial meaning. Do not give
+this agent unrelated source data, the answer key, or the writer's prompt.
 
 Use this prompt:
 
@@ -354,7 +427,17 @@ ACCURACY — fail if any:
   turns did not already name the tab.
 - A senior turn that opens with "On/For/In {sheet}" when that tab is
   already clear from the question or the turns above.
-- Any A1 / range token (J15, J15:S15, 'Sheet'!A1) in a senior turn.
+- Any actual cell or range reference in a senior turn. For an address-shaped
+  text literal, independently check the owning original formula and
+  reviewer_only.reference_literal_proof: it must be a direct comparison
+  operand, occur once as explicitly typed JSON-quoted text in that claim,
+  and never be interpreted as a location. The proof is supporting evidence,
+  not an accuracy verdict. Fail unproved, extra or other-claim occurrences.
+  Numeric-answer leakage remains forbidden without any new exemption.
+- Missing or altered frozen junior_scope headers. Exact junior headers
+  establish the relevant cells; a senior may describe that required scope
+  without repeating the addresses. Named ranges and row labels remain
+  distinct operand types.
 - A senior turn is still paren-AST (`multiply (take the negative of`).
 - The exercise is called a rebuild or restoration (rebuild, restore, original
   model, original logic).

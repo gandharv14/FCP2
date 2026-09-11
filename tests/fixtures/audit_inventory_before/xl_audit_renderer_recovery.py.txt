@@ -1,0 +1,229 @@
+"""Re-render completed original audit calls under one exact reviewed label fix.
+
+No network, old-code execution, semantic retries, source modification or approval
+is performed. The root explicitly selects every retained journal and publishes
+an immutable derived artifact; old incomplete metadata remains unchanged.
+"""
+from dataclasses import dataclass,asdict
+import datetime as dt
+import hashlib
+import json
+from pathlib import Path
+import xl_variable_source_audit as audit
+from scripts.batch.harbor_admission import read,record,require
+from scripts.batch.harbor_tracker_lifecycle import checked_record
+
+SCHEMA='completed-audit-renderer-reconciliation/v1'
+POLICY='audit-label-lines/9a0f56af/v1'
+ORIGINAL_SHA256='9a0f56af8c89ef9e7867f19d0182187ac097d391b81e281a0b15c3960bb14d79'
+KEYS=('variable_source_metadata','variable_source_inventory','variable_source_audit')
+
+@dataclass(frozen=True)
+class Selection:
+    root_plan: dict
+    original_code: dict
+    original_metadata: dict
+    attempts: tuple  # Every root-selected bridge prepared.json, not final-only.
+    output: Path
+    campaign: object
+    policy: object
+
+
+def code_identity(original_code):
+    from xl_audit_validator_upgrade import LABEL_RENDERING
+    checked_record(original_code);old=Path(original_code['path']).read_bytes()
+    current=Path(audit.__file__);raw=current.read_bytes();before,after=LABEL_RENDERING
+    require(original_code['sha256']==ORIGINAL_SHA256,'only exact pre-label-fix generator is supported')
+    require(raw.count(after)==1 and before not in raw,'current renderer is not the reviewed label fix')
+    restored=raw.replace(after,before,1)
+    require(restored==old and hashlib.sha256(restored).hexdigest()==ORIGINAL_SHA256,'generator changed beyond exact label rendering')
+    return dict(policy=POLICY,original_generator=original_code,current_generator=record(current),adapter=record(__file__),historical_code_executed=False)
+
+
+def serial(value):
+    if isinstance(value,Path):return str(value)
+    if isinstance(value,dict):return {k:serial(v) for k,v in value.items()}
+    if isinstance(value,(list,tuple)):return [serial(v) for v in value]
+    return value
+
+
+def from_data(value):
+    from scripts.batch.harbor_model_executor import Campaign
+    from scripts.batch.harbor_model_review_provenance import Policy as ModelPolicy
+    require(set(value)==set(Selection.__dataclass_fields__),'reconciliation selection fields differ')
+    return Selection(value['root_plan'],value['original_code'],value['original_metadata'],tuple(value['attempts']),Path(value['output']),Campaign(Path(value['campaign']['root']),Path(value['campaign']['slot_root']),value['campaign']['model_slots']),ModelPolicy(**value['policy']))
+
+
+def _project(s):
+    from scripts.batch import harbor_audit_bridge as bridge
+    from scripts.batch import harbor_model_executor as executor
+    from scripts.batch.harbor_model_review_provenance import validate_call
+    from xl_release_publication import resolve_build_context
+    from xl_source_publication import validate_source_generation
+    require(isinstance(s,Selection),'typed root-selected renderer recovery required')
+    identity=code_identity(s.original_code);plan=read(s.root_plan);old_meta=read(s.original_metadata)
+    prepared=read(plan['prepared']);wb=prepared['validated']['workbook'];baseline=read(plan['baseline']);b=baseline['bindings']
+    require(plan['entry']['sha256']==ORIGINAL_SHA256,'root plan belongs to another generator')
+    require(old_meta.get('status')=='in_progress' and old_meta.get('workbook')==wb,'only retained unfinished rendering is supported')
+    require(bool(s.attempts) and len({r['path'] for r in s.attempts})==len(s.attempts),'complete distinct bridge attempt selection required')
+    expected_bridge=Path(s.root_plan['path']).parent/'audit-bridge'
+    target=Path(plan['prepared']['path']).parent/'audit'/(wb+'-variable-sources');stem=wb+'-inputs-variable-sources'
+    require(Path(s.original_metadata['path'])==target/(stem+'.metadata.json'),'foreign original metadata')
+    for key in ('source_file','original_raw_source','baseline_inputs','baseline_segmentation','curation'):checked_record(b[key])
+    source=Path(b['source_generation']['path']);seg=Path(b['segmentation_generation']['path'])
+    manifest=validate_source_generation(source,expected_generation_id=source.name)
+    require(manifest['identity']['policy_decision']['route']=='pass' and b['source_file']['sha256']==b['original_raw_source']['sha256'],'renderer recovery requires unchanged native source-pass identity')
+    pair=resolve_build_context(wb,source_root=source.parent.parent,source_generation_id=source.name,segmentation_root=seg.parent.parent,segmentation_generation_id=seg.name)
+    require(Path(pair['source_path'])==Path(b['source_file']['path']),'current source differs')
+    resolved,segmeta=audit.resolve_segmentation_directory(seg.parents[2],wb,segmentation_generation_id=seg.name,source_generation_root=source.parents[2],source_generation_id=source.name)
+    inventory=audit.build_inventory(wb,b['baseline_inputs']['path'],resolved,segmentation=segmeta)
+    original_inventory=record(target/(stem+'.inventory.json'));require(read(original_inventory)==inventory,'current baseline/inventory changed')
+    require(plan['inventory_sha256']==executor.sha(executor.canonical(inventory)),'root inventory identity differs')
+    scope=audit._attempt_scope_config(audit._canonical_hash(inventory),s.policy.endpoint.removesuffix('/chat/completions'),s.policy.model,s.policy.project_id);scope['generator_sha256']=ORIGINAL_SHA256
+    require(old_meta.get('attempt_scope')==scope,'original audit scope differs')
+    scope_root=target/'.audit-attempts'/audit._canonical_hash(scope);own_policy=record(scope_root/'policy.json');policy=read(own_policy)
+    require(policy.get('schema_version')=='audit-attempt-policy/v1' and type(policy.get('limit')) is int and policy['limit'] in (1,2),'original policy contract changed')
+    require(policy['scope']==scope and policy.get('inherited_budget')==plan['inherited_budget'],'original scope/policy or inherited budget changed')
+    observed_paths={str(p) for p in expected_bridge.glob('batch-*/prepared.json')}
+    require({r['path'] for r in s.attempts}==observed_paths,'bridge attempt set omitted or expanded')
+    all_requests={str(p) for p in scope_root.glob('batch-*/*.request.json')};seen_requests=set();by_batch={};calls=[];completed_at=[]
+    require({str(p) for p in (target/'.audit-attempts').rglob('*.request.json')}==all_requests,'another original audit scope has unaccounted attempts')
+    files={}
+    def collect(value):
+        if isinstance(value,dict):
+            if set(value)=={'path','sha256'}:
+                checked_record(value);files[value['path']]=value['sha256']
+            else:
+                for child in value.values():collect(child)
+        elif isinstance(value,(list,tuple)):
+            for child in value:collect(child)
+    collect([s.root_plan,plan['prepared'],plan['baseline'],s.original_code,s.original_metadata,own_policy,original_inventory,identity,b])
+    for directory in (source,seg):
+        for item in directory.rglob('*'):
+            if item.is_file():collect(record(item))
+    for binding in sorted(s.attempts,key=lambda r:r['path']):
+        saved=read(binding);call=bridge.prepared_from(saved);ctx=call.audit_context
+        require(read(ctx.policy_snapshot)['limit']==policy['limit'],'original final policy limit changed')
+        require(call.policy==__import__('dataclasses').replace(s.policy,reasoning_effort=None) and ctx.root_plan==s.root_plan and ctx.inventory==original_inventory,'attempt is outside selected context')
+        require(ctx.attempt['path'] in all_requests and ctx.attempt['path'] not in seen_requests,'original request omitted or duplicated');seen_requests.add(ctx.attempt['path'])
+        observed=executor.inspect(call,s.campaign,original_renderer_code=s.original_code)
+        require(observed.status=='completed' and observed.call is not None,'unknown/rejected transport cannot be reconciled')
+        actual=validate_call(observed.call,read(call.request),policy=call.policy,json_response=False,audit_context=ctx,original_renderer_code=s.original_code)
+        request=read(ctx.attempt);response_path=Path(ctx.attempt['path']).with_name(Path(ctx.attempt['path']).name.replace('.request.','.response.'));response=record(response_path)
+        expected_response=dict(request_sha256=ctx.attempt['sha256'],content=actual['review'].strip(),finish_reason='stop')
+        require(response_path.read_bytes()==(json.dumps(expected_response,sort_keys=True)+'\n').encode(),'original auditor response differs from completed strict transport')
+        require(Path(binding['path']).parent==expected_bridge/(f'batch-{request["batch"]:04d}-{request["attempt"]:02d}'),'bridge path differs')
+        by_batch.setdefault(request['batch'],[]).append((request['attempt'],ctx.attempt,response,audit._clean_table(actual['review'])))
+        calls.append(dict(prepared=binding,request=observed.call.request,response=observed.call.response,outcome=observed.outcome,response_id=actual['response_id'],attempt_id=actual['attempt_id']))
+        completed_at.append(read(observed.call.completed)['completed_at_ns']);collect([binding,asdict(observed.call),observed.outcome,asdict(ctx),response])
+        # Include every immutable transport file named by its sealed outcome.
+        transport_root=Path(observed.outcome['path']).parent
+        for name,sha in read(observed.outcome)['evidence'].items():collect({'path':str(transport_root/name),'sha256':sha})
+    require(seen_requests==all_requests,'an original request lacks complete transport proof')
+    chunks=audit._split_chunks(inventory);consumed=audit._inherited_batch_counts(plan['inherited_budget'],inventory)
+    require(set(by_batch)==set(range(1,len(chunks)+1)) and set(policy['submitted_counts'])=={str(i) for i in by_batch},'batch coverage incomplete')
+    all_ids={r['row_id'] for r in inventory['variables']};batches=[];tables=[]
+    for index,(header,rows) in enumerate(chunks,1):
+        history=sorted(by_batch[index]);n=len(history)
+        require([x[0] for x in history]==list(range(1,n+1)) and n==policy['submitted_counts'][str(index)] and n<=min(policy['limit'],2-consumed[index]),'original budget history incomplete or exceeded')
+        number,request,response,table=history[-1];by_id={json.loads(r)['row_id']:json.loads(r) for r in rows}
+        faults=audit.validate_row_ids(table,set(by_id),all_ids)
+        require(not faults,'retained model table fails current row coverage')
+        resolved=audit.resolve_table(table,by_id);require(not audit.validate_table(resolved,rows,inventory['metadata']),'retained model table fails current value/source checks')
+        batches.append(dict(row_ids=list(by_id),model_table=table,attempt=number,request=request,response=response,history=[x[1] for x in history],response_history=[x[2] for x in history]));tables.append(resolved)
+    parts=[f'# `{Path(b["baseline_inputs"]["path"]).name}` — variable values and plausible external sources','',
+        'Re-rendered from the exact retained completed Labelbox responses; no model was called again.','',
+        '> **Audit warning:** This audit maps workbook-supplied values to plausible sources. It does not prove that any source supplied the exact value.','']
+    for index,table in enumerate(tables,1):
+        if len(tables)>1:parts.extend([f'## Inventory batch {index} of {len(tables)}',''])
+        parts.extend([table,''])
+    markdown='\n'.join(parts).rstrip()+'\n';coverage=dict(schema_version='variable-source-audit-coverage/v1',inventory_sha256=audit._canonical_hash(inventory),batches=batches)
+    require(not audit.validate_audit_coverage(markdown,inventory,coverage),'current derived audit coverage failed')
+    coverage_raw=(json.dumps(coverage,indent=2)+'\n').encode();md_raw=markdown.encode()
+    metadata=dict(schema_version=1,status='complete',completion_kind='derived_from_retained_completed_transport',generator_version=audit.GENERATOR_VERSION,prompt_version=audit.PROMPT_VERSION,row_id_resolution=True,
+        generator_sha256=ORIGINAL_SHA256,rendering_generator_sha256=identity['current_generator']['sha256'],renderer_policy=POLICY,
+        system_prompt_sha256=hashlib.sha256(audit.SYSTEM_PROMPT.encode()).hexdigest(),workbook=wb,artifact=b['baseline_inputs']['path'],model=s.policy.model,endpoint=s.policy.endpoint.removesuffix('/chat/completions'),project_id=s.policy.project_id,
+        request_config_sha256=scope['request_config_sha256'],inventory_sha256=scope['inventory_sha256'],inventory_rows=len(inventory['variables']),attempt_scope=scope,attempt_policy=own_policy,semantic_attempt_limit=policy['limit'],api_calls=len(calls),model_calls_added=0,
+        retained_completed_at_ns=completed_at,original_metadata=s.original_metadata,generated_at=dt.datetime.fromtimestamp(max(completed_at)/1e9,dt.timezone.utc).isoformat(),generated_at_basis='retained_transport_completion',
+        markdown_sha256=hashlib.sha256(md_raw).hexdigest(),coverage_path=str(s.output/(stem+'.coverage.json')),coverage_sha256=hashlib.sha256(coverage_raw).hexdigest(),finish_reasons=['stop']*len(chunks),validation={'status':'passed','checks':['complete_current_coverage','exact_retained_transport','unchanged_original_inventory']},markdown=str(s.output/(stem+'.md')),inventory=str(s.output/(stem+'.inventory.json')),cache_hit=False)
+    outputs={stem+'.inventory.json':Path(original_inventory['path']).read_bytes(),stem+'.md':md_raw,stem+'.coverage.json':coverage_raw,stem+'.metadata.json':(json.dumps(metadata,indent=2)+'\n').encode()}
+    return dict(identity=identity,workbook=wb,original_bindings=b,calls=calls,consumption=dict(submitted_counts=policy['submitted_counts'],inherited_batch_counts={str(k):v for k,v in consumed.items()}),checked_files=files),outputs
+
+
+def publish(s):
+    from scripts.batch import harbor_model_executor as executor
+    output=executor.safe(s.output);require(not output.exists(),'fresh immutable recovery destination required')
+    report,outputs=_project(s)
+    protected=[Path(s.root_plan['path']).parent,Path(s.original_metadata['path']).parent,*[Path(report['original_bindings'][k]['path']) for k in ('source_file','original_raw_source','baseline_inputs')]]
+    require(all(output!=p and output not in p.parents and p not in output.parents for p in protected),'recovery output overlaps original evidence')
+    output.mkdir(parents=True,mode=0o700)
+    for name,raw in outputs.items():executor.retain(output/name,raw)
+    stem=report['workbook']+'-inputs-variable-sources';bindings={key:record(output/(stem+suffix)) for key,suffix in zip(KEYS,('.metadata.json','.inventory.json','.md'))}
+    value=dict(schema_version=SCHEMA,policy=POLICY,selection=serial(asdict(s)),report=report,audit_bindings=bindings,outputs={name:record(output/name) for name in outputs},model_reexecuted=False,semantic_attempts_added=0,source_approval=False)
+    executor.save(output/'renderer-reconciliation.json',value)
+    receipt=record(output/'renderer-reconciliation.json');validate_receipt(receipt,bindings=bindings,original_code=s.original_code);return receipt
+
+
+def validate_receipt(receipt,*,bindings,original_code,model=None,endpoint=None,project_id=None):
+    value=read(receipt);require(value.get('schema_version')==SCHEMA and value.get('policy')==POLICY,'unsupported renderer reconciliation')
+    s=from_data(value['selection']);require(s.original_code==original_code,'root-selected original renderer differs')
+    if model is not None:
+        require((s.policy.model,s.policy.endpoint.removesuffix('/chat/completions'),s.policy.project_id)==(model,endpoint.rstrip('/'),project_id),'selected renderer model configuration differs')
+    report,outputs=_project(s);require(value['report']==report,'renderer reconciliation evidence changed')
+    require(value['model_reexecuted'] is False and value['semantic_attempts_added']==0 and value['source_approval'] is False,'reconciliation is not a new model call or source approval')
+    require({k:bindings[k] for k in KEYS}==value['audit_bindings'],'selected derived audit differs')
+    require(set(value['outputs'])==set(outputs),'derived audit artifact set changed')
+    files=dict(report['checked_files'])
+    for name,raw in outputs.items():
+        binding=value['outputs'][name];checked_record(binding)
+        require(Path(binding['path'])==s.output/name and Path(binding['path']).read_bytes()==raw,'derived audit changed from exact current rendering')
+        files[binding['path']]=binding['sha256']
+    require(Path(receipt['path'])==s.output/'renderer-reconciliation.json','reconciliation receipt path differs');files[receipt['path']]=receipt['sha256'];return files
+
+
+def validate_installed(pointer,*,root,target,plan,policy,campaign):
+    """Read-only bridge projection of an explicit coordinator recovery choice."""
+    from xl_audit_equivalence import validate_audit_equivalence
+    value=read(pointer)
+    require(set(value)=={'schema_version','receipt','equivalence'} and value['schema_version']=='audit-renderer-bridge-selection/v1','invalid renderer bridge selection')
+    receipt=read(value['receipt']);s=from_data(receipt['selection'])
+    require(s.root_plan==plan and s.policy==policy and s.campaign==campaign,'foreign renderer bridge scope')
+    require(Path(root)==Path(plan['path']).parent/'audit-bridge','bridge root differs from original plan')
+    require(Path(pointer['path'])==Path(root)/'renderer-recovery.json' and Path(s.original_metadata['path']).parent==target,'foreign renderer bridge path')
+    files=validate_receipt(value['receipt'],bindings=receipt['audit_bindings'],original_code=s.original_code)
+    bindings={**receipt['report']['original_bindings'],**receipt['audit_bindings']}
+    checked_record(value['equivalence'])
+    eq=read(value['equivalence'])
+    require(eq.get('validator_upgrade')==value['receipt'] and eq.get('original_auditor')==s.original_code,'equivalence selected different renderer proof')
+    files.update(validate_audit_equivalence(value['equivalence']['path'],current_bindings=bindings,model=policy.model,endpoint=policy.endpoint.removesuffix('/chat/completions'),project_id=policy.project_id,validator_upgrade=value['receipt'],original_auditor=s.original_code))
+    metadata=read(receipt['audit_bindings']['variable_source_metadata'])
+    selected={**receipt['audit_bindings'],'audit_equivalence':value['equivalence'],'audit_validator_upgrade':value['receipt'],'audit_upgrade_original_code':s.original_code,'audit_current_inventory':receipt['audit_bindings']['variable_source_inventory']}
+    return dict(coverage=dict(passed=True,inventory_rows=metadata['inventory_rows'],model_calls_added=0),calls=[{'path':p,'sha256':h} for p,h in sorted(files.items())]+[pointer],bindings=selected)
+
+
+def install_research(worker,lease,*,receipt,equivalence):
+    """Explicit root CAS operation, never called automatically by audit dispatch.
+
+    A failed/partial prior pointer or checkpoint is retained and must match
+    exactly before resumption. There is no invocation or budget reset here.
+    """
+    from scripts.batch import harbor_environment_worker as W
+    facade,before,saved=W._setup(worker,lease)
+    require(before['lane_state']['harbor-research-auditor']['state']!='passed','already completed research requires root invalidation, not reconciliation')
+    plan=record(worker.run/'audit-plan.json');value=read(receipt);s=from_data(value['selection'])
+    require(s.root_plan==plan and s.policy==worker.bootstrap.model_policy and s.campaign==worker.campaign,'worker recovery selection differs')
+    require(read(plan)['prepared']==worker.prepared,'worker admission changed')
+    pointer_value=dict(schema_version='audit-renderer-bridge-selection/v1',receipt=receipt,equivalence=equivalence)
+    # Fully validate the exact prospective pointer before installing anything.
+    root=worker.run/'audit-bridge';target=worker.bootstrap.run/'audit'/(worker.bootstrap.workbook+'-variable-sources')
+    validate_receipt(receipt,bindings=value['audit_bindings'],original_code=s.original_code)
+    from xl_audit_equivalence import validate_audit_equivalence
+    current={**value['report']['original_bindings'],**value['audit_bindings']}
+    checked_record(equivalence)
+    validate_audit_equivalence(equivalence['path'],current_bindings=current,model=s.policy.model,endpoint=s.policy.endpoint.removesuffix('/chat/completions'),project_id=s.policy.project_id,validator_upgrade=receipt,original_auditor=s.original_code)
+    pointer=W.keep(root/'renderer-recovery.json',pointer_value)
+    proof=validate_installed(pointer,root=root,target=target,plan=plan,policy=s.policy,campaign=s.campaign)
+    content=W._content(worker,{**current,**proof['bindings']},saved['normalization_records']);selection=W._selection(content)
+    checkpoint=W._checkpoint(worker,'research',selection,proof['calls'])
+    result=W._gate(worker,lease,'research',selection)
+    result['evidence'].append(checkpoint);return result

@@ -1,0 +1,45 @@
+"""Exact retained structured round-two request applicability after executor repair.
+
+This proves code applicability only. Owning task, body, budget, call and current
+financial gates still validate independently; no request or UUID is rewritten.
+"""
+from pathlib import Path
+from scripts.batch.harbor_admission import record, require
+OLD_P='2dbf39912b18cade9b1509930b7c0863cbae910219e42fbd9ad95e1de29a5b32'
+OLD_E='3ce097194f6219538fffa37847ee7f96d134b1185394c9355cdd55d49386ac17'
+NEW_E='c5f32d45ca696a2e13bd67602b3e6b1103503ab7b69aacd18b96a692e46164dd'
+EDITS=(
+ (b'    return [record(path) for path in paths]\n',b'    from scripts import harbor_instruction_code_applicability as applicability\n    paths += applicability.paths()\n    return [record(path) for path in paths]\n'),
+ (b"    require(context['code']==code_evidence(task),'instruction producer/validator code changed')",b"    from scripts import harbor_instruction_code_applicability as applicability\n    applicability.validate(context,code_evidence(task),request)"),
+)
+
+def paths():
+    home=Path(__file__).resolve().with_name('harbor_instruction_code_v1')
+    p=home/'producer-before.py.txt';e=home/'executor-before.py.txt'
+    require(record(p)['sha256']==OLD_P and record(e)['sha256']==OLD_E,'instruction applicability archive changed')
+    return [Path(__file__).resolve(),p,e]
+
+
+def profile(current):
+    from scripts.batch import harbor_instruction_producer as P,harbor_model_executor as E
+    files=paths();expected=files[1].read_bytes()
+    for old,new in EDITS:
+        require(expected.count(old)==1,'instruction upgrade anchor differs');expected=expected.replace(old,new,1)
+    require(Path(P.__file__).read_bytes()==expected and record(E.__file__)['sha256']==NEW_E,'unreviewed producer/executor delta')
+    added=[record(x) for x in files]
+    require(current[-len(added):]==added,'instruction applicability evidence not exported')
+    prior=[]
+    for row in current[:-len(added)]:
+        sha=OLD_P if row['path']==str(Path(P.__file__).resolve()) else OLD_E if row['path']==str(Path(E.__file__).resolve()) else row['sha256']
+        prior.append(dict(path=row['path'],sha256=sha))
+    return prior
+
+
+def validate(context,current,request):
+    if context['code']==current:return
+    p=request.prepared
+    require(context['kind']=='dialogue-writer' and context.get('structural_round') is None and context.get('writer_round') is None,
+            'historical code applicability is remaining structured dialogue writer only')
+    require(p.scope.lane=='harbor-dialogue-author' and p.scope.budget_id=='dialogue-writer'
+            and p.ordinal==p.limit==2 and p.response_mode=='json_object','historical writer scope/budget differs')
+    require(context['code']==profile(current),'prepared code changed beyond exact executor repair')

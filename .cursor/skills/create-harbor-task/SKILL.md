@@ -23,6 +23,7 @@ Accept a workbook path, a filename under `4-10 100`, or an id. Work from the
 pipeline repository root and set:
 
 ```bash
+source .venv/bin/activate  # persistent Python 3.12 pipeline runtime
 WB=0256
 RAW_SOURCE_FILE="4-10 100/$WB.xlsx"
 ORIGINAL_RAW_SOURCE_FILE="$RAW_SOURCE_FILE"
@@ -37,7 +38,7 @@ EXCEL_SANDBOX_RUNNER="/Library/Application Support/FCP2/recalc/harbor-excel-sand
 EXCEL_ENGINE_VERSION="<exact-approved-Microsoft-Excel-version>"
 SOURCE_BATCH_ID="<approved-batch-id>"
 SOURCE_INVENTORY="<approved-source-inventory.json>"
-SOURCE_INVENTORY_APPROVAL=verification_manifests/approved_source_inventories.v1.json
+SOURCE_INVENTORY_APPROVAL=verification_manifests/approved_source_inventories.v2.json
 # SOURCE, SOURCE_FILE, SOURCE_GENERATION_ID, and AST_ROOT are resolved from one
 # immutable candidate tuple during staging, then from current-release.json.
 SEG_ROOT=seg_out

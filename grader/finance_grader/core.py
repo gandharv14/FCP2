@@ -20,18 +20,26 @@ def _clamp01(value: float) -> float:
 
 
 def _normalise_ref(ref: Any) -> str:
-    return str(ref).replace("'", "").replace("$", "").strip()
+    text = str(ref).strip()
+    if "!" not in text:
+        return text.replace("$", "")
+    sheet, address = text.rsplit("!", 1)
+    # Quotes delimit sheet names; apostrophes and dollar signs inside a name
+    # are meaningful. Only the cell address has absolute-reference markers.
+    if sheet.startswith("'") and sheet.endswith("'"):
+        sheet = sheet[1:-1].replace("''", "'")
+    return sheet + "!" + address.replace("$", "")
 
 
 def _as_number(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-        return number if math.isfinite(number) else None
     try:
-        number = float(str(value).replace(",", "").replace("%", "").strip())
-    except (TypeError, ValueError):
+        if isinstance(value, (int, float)):
+            number = float(value)
+        else:
+            number = float(str(value).replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
 
@@ -39,13 +47,21 @@ def _as_number(value: Any) -> float | None:
 def _finite_nonnegative(value: Any, default: float) -> float:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return number if math.isfinite(number) and number >= 0.0 else default
 
 
 def _matches(got: float, expected: float, abs_tol: float, rel_tol: float) -> bool:
-    return abs(got - expected) <= max(abs_tol, rel_tol * abs(expected))
+    error = abs(got - expected)
+    if math.isfinite(error):
+        return error <= max(abs_tol, rel_tol * abs(expected))
+    # Finite inputs can overflow both the subtraction and tolerance product;
+    # comparing those infinities would incorrectly grant an exact match.
+    scale = max(abs(got), abs(expected))
+    return abs(got / scale - expected / scale) <= max(
+        abs_tol / scale, rel_tol * (abs(expected) / scale)
+    )
 
 
 def _continuous_numeric_score(
@@ -63,7 +79,14 @@ def _continuous_numeric_score(
     """
     error = abs(got - expected)
     denominator = max(abs(got), abs(expected), abs_tol)
-    normalized_error = error / denominator
+    if denominator == 0.0:
+        normalized_error = 0.0  # Both values are exactly zero.
+    elif math.isfinite(error):
+        normalized_error = error / denominator
+    else:
+        # Opposite finite extremes can overflow during subtraction. Scaling
+        # first preserves their normalized error and keeps JSON output finite.
+        normalized_error = abs(got / denominator - expected / denominator)
     if _matches(got, expected, abs_tol, rel_tol):
         return 1.0, normalized_error
     return _clamp01(1.0 - normalized_error), normalized_error

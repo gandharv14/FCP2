@@ -28,6 +28,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -51,8 +52,15 @@ def classify(verification: dict | None, source_exists: bool) -> tuple[str, dict]
     """(classification, evidence) for one workbook, fail-closed ordering."""
     if not source_exists:
         return "missing_source", {}
-    if not verification or verification.get("skipped"):
+    if not isinstance(verification, dict) or not verification or verification.get("skipped"):
         return "unverified", {}
+    for field in ("iterative_blocks", "failures"):
+        records = verification.get(field, [])
+        if not isinstance(records, list) or any(not isinstance(r, dict) for r in records):
+            return "unverified", {"invalid_field": field}
+    counts = verification.get("counts", {})
+    if not isinstance(counts, dict) or not isinstance(counts.get("outputs", {}), dict):
+        return "unverified", {"invalid_field": "counts"}
 
     evidence = {
         "passed": verification.get("passed"),
@@ -64,12 +72,18 @@ def classify(verification: dict | None, source_exists: bool) -> tuple[str, dict]
         "divergence_roots": verification.get("divergence_roots") or [],
         "unconverged_blocks": [
             block for block in (verification.get("iterative_blocks") or [])
-            if not block.get("converged", True) or not block.get("unique", True)
+            if block.get("output_relevant") is not False and (
+                block.get("converged") is not True
+                or block.get("unique") is False
+                or block.get("uniqueness") == "demonstrated_non_unique"
+                or block.get("certified") is not True
+                or block.get("budget_exhausted")
+                or block.get("errors") or block.get("unresolved")
+                or block.get("topology_stable") is False
+                or block.get("targets_stable") is False
+            )
         ],
     }
-
-    if verification.get("passed") is True:
-        return "healthy", evidence
 
     if (evidence["seeded_inside_output_cone_count"]
             or evidence["oracle_fallback_inside_output_cone_count"]):
@@ -84,6 +98,35 @@ def classify(verification: dict | None, source_exists: bool) -> tuple[str, dict]
         return "unsafe_circular", evidence
 
     outputs = evidence["outputs"]
+    if not isinstance(outputs, dict):
+        return "unverified", evidence
+    numeric_counts = [outputs.get(k, 0) for k in
+                      ("match", "mismatch", "unresolved", "unverifiable")]
+    if any(type(n) is not int or n < 0 for n in numeric_counts):
+        return "unverified", evidence
+    if outputs.get("match", 0) > 0 and verification.get("passed") is True:
+        counts = (verification.get("counts") or {}).get("outputs") or {}
+        matches = outputs["match"]
+        targets = verification.get("ordered_output_cells")
+        targets_complete = (isinstance(targets, list) and len(targets) == matches
+                            and all(isinstance(ref, str) and ref.strip() for ref in targets)
+                            and len(set(targets)) == matches)
+        if (not any(numeric_counts[1:])
+                and targets_complete
+                and not failures
+                and all(k in outputs for k in ("match", "mismatch", "unresolved", "unverifiable"))
+                and not verification.get("blocking_reasons")
+                and verification.get("status", "pass") == "pass"
+                and verification.get("disposition", "pass") == "pass"
+                and counts.get("eligible", matches) == matches
+                and counts.get("checked", matches) == matches
+                and all(type(counts.get(k, matches)) is int for k in ("eligible", "checked"))
+                and all(type(verification.get(k)) is int and verification[k] == 0
+                        for k in ("seeded_inside_output_cone_count",
+                                  "oracle_fallback_inside_output_cone_count"))):
+            return "healthy", evidence
+    if not any(numeric_counts):
+        return "unverified", evidence
     if outputs.get("unverifiable", 0) and not outputs.get("mismatch", 0) \
             and not outputs.get("unresolved", 0):
         return "stale_cache_repairable", evidence
@@ -91,9 +134,33 @@ def classify(verification: dict | None, source_exists: bool) -> tuple[str, dict]
     return "cached_mismatch", evidence
 
 
-def preflight(workbook: str, source_dir: Path, seg_root: Path, out_dir: Path) -> dict:
-    source = resolve_workbook_artifact(source_dir, workbook)
+def preflight(workbook: str, source_dir: Path, seg_root: Path, out_dir: Path,
+              *, release_root=None, release_id=None, source_generation_root=None,
+              source_generation_id=None, segmentation_generation_id=None) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", workbook):
+        raise ValueError("unsafe workbook identity")
+    source = source_dir / f"{workbook}.xlsx"
     segments = seg_root / workbook / "segments.json"
+    bindings = None
+    if any((release_root, release_id, source_generation_id, segmentation_generation_id)):
+        if release_id and not release_root:
+            raise ValueError("release ID requires a release root")
+        if release_root and (source_generation_id or segmentation_generation_id):
+            raise ValueError("release and candidate generation modes conflict")
+        from xl_release_publication import resolve_build_context
+        context = resolve_build_context(
+            workbook, release_root=Path(release_root) / workbook if release_root else None,
+            release_id=release_id,
+            source_root=Path(source_generation_root or "source_out") / workbook,
+            segmentation_root=seg_root / workbook,
+            source_generation_id=source_generation_id,
+            segmentation_generation_id=segmentation_generation_id,
+        )
+        source = Path(context["source_path"])
+        segments = Path(context["segmentation_dir"]) / "segments.json"
+        bindings = context["bindings"]
+    else:
+        source = resolve_workbook_artifact(source_dir, workbook)
     verification = None
     if segments.is_file():
         try:
@@ -109,9 +176,15 @@ def preflight(workbook: str, source_dir: Path, seg_root: Path, out_dir: Path) ->
         "classification": classification,
         "healthy": classification == "healthy",
         "evidence": evidence,
+        "bindings": bindings,
         "generated_at": _dt.datetime.now(_dt.timezone.utc)
         .strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    _write_verdict(out_dir, workbook, verdict)
+    return verdict
+
+
+def _write_verdict(out_dir, workbook, verdict):
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / ("%s.json" % workbook)
     fd, tmp = tempfile.mkstemp(dir=str(out_dir), suffix=".tmp")
@@ -121,7 +194,6 @@ def preflight(workbook: str, source_dir: Path, seg_root: Path, out_dir: Path) ->
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, target)
-    return verdict
 
 
 def main(argv=None):
@@ -130,12 +202,36 @@ def main(argv=None):
     parser.add_argument("--source", default="4-10 100")
     parser.add_argument("--seg-root", default="seg_out")
     parser.add_argument("--out", default="runs/preflight")
+    parser.add_argument("--release-root")
+    parser.add_argument("--release-id")
+    parser.add_argument("--source-generation-root", default="source_out")
+    parser.add_argument("--source-generation-id")
+    parser.add_argument("--segmentation-generation-id")
     args = parser.parse_args(argv)
+    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", wb) for wb in args.workbooks):
+        parser.error("unsafe workbook identity")
+    if len(args.workbooks) != 1 and any((args.release_id, args.source_generation_id,
+                                        args.segmentation_generation_id)):
+        parser.error("pinned generation IDs require exactly one workbook")
 
     unhealthy = 0
     for workbook in args.workbooks:
-        verdict = preflight(
-            workbook, Path(args.source), Path(args.seg_root), Path(args.out))
+        try:
+            verdict = preflight(
+                workbook, Path(args.source), Path(args.seg_root), Path(args.out),
+                release_root=args.release_root, release_id=args.release_id,
+                source_generation_root=args.source_generation_root,
+                source_generation_id=args.source_generation_id,
+                segmentation_generation_id=args.segmentation_generation_id)
+        except (ValueError, OSError) as exc:
+            _write_verdict(Path(args.out), workbook, {
+                "workbook": workbook, "classification": "unverified",
+                "healthy": False, "evidence": {"validation_error": str(exc)},
+                "bindings": None,
+            })
+            print("%s unverified: %s" % (workbook, exc), file=sys.stderr)
+            unhealthy += 1
+            continue
         print("%s %s%s" % (
             workbook, verdict["classification"],
             "" if verdict["healthy"] else "  (not eligible)"))

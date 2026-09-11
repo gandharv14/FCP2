@@ -98,6 +98,25 @@ class InstructionNaturalizationTests(unittest.TestCase):
         self.assertTrue(report["valid"])
         self.assertNotEqual(report["source_sha256"], report["candidate_sha256"])
 
+    def test_marked_writer_output_requires_restore_before_validation(self):
+        marked, spans = FREEZER.freeze(SOURCE)
+        with self.assertRaises(VALIDATOR.RewriteValidationError) as caught:
+            VALIDATOR.validate(SOURCE, marked)
+        self.assertEqual(caught.exception.reason_codes, ["frozen_span_marker_residue"])
+        restored, errors, drift = FREEZER.restore(marked, spans)
+        self.assertEqual(errors, [])
+        self.assertEqual(drift, [])
+        self.assertEqual(restored, SOURCE)
+        self.assertTrue(VALIDATOR.validate(SOURCE, restored)["valid"])
+
+    def test_rejects_unknown_and_orphan_marker_residue(self):
+        for marker in ("[[F999]]", "[[/F999]]", "[[F1]]", "[[F02", "[[F02broken]]"):
+            with self.subTest(marker=marker):
+                candidate = CANDIDATE + marker
+                with self.assertRaises(VALIDATOR.RewriteValidationError) as caught:
+                    VALIDATOR.validate(SOURCE, candidate)
+                self.assertEqual(caught.exception.reason_codes, ["frozen_span_marker_residue"])
+
     def test_rejects_modified_protected_section(self):
         changed = CANDIDATE.replace(
             "Report 2 values without rounding.",
@@ -412,6 +431,22 @@ timeout_sec = 100
             'instruction_sha256 = "%s"' % SPANS.sha256_bytes(CANDIDATE.encode()),
             metadata,
         )
+
+    def test_endpoint_binding_preserves_submitted_attempt_and_semantic_review(self):
+        self.init()
+        preamble, body = self.candidate_bodies()
+        RECOVERY.submit_attempt(self.recovery, preamble, body)
+        self.approve()
+        before = RECOVERY.recovery_status(self.recovery)
+        bound = RECOVERY.bind_endpoint(self.recovery, "https://litellm.labelbox.com")
+        self.assertEqual(bound["attempts"], before["attempts"])
+        self.assertEqual(bound["accepted_semantic_review"], before["accepted_semantic_review"])
+        with self.assertRaises(RECOVERY.RecoveryError):
+            RECOVERY.bind_endpoint(self.recovery, "cursor-subagent")
+        RECOVERY.apply_recovery(self.recovery)
+        verified = RECOVERY.verify_applied_recovery(self.recovery)
+        self.assertEqual(verified["metadata"]["endpoint"], "https://litellm.labelbox.com")
+        self.assertEqual(verified["metadata"]["attempts"], 1)
 
     def test_two_invalid_attempts_exhaust_recovery(self):
         self.init()

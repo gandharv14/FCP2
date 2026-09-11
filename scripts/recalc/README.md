@@ -74,6 +74,30 @@ directory. Never copy the private key or runner configuration.
 
 ## Local execution
 
+An installed runner may enter a temporary offline window on the configured
+Mac. `install_runner.py preflight` reports `ready_for_offline_window` separately
+from the live `ready` verdict; execution still requires actual loopback-only
+interfaces and the signed runner's independent network enforcement.
+
+Prepare requests from a frozen corpus inventory using the persistent project
+Python environment (temporary `uv run --with` environments must not be embedded
+in delayed execution scripts):
+
+```bash
+.venv/bin/python -m scripts.recalc.prepare_offline_batch \
+  --inventory .corpus-runs/rebuild/inventory.json \
+  --output /path/to/recalc-recovery/new-request-batch \
+  --workbooks 0266 0332
+bash /path/to/recalc-recovery/new-request-batch/run-local.sh
+```
+
+The local command prompts for sudo to change interface state. It validates the
+Python runtime before changing the network, serializes Excel execution, and
+restores previously active interfaces on completion or interruption. Requests
+expire after seven days; expired or incomplete results cannot be published.
+Existing request/result artifacts are never overwritten. A failed readiness
+check or unavailable sudo is an infrastructure blocker, not source invalidity.
+
 Create a request on the Linux VM with the installed public key hash. Transfer
 the request and source as one bundle:
 
@@ -123,3 +147,29 @@ Bundle import verifies every member hash and refuses existing destinations.
 `xl_source_recalc.py` still verifies the Ed25519 receipt, request binding,
 output hash, completion time, Excel version, semantic equivalence, and original
 source hash before publishing the candidate.
+
+## Data-table observations and maintained deployments
+
+Ordinary recalculation does not accept workbooks with data tables. The separate
+`table_quarantine_runner.py` records complete table observations and a signed
+intermediate under the dedicated offline session. `table_quarantine_window.py`
+uses system Python for protected controls and checks the persistent Python 3.12
+environment before disabling interfaces. Pipeline-derived semantic evidence is
+assembled as the normal user after networking is restored. Full private output
+and failure diagnostics are retained; the terminal receives a short result.
+
+For an existing deployment, `maintain_table_runner.py` provides `prepare`,
+`plan`, `check`, `apply` and `recover`. The coordinator reviews exact bundle and
+deployment-plan hashes, then uses a hash-checked bootstrap to copy reviewed code
+into protected staging before invoking it as root. Installation changes the
+observer implementation binding and adds the separate producer/window/config;
+existing key references and bytes remain intact. Each replacement has a
+compare-and-swap precondition and protected rollback evidence. New requests are
+created only after the installed transaction passes its postcheck. See the
+[full maintenance and recovery contract](../../reports/table-maintained-installer-proposal.md).
+
+Successful observation is an intermediate result. The consuming pipeline still
+requires independent original-to-intermediate and intermediate-to-candidate
+proof, unchanged curation, complete reconstruction, certified exclusion of
+presentation tables, leak scanning, explicit inventory approval and all normal
+source, segmentation and Harbor gates.

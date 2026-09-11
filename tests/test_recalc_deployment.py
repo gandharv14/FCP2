@@ -74,68 +74,32 @@ def _write_request(path: Path, request: dict) -> None:
     path.write_bytes(excel_runner.canonical_json(request))
 
 
-def _ed25519_keys(tmp_path: Path) -> tuple[Path, Path, Path]:
-    openssl_text = shutil.which("openssl")
-    if openssl_text is None:
-        pytest.skip("OpenSSL 3 is unavailable")
-    openssl = Path(openssl_text)
+def _ed25519_keys(tmp_path: Path) -> tuple[Path, Path]:
+    # Test keys use the declared dev dependency, independent of host OpenSSL.
+    # The installed runner retains its separate stdlib/system-tool contract.
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    key = Ed25519PrivateKey.generate()
     private_key = tmp_path / "private.pem"
     public_key = tmp_path / "public.pem"
-    generated = subprocess.run(
-        [str(openssl), "genpkey", "-algorithm", "Ed25519", "-out", str(private_key)],
-        check=False,
-        capture_output=True,
-    )
-    if generated.returncode != 0:
-        pytest.skip("installed OpenSSL has no Ed25519 support")
-    subprocess.run(
-        [
-            str(openssl),
-            "pkey",
-            "-in",
-            str(private_key),
-            "-pubout",
-            "-out",
-            str(public_key),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    private_key.write_bytes(key.private_bytes(serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    public_key.write_bytes(key.public_key().public_bytes(serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo))
     private_key.chmod(0o600)
     public_key.chmod(0o600)
-    return openssl, private_key, public_key
+    return private_key, public_key
 
 
-def _signed_receipt(
-    tmp_path: Path,
-    payload: dict,
-    openssl: Path,
-    private_key: Path,
-) -> dict:
-    message = tmp_path / "payload.json"
-    signature = tmp_path / "signature.bin"
-    message.write_bytes(excel_runner.canonical_json(payload))
-    subprocess.run(
-        [
-            str(openssl),
-            "pkeyutl",
-            "-sign",
-            "-rawin",
-            "-inkey",
-            str(private_key),
-            "-in",
-            str(message),
-            "-out",
-            str(signature),
-        ],
-        check=True,
-        capture_output=True,
-    )
+def _signed_receipt(tmp_path: Path, payload: dict, private_key: Path) -> dict:
+    from cryptography.hazmat.primitives import serialization
+    key = serialization.load_pem_private_key(private_key.read_bytes(), password=None)
+    signature = key.sign(excel_runner.canonical_json(payload))
     return {
         "schema_version": "excel-runner-receipt/v1",
         "signature_algorithm": "ed25519",
         "signed_payload": payload,
-        "signature_base64": base64.b64encode(signature.read_bytes()).decode("ascii"),
+        "signature_base64": base64.b64encode(signature).decode("ascii"),
     }
 
 
@@ -159,9 +123,9 @@ def _payload(completed_at_ns: int | None = None) -> dict:
 
 
 def test_ed25519_receipt_rejects_forged_stale_and_wrong_request(tmp_path):
-    openssl, private_key, public_key = _ed25519_keys(tmp_path)
+    private_key, public_key = _ed25519_keys(tmp_path)
     payload = _payload()
-    receipt = _signed_receipt(tmp_path, payload, openssl, private_key)
+    receipt = _signed_receipt(tmp_path, payload, private_key)
 
     verified = verify_signed_runner_receipt(
         receipt,
@@ -542,6 +506,7 @@ def test_pf_isolation_remains_active_through_receipt_signing(
     sys.platform != "darwin",
     reason="macOS sandbox-exec control",
 )
+@pytest.mark.host_controls
 def test_macos_sandbox_profile_denies_network_syscalls():
     if not excel_runner.NETWORK_SANDBOX.is_file():
         pytest.skip("sandbox-exec is unavailable")
@@ -717,3 +682,75 @@ def test_generated_sudoers_policy_has_valid_syntax(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
+
+@pytest.mark.parametrize('before,after', [(' ca="1"',''), ('',' ca="0"'), (' ca="true"',' ca="false"')])
+def test_cache_graft_accepts_completed_calculate_cell_flag(tmp_path, before, after):
+    candidate, calculated = tmp_path / 'candidate.xlsx', tmp_path / 'calculated.xlsx'
+    def write(path, attrs, value):
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr('[Content_Types].xml', '<Types/>')
+            archive.writestr('xl/workbook.xml', '<workbook/>')
+            archive.writestr('xl/worksheets/sheet1.xml',
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f'<sheetData><row r="1"><c r="B1"><f{attrs}>A1+1</f><v>{value}</v></c>'
+                '</row></sheetData></worksheet>')
+    write(candidate, before, 2); write(calculated, after, 3)
+    excel_runner._replace_candidate_from_staging(calculated, candidate)
+    with zipfile.ZipFile(candidate) as archive:
+        root = excel_runner.ElementTree.fromstring(archive.read('xl/worksheets/sheet1.xml'))
+    assert root.find('.//{*}f').attrib == excel_runner.ElementTree.fromstring(f'<f{before}/>').attrib
+    assert root.find('.//{*}v').text == '3'
+
+@pytest.mark.parametrize('before,after', [
+    ('<f ca="invalid">A1</f>', '<f>A1</f>'),
+    ('<f ca="1">A1</f>', '<f>A2</f>'),
+    ('<f t="array" ref="A1:B1">A1</f>', '<f t="array" ref="A1:C1">A1</f>'),
+    ('<f t="shared" si="1">A1</f>', '<f t="shared" si="2">A1</f>'),
+])
+def test_cache_graft_rejects_semantic_or_unknown_encoding_changes(tmp_path, before, after):
+    candidate, calculated = tmp_path / 'candidate.xlsx', tmp_path / 'calculated.xlsx'
+    for path, formula in [(candidate, before), (calculated, after)]:
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr('[Content_Types].xml', '<Types/>')
+            archive.writestr('xl/workbook.xml', '<workbook/>')
+            archive.writestr('xl/worksheets/sheet1.xml',
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f'<sheetData><row r="1"><c r="B1">{formula}<v>2</v></c></row></sheetData></worksheet>')
+    original = candidate.read_bytes()
+    with pytest.raises(excel_runner.RunnerError):
+        excel_runner._replace_candidate_from_staging(calculated, candidate)
+    assert candidate.read_bytes() == original
+
+
+def test_offline_runner_refresh_requires_exact_reviewed_source(tmp_path, monkeypatch):
+    from scripts.recalc import offline_window
+    source = tmp_path / 'runner.py'; source.write_text('# reviewed\n')
+    config = {'excel_app': '/trusted/Microsoft Excel.app', 'openssl_binary': '/trusted/openssl',
+              'automation_user': 'worker', 'isolation_controls': {'network_disabled': True}}
+    monkeypatch.setattr(excel_runner, 'load_config', lambda: config)
+    calls = []
+    monkeypatch.setattr(install_runner, 'install', lambda **kwargs: calls.append(kwargs))
+    offline_window.refresh_runner(Path(__file__).resolve().parents[1], source,
+                                  excel_runner.sha256_file(source))
+    assert calls[0]['source_runner'] == source
+    assert calls[0]['controls'] == config['isolation_controls']
+    with pytest.raises(RuntimeError, match='changed'):
+        offline_window.refresh_runner(tmp_path, source, '0' * 64)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('field,bad_value', [
+    ('isolation_controls',None),('isolation_controls',{}),
+    ('calculation_complete',1),('isolation_enforced',1),('completed_at_ns',True),
+    *[(name,value) for name in excel_runner.REQUIRED_CONTROLS for value in (False,1,None)],
+])
+def test_even_valid_signatures_require_complete_typed_isolation_proof(tmp_path,field,bad_value):
+    private_key,public_key=_ed25519_keys(tmp_path)
+    payload=_payload()
+    if field in excel_runner.REQUIRED_CONTROLS:
+        payload['isolation_controls'][field]=bad_value
+    else:payload[field]=bad_value
+    receipt=_signed_receipt(tmp_path,payload,private_key)
+    with pytest.raises(RecalculationError):
+        verify_signed_runner_receipt(receipt,public_key,request_sha256='a'*64,
+            source_sha256='b'*64,output_sha256='c'*64,require_root_owner=False)

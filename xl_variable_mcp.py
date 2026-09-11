@@ -484,14 +484,16 @@ def cmd_smoke(args):
 
     async def run():
         from fastmcp import Client
+        from xl_mcp_oracle import _tool_data
 
         async def query_all(client, args, max_pages=40):
             rows, cursor = [], 0
             for _ in range(max_pages):
                 result = await client.call_tool(
                     "query_records", {**args, "limit": 5, "cursor": cursor})
-                rows.extend(result.data["rows"])
-                cursor = result.data.get("next_cursor")
+                page = _tool_data(result)
+                rows.extend(page["rows"])
+                cursor = page.get("next_cursor")
                 if cursor is None:
                     break
             return rows
@@ -499,7 +501,7 @@ def cmd_smoke(args):
         async with Client(server) as client:
             tools = sorted(tool.name for tool in await client.list_tools())
             datasets = await client.call_tool("list_datasets", {"limit": 100})
-            checks = {"tools": tools, "datasets": len(datasets.data), "resolved": 0,
+            checks = {"tools": tools, "datasets": len(_tool_data(datasets)), "resolved": 0,
                       "broad_conflicts": 0, "chains_seen": 0, "failures": []}
             tasks = [json.loads(line) for line in
                      (bundle / "eval" / "tasks.jsonl").read_text(

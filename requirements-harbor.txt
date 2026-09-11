@@ -1,0 +1,3 @@
+-r requirements.txt
+# Match the generated sidecar and persistent smoke/oracle runtime.
+fastmcp==2.14.7

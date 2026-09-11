@@ -1,0 +1,1 @@
+Golden files emitted by the original eager lineage implementation for the hermetic fixture in test_lineage_streaming.py. Compare bytes; do not regenerate from the streaming implementation. Original emit.py SHA-256: f3535e2ea81989ae01002899464a46b62e8e5bf756874a54ed7e45aa89b22598. Original lineage.py SHA-256: a942c3c234be92049e314133170d4f8386dbe9012164408d621ea7d5aedae8e8.

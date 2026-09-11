@@ -1,0 +1,468 @@
+"""Explicit audit applicability proof for unchanged financial artifacts; never a model cache rewrite.
+
+The proof builder makes no network calls or budget allocations. The CLI publishes
+completed proof receipts atomically without replacing earlier evidence.
+Production callers must explicitly select this separate contract and supply the
+current bindings independently. The original auditor continues to validate its
+actual historical request in its original context.
+"""
+from pathlib import Path
+import copy
+import hashlib
+import json
+import struct
+import zipfile
+
+import xl_variable_source_audit as audit
+import xl_release_publication as release
+import xl_source_publication as source_pub
+from xl_seg import publication as seg_pub
+
+SCHEMA = 'audit-locator-equivalence/v2'
+FILE_KEYS = ('source_file', 'original_raw_source', 'baseline_inputs', 'baseline_segmentation')
+GEN_KEYS = ('source_generation', 'segmentation_generation')
+AUDIT_KEYS = ('variable_source_metadata', 'variable_source_inventory', 'variable_source_audit')
+LOCATORS = ('generation_id', 'manifest_sha256')
+SOURCE_LOCATORS = LOCATORS + ('source_generation_id',)
+STORAGE_BUILDER_ADDITION_POLICY = 'ast-disk-storage-builder-addition/v1'
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def read(path):
+    return json.loads(Path(path).read_text())
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def file_record(path):
+    path = Path(path)
+    require(path.is_file() and not path.is_symlink(), 'evidence must be a regular file')
+    return {'path': str(path.resolve()), 'sha256': digest(path)}
+
+
+def checked(record):
+    require(isinstance(record, dict) and set(record) >= {'path', 'sha256'}, 'missing file binding')
+    actual = file_record(record['path'])
+    require(actual['sha256'] == record['sha256'], 'changed file evidence')
+    return Path(actual['path'])
+
+
+def selected(bindings, *, historical=False):
+    keys = FILE_KEYS + GEN_KEYS + (AUDIT_KEYS if historical else ())
+    require(isinstance(bindings, dict) and all(k in bindings for k in keys), 'missing context bindings')
+    result = {k: copy.deepcopy(bindings[k]) for k in keys}
+    if historical and 'historical_baseline_witness' in bindings:
+        result['historical_baseline_witness'] = copy.deepcopy(bindings['historical_baseline_witness'])
+    return result
+
+
+def historical_baseline(bindings):
+    actual = checked(bindings['baseline_inputs'])
+    witness = bindings.get('historical_baseline_witness')
+    if witness is None:
+        return actual, checked(bindings['baseline_segmentation'])
+    require(isinstance(witness, dict) and set(witness) == {'workbook', 'sidecar'}, 'invalid historical baseline witness')
+    workbook, sidecar = checked(witness['workbook']), checked(witness['sidecar'])
+    require(workbook.name == actual.name and digest(workbook) == digest(actual),
+            'historical baseline witness is not exact artifact bytes/name')
+    require(sidecar == seg_pub.inputs_sidecar_path(workbook).resolve(), 'historical witness sidecar path mismatch')
+    return workbook, sidecar
+
+
+def _historical_context(source_dir, segmentation_dir):
+    """Read a retained audit envelope; this cannot certify a current build.
+
+    Keep this separate from the production resolver, which always requires live
+    proof. Both immutable generations and their complete join still validate.
+    The equivalence contract separately requires a current reconstructed pair.
+    """
+    source_dir, source = source_pub.resolve_source_generation_by_id(
+        source_dir.parent.parent, source_dir.name)
+    segmentation_dir, segmentation = seg_pub.resolve_generation_by_id(
+        segmentation_dir.parent.parent, segmentation_dir.name,
+        require_pass=True, source_generation_dir=source_dir)
+    join = (segmentation.get('source_policy_bindings') or {}).get('source_generation') or {}
+    require(join.get('generation_id') == source_dir.name, 'historical segmentation/source IDs do not bind')
+    layout, source_bindings = source['layout'], source['bindings']
+    bindings = {key: source_bindings.get(key) for key in (
+        'restriction_evidence_sha256', 'restriction_events_sha256',
+        'restriction_profile_sha256', 'inventory_approval_sha256', 'recalc_signals_sha256')}
+    bindings.update(release_id=None, source_generation_id=source_dir.name,
+        source_manifest_sha256=digest(source_dir / 'generation-manifest.json'),
+        source_health_sha256=source_bindings.get('health_sha256'),
+        source_health_report_sha256=source_bindings.get('health_report_sha256'),
+        segmentation_generation_id=segmentation_dir.name,
+        segmentation_manifest_sha256=digest(segmentation_dir / 'generation-manifest.json'),
+        cone_certificate_sha256=(segmentation.get('source_policy_bindings') or {}).get('cone_certificate_sha256'),
+        task_generation_id=None, task_manifest_sha256=None, task_generation_hash=None)
+    return dict(source_dir=str(source_dir), segmentation_dir=str(segmentation_dir),
+        source_path=str(source_dir / layout['source_workbook']),
+        ast_dir=str(source_dir / layout['ast_directory']), bindings=bindings)
+
+
+def _context(bindings, *, historical):
+    """Historical envelope plus baseline; current side additionally runs live proof."""
+    paths = {key: checked(bindings[key]) for key in FILE_KEYS}
+    if historical:
+        paths['baseline_inputs'], paths['baseline_segmentation'] = historical_baseline(bindings)
+    dirs = {}
+    for key in GEN_KEYS:
+        r = bindings[key]
+        require(isinstance(r, dict) and set(r) >= {'path', 'id', 'manifest_sha256'}, 'missing generation binding')
+        p = Path(r['path'])
+        require(p.name == r['id'] and p.parent.name == 'generations', 'noncanonical generation path')
+        checked({'path': str(p / 'generation-manifest.json'), 'sha256': r['manifest_sha256']})
+        dirs[key] = p
+    source = source_pub.validate_source_generation(dirs['source_generation'],
+        expected_generation_id=bindings['source_generation']['id'])
+    # Narrow first contract: untransformed source-pass workbooks only. This also
+    # establishes that original_raw_source really is the current source bytes.
+    require(source['identity'].get('policy_decision', {}).get('route') == 'pass', 'equivalence supports source-pass only')
+    require(digest(paths['original_raw_source']) == digest(paths['source_file']) == source['bindings']['source_sha256'],
+            'original/source workbook changed')
+    wb = source['layout']['workbook_id']
+    if historical:
+        context = _historical_context(dirs['source_generation'], dirs['segmentation_generation'])
+    else:
+        context = release.resolve_build_context(wb,
+            source_root=dirs['source_generation'].parent.parent,
+            source_generation_id=bindings['source_generation']['id'],
+            segmentation_root=dirs['segmentation_generation'].parent.parent,
+            segmentation_generation_id=bindings['segmentation_generation']['id'])
+    require(Path(context['source_path']).resolve() == paths['source_file'], 'source path mismatch')
+    for key in GEN_KEYS:
+        name = 'source_dir' if key == 'source_generation' else 'segmentation_dir'
+        require(Path(context[name]).resolve() == dirs[key].resolve(), 'resolved generation path changed')
+        require(context['bindings'][key.replace('_generation', '_manifest_sha256')] == bindings[key]['manifest_sha256'],
+                'resolved generation manifest changed')
+    if not historical:
+        recorded = source['ast_provenance']['builder']['code']
+        current = source_pub._default_builder_paths()
+        require(sorted((r['name'], r['sha256'], r['size_bytes']) for r in recorded) ==
+                sorted((p.name, digest(p), p.stat().st_size) for p in current), 'current AST builder changed')
+        seg_pub.resolve_generation_by_id(dirs['segmentation_generation'].parent.parent,
+            dirs['segmentation_generation'].name, source_path=context['source_path'],
+            ast_dir=context['ast_dir'], source_generation_dir=dirs['source_generation'],
+            require_pass=True, validate_live_evidence=True)
+    require(paths['baseline_segmentation'] == seg_pub.inputs_sidecar_path(paths['baseline_inputs']).resolve(),
+            'baseline sidecar path changed')
+    seg_pub.validate_inputs_sidecar(paths['baseline_inputs'], expected_generation_id=dirs['segmentation_generation'].name,
+        generation_dir=dirs['segmentation_generation'], expected_pipeline_bindings=context['bindings'])
+    segmentation = read(dirs['segmentation_generation'] / 'generation-manifest.json')
+    b = context['bindings']
+    metadata = {'generation_id': b['segmentation_generation_id'], 'manifest_sha256': b['segmentation_manifest_sha256'],
+        'source_generation_id': b['source_generation_id'], 'inventory_approval_sha256': b['inventory_approval_sha256'],
+        'recalc_signals_sha256': b['recalc_signals_sha256']}
+    inventory = audit.build_inventory(wb, paths['baseline_inputs'], dirs['segmentation_generation'], segmentation=metadata)
+    return context, segmentation, inventory
+
+
+def zip_members(path):
+    """Exact OOXML member bytes/metadata; only DOS container timestamps ignored."""
+    normalized = bytearray(Path(path).read_bytes())
+    with zipfile.ZipFile(path) as archive:
+        items = archive.infolist()
+        require(len({i.filename for i in items}) == len(items), 'duplicate ZIP member')
+        members = []
+        central = archive.start_dir
+        for info in items:
+            require(not info.flag_bits & 1, 'encrypted ZIP member')
+            # Bind the physical ZIP too: do not silently accept recompression,
+            # extra records, or padding. Zero only local/central DOS timestamps.
+            require(normalized[info.header_offset:info.header_offset + 4] == b'PK\x03\x04', 'invalid local ZIP header')
+            normalized[info.header_offset + 10:info.header_offset + 14] = b'\0' * 4
+            require(normalized[central:central + 4] == b'PK\x01\x02', 'invalid central ZIP header')
+            normalized[central + 12:central + 16] = b'\0' * 4
+            name_len, extra_len, comment_len = struct.unpack_from('<HHH', normalized, central + 28)
+            central += 46 + name_len + extra_len + comment_len
+            members.append({'name': info.filename, 'sha256': hashlib.sha256(archive.read(info)).hexdigest(),
+                'metadata': {key: getattr(info, key) for key in ('compress_type', 'flag_bits', 'create_system',
+                    'create_version', 'extract_version', 'internal_attr', 'external_attr', 'volume')},
+                'extra': info.extra.hex(), 'comment': info.comment.hex()})
+        return {'members': members, 'comment': archive.comment.hex(),
+                'zip_bytes_except_dos_timestamps_sha256': hashlib.sha256(normalized).hexdigest()}
+
+
+def inventory_equivalence(old, fresh, *, source_builder_changed=False):
+    locators = SOURCE_LOCATORS if source_builder_changed else LOCATORS
+    a, b = copy.deepcopy(old), copy.deepcopy(fresh)
+    changes = {}
+    for key in locators:
+        before, after = a['metadata']['segmentation'].pop(key), b['metadata']['segmentation'].pop(key)
+        require(all(isinstance(v, str) and len(v) == 64 and all(c in '0123456789abcdef' for c in v) for v in (before, after)),
+                'invalid opaque locator')
+        if before != after:
+            changes['/metadata/segmentation/' + key] = {'before': before, 'after': after}
+    require(a == b, 'audit inputs changed beyond locator fields')
+    label = 'three' if source_builder_changed else 'two'
+    require(set(changes) == {'/metadata/segmentation/' + k for k in locators}, f'not exactly a {label}-locator change')
+    require([rows for _, rows in audit._split_chunks(old)] == [rows for _, rows in audit._split_chunks(fresh)],
+            'audit batch boundaries changed')
+    return changes
+
+
+def _audit_history(bindings, config, *, locators=LOCATORS, validator_upgrade=None, original_auditor=None):
+    paths = [checked(bindings[k]) for k in AUDIT_KEYS]
+    upgrade_files = {}
+    require((validator_upgrade is None) == (original_auditor is None), 'upgrade and original generator must be selected together')
+    if validator_upgrade is None:
+        audit.validate_saved_audit_coverage(*paths, **config)
+    else:
+        from xl_audit_validator_upgrade import validate_upgrade
+        upgrade_files = validate_upgrade(validator_upgrade, bindings=bindings,
+            original_code=original_auditor, **config)
+    metadata, inventory = read(paths[0]), read(paths[1])
+    require(Path(metadata['artifact']).resolve() == checked(bindings['baseline_inputs']), 'historical baseline artifact mismatch')
+    evidence = dict(upgrade_files)
+    def collect(value):
+        if isinstance(value, dict):
+            if {'path', 'sha256'} <= set(value):
+                p = checked(value); evidence[str(p)] = digest(p)
+            for child in value.values(): collect(child)
+        elif isinstance(value, list):
+            for child in value: collect(child)
+    for p in paths:
+        evidence[str(p)] = digest(p)
+    coverage_path = Path(metadata['coverage_path']); evidence[str(coverage_path.resolve())] = digest(coverage_path)
+    coverage = read(coverage_path)
+    collect(metadata); collect(coverage)
+    policy = read(checked(metadata['attempt_policy'])); collect(policy)
+    if policy.get('inherited_budget'):
+        collect(read(checked(policy['inherited_budget'])))
+    for p in sorted(checked(metadata['attempt_policy']).parent.glob('*.json')):
+        evidence[str(p.resolve())] = digest(p)
+    # Scan accepted actual response content and rendered audit, not requests,
+    # which necessarily contain the historical opaque locators.
+    texts = [paths[2].read_text()]
+    for batch in coverage['batches']:
+        response = read(checked(batch['response']))
+        require(isinstance(response.get('content'), str), 'accepted response content missing')
+        texts.append(response['content'])
+        texts.append(batch['model_table'])
+    for locator in (inventory['metadata']['segmentation'][k] for k in locators):
+        require(not any(locator.casefold() in text.casefold() for text in texts), 'accepted audit relies on historical locator')
+    consumption = {'limit': policy['limit'], 'submitted_counts': policy['submitted_counts'],
+                   'inherited_batch_counts': {str(k): v for k, v in
+                       audit._inherited_batch_counts(policy.get('inherited_budget'), inventory).items()}}
+    return inventory, coverage, evidence, consumption
+
+
+def _builder_inventory_migration(before, after):
+    """Allow only the forward addition of the installed temporary AST store.
+
+    This proves a code-inventory transition, not financial equivalence. The
+    surrounding contract still compares every source and AST byte and requires
+    an independently qualified current generation pair.
+    """
+    old_names, new_names = ([r['name'] for r in rows] for rows in (before, after))
+    if old_names == new_names:
+        return None
+    require(old_names == ['xl_ast_graph.py'] and
+            new_names == ['xl_ast_graph.py', 'xl_graph_store.py'],
+            'builder module inventory changed outside storage addition policy')
+    installed = Path(__file__).resolve().with_name('xl_graph_store.py')
+    added = after[1]
+    require(added['sha256'] == digest(installed) and added['size_bytes'] == installed.stat().st_size,
+            'added AST storage module differs from installed implementation')
+    return {'policy_version': STORAGE_BUILDER_ADDITION_POLICY,
+            'before': old_names, 'after': new_names,
+            'added_module_sha256': added['sha256'], 'added_module_size_bytes': added['size_bytes']}
+
+
+def source_builder_equivalence(old_record, new_record):
+    """Only builder code provenance may change; all financial AST bytes stay exact.
+
+    The caller also validates the new source against current builder code and
+    runs current segmentation proof. This helper does not certify currentness.
+    """
+    manifests, directories = [], []
+    for record in (old_record, new_record):
+        require(isinstance(record, dict) and set(record) == {'path', 'id', 'manifest_sha256'},
+                'invalid source-generation record')
+        directory = Path(record['path'])
+        require(directory.name == record['id'] and directory.parent.name == 'generations',
+                'noncanonical source-generation path')
+        checked({'path': str(directory / 'generation-manifest.json'), 'sha256': record['manifest_sha256']})
+        m = source_pub.validate_source_generation(directory, expected_generation_id=record['id'])
+        require(m['schema_version'] == 'source-generation/v2' and
+                m['ast_provenance']['schema_version'] == 'ast-provenance/v2', 'unsupported source/AST schema')
+        require(m['identity']['policy_decision']['route'] == 'pass', 'source equivalence supports pass only')
+        require(m['identity']['builder'] == m['ast_provenance']['builder'], 'source builder copies disagree')
+        code = m['identity']['builder']['code']
+        require(isinstance(code, list) and bool(code) and
+                all(isinstance(r, dict) and set(r) == {'name', 'path', 'sha256', 'size_bytes'} for r in code),
+                'unexpected builder provenance fields')
+        require(len({r['name'] for r in code}) == len(code), 'duplicate builder module identity')
+        manifests.append(m); directories.append(directory)
+    before, after = manifests
+    require(before['generation_id'] != after['generation_id'], 'source generation did not change')
+    migration = _builder_inventory_migration(before['identity']['builder']['code'],
+                                             after['identity']['builder']['code'])
+    # The schema stores all provenance outside the two CSV files. Do not erase
+    # array flags, parse status, schema tags, node IDs, row order, or any CSV field.
+    paths = ('request.json', 'result.json', 'health.json', before['layout']['source_workbook'],
+             before['layout']['ast_directory'] + '/nodes.csv', before['layout']['ast_directory'] + '/edges.csv')
+    require(before['layout'] == after['layout'], 'source layout changed')
+    for relative in paths:
+        require(digest(directories[0] / relative) == digest(directories[1] / relative),
+                'source financial/health/request/result bytes changed: ' + relative)
+    projected = []
+    for m in manifests:
+        p = copy.deepcopy(m)
+        del p['generation_id']
+        del p['bindings']['ast_provenance_sha256']
+        for key in ('sha256', 'size_bytes'):
+            del p['artifacts']['ast-provenance.json'][key]
+        for builder in (p['identity']['builder'], p['ast_provenance']['builder']):
+            del builder['code']
+            del builder['code_sha256']
+        projected.append(p)
+    require(projected[0] == projected[1], 'source manifest changed outside builder provenance allowlist')
+    return {'old_generation': old_record, 'current_generation': new_record,
+        'unchanged_artifacts': {relative: digest(directories[0] / relative) for relative in paths},
+        'allowed_manifest_differences': ['generation_id', 'bindings.ast_provenance_sha256',
+            'artifacts.ast-provenance.json.sha256', 'artifacts.ast-provenance.json.size_bytes',
+            'identity.builder.code', 'identity.builder.code_sha256',
+            'ast_provenance.builder.code', 'ast_provenance.builder.code_sha256'],
+        'builder_arguments_unchanged': True, 'semantic_ast_bytes_unchanged': True,
+        **({'builder_inventory_migration': migration} if migration is not None else {})}
+
+
+def propose_audit_equivalence(old_bindings, current_bindings, *, model=audit.DEFAULT_MODEL,
+                              endpoint=audit.PROD_ENDPOINT, project_id=audit.DEFAULT_PROJECT_ID,
+                              validator_upgrade=None, original_auditor=None):
+    """Return a proposal only after every proof passes; never publish/write it."""
+    old, new = selected(old_bindings, historical=True), selected(current_bindings)
+    config = {'model': model, 'endpoint': endpoint, 'project_id': project_id}
+    source_changed = old['source_generation'] != new['source_generation']
+    saved, coverage, files, consumption = _audit_history(
+        old, config, locators=SOURCE_LOCATORS if source_changed else LOCATORS,
+        validator_upgrade=validator_upgrade, original_auditor=original_auditor)
+    historical_baseline(old)
+    old_context, old_seg, rebuilt_old = _context(old, historical=True)
+    new_context, new_seg, fresh = _context(new, historical=False)
+    require(saved == rebuilt_old, 'old audit differs from its historical pair/baseline')
+    source_comparison = (source_builder_equivalence(old['source_generation'], new['source_generation'])
+                         if source_changed else None)
+    require(old['original_raw_source'] == new['original_raw_source'], 'original source binding changed')
+    require(old_seg['artifacts']['curation.toml'] == new_seg['artifacts']['curation.toml'], 'curation changed')
+    require(old_seg['curated_output_cells'] == new_seg['curated_output_cells'], 'ordered target identity changed')
+    require(bool(new_seg['curated_output_cells']['ordered']), 'empty target scope')
+    original_members, fresh_members = (zip_members(checked(v['baseline_inputs'])) for v in (old, new))
+    require(original_members == fresh_members, 'baseline ZIP member bytes or metadata changed')
+    same_pair_renderer = False
+    if validator_upgrade is not None:
+        from xl_audit_renderer_recovery import SCHEMA as RENDERER_SCHEMA
+        from xl_audit_inventory_lineage import AUDIT_SCHEMA
+        same_pair_renderer = (read(checked(validator_upgrade)).get('schema_version') in (RENDERER_SCHEMA,AUDIT_SCHEMA)
+                             and all(old[k] == new[k] for k in (*FILE_KEYS, *GEN_KEYS)))
+    if same_pair_renderer:
+        require(saved == fresh, 'same-pair renderer inventory changed')
+        changes = {}
+    else:
+        changes = inventory_equivalence(saved, fresh, source_builder_changed=source_changed)
+    refreshed_coverage = copy.deepcopy(coverage)
+    refreshed_coverage['inventory_sha256'] = audit._canonical_hash(fresh)
+    require(not audit.validate_audit_coverage(checked(old['variable_source_audit']).read_text(), fresh, refreshed_coverage),
+            'retained audit fails current inventory coverage')
+    for collection in (old, new):
+        for key in FILE_KEYS:
+            p = checked(collection[key]); files[str(p)] = digest(p)
+        for key in GEN_KEYS:
+            directory = Path(collection[key]['path'])
+            for p in directory.rglob('*'):
+                if p.is_file(): files[str(p.resolve())] = digest(p)
+            if key == 'segmentation_generation':
+                p = directory.parent.parent / 'curation.toml'
+                files[str(p.resolve())] = digest(p)
+    if old.get('historical_baseline_witness'):
+        for record in old['historical_baseline_witness'].values():
+            p = checked(record); files[str(p)] = digest(p)
+    for p in (*seg_pub.verifier_paths(), *source_pub._default_builder_paths(), Path(__file__), Path(audit.__file__)):
+        files[str(Path(p).resolve())] = digest(p)
+    result = {'schema_version': SCHEMA, 'model_reexecuted': False, 'semantic_attempts_added': 0,
+        'adapter_sha256': digest(__file__), 'auditor_sha256': digest(audit.__file__),
+        'old_bindings': old, 'current_bindings': new, 'config': config,
+        'source_builder_equivalence': source_comparison,
+        'differences': changes, 'old_inventory_sha256': audit._canonical_hash(saved),
+        'current_inventory_sha256': audit._canonical_hash(fresh),
+        'baseline_zip_members_sha256': audit._canonical_hash(original_members),
+        'retained_consumption': consumption, 'checked_files': dict(sorted(files.items()))}
+    if validator_upgrade is not None:
+        result['validator_upgrade'] = validator_upgrade
+        result['original_auditor'] = original_auditor
+    return result
+
+
+def validate_audit_equivalence(receipt_path, *, current_bindings, model=audit.DEFAULT_MODEL,
+                               endpoint=audit.PROD_ENDPOINT, project_id=audit.DEFAULT_PROJECT_ID,
+                               validator_upgrade=None, original_auditor=None):
+    """Recompute everything from caller-selected current inputs; no trusted flags."""
+    receipt = read(receipt_path)
+    require(isinstance(receipt, dict), 'invalid equivalence schema')
+    from xl_audit_inventory_lineage import LOCATOR_SCHEMA, validate_locator
+    if receipt.get('schema_version')==LOCATOR_SCHEMA:
+        return validate_locator({'path':str(Path(receipt_path).resolve()),'sha256':digest(receipt_path)},current_bindings=current_bindings,validator_upgrade=validator_upgrade,
+            original_auditor=original_auditor,model=model,endpoint=endpoint,project_id=project_id)
+    require(receipt.get('schema_version') == SCHEMA, 'invalid equivalence schema')
+    require(receipt.get('current_bindings') == selected(current_bindings), 'receipt current binding mismatch')
+    rebuilt = propose_audit_equivalence(receipt['old_bindings'], current_bindings,
+        model=model, endpoint=endpoint, project_id=project_id,
+        validator_upgrade=validator_upgrade, original_auditor=original_auditor)
+    require(receipt == rebuilt, 'equivalence receipt changed or stale')
+    return {**rebuilt['checked_files'], str(Path(receipt_path).resolve()): digest(receipt_path)}
+
+
+def main():
+    import argparse
+    import os
+    import tempfile
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('propose', 'validate'))
+    parser.add_argument('--current-bindings', required=True)
+    parser.add_argument('--historical-bindings')
+    parser.add_argument('--receipt', required=True)
+    args = parser.parse_args()
+    current = read(args.current_bindings)
+    destination = Path(args.receipt)
+    if args.action == 'validate':
+        records = validate_audit_equivalence(destination, current_bindings=current)
+    else:
+        if not args.historical_bindings:
+            parser.error('propose requires --historical-bindings')
+        value = propose_audit_equivalence(read(args.historical_bindings), current)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix='.audit-equivalence-', dir=destination.parent)
+        try:
+            with os.fdopen(descriptor, 'w') as stream:
+                json.dump(value, stream, sort_keys=True, indent=2)
+                stream.write('\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Atomic publication without replacing any previous receipt.
+            os.link(temporary, destination)
+            directory = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            os.unlink(temporary)
+        records = validate_audit_equivalence(destination, current_bindings=current)
+    print(json.dumps({'receipt': str(destination.resolve()), 'checked_files': len(records),
+                      'model_reexecuted': False, 'semantic_attempts_added': 0}))
+
+
+if __name__ == '__main__':
+    main()

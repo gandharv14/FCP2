@@ -53,8 +53,15 @@ def _walk(start, step, mirrors, real_nodes):
     return out
 
 
-def bypass_mirrors(bg: BandGraph):
-    mirrors = {bid for bid, b in bg.bands.items() if b.is_mirror}
+def bypass_mirrors(bg: BandGraph, *, retain_bands=()):
+    retain_bands = set(retain_bands)
+    unknown = retain_bands - set(bg.bands)
+    if unknown:
+        raise ValueError(f"curated bands absent from band graph: {sorted(unknown)}")
+    mirrors = {
+        bid for bid, b in bg.bands.items()
+        if b.is_mirror and bid not in retain_bands
+    }
     real = {bid for bid in bg.bands if bid not in mirrors}
 
     adj: dict[str, set] = {}
@@ -120,8 +127,10 @@ def strongly_connected(nodes, adj) -> list[list]:
     return result
 
 
-def build(bg: BandGraph) -> Condensed:
-    adj, radj, mirrors, fanin, presented = bypass_mirrors(bg)
+def build(bg: BandGraph, *, retain_bands=()) -> Condensed:
+    adj, radj, mirrors, fanin, presented = bypass_mirrors(
+        bg, retain_bands=retain_bands
+    )
     real = [bid for bid in bg.bands if bid not in mirrors]
 
     comp_of: dict[str, str] = {}

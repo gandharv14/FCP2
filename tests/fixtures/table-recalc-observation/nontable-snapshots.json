@@ -1,0 +1,280 @@
+{
+  "source": {
+    "formula_cache_sha256": "5a056f7bace077f272e22f42d2c56ffcdfa59892eac451e6a9f8806c37faa6df",
+    "formula_caches": {
+      "3 O'Brien": {
+        "B1": {
+          "present": true,
+          "type": "n",
+          "value": "6"
+        }
+      }
+    },
+    "schema_version": "xlsx-semantic-snapshot/v1",
+    "semantic_sha256": "f3b1b1d1856b4dc2ff4a4e460fd11ff28da91173f731868eb41d0d49c8e431ec",
+    "semantics": {
+      "calculation_settings": [
+        [
+          "calcMode",
+          "auto"
+        ],
+        [
+          "fullPrecision",
+          "1"
+        ],
+        [
+          "iterate",
+          "1"
+        ],
+        [
+          "iterateCount",
+          "100"
+        ],
+        [
+          "iterateDelta",
+          "0.001"
+        ],
+        [
+          "refMode",
+          "A1"
+        ]
+      ],
+      "defined_names": [],
+      "formulas": {
+        "3 O'Brien": {
+          "B1": [
+            "A1*3",
+            []
+          ]
+        }
+      },
+      "inputs": {
+        "3 O'Brien": {
+          "A1": [
+            "number",
+            "2"
+          ],
+          "A2": [
+            "string",
+            "retained"
+          ],
+          "D3": [
+            "number",
+            "5"
+          ],
+          "D4": [
+            "number",
+            "10"
+          ],
+          "E3": [
+            "number",
+            "9"
+          ],
+          "E4": [
+            "number",
+            "11"
+          ]
+        }
+      },
+      "merges": {
+        "3 O'Brien": []
+      },
+      "package_parts": {},
+      "relationships": [
+        [
+          "_rels/.rels",
+          [
+            [
+              "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties",
+              "/docProps/app.xml",
+              null
+            ],
+            [
+              "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+              "/xl/workbook.xml",
+              null
+            ],
+            [
+              "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties",
+              "/docProps/core.xml",
+              null
+            ]
+          ]
+        ],
+        [
+          "xl/_rels/workbook.xml.rels",
+          [
+            [
+              "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
+              "xl/styles.xml",
+              null
+            ],
+            [
+              "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
+              "xl/theme/theme1.xml",
+              null
+            ],
+            [
+              "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+              "xl/worksheets/sheet1.xml",
+              null
+            ]
+          ]
+        ]
+      ],
+      "sheets": [
+        [
+          "3 O'Brien",
+          "xl/worksheets/sheet1.xml",
+          {
+            "name": "3 O'Brien",
+            "sheetId": "1",
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id": "rId1"
+          }
+        ]
+      ],
+      "tables": {}
+    },
+    "supported_semantics": true,
+    "unsupported_features": []
+  },
+  "staged": {
+    "formula_cache_sha256": "486a68b5f2dfb990d91b351a73bb915750f733859cf7aa95d2b2e6de07f6ac7f",
+    "formula_caches": {
+      "3 O'Brien": {
+        "B1": {
+          "present": true,
+          "type": "n",
+          "value": "7"
+        }
+      }
+    },
+    "schema_version": "xlsx-semantic-snapshot/v1",
+    "semantic_sha256": "f3b1b1d1856b4dc2ff4a4e460fd11ff28da91173f731868eb41d0d49c8e431ec",
+    "semantics": {
+      "calculation_settings": [
+        [
+          "calcMode",
+          "auto"
+        ],
+        [
+          "fullPrecision",
+          "1"
+        ],
+        [
+          "iterate",
+          "1"
+        ],
+        [
+          "iterateCount",
+          "100"
+        ],
+        [
+          "iterateDelta",
+          "0.001"
+        ],
+        [
+          "refMode",
+          "A1"
+        ]
+      ],
+      "defined_names": [],
+      "formulas": {
+        "3 O'Brien": {
+          "B1": [
+            "A1*3",
+            []
+          ]
+        }
+      },
+      "inputs": {
+        "3 O'Brien": {
+          "A1": [
+            "number",
+            "2"
+          ],
+          "A2": [
+            "string",
+            "retained"
+          ],
+          "D3": [
+            "number",
+            "5"
+          ],
+          "D4": [
+            "number",
+            "10"
+          ],
+          "E3": [
+            "number",
+            "9"
+          ],
+          "E4": [
+            "number",
+            "11"
+          ]
+        }
+      },
+      "merges": {
+        "3 O'Brien": []
+      },
+      "package_parts": {},
+      "relationships": [
+        [
+          "_rels/.rels",
+          [
+            [
+              "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties",
+              "/docProps/app.xml",
+              null
+            ],
+            [
+              "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+              "/xl/workbook.xml",
+              null
+            ],
+            [
+              "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties",
+              "/docProps/core.xml",
+              null
+            ]
+          ]
+        ],
+        [
+          "xl/_rels/workbook.xml.rels",
+          [
+            [
+              "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
+              "xl/styles.xml",
+              null
+            ],
+            [
+              "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
+              "xl/theme/theme1.xml",
+              null
+            ],
+            [
+              "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+              "xl/worksheets/sheet1.xml",
+              null
+            ]
+          ]
+        ]
+      ],
+      "sheets": [
+        [
+          "3 O'Brien",
+          "xl/worksheets/sheet1.xml",
+          {
+            "name": "3 O'Brien",
+            "sheetId": "1",
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id": "rId1"
+          }
+        ]
+      ],
+      "tables": {}
+    },
+    "supported_semantics": true,
+    "unsupported_features": []
+  }
+}

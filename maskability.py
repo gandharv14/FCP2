@@ -11,7 +11,7 @@ the HTTP oracle applies to delivered workbooks
 The scan runs against the *golden* workbook before any masking, so masked
 cells are expected to still hold their raw values; only unapproved duplicate
 representations outside the mask (and allowlist hygiene) decide validity.
-An optional per-run ``leak_allowlist.json`` documents reviewed, legitimate
+An optional per-run ``oracle-allowlist.json`` documents reviewed, legitimate
 duplicates.
 
 Usage:  maskability.py <workbook-id> [--source DIR] [--runs-root DIR]
@@ -21,12 +21,15 @@ non-zero on any unapproved leak.
 """
 import argparse
 import datetime
+import hashlib
 import json
 import sys
 from pathlib import Path
 
 from xl_variable_mcp import expand_cells, raw_value
 from xl_mcp_oracle import scan_value_leaks
+from xl_artifact_paths import resolve_workbook_artifact
+from scripts.batch.hardened_runner import atomic_write_json
 
 
 def spec_mask_and_audit(spec):
@@ -66,6 +69,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     run = Path(args.runs_root) / ("%s-variable-sources" % args.workbook)
+    out = run / "maskability_report.json"
+    # A failed/interrupted recheck must not leave an earlier passing verdict.
+    atomic_write_json(out, {"schema_version": "2.0", "workbook": args.workbook,
+                            "valid": False, "status": "incomplete"})
     spec_path = run / "normalized.json"
     if not spec_path.is_file():
         sys.exit("maskability: %s is missing" % spec_path)
@@ -75,17 +82,14 @@ def main(argv=None):
     if not mask_refs or not audit:
         sys.exit("maskability: %s yields no masked cells to check" % spec_path)
 
-    golden = None
-    for suffix in (".xlsx", ".xlsm"):
-        candidate = Path(args.source) / (args.workbook + suffix)
-        if candidate.is_file():
-            golden = candidate
-            break
-    if golden is None:
+    golden = resolve_workbook_artifact(args.source, args.workbook)
+    if not golden.is_file():
         sys.exit("maskability: no golden workbook %s under %s"
                  % (args.workbook, args.source))
 
-    allowlist = run / "leak_allowlist.json"
+    allowlist = run / "oracle-allowlist.json"
+    if (run / "leak_allowlist.json").exists():
+        sys.exit("maskability: legacy leak_allowlist.json needs explicit review and migration to oracle-allowlist.json")
     report = scan_value_leaks(
         golden, mask_refs, audit,
         allowlist if allowlist.is_file() else None,
@@ -95,10 +99,13 @@ def main(argv=None):
     report["workbook_scanned"] = str(golden)
     report["total_masked_cells"] = len(mask_refs)
     report["variables_reviewed"] = len(audit)
+    report["allowlist_path"] = str(allowlist.resolve())
+    report["allowlist_sha256"] = (hashlib.sha256(allowlist.read_bytes()).hexdigest()
+                                  if allowlist.is_file() else None)
+    report["source_sha256"] = hashlib.sha256(golden.read_bytes()).hexdigest()
+    report["spec_sha256"] = hashlib.sha256(spec_path.read_bytes()).hexdigest()
 
-    out = run / "maskability_report.json"
-    out.write_text(json.dumps(report, indent=1, ensure_ascii=False,
-                              sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_json(out, report)
     print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0 if report.get("valid") else 1
 

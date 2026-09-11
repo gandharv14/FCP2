@@ -97,7 +97,8 @@ def _json_value(value: dict | str | Path, description: str) -> dict:
 
 
 def _default_builder_paths() -> tuple[Path, ...]:
-    return (Path(__file__).resolve().with_name("xl_ast_graph.py"),)
+    return tuple(Path(__file__).resolve().with_name(name)
+                 for name in ("xl_ast_graph.py", "xl_graph_store.py"))
 
 
 def _validate_ast_directory(ast_dir: Path, *, require_two_csv: bool = True) -> None:
@@ -665,7 +666,7 @@ def publish_source_generation(
                 raise SourcePublicationError(
                     f"trusted runner receipt validation failed: {exc}"
                 ) from exc
-    if route == "recalc_candidate" and not recalc_pair:
+    if route in {"recalc_candidate", "restricted_recalc_pass"} and not recalc_pair:
         raise SourcePublicationError(
             "recalculation candidate requires authoritative recalculation evidence"
         )
@@ -679,11 +680,7 @@ def publish_source_generation(
     )
     inventory_approval_value = None
     if route in {"restricted_pass", "restricted_recalc_pass"}:
-        expected_route_evidence = (
-            restricted_pair
-            if route == "restricted_pass"
-            else (restricted_pair or recalc_pair)
-        )
+        expected_route_evidence = restricted_pair or recalc_pair
         if (
             not expected_route_evidence
             or inventory_value is None
@@ -723,7 +720,8 @@ def publish_source_generation(
             if not restricted_pair and (
                 request_value.get("source_sha256")
                 != expected_request.get("source_sha256")
-                or expected_request.get("route") != "restricted_recalc_pass"
+                or expected_request.get("restriction", {}).get("source_route")
+                != "restricted_recalc_pass"
             ):
                 raise ValueError(
                     "recalculation evidence does not match approved restricted source"
@@ -1073,7 +1071,8 @@ def validate_source_generation(
                     (
                         "source-restriction-request/v2",
                         "source-restriction-result/v2",
-                    )
+                    ),
+                    ("source-recalc-request/v2", "source-recalc-result/v2"),
                 },
                 "restricted_recalc_pass": {
                     (
@@ -1106,16 +1105,6 @@ def validate_source_generation(
                         inventory_approval_document,
                         inventory_document,
                     )
-                    expected_request, expected_result = (
-                        create_restriction_documents(
-                            source_path,
-                            health_document,
-                            inventory_document,
-                            batch_id=inventory_approval_document[
-                                "approval"
-                            ]["batch_id"],
-                        )
-                    )
                     if (
                         evidence_schemas
                         == (
@@ -1123,12 +1112,24 @@ def validate_source_generation(
                             "source-restriction-result/v2",
                         )
                     ):
+                        expected_request, expected_result = create_restriction_documents(
+                            source_path,
+                            health_document,
+                            inventory_document,
+                            batch_id=inventory_approval_document["approval"]["batch_id"],
+                        )
                         if (
                             request_document != expected_request
                             or result_document != expected_result
                         ):
                             raise ValueError("restriction evidence changed")
                     else:
+                        # A trusted recalculation deliberately has two source
+                        # hashes: approval covers the original workbook, while
+                        # the receipt binds its recalculated candidate. Never
+                        # reinterpret the original approval as candidate identity
+                        # evidence. Publication already checked the original's
+                        # health, exact semantics and signed receipt together.
                         selected = [
                             item
                             for item in inventory_document.get("workbooks", [])
@@ -1379,4 +1380,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

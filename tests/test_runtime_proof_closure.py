@@ -567,7 +567,8 @@ def _restricted_certificate_source(tmp_path, monkeypatch, events):
         "restriction_events": events,
         "restriction_events_sha256": restriction_cone.object_hash(events),
     }
-    result = {"restriction": {"profile": profile, "restriction_events": events}}
+    result = {"schema_version": "source-restriction-result/v2",
+              "restriction": {"profile": profile, "restriction_events": events}}
     source_dir = tmp_path / "source-generation"
     source_dir.mkdir(parents=True)
     (source_dir / "health.json").write_text(json.dumps(health), encoding="utf-8")

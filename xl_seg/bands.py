@@ -117,14 +117,13 @@ def build(cg: CellGraph) -> BandGraph:
 
     adj: dict[str, set] = {}
     radj: dict[str, set] = {}
-    for src, targets in cg.adj.items():
-        bsrc = of_cell.get(src)
-        if bsrc is None:
-            continue
-        for dst in targets:
-            bdst = of_cell.get(dst)
-            if bdst is None or bdst == bsrc:
-                continue
+    if cg.range_products is not None:
+        pairs = cg.range_products.band_pairs(of_cell)
+    else:
+        pairs = ((of_cell.get(src), of_cell.get(dst))
+                 for src, targets in cg.adj.items() for dst in targets)
+    for bsrc, bdst in pairs:
+        if bsrc is not None and bdst is not None and bdst != bsrc:
             adj.setdefault(bsrc, set()).add(bdst)
             radj.setdefault(bdst, set()).add(bsrc)
 

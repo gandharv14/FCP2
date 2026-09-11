@@ -175,6 +175,25 @@ def _static_scalar(
         }]
     if node.kind != "op":
         raise RestrictionConeError("dynamic argument depends on a non-scalar AST node")
+    if node.op in {"u+", "u-"}:
+        # AST unary signs use explicit u+/u- names. Accept only the narrow
+        # signed integer literal profile, not arbitrary unary expressions.
+        edges = list(graph.in_edges.get(node.id, ()))
+        child = graph.nodes.get(edges[0].source) if len(edges) == 1 else None
+        if (str(node.arity) != "1" or len(edges) != 1 or edges[0].arg_index != 0
+                or child is None or child.kind != "const" or child.op != "number"
+                or graph.in_edges.get(child.id)):
+            raise RestrictionConeError("signed displacement is not one numeric literal")
+        raw = evaluate.literal(child.value)
+        if (type(raw) not in {int, float} or not (-MAX_EXCEL_ROW <= raw <= MAX_EXCEL_ROW)
+                or raw != int(raw)):
+            raise RestrictionConeError("signed displacement is not a bounded integer")
+        value = int(raw) * (-1 if node.op == "u-" else 1)
+        record = {"kind": "signed_literal", "ast_node": node.id,
+                  "literal_node": child.id, "operator": node.op,
+                  "literal_value": raw, "value": value}
+        record["binding_sha256"] = object_hash(record)
+        return value, [record]
     arity = int(node.arity) if str(node.arity).isdigit() else 0
     arguments = []
     records = []
@@ -597,6 +616,79 @@ def _match_event_nodes(graph: model.Graph, events: list[dict]) -> list[list[str]
     return [list(item or ()) for item in assignments]
 
 
+def _enclosing_static_ranges(graph, offset, runtime_targets_map, cone):
+    """Independently prove full spans of signed integer literal OFFSET endpoints."""
+    records = []
+    for edge in graph.out_edges.get(offset.id, ()):
+        parent = graph.nodes.get(edge.target)
+        if parent is None or parent.kind != "op" or parent.op != ":":
+            continue
+        if edge.arg_index != 1 or parent.owner != offset.owner:
+            raise RestrictionConeError("static range has a mismatched OFFSET endpoint")
+        starts = _arg_sources(graph, parent, 0)
+        if (len(starts) != 1 or _arg_sources(graph, parent, 1) != [offset.id]
+                or {e.arg_index for e in graph.in_edges.get(parent.id, ())} != {0, 1}):
+            raise RestrictionConeError("static range has ambiguous endpoints")
+        start = graph.nodes.get(starts[0])
+        bases = _arg_sources(graph, offset, 0)
+        base = graph.nodes.get(bases[0]) if len(bases) == 1 else None
+        if (start is None or not start.is_cell or base is None or not base.is_cell
+                or start.sheet != parent.sheet or base.sheet != parent.sheet
+                or str(offset.arity) != "3"
+                or {e.arg_index for e in graph.in_edges.get(offset.id, ())} != {0, 1, 2}):
+            raise RestrictionConeError("static range is outside bounded OFFSET semantics")
+        displacements = []
+        for index in (1, 2):
+            sources = _arg_sources(graph, offset, index)
+            term = graph.nodes.get(sources[0]) if len(sources) == 1 else None
+            sign = 1
+            if term is not None and term.kind == "op" and term.op in {"u+", "u-"}:
+                children = list(graph.in_edges.get(term.id, ()))
+                if str(term.arity) != "1" or len(children) != 1 or children[0].arg_index != 0:
+                    raise RestrictionConeError("static range displacement has an invalid unary sign")
+                sign = -1 if term.op == "u-" else 1
+                term = graph.nodes.get(children[0].source)
+            if (term is None or term.kind != "const" or term.op != "number"
+                    or graph.in_edges.get(term.id)):
+                raise RestrictionConeError("static range displacement is not a signed literal")
+            value = evaluate.literal(term.value)
+            if (type(value) not in {int, float} or not (-MAX_EXCEL_ROW <= value <= MAX_EXCEL_ROW)
+                    or value != int(value)):
+                raise RestrictionConeError("static range displacement is not a bounded integer")
+            displacements.append(sign * int(value))
+        if any(type(v) is not int for v in (start.row, start.col, base.row, base.col)):
+            raise RestrictionConeError("static range endpoint coordinate is missing")
+        # Reconstruct from AST coordinates and signed literals independently of
+        # evaluator values, caches, and its claimed runtime target list.
+        _bounded_rectangle(parent.sheet, start.row, start.col, 1, 1)
+        _bounded_rectangle(parent.sheet, base.row, base.col, 1, 1)
+        end_row, end_col = base.row + displacements[0], base.col + displacements[1]
+        endpoint = _bounded_rectangle(parent.sheet, end_row, end_col, 1, 1)[0]
+        if runtime_targets_map.get(offset.id) != [endpoint]:
+            raise RestrictionConeError("static range OFFSET endpoint receipt disagrees with AST")
+        targets = _bounded_rectangle(parent.sheet,
+                                     min(start.row, end_row), min(start.col, end_col),
+                                     abs(start.row - end_row) + 1, abs(start.col - end_col) + 1)
+        runtime = runtime_targets_map.get(parent.id)
+        if (not isinstance(runtime, list) or any(not isinstance(t, str) for t in runtime)
+                or len(runtime) != len(set(runtime))
+                or set(runtime) != set(targets) or not set(targets) <= cone):
+            raise RestrictionConeError("static range runtime closure disagrees with endpoints")
+        if any(target not in graph.nodes or not graph.nodes[target].is_cell for target in targets):
+            raise RestrictionConeError("static range target is absent from AST")
+        if any(graph.nodes[target].kind == "formula"
+               and (graph.nodes[target].parse_status not in {"", "ok"}
+                    or graph.root_of(target) is None) for target in targets):
+            raise RestrictionConeError("static range formula target is omitted from AST")
+        record = {"range_operation": parent.id, "offset_operation": offset.id,
+                  "start": start.id, "base": base.id, "displacement": displacements,
+                  "endpoint": endpoint,
+                  "static_targets": targets, "runtime_targets": runtime}
+        record["binding_sha256"] = object_hash(record)
+        records.append(record)
+    return sorted(records, key=lambda record: record["range_operation"])
+
+
 def _strict_verification_passes(verification: dict, proof: dict) -> bool:
     closure = proof.get("closure") if isinstance(proof, dict) else {}
     return (
@@ -611,6 +703,25 @@ def _strict_verification_passes(verification: dict, proof: dict) -> bool:
         and closure.get("stabilized") is True
         and closure.get("targets_stable") is True
     )
+
+
+def _restriction_policy_record(source_dir: Path, result: dict, health: dict) -> dict:
+    """Read policy evidence without treating a signed recalc as policy identity."""
+    if result.get("schema_version") == "source-restriction-result/v2":
+        return result.get("restriction", {})
+    if result.get("schema_version") != "source-recalc-result/v2":
+        raise RestrictionConeError("unsupported restricted source evidence schema")
+    request = _read_json(source_dir / "request.json", "recalculation request")
+    inventory = _read_json(source_dir / "inventory.json", "approved original inventory")
+    selected = [row for row in inventory.get("workbooks", [])
+                if row.get("sha256") == request.get("source_sha256")]
+    if (len(selected) != 1 or result.get("source_sha256") != request.get("source_sha256")
+            or result.get("output_sha256") != health.get("source_sha256")
+            or selected[0].get("route") != "restricted_recalc_pass"):
+        raise RestrictionConeError("recalculation policy is not bound to original and candidate")
+    original_health = selected[0].get("health_report", {})
+    return {"restriction_events": original_health.get("restriction_events"),
+            "profile": original_health.get("restriction_profile")}
 
 
 def build_certificate(
@@ -650,13 +761,14 @@ def build_certificate(
         raise RestrictionConeError("restricted source has no complete event ledger")
     if health.get("restriction_events_sha256") != object_hash(events):
         raise RestrictionConeError("restriction event ledger hash is invalid")
-    if result.get("restriction", {}).get("restriction_events") != events:
+    restriction = _restriction_policy_record(source_dir, result, health)
+    if restriction.get("restriction_events") != events:
         raise RestrictionConeError("restriction result and health event ledgers disagree")
     profile = health.get("restriction_profile")
     if (
         not isinstance(profile, dict)
         or profile.get("schema_version") not in POLICY_PROFILE_SCHEMAS
-        or result.get("restriction", {}).get("profile") != profile
+        or restriction.get("profile") != profile
     ):
         raise RestrictionConeError("restriction policy profile is absent or mismatched")
     immutable = _immutable_cells(profile)
@@ -739,6 +851,8 @@ def build_certificate(
             if dependency.get("kind") == "immutable_cell"
         }
         dynamic_details[index] = {
+            "enclosing_static_ranges": (_enclosing_static_ranges(
+                graph, op_node, runtime_targets_map, cone) if function == "OFFSET" else []),
             "static_targets": list(targets),
             "runtime_targets": list(raw_runtime),
             "arguments": arguments,
@@ -835,6 +949,7 @@ def build_certificate(
             "host_location": location,
             "scope": scope,
             "package_part": location if scope == "package" else None,
+            "enclosing_static_ranges": dynamic_details.get(index, {}).get("enclosing_static_ranges", []),
             "matching_ast_nodes": ast_nodes,
             "ast_operation_node": (
                 ast_nodes[0]
@@ -947,17 +1062,17 @@ def validate_certificate(
     ast_relative = layout.get("ast_directory")
     if not isinstance(ast_relative, str):
         raise RestrictionConeError("source generation AST layout is invalid")
-    graph = model.load(source_dir / ast_relative, str(layout.get("workbook_id", "")))
-    expected = build_certificate(
-        source_generation_dir=source_dir,
-        graph=graph,
-        proof=proof,
-        verification=verification,
-        ordered_outputs=supplied.get("segmentation", {}).get(
-            "ordered_outputs", []
-        ),
-        segmentation_fingerprints=verification.get("fingerprints") or {},
-    )
+    with model.load(source_dir / ast_relative, str(layout.get("workbook_id", ""))) as graph:
+        expected = build_certificate(
+            source_generation_dir=source_dir,
+            graph=graph,
+            proof=proof,
+            verification=verification,
+            ordered_outputs=supplied.get("segmentation", {}).get(
+                "ordered_outputs", []
+            ),
+            segmentation_fingerprints=verification.get("fingerprints") or {},
+        )
     if supplied != expected:
         raise RestrictionConeError(
             "restriction cone certificate does not match exact source and segmentation"

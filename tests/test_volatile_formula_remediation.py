@@ -15,7 +15,7 @@ from xl_volatile_formula_remediation import (
 )
 
 
-def _workbook(path: Path, *, dynamic: bool = False) -> None:
+def _workbook(path: Path, *, dynamic: bool = False, today: bool = False) -> None:
     workbook = (
         '<workbook xmlns="http://schemas.openxmlformats.org/'
         'spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/'
@@ -54,7 +54,7 @@ def _workbook(path: Path, *, dynamic: bool = False) -> None:
         '<row r="1">'
         '<c r="C1" t="s"><v>0</v></c>'
         '<c r="D1" t="s"><v>1</v></c>'
-        '<c r="E1"><f>TODAY()</f><v>45200</v></c>'
+        f'<c r="E1">{"<f>TODAY()</f>" if today else ""}<v>45200</v></c>'
         '</row><row r="2">'
         '<c r="A2" t="s"><v>2</v></c>'
         f'<c r="C2"><f t="shared" si="1" ref="C2:D2">{indirect}</f><v>5</v></c>'
@@ -106,7 +106,6 @@ def test_closed_rewrites_preserve_caches_and_untouched_members(tmp_path):
         "dead-defined-name/v1": 1,
         "indirect-static-concat-to-a1/v1": 2,
         "offset-blank-column-to-index/v1": 1,
-        "unreferenced-today-to-as-of-constant/v1": 1,
     }
 
     manifest = apply_plan(source, plan, output)
@@ -134,8 +133,8 @@ def test_closed_rewrites_preserve_caches_and_untouched_members(tmp_path):
         assert b"INDIRECT" not in output_sheet
         assert b"OFFSET" not in output_sheet
         assert b"TODAY" not in output_sheet
-        assert b"'Target 1'!A1" in output_sheet
-        assert b"'Target 2'!A1" in output_sheet
+        assert b"'Target 1'!$A$1" in output_sheet
+        assert b"'Target 2'!$A$1" in output_sheet
         assert b"INDEX(" in output_sheet
         assert b'name="Dead"' not in after.read("xl/workbook.xml")
         assert b'_xlnm.Print_Area' in after.read("xl/workbook.xml")
@@ -195,3 +194,49 @@ def test_harbor_skills_bind_intake_remediation_contract():
         assert binding in orchestrator
     assert "xl_volatile_formula_remediation.py verify" in warden
     assert "RAW_SOURCE_FILE=\"$SOURCE_REMEDIATION_RUN/$WB.xlsx\"" in creator
+
+
+@pytest.mark.parametrize("formula", ['INDIRECT("A1")', 'INDIRECT(B1)', 'INDIRECT("A1",TRUE)'])
+def test_static_indirect_has_absolute_internal_target(formula):
+    from xl_volatile_formula_remediation import _resolve_indirect
+    assert _resolve_indirect(formula, "5yr plan", {"5yr plan": {"B1": "A1"}}, {"5yr plan"}) == ("'5yr plan'!$A$1", 1)
+
+
+@pytest.mark.parametrize("target", ["[outside.xlsx]S!A1", "Missing!A1", "S!A1:XFE1", "S!A1048577"])
+def test_static_indirect_rejects_missing_external_or_out_of_bounds_targets(target):
+    from xl_volatile_formula_remediation import _resolve_indirect
+    with pytest.raises(RemediationError):
+        _resolve_indirect('INDIRECT(B1)', "S", {"S": {"B1": target}}, {"S"})
+
+
+def test_formula_looking_text_is_not_rewritten():
+    from xl_volatile_formula_remediation import _rewrite_offset, _resolve_indirect
+    assert _rewrite_offset('"OFFSET(A1,2,)"') == ('"OFFSET(A1,2,)"', 0)
+    assert _resolve_indirect('"INDIRECT(B1)"', "S", {"S": {"B1": "A1"}}, {"S"}) == ('"INDIRECT(B1)"', 0)
+
+
+def test_inline_address_is_static_but_calculated_address_is_not():
+    from xl_volatile_formula_remediation import _static_cell_values
+    xml = '<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>B2</t></is></c><c r="B1" t="str"><f>"B2"</f><v>B2</v></c></row></sheetData></worksheet>'
+    assert _static_cell_values({"S": xml}, []) == {"S": {"A1": "B2"}}
+
+
+def test_only_dead_false_external_names_are_removed():
+    from xl_volatile_formula_remediation import _defined_name_plan
+    xml = b'<workbook><definedNames><definedName name="Label">"[old.xls] label"</definedName></definedNames></workbook>'
+    dead, unresolved = _defined_name_plan(xml, [])
+    assert len(dead) == 1 and not unresolved
+    live, unresolved = _defined_name_plan(xml, ["=Label"])
+    assert live == [] and unresolved == []
+
+
+def test_unused_today_cache_does_not_prove_original_as_of_meaning(tmp_path):
+    source = tmp_path / "source.xlsx"
+    _workbook(source, today=True)
+    plan = build_plan(source)
+    assert plan["status"] == "ineligible"
+    assert any(item["kind"] == "today_unresolved" and "as-of" in item["reason"]
+               for item in plan["unresolved"])
+    assert all(action["kind"] != "freeze_cached_today" for action in plan["actions"])
+    with pytest.raises(RemediationError, match="not eligible"):
+        apply_plan(source, plan, tmp_path / "candidate.xlsx")

@@ -260,11 +260,19 @@ def verify_signed_runner_receipt(
     }
     if any(payload.get(key) != value for key, value in required.items()):
         raise RecalculationError("sandbox runner receipt claims do not match")
+    if any(payload.get(key) is not True for key in ("calculation_complete", "isolation_enforced")):
+        raise RecalculationError("sandbox runner receipt proof flags must be true booleans")
+    controls = payload.get("isolation_controls")
+    if not isinstance(controls, dict) or any(controls.get(name) is not True for name in (
+        "dedicated_session", "network_disabled", "macros_disabled", "add_ins_disabled",
+        "link_updates_disabled", "prompts_suppressed",
+    )):
+        raise RecalculationError("sandbox runner receipt signed isolation controls are incomplete")
     if not isinstance(payload.get("engine_version"), str) or not payload[
         "engine_version"
     ]:
         raise RecalculationError("sandbox runner receipt lacks engine version")
-    if not isinstance(payload.get("completed_at_ns"), int):
+    if type(payload.get("completed_at_ns")) is not int:
         raise RecalculationError("sandbox runner receipt lacks completion time")
     completed_at_ns = payload["completed_at_ns"]
     if (
@@ -528,6 +536,37 @@ def _package_snapshot(
     return result
 
 
+def _worksheet_records(archive: zipfile.ZipFile, part: str):
+    """Yield complete cells/merge records without retaining the worksheet tree.
+
+    Keep descendants until the enclosing cell has been consumed. Remove completed
+    records and rows from their parents so formatted empty rows cannot accumulate.
+    Exhausting the iterator also validates the XML tail and ZIP member CRC.
+    """
+    with archive.open(part) as stream:
+        stack = []
+        cell_depth = 0
+        for event, element in ElementTree.iterparse(stream, events=("start", "end")):
+            local = element.tag.rsplit("}", 1)[-1]
+            if event == "start":
+                stack.append(element)
+                if local == "c":
+                    cell_depth += 1
+                    if cell_depth != 1:
+                        raise RecalculationError("nested worksheet cell records")
+                continue
+            if local == "c":
+                yield "cell", element
+                cell_depth -= 1
+            elif local == "mergeCell" and not cell_depth:
+                yield "merge", element
+            if not cell_depth:
+                if len(stack) > 1:
+                    stack[-2].remove(element)
+                element.clear()
+            stack.pop()
+
+
 def semantic_workbook_snapshot(path: str | Path) -> dict:
     """Snapshot workbook meaning separately from formula cached values."""
     workbook_path = Path(path)
@@ -552,12 +591,33 @@ def semantic_workbook_snapshot(path: str | Path) -> dict:
             inputs = {}
             caches = {}
             merges = {}
+            table_observation = None
+            table_results = {}
             for sheet_name, part, _ in sheet_parts:
-                root = _xml_root(archive, part)
+                has_data_tables = False
+                if table_observation is None:
+                    for kind, cell in _worksheet_records(archive, part):
+                        if kind == "cell":
+                            formula = cell.find("{*}f")
+                            has_data_tables |= formula is not None and formula.get("t") == "dataTable"
+                if table_observation is None and has_data_tables:
+                    from scripts.recalc.excel_runner import observe_data_tables, RunnerError
+                    try:
+                        table_observation = observe_data_tables(workbook_path)
+                    except (RunnerError, OSError, ValueError) as exc:
+                        raise RecalculationError(f"invalid data table observation: {exc}") from exc
+                    table_results = {
+                        (table["part"], cell["coordinate"]): cell["value"]
+                        for table in table_observation["tables"] for cell in table["results"]
+                    }
                 sheet_formulas = {}
                 sheet_inputs = {}
                 sheet_caches = {}
-                for cell in root.findall(".//{*}c"):
+                sheet_merges = []
+                for kind, cell in _worksheet_records(archive, part):
+                    if kind == "merge":
+                        sheet_merges.append(cell.attrib.get("ref", ""))
+                        continue
                     coordinate = cell.attrib.get("r", "")
                     formula = cell.find("{*}f")
                     if formula is not None:
@@ -571,6 +631,14 @@ def semantic_workbook_snapshot(path: str | Path) -> dict:
                             "value": None if value is None else value.text,
                             "type": cell.attrib.get("t"),
                         }
+                    elif (part, coordinate) in table_results:
+                        # Non-anchor sensitivity results are calculated caches,
+                        # never independently supplied primitive assumptions.
+                        sheet_caches[coordinate] = {
+                            "present": True,
+                            "type": "dataTableResult",
+                            "value": table_results[(part, coordinate)],
+                        }
                     else:
                         value = _input_value(cell, shared)
                         if value is not None:
@@ -578,10 +646,7 @@ def semantic_workbook_snapshot(path: str | Path) -> dict:
                 formulas[sheet_name] = sheet_formulas
                 inputs[sheet_name] = sheet_inputs
                 caches[sheet_name] = sheet_caches
-                merges[sheet_name] = sorted(
-                    merge.attrib.get("ref", "")
-                    for merge in root.findall(".//{*}mergeCell")
-                )
+                merges[sheet_name] = sorted(sheet_merges)
 
             defined_names = sorted(
                 [
@@ -1772,9 +1837,9 @@ def prepare_source_generation(
         inventory_value = inventory
     if (request is None) != (result is None):
         raise RecalculationError("request and result must be supplied together")
-    if request is None and health_value.get("route") == "recalc_candidate":
+    if request is None and health_value.get("route") in {"recalc_candidate", "restricted_recalc_pass"}:
         raise RecalculationError(
-            "recalculation candidate cannot use identity evidence"
+            "recalculation candidate requires authoritative recalculation evidence"
         )
     if request is None and health_value.get("route") == "pass":
         identity_request, identity_result = _identity_documents(source)
@@ -1805,13 +1870,10 @@ def prepare_source_generation(
             (
                 RESTRICTION_REQUEST_SCHEMA_VERSION,
                 RESTRICTION_RESULT_SCHEMA_VERSION,
-            )
+            ),
+            (REQUEST_SCHEMA_VERSION, RESULT_SCHEMA_VERSION),
         },
         "restricted_recalc_pass": {
-            (
-                RESTRICTION_REQUEST_SCHEMA_VERSION,
-                RESTRICTION_RESULT_SCHEMA_VERSION,
-            ),
             # A restricted source that also required cache refresh carries the
             # signed authoritative recalculation pair. The inventory and its
             # approval are still independently required and bound by
@@ -1906,6 +1968,8 @@ def main(argv: list[str] | None = None) -> int:
     execute_command.add_argument("--sandbox-runner", required=True)
     execute_command.add_argument("--timeout-seconds", type=int, default=300)
     execute_command.add_argument("-o", "--output", required=True)
+    execute_command.add_argument("--full-output", action="store_true",
+                                 help="Print the full saved evidence instead of a compact summary")
     prepare_command = commands.add_parser("prepare")
     prepare_command.add_argument("source")
     prepare_command.add_argument("--workbook", required=True)
@@ -1960,7 +2024,14 @@ def main(argv: list[str] | None = None) -> int:
                 source_path=args.source,
             )
             atomic_write_report(Path(args.output), result)
-            print(json.dumps(result, sort_keys=True))
+            summary = {key: result.get(key) for key in (
+                "request_id", "request_sha256", "result_sha256", "output_sha256",
+                "destination", "engine", "authoritative", "proven_stale_cache")}
+            summary["result_path"] = str(Path(args.output).resolve())
+            summary["semantic_diff"] = {key: result.get("semantic_diff", {}).get(key)
+                for key in ("equivalent_semantics", "formula_cache_changes",
+                            "populated_cache_changes")}
+            print(json.dumps(result if args.full_output else summary, sort_keys=True))
         elif args.command == "prepare":
             destination, manifest = prepare_source_generation(
                 args.source,

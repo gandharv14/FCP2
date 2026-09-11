@@ -18,7 +18,37 @@ from openpyxl import Workbook
 from openpyxl.workbook.defined_name import DefinedName
 
 import xl_source_publication as publication
+import xl_source_recalc
 import xl_inventory_approval
+
+
+@pytest.mark.parametrize('full_output', [False, True])
+def test_execute_cli_saves_complete_evidence_with_bounded_default_stdout(tmp_path, monkeypatch, capsys, full_output):
+    request = tmp_path / 'request.json'
+    request.write_text('{}')
+    output = tmp_path / 'result.json'
+    result = {'authoritative': True, 'output_sha256': 'a' * 64,
+              'semantic_diff': {'equivalent_semantics': True,
+                                'formula_cache_changes': 10000,
+                                'formula_cache_change_cells': ['Sheet!A1'] * 10000}}
+    monkeypatch.setattr(xl_source_recalc, 'execute_recalc', lambda *a, **kw: result)
+    monkeypatch.setattr(xl_source_recalc, 'MacOSExcelEngine', lambda **kw: object())
+    args = ['execute', str(request), '--allowed-root', str(tmp_path),
+            '--isolation-attestation', 'fixture', '--sandbox-runner', 'fixture',
+            '-o', str(output)]
+    if full_output:
+        args.append('--full-output')
+    assert xl_source_recalc.main(args) == 0
+    assert json.loads(output.read_text()) == result
+    stdout = capsys.readouterr().out
+    printed = json.loads(stdout)
+    if full_output:
+        assert printed == result
+    else:
+        assert len(stdout) < 1500
+        assert printed['result_path'] == str(output)
+        assert printed['semantic_diff']['formula_cache_changes'] == 10000
+        assert 'formula_cache_change_cells' not in printed['semantic_diff']
 from xl_inventory_approval import approval_claims, object_hash
 from xl_source_health import inspect_workbook, sha256_file
 from xl_source_recalc import (
@@ -386,6 +416,9 @@ def test_signed_runner_receipt_rejects_forgery(tmp_path):
         "network_isolation_rules_sha256":
             PF_NETWORK_RULES_SHA256,
         "completed_at_ns": 123,
+        "isolation_controls": {name: True for name in (
+            "dedicated_session", "network_disabled", "macros_disabled",
+            "add_ins_disabled", "link_updates_disabled", "prompts_suppressed")},
     }
     payload_path = tmp_path / "payload.json"
     signature_path = tmp_path / "signature.bin"
@@ -623,7 +656,7 @@ def test_recalc_candidate_cannot_publish_with_identity_evidence(tmp_path):
     book.active["A1"] = "=1+1"
     book.save(source)
 
-    with pytest.raises(RecalculationError, match="identity evidence"):
+    with pytest.raises(RecalculationError, match="authoritative recalculation evidence"):
         prepare_source_generation(
             source,
             "0003",
@@ -683,22 +716,20 @@ def test_approved_mixed_restricted_source_binds_signals_and_approval(
 
     monkeypatch.setattr("xl_ast_graph.main", fake_ast_main)
 
-    generation, manifest = prepare_source_generation(
-        source,
-        "0004",
-        tmp_path / "published",
-        health=health,
-        inventory=inventory,
-        inventory_batch_id="batch-mixed",
-        inventory_approval_registry=registry,
-    )
-
+    request, result = create_restriction_documents(
+        source, health, inventory, batch_id="batch-mixed",
+        inventory_approval_registry=registry, workbook_id="0004")
+    assert request["restriction"]["recalc_signals_sha256"] == health["recalc_signals_sha256"]
+    # Policy approval is still recorded, but cannot replace required Excel proof.
     assert health["route"] == "restricted_recalc_pass"
-    assert manifest["bindings"]["inventory_approval_sha256"]
-    assert manifest["bindings"]["recalc_signals_sha256"] == (
-        health["recalc_signals_sha256"]
-    )
-    assert generation.is_dir()
+    with pytest.raises(RecalculationError, match="authoritative recalculation evidence"):
+        prepare_source_generation(source, "0004", tmp_path / "published",
+            health=health, inventory=inventory, inventory_batch_id="batch-mixed",
+            inventory_approval_registry=registry)
+    with pytest.raises(RecalculationError, match="evidence schemas"):
+        prepare_source_generation(source, "0004", tmp_path / "published",
+            health=health, inventory=inventory, inventory_batch_id="batch-mixed",
+            inventory_approval_registry=registry, request=request, result=result)
     assert not (tmp_path / "published" / "current.json").exists()
 
 
@@ -978,3 +1009,71 @@ def test_real_excel_recalculation_preserves_semantics(tmp_path):
     assert result["semantic_diff"]["equivalent_semantics"] is True
     assert (tmp_path / "real-excel-output.xlsx").is_file()
 
+
+
+@pytest.mark.parametrize("manual", [True, False])
+def test_recalculated_restricted_generation_revalidates_original_approval(tmp_path, monkeypatch, manual):
+    """A cache refresh changes the candidate hash, not the approved original."""
+    source_root = tmp_path / "raw"
+    source_root.mkdir()
+    source = source_root / "0004.xlsx"
+
+    def write(path, cache):
+        _workbook(path, formula="OFFSET(A1,0,0)", cache=cache)
+        with zipfile.ZipFile(path) as archive:
+            members = [(i, archive.read(i)) for i in archive.infolist()]
+        with zipfile.ZipFile(path, "w") as archive:
+            for info, data in members:
+                if info.filename == "xl/workbook.xml" and manual:
+                    data = data.replace(b'calcMode="auto"', b'calcMode="manual"')
+                archive.writestr(info, data)
+
+    write(source, "0" if manual else None)
+    inventory = build_inventory_manifest(source_root, workbook_ids=["0004"])
+    registry = _approve_inventory(tmp_path, monkeypatch, inventory)
+    key = tmp_path / "public.pem"
+    key.write_text("fixture: signature cryptography has separate regressions")
+    destination = tmp_path / "calculated" / "0004.xlsx"
+    request = create_recalc_request(source, destination,
+        allowed_root=destination.parent, engine_constraints={
+            "required_engine": "excel-macos", "allowed_engines": ["excel-macos"],
+            "permitted_versions": ["fixture-v1"],
+            "trusted_runner_public_key_sha256": sha256_file(key)})
+
+    class Engine:
+        name = "excel-macos"
+        version = "fixture-v1"
+        authoritative = True
+
+        def execute(self, original, candidate, request_value):
+            write(candidate, "1")
+            self.evidence = {
+                "controls": {k: True for k in ("dedicated_session", "network_disabled",
+                    "macros_disabled", "add_ins_disabled", "link_updates_disabled", "prompts_suppressed")},
+                "runner_receipt": {"signed_payload": {"engine": self.name,
+                    "engine_version": self.version, "completed_at_ns": time.time_ns()}}}
+
+    result = execute_recalc(request, Engine(), allowed_root=destination.parent)
+    assert result["source_sha256"] != result["output_sha256"]
+    monkeypatch.setattr("xl_source_recalc.verify_signed_runner_receipt",
+                        lambda receipt, *_a, **_kw: receipt["signed_payload"])
+    ast = tmp_path / "ast" / "0004"
+    ast.parent.mkdir()
+    _ast(ast, "recalculated")
+    generation, manifest = publication.publish_source_generation(destination, ast,
+        tmp_path / "published", request=request, result=result,
+        health=inspect_workbook(destination), activate=False,
+        trusted_runner_public_key=key, original_source_path=source,
+        inventory=inventory, inventory_batch_id="test-batch",
+        inventory_approval_registry=registry)
+    assert publication.validate_source_generation(generation) == manifest
+
+    # An approval of the output alone must not substitute for original evidence.
+    candidate_inventory = build_inventory_manifest(destination.parent, workbook_ids=["0004"])
+    registry = _approve_inventory(tmp_path, monkeypatch, candidate_inventory)
+    with pytest.raises(publication.SourcePublicationError, match="approved inventory"):
+        publication.publish_source_generation(destination, ast, tmp_path / "wrong-approval",
+            request=request, result=result, health=inspect_workbook(destination), activate=False,
+            trusted_runner_public_key=key, original_source_path=source,
+            inventory=candidate_inventory, inventory_batch_id="test-batch",
+            inventory_approval_registry=registry)

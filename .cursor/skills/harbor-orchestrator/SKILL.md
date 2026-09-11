@@ -155,7 +155,11 @@ ast_workbook_root, curation, segmentation_root, segmentation_workbook_root,
 segmentation_generation, preflight_root, preflight_report,
 baseline_inputs_root, baseline_inputs, baseline_segmentation, audit_root,
 variable_source_run, variable_source_audit, variable_source_inventory,
-variable_source_metadata, normalization_draft, normalizer, normalized_phase1,
+variable_source_metadata, audit_equivalence, audit_current_inventory,
+audit_validator_upgrade, audit_upgrade_original_code,
+normalization_audit_applicability, normalization_original_locator_code,
+normalization_prepared_manifest, normalization_prepared_request,
+normalization_draft, normalizer, normalized_phase1,
 normalized_final, normalization_exclusions, normalization_report,
 plain_eligibility, source_profiles, source_profile_mapping, maskability_report,
 leakscan_report, oracle_allowlist, task_mode, mcp_inputs_root, mcp_inputs,
@@ -169,6 +173,23 @@ available. `staged_bundle.sha256` covers the tree. Evidence never substitutes
 for a binding. Handoffs and confidence/repair/failure histories are append-only.
 Leases include owner, random token, scope, acquisition/heartbeat/expiry times,
 and acquisition revision.
+
+`audit_equivalence` binds a completed, independently revalidated applicability
+receipt; it never substitutes for complete original audit coverage or extends a
+semantic attempt budget. `audit_current_inventory` binds the newly reconstructed
+inventory checked by that receipt. Prepared normalization manifest/request
+bindings identify a validated pending request, not a passed review. Retain old
+requests as historical evidence and remove stale prepared bindings when their
+generation pair or generator changes. Publication still requires the completed
+owning and downstream gates against the selected generation pair.
+
+The paired `audit_validator_upgrade` and `audit_upgrade_original_code` bindings
+support only the explicitly implemented completion-validator upgrade. The
+current validator rechecks complete original responses and consumed budgets;
+historical code is never executed. The paired normalization applicability and
+original locator code bindings preserve the exact original review request while
+independently proving applicability to the newly validated audit receipt. These
+receipts do not qualify any downstream lane or reset a model attempt.
 
 ## Universal promotion-failure contract
 

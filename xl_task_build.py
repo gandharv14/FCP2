@@ -833,8 +833,8 @@ def call_naturalizer(base_url, api_key, model, project_id, messages):
             "Content-Type": "application/json",
             "x-labelbox-context": json.dumps({"project_id": project_id}),
         })
-    with urllib.request.urlopen(request, timeout=180) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    from xl_transport import read_response
+    payload = json.loads(read_response(request, timeout=180).decode("utf-8"))
     return payload["choices"][0]["message"]["content"].strip()
 
 

@@ -438,6 +438,14 @@ ACCURACY — fail if any:
   establish the relevant cells; a senior may describe that required scope
   without repeating the addresses. Named ranges and row labels remain
   distinct operand types.
+  The deterministic template may prepend the owning sheet name before the
+  scope, for example "Model: For `Model!E17`:". That owning-sheet prefix is
+  part of the frozen header, not an alteration of the scope or an extra
+  modelling assertion. A grouped header joins each claim's exact scope
+  with "; ". Check each scope against its claim; do not require removal of
+  the sheet prefix. Missing or changed scopes, a wrong sheet, extra cell
+  addresses, and senior-turn address leakage still fail. This formatting
+  rule does not establish that any must_say clause is entailed.
 - A senior turn is still paren-AST (`multiply (take the negative of`).
 - The exercise is called a rebuild or restoration (rebuild, restore, original
   model, original logic).

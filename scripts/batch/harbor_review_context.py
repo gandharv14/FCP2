@@ -99,8 +99,10 @@ def normalization_review(call,prepared,*,source,baseline,draft,rows,bindings,pol
     manifest=read(prepared)
     for key in ('request','evidence','analysis'):checked_record(manifest[key])
     require(manifest['request']['sha256']==call.request['sha256'],'call did not use prepared request')
-    require(read(manifest['analysis'])==json_value(rows),'prepared analysis differs from current reconstruction')
-    body=read(manifest['evidence'])
+    from scripts.batch.harbor_normalization_producer import expand_artifact
+    from scripts.batch.harbor_normalization_compact import json_value as shared_json_value, equal
+    require(equal(expand_artifact(read(manifest['analysis'])),shared_json_value(rows)),'prepared analysis differs from current reconstruction')
+    body=expand_artifact(read(manifest['evidence']))
     normalization_body(body,source=source,baseline=baseline,draft=draft,rows=rows,bindings=bindings)
     request=read(manifest['request'])
     require(request['messages'][1]['content']==Path(manifest['evidence']['path']).read_text(),'review request omitted or changed evidence')

@@ -4,14 +4,17 @@ No CLI and no arbitrary tracker mutation API. The root dispatcher constructs
 the authority and supplies independent validators; worksheet/model data cannot.
 """
 import copy
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
 import os
+import stat
 from pathlib import Path
 import tempfile
+import threading
 import time
 import uuid
 
@@ -24,6 +27,47 @@ CREATE_SCHEMA = 'harbor-tracker-created/v1'
 PAUSE_EVENT_SCHEMA = 'harbor-coordinator-pause-lease/v1'
 MAX_EXPIRED_REPLACEMENTS = 3
 
+# Cache only byte digests, never qualification decisions. Every lookup opens
+# the actual regular file and checks its inode, size and nanosecond change
+# metadata. Mutable evidence is hashed again after any observed change.
+_DIGEST_CACHE = OrderedDict()
+_DIGEST_CACHE_PID = os.getpid()
+_DIGEST_CACHE_LIMIT = 1024
+_DIGEST_CACHE_LOCK = threading.RLock()
+
+
+def _file_identity(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _checked_digest(path):
+    global _DIGEST_CACHE_PID, _DIGEST_CACHE_LOCK
+    if _DIGEST_CACHE_PID != os.getpid():
+        _DIGEST_CACHE_LOCK = threading.RLock()
+        _DIGEST_CACHE.clear()
+        _DIGEST_CACHE_PID = os.getpid()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise Conflict('regular evidence file required: ' + str(path))
+        identity = _file_identity(before)
+        key = (str(path), identity)
+        with _DIGEST_CACHE_LOCK:
+            digest = _DIGEST_CACHE.get(key)
+        if digest is None:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if (_file_identity(os.fstat(stream.fileno())) != identity
+                or _file_identity(os.stat(path, follow_symlinks=False)) != identity):
+            raise Conflict('evidence changed while hashing: ' + str(path))
+    with _DIGEST_CACHE_LOCK:
+        _DIGEST_CACHE[key] = digest
+        _DIGEST_CACHE.move_to_end(key)
+        while len(_DIGEST_CACHE) > _DIGEST_CACHE_LIMIT:
+            _DIGEST_CACHE.popitem(last=False)
+    return digest
+
 
 @dataclass(frozen=True)
 class RootAuthority:
@@ -32,6 +76,7 @@ class RootAuthority:
     max_duration_ns: int
     authorize: object
     max_replacements: int = 1
+    allowance: dict | None = None  # Explicit root-selected append-only policy.
 
 
 def canonical(value):
@@ -54,8 +99,7 @@ def checked_record(record):
         raise Conflict('invalid evidence digest')
     if not path.is_file():
         raise Conflict('missing evidence: ' + str(path))
-    with path.open('rb') as stream:
-        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    digest = _checked_digest(path)
     if digest != record['sha256']:
         raise Conflict('changed evidence: ' + str(path))
     return copy.deepcopy(record)
@@ -299,6 +343,7 @@ def _validate_lifecycle(d):
     replacement_count = 0
     last_revision = 0
     pause_count = 0
+    historical_replacement_limit = MAX_EXPIRED_REPLACEMENTS
     for index, event in enumerate(d['handoffs']):
         if isinstance(event, dict) and event.get('schema_version') == PAUSE_EVENT_SCHEMA:
             from scripts.batch.harbor_pause_recovery import validate_event
@@ -326,7 +371,7 @@ def _validate_lifecycle(d):
             'prior_tracker_sha256'
         }
         if (
-            set(event) - expected - {'stopped_owner_proof'}
+            set(event) - expected - {'stopped_owner_proof', 'allowance'}
             or expected - set(event)
             or event['root_actor'] != 'harbor-orchestrator'
             or not schema.integer(event['at'])
@@ -370,6 +415,17 @@ def _validate_lifecycle(d):
                 raise Conflict('invalid replacement history')
             checked_record(event['stopped_owner_proof'])
             replacement_count += 1
+        allowed_replacements = historical_replacement_limit
+        if event.get('allowance') is not None:
+            from scripts.batch.harbor_continuation_allowance import lease_limits
+            allowed_replacements, allowed_duration = lease_limits(event['allowance'], d, at=event['at'])
+            if new is not None and new['expires_at'] - event['at'] > allowed_duration:
+                raise Conflict('retained lease exceeds selected allowance')
+        if operation == 'replace_expired' and replacement_count > MAX_EXPIRED_REPLACEMENTS and event.get('allowance') is None:
+            raise Conflict('additional replacement omitted explicit allowance')
+        historical_replacement_limit = max(historical_replacement_limit, allowed_replacements)
+        if replacement_count > allowed_replacements:
+            raise Conflict('expired task-agent replacement budget exhausted')
         if operation == 'release' and event['at'] >= old['expires_at']:
             if not event.get('stopped_owner_proof'):
                 raise Conflict('expired release omitted stopped-owner proof')
@@ -382,8 +438,6 @@ def _validate_lifecycle(d):
             continue
         if not same_lease(recorded, live):
             raise Conflict('lease not bound to retained operation history')
-    if replacement_count > MAX_EXPIRED_REPLACEMENTS:
-        raise Conflict('expired task-agent replacement budget exhausted')
     return replacement_count
 
 
@@ -461,6 +515,12 @@ def lease_operation(
             'stopped_owner_proof': stopped_owner_proof
         }
         authorize(authority, operation, path, before, request)
+        allowed_replacements = MAX_EXPIRED_REPLACEMENTS
+        if authority.allowance is not None:
+            from scripts.batch.harbor_continuation_allowance import lease_limits
+            allowed_replacements, allowed_duration = lease_limits(authority.allowance, before, at=now)
+            if authority.max_duration_ns > allowed_duration:
+                raise Conflict('root lease configuration exceeds selected allowance')
         if lease_kind == 'task_agent' and scope != 'workbook:' + before['workbook_id']:
             raise Conflict('task lease scope mismatch')
         if operation != 'release' and before['execution_state'] in {'STOPPED', 'PROMOTED'}:
@@ -476,7 +536,7 @@ def lease_operation(
             if operation == 'replace_expired':
                 if lease_kind != 'task_agent' or old is None or now < old['expires_at']:
                     raise Conflict('cannot steal active lease or replace another lease kind')
-                if (type(authority.max_replacements) is not int or not 1 <= authority.max_replacements <= MAX_EXPIRED_REPLACEMENTS
+                if (type(authority.max_replacements) is not int or not 1 <= authority.max_replacements <= allowed_replacements
                         or replacements >= authority.max_replacements):
                     raise Conflict('expired task-agent replacement budget exhausted')
                 if prior_lease != old:
@@ -492,10 +552,9 @@ def lease_operation(
             if operation == 'renew' and now >= old['expires_at']:
                 raise Conflict('cannot renew expired lease')
             if operation == 'release' and now >= old['expires_at']:
-                if lease_kind != 'task_agent' or before['execution_state'] not in {
-                    'STOPPED',
-                    'PROMOTED'
-                }:
+                terminal_task = lease_kind == 'task_agent' and before['execution_state'] in {'STOPPED', 'PROMOTED'}
+                completed_publication = lease_kind == 'publication' and before['execution_state'] == 'PROMOTED'
+                if not (terminal_task or completed_publication):
                     raise Conflict('expired lease needs explicit recovery; release cannot hide replacement')
                 proof = checked_record(stopped_owner_proof)
                 records.append(proof)
@@ -541,6 +600,8 @@ def lease_operation(
             'after': copy.deepcopy(new),
             'prior_tracker_sha256': schema.sha(raw)
         }
+        if authority.allowance is not None:
+            event['allowance'] = checked_record(authority.allowance)
         if proof:
             event['stopped_owner_proof'] = proof
         after['handoffs'].append(event)

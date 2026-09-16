@@ -76,9 +76,19 @@ def _history(worker, before):
             require(row['original']['sha256'] == row['retained']['sha256'], 'previous continuation archive changed')
             records.append(row['retained'])
     if worker.code_repair is not None:
-        from scripts.batch.harbor_instruction_repair import validate_historical_integrity
-        _, retained = validate_historical_integrity(worker, before)
-        records.extend(retained)
+        from scripts.batch import harbor_disclosure_command_repair as command_repair
+        if read(worker.code_repair).get('schema_version')==command_repair.SCHEMA:
+            # A deterministic disclosure suffix is a different recorded repair
+            # type. Its original validator owns source, full snapshots, command
+            # history and custody; never reinterpret it as an extraction repair.
+            permit=command_repair.validate(worker,before)
+            from scripts.batch.harbor_complete_readiness import evidence_records
+            records.extend([worker.code_repair,*(permit[k]for k in ('profile','initial','original','tracker')),
+                            *evidence_records(read(permit['profile']))])
+        else:
+            from scripts.batch.harbor_instruction_repair import validate_historical_integrity
+            _, retained = validate_historical_integrity(worker, before)
+            records.extend(retained)
     from scripts.batch.harbor_nat_retry import _disclosure_history
     if worker.dialogue_pre_review_repair is not None:
         require(worker.disclosure_repair is None,'unsupported physical disclosure before pre-review correction')
@@ -313,6 +323,9 @@ def recover(worker, permit, lease):
 
 def validate_completed_integrity(worker, before):
     """Historical transaction integrity only; never establishes current quality."""
+    if worker.warning_requalification is not None and worker.lease_renewal is not None:
+        from scripts.batch.harbor_dialogue_warning_requalification import completed_semantic_history
+        return completed_semantic_history(worker,before)
     w = _worker(); complete = read(worker.dialogue_semantic_retry); value = read(complete['permit'])
     require(complete['schema_version'] == value['schema_version'] == SCHEMA
             and value['worker_run'] == str(worker.run), 'semantic continuation context changed')

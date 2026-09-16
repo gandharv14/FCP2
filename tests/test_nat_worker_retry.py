@@ -332,6 +332,7 @@ def test_semantic_retry_preserves_rejection_and_informs_remaining_revision(seman
     assert request.prepared.ordinal==request.prepared.limit==2
     assert 'The procedure was weakened' in p.read(request.prepared.request)['messages'][0]['content']
     assert before==record(before['path'])
+
     assert p.read(record(t.run/'naturalization/state.json'))==state
     assert w.step_directory(worker,'nat-review')==worker.run/'steps/nat-review/round-02'
     assert len(calls)==2
@@ -350,3 +351,41 @@ def test_semantic_retry_preserves_rejection_and_informs_remaining_revision(seman
     assert final['semantic_reviews'][0]==state['semantic_reviews'][0]
     assert len(final['attempts'])==2 and len(calls)==4
     assert before==record(before['path'])
+
+def test_completed_takeover_retains_original_request_through_real_retry_cas(semantic_failed, monkeypatch):
+    from scripts.batch import harbor_lease_takeover as takeover
+    w,r,worker,s,lease,blocked,t,_,calls,*_=semantic_failed
+    selected=w.keep(worker.run/'selected-takeover.json',{'fixture':'completed custody'})
+    original_request=w.request_saved(w.step_directory(worker,'nat-review')/'request.json')
+    original_tracker=p.read(original_request.context)['budget_evidence'][0]
+    witnesses=[]
+    def chain(original,old,current,actual,**kw):
+        assert original==original_tracker and old==p.read(blocked)['lease']
+        assert kw==dict(takeover=selected,tracker_path=Path(t.tracker['path']))
+        assert actual.owner==lease.owner and actual.token==lease.token
+        witnesses.append(current['revision'])
+    monkeypatch.setattr(takeover,'continuation_chain',chain)
+    monkeypatch.setattr(takeover,'completion_records',lambda value:[selected] if value==selected else [])
+    monkeypatch.setattr(r,'_renewal_chain',lambda *a:pytest.fail('explicit takeover cannot use renewal-only history'))
+    old_blocked=record(blocked['path'])
+    renewed,s,lease,checkpoint=r.authorize(worker,s,lease,blocked=blocked,takeover=selected)
+    current=p.read(record(t.tracker['path']))
+    permit=r.validate(renewed,current)
+    assert permit['lease_takeover']==selected
+    assert selected in [row['original'] for row in permit['copies']]
+    assert record(blocked['path'])==old_blocked and len(calls)==2
+    # Historical validation must read the original review request, even though
+    # the selected worker now resolves future NAT paths under round-02.
+    assert len(witnesses)>=3 and w.step_directory(renewed,'nat-review').name=='round-02'
+
+
+def test_completed_takeover_rejection_precedes_retry_cas(semantic_failed, monkeypatch):
+    from scripts.batch import harbor_lease_takeover as takeover
+    w,r,worker,s,lease,blocked,t,_,calls,*_=semantic_failed
+    selected=w.keep(worker.run/'foreign-takeover.json',{'fixture':'wrong custody'})
+    before=record(t.tracker['path'])
+    def reject(*a,**k):raise ValueError('foreign completed takeover')
+    monkeypatch.setattr(takeover,'continuation_chain',reject)
+    with pytest.raises(ValueError,match='foreign completed takeover'):
+        r.authorize(worker,s,lease,blocked=blocked,takeover=selected)
+    assert record(t.tracker['path'])==before and len(calls)==2

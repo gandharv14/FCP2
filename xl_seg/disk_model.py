@@ -14,6 +14,8 @@ import tempfile
 import weakref
 
 CACHE_ROWS = 4096
+ADJACENCY_CACHE_ENTRIES = 2048
+MAX_CACHED_ADJACENCY = 32
 
 
 def _cleanup(connection, temporary):
@@ -40,6 +42,7 @@ class Store:
         self.connection = sqlite3.connect(self.path)
         self._finalizer = weakref.finalize(self, _cleanup, self.connection, self.temporary)
         self.cache = OrderedDict()
+        self.adjacency_cache = OrderedDict()
         self.node_fields = tuple(f.name for f in fields(Node))
         self.edge_fields = tuple(f.name for f in fields(Edge))
         self.node_type, self.edge_type = _readonly_type(Node), _readonly_type(Edge)
@@ -60,6 +63,7 @@ class Store:
 
     def close(self):
         self.cache.clear()
+        self.adjacency_cache.clear()
         self._finalizer()
 
     def add_node(self, ordinal, node):
@@ -85,6 +89,10 @@ class Store:
         ''')
         self.connection.commit()
         self.connection.execute('PRAGMA query_only=ON')
+        # This private disposable index is immutable after sealing. Keep one
+        # read transaction until close so hot lookups do not repeatedly acquire
+        # filesystem locks and inspect journal files for every graph edge.
+        self.connection.execute('BEGIN')
 
     def rows(self, query, params=()):
         self.require_open()
@@ -130,6 +138,19 @@ class Store:
     def literal_values(self, owner):
         return tuple(row[0] for row in self.rows(
             "SELECT value FROM nodes WHERE owner=? AND kind='const' ORDER BY n",(owner,)))
+
+    def root_of(self, cell_id):
+        """Read the unique valid producer without decoding an edge payload.
+
+        Two rows suffice to distinguish a unique root from duplicate/multiple
+        edges. The sealed index and original integrity diagnostics remain the
+        authority; this does not cache calculated values or repair bad graphs.
+        """
+        self.require_open()
+        rows = self.connection.execute(
+            'SELECT source FROM edges WHERE target=? AND valid=1 LIMIT 2',
+            (cell_id,)).fetchall()
+        return rows[0][0] if len(rows) == 1 else None
 
     def integrity(self):
         for n, source, target, has_source, has_target in self.rows('''
@@ -179,6 +200,8 @@ class Nodes(Mapping):
         return (r[0] for r in self.store.rows('SELECT id FROM nodes ORDER BY n'))
     def __contains__(self,key):
         self.store.require_open()
+        if isinstance(key, str) and key in self.store.cache:
+            return True
         return self.store.connection.execute('SELECT 1 FROM nodes WHERE id=?',(key,)).fetchone() is not None
     def __getitem__(self,key):
         self.store.require_open()
@@ -198,11 +221,26 @@ class Edges(Sequence):
         self.store=store;self.column=column;self.node_id=node_id
         self.where='' if column is None else ' WHERE '+column+'=? AND valid=1'
         self.params=() if column is None else (node_id,)
+        self._length = None
+        self._small_rows = None
     def __len__(self):
         self.store.require_open()
         if self.column is None:return self.store.edge_count
-        return self.store.connection.execute('SELECT COUNT(*) FROM edges'+self.where,self.params).fetchone()[0]
+        if self._length is None:
+            self._length = self.store.connection.execute('SELECT COUNT(*) FROM edges'+self.where,self.params).fetchone()[0]
+        return self._length
+    def _small(self):
+        # Only the sealed graph's immutable adjacency is cached. Formula values
+        # and runtime proof dependencies still execute their original readers.
+        self.store.require_open()
+        if self.column is None or len(self) > MAX_CACHED_ADJACENCY:return None
+        if self._small_rows is None:
+            self._small_rows = tuple(self.store.edge(payload,n) for n,payload in self.store.rows(
+                'SELECT n,payload FROM edges'+self.where+' ORDER BY n',self.params))
+        return self._small_rows
     def __iter__(self):
+        rows = self._small()
+        if rows is not None:return iter(rows)
         return (self.store.edge(payload,n) for n,payload in self.store.rows('SELECT n,payload FROM edges'+self.where+' ORDER BY n',self.params))
     def __getitem__(self,index):
         if isinstance(index,slice):return list(self)[index]
@@ -210,6 +248,8 @@ class Edges(Sequence):
         if index<0:index+=len(self)
         if index<0:raise IndexError(index)
         self.store.require_open()
+        rows = self._small()
+        if rows is not None:return rows[index]
         row=self.store.connection.execute('SELECT n,payload FROM edges'+self.where+' ORDER BY n LIMIT 1 OFFSET ?',(*self.params,index)).fetchone()
         if row is None:raise IndexError(index)
         return self.store.edge(row[1],row[0])
@@ -223,7 +263,18 @@ class Adjacency(Mapping):
         self.store.require_open()
         return self.store.connection.execute('SELECT COUNT(DISTINCT '+self.column+') FROM edges WHERE valid=1').fetchone()[0]
     def __getitem__(self,key):
-        result=Edges(self.store,self.column,key)
+        self.store.require_open()
+        cache = self.store.adjacency_cache
+        identity = (self.column,key)
+        if isinstance(key,str) and identity in cache:
+            result=cache[identity];cache.move_to_end(identity)
+        else:
+            result=Edges(self.store,self.column,key)
+            # Invalid key types retain SQLite's original error behavior.
+            len(result)
+            if isinstance(key,str):
+                cache[identity]=result
+                if len(cache)>ADJACENCY_CACHE_ENTRIES:cache.popitem(last=False)
         if not len(result):raise KeyError(key)
         return result
 

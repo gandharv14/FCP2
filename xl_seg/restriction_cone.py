@@ -80,13 +80,17 @@ def base_segmentation_fingerprints(fingerprints: dict) -> dict:
 
 
 def _proof_cone(outputs: list[str], runtime_radj: dict) -> set[str]:
+    from xl_seg.proof_graph import Relation, read
+    runtime_radj = read(runtime_radj)
     cone = set(outputs)
     stack = list(outputs)
     while stack:
         target = stack.pop()
         sources = runtime_radj.get(target)
-        if not isinstance(sources, list):
+        if not isinstance(runtime_radj, Relation) and not isinstance(sources, list):
             sources = []
+        if sources is None:
+            sources = ()
         for source in sources:
             if not isinstance(source, str):
                 raise RestrictionConeError("runtime proof contains a non-string cell")
@@ -505,7 +509,62 @@ def _ast_ordinal(host: str, node_id: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _match_event_nodes(graph: model.Graph, events: list[dict]) -> list[list[str]]:
+class _SameRowTableProof:
+    """Re-read authenticated source metadata and require its exact AST edge."""
+    def __init__(self, source, expected_sha256):
+        self.source = source
+        self.expected_sha256 = expected_sha256
+        self.formulas = None
+
+    def match(self, graph, event):
+        import io
+        import zipfile
+        from xl_source_health import (_workbook_sheet_parts, _table_reference_context,
+                                      _parse_xml, _formula_restriction_events)
+        if self.formulas is None:
+            if self.source is None:
+                raise RestrictionConeError("same-row proof lacks source identity")
+            raw = Path(self.source).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != self.expected_sha256:
+                raise RestrictionConeError("same-row proof source hash changed")
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                if len(archive.namelist()) != len(set(archive.namelist())):
+                    raise RestrictionConeError("same-row source has duplicate parts")
+                sheets = _workbook_sheet_parts(archive)
+                self.context = _table_reference_context(archive, sheets)
+                self.formulas = {}
+                for sheet, part in sheets:
+                    for cell in _parse_xml(archive, part).findall(".//{*}c"):
+                        formula = cell.find("{*}f")
+                        if formula is not None and formula.attrib.get("t", "normal") == "normal":
+                            self.formulas[sheet + "!" + cell.attrib.get("r", "")] = formula.text or ""
+        host = event.get("location")
+        node = graph.nodes.get(host)
+        formula = self.formulas.get(host)
+        if (node is None or node.kind != "formula" or formula is None
+                or node.formula.lstrip("=") != formula
+                or event.get("event") != "structured_reference"
+                or event.get("reason") != "exact_same_row_table_reference"
+                or event.get("allowed") is not True or event.get("scope") != "worksheet"):
+            raise RestrictionConeError("same-row event lacks its exact source formula")
+        actual = _formula_restriction_events(formula, scope="worksheet", location=host,
+                                             table_context=self.context)
+        if event not in actual:
+            raise RestrictionConeError("same-row metadata or token differs from source")
+        _, sheet, row, col = event["resolved_cell"]
+        from openpyxl.utils.cell import get_column_letter
+        target = sheet + "!" + get_column_letter(col) + str(row)
+        cell = graph.nodes.get(target)
+        edges = [edge for edge in graph.out_edges.get(target, ())
+                 if edge.cell == host and edge.ref == event["token"] and not edge.via_range]
+        occurrences = [item for item in actual if item.get("event") == "structured_reference"
+                       and item.get("token") == event["token"]]
+        if cell is None or not cell.is_cell or len(edges) != len(occurrences):
+            raise RestrictionConeError("same-row source target disagrees with AST edges")
+        return [host, target]
+
+
+def _match_event_nodes(graph: model.Graph, events: list[dict], same_row=None) -> list[list[str]]:
     assignments: list[list[str] | None] = [None] * len(events)
     by_host_function: dict[tuple[str, str], list[int]] = {}
     for index, event in enumerate(events):
@@ -521,6 +580,8 @@ def _match_event_nodes(graph: model.Graph, events: list[dict]) -> list[list[str]
                     "false-external event has no matching worksheet AST host"
                 )
             assignments[index] = [node.id]
+        elif event.get("event") == "structured_reference" and same_row is not None:
+            assignments[index] = same_row.match(graph, event)
         else:
             raise RestrictionConeError(
                 f"restriction event remains closed: {event.get('event')}"
@@ -616,7 +677,165 @@ def _match_event_nodes(graph: model.Graph, events: list[dict]) -> list[list[str]
     return [list(item or ()) for item in assignments]
 
 
-def _enclosing_static_ranges(graph, offset, runtime_targets_map, cone):
+def _known_scalar_formula(text):
+    """Closed return-shape proof; unknown array-returning syntax is not blank-safe."""
+    from xl_ast_graph import parse_formula
+    reducers = {"SUM", "COUNT", "COUNTA", "COUNTBLANK", "MIN", "MAX", "AVERAGE", "PRODUCT",
+                "ROWS", "COLUMNS", "SUMPRODUCT"}
+    scalar_functions = {"IF", "IFERROR", "IFNA", "AND", "OR", "NOT", "ABS", "ROUND", "ROUNDUP",
+                        "ROUNDDOWN", "INT", "MOD", "EOMONTH", "EDATE", "DATE", "YEAR", "MONTH",
+                        "DAY", "TODAY", "NOW", "RAND", "LEN", "LEFT", "RIGHT", "MID"}
+    def scalar(node):
+        if node.kind == "const": return True
+        if node.kind == "ref":
+            match = _A1_TARGET_RE.fullmatch(node.name)
+            return match is not None and match["col1"] is None and match["row1"] is None
+        if node.kind in {"prefix", "postfix", "infix"}:
+            return node.name in {"+", "-", "*", "/", "^", "%", "&", "=", "<>", "<", ">", "<=", ">="} and all(scalar(arg) for arg in node.args)
+        if node.kind == "func":
+            if node.name.upper() in reducers: return True
+            return node.name.upper() in scalar_functions and all(scalar(arg) for arg in node.args)
+        return False
+    try:
+        return scalar(parse_formula("=" + text.lstrip("=")))
+    except (ValueError, TypeError, AttributeError, IndexError, RecursionError):
+        return False
+
+
+class _SourceBlankProof:
+    """Prove omitted AST blanks from the exact validated source ZIP, never caches.
+
+    Array/shared formula coverage remains nonblank even when no <c> is stored.
+    Unknown dynamic extents fail closed; this proof only serves complete static
+    ranges with signed literal OFFSET endpoints.
+    """
+    def __init__(self, source, expected_sha256):
+        self.source = None if source is None else Path(source)
+        self.expected_sha256 = expected_sha256
+        self._sheets = None
+
+    def _load(self):
+        import io
+        import posixpath
+        import zipfile
+        import xml.etree.ElementTree as ET
+        if self._sheets is not None:
+            return
+        if self.source is None or not isinstance(self.expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.expected_sha256):
+            raise RestrictionConeError("blank proof lacks validated source identity")
+        raw = self.source.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != self.expected_sha256:
+            raise RestrictionConeError("blank proof source hash changed")
+        ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+        rn = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)):
+                raise RestrictionConeError("blank proof source ZIP has duplicate parts")
+            workbook = archive.read("xl/workbook.xml")
+            relationships = archive.read("xl/_rels/workbook.xml.rels")
+            links = {}
+            for rel in ET.fromstring(relationships):
+                identity = rel.get("Id")
+                if not identity or identity in links:
+                    raise RestrictionConeError("blank proof has ambiguous sheet relationships")
+                links[identity] = rel
+            workbook_node = ET.fromstring(workbook)
+            if workbook_node.tag != ns + "workbook":
+                raise RestrictionConeError("blank proof workbook namespace is unknown")
+            sheets = {}
+            for sheet in workbook_node.findall(ns + "sheets/" + ns + "sheet"):
+                name = sheet.get("name")
+                rel = links.get(sheet.get(rn))
+                if not name or name in sheets or rel is None or rel.get("TargetMode") == "External":
+                    raise RestrictionConeError("blank proof sheet identity is ambiguous")
+                target = rel.get("Target", "")
+                part = posixpath.normpath(target.lstrip("/") if target.startswith("/") else "xl/" + target)
+                if not part.startswith("xl/worksheets/") or "\\" in part or not rel.get("Type", "").endswith("/worksheet"):
+                    raise RestrictionConeError("blank proof sheet target is not an internal worksheet")
+                sheet_raw = archive.read(part)
+                node = ET.fromstring(sheet_raw)
+                if node.tag != ns + "worksheet":
+                    raise RestrictionConeError("blank proof worksheet namespace is unknown")
+                selected_cells = node.findall(ns + "sheetData/" + ns + "row/" + ns + "c")
+                if len(selected_cells) != sum(1 for entry in node.iter() if entry.tag.rsplit("}", 1)[-1] == "c"):
+                    raise RestrictionConeError("blank proof cell records have unknown placement or namespace")
+                cells = {}; spans = []; unknown = False; shared = {}; shared_members = []
+                for cell in selected_cells:
+                    ref = cell.get("r", "")
+                    if ref in cells or not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]*", ref):
+                        raise RestrictionConeError("blank proof has duplicate or invalid cell coordinates")
+                    cells[ref] = cell
+                    formulas = cell.findall(ns + "f")
+                    if len(formulas) > 1:
+                        raise RestrictionConeError("blank proof has ambiguous formula records")
+                    if cell.get("cm") is not None or cell.get("vm") is not None:
+                        unknown = True
+                    for formula in formulas:
+                        kind = formula.get("t", "normal")
+                        span = formula.get("ref")
+                        if kind == "shared":
+                            identity = formula.get("si")
+                            if identity is None:
+                                unknown = True
+                            shared_members.append(identity)
+                            if span:
+                                if identity in shared:
+                                    raise RestrictionConeError("blank proof has duplicate shared formula anchors")
+                                shared[identity] = span
+                        if kind not in {"normal", "shared", "array"}:
+                            unknown = True
+                        if span:
+                            match = _A1_TARGET_RE.fullmatch(span)
+                            if match is None or match['quoted'] or match['bare']:
+                                raise RestrictionConeError("blank proof formula span is not local and bounded")
+                            from openpyxl.utils.cell import range_boundaries
+                            bounds = range_boundaries(span)
+                            if None in bounds or not (1 <= bounds[0] <= bounds[2] <= MAX_EXCEL_COLUMN and 1 <= bounds[1] <= bounds[3] <= MAX_EXCEL_ROW):
+                                raise RestrictionConeError("blank proof formula span is invalid")
+                            spans.append((bounds, ref, span, kind))
+                        elif kind == "array" or (kind == "shared" and (formula.text or '').strip()):
+                            unknown = True
+                        text = (formula.text or "").upper()
+                        if text and kind != "array" and not _known_scalar_formula(formula.text):
+                            unknown = True
+                        if "_XLFN." in text or "_XLWS." in text or "#" in text or re.search(r"\b(?:FILTER|SORT|SORTBY|UNIQUE|SEQUENCE|RANDARRAY|TAKE|DROP|EXPAND|VSTACK|HSTACK|TOCOL|TOROW|WRAPROWS|WRAPCOLS|CHOOSECOLS|CHOOSEROWS|TEXTSPLIT|MAKEARRAY|MAP|BYROW|BYCOL|SCAN|REDUCE)\s*\(", text):
+                            unknown = True
+                if any(identity is None or identity not in shared for identity in shared_members):
+                    unknown = True
+                sheets[name] = (part, hashlib.sha256(sheet_raw).hexdigest(), cells, spans, unknown)
+        self._sheets = sheets
+        self._mapping = {"workbook_sha256": hashlib.sha256(workbook).hexdigest(),
+                         "relationships_sha256": hashlib.sha256(relationships).hexdigest()}
+
+    def prove(self, targets):
+        self._load()
+        records = []
+        for target in targets:
+            split = model.split_ref(target)
+            if split is None or split[0] not in self._sheets:
+                raise RestrictionConeError("blank proof target sheet is missing")
+            sheet, row, col = split
+            coordinate = target.rpartition("!")[2]
+            part, digest, cells, spans, unknown = self._sheets[sheet]
+            if unknown:
+                raise RestrictionConeError("blank proof cannot exclude unknown dynamic formula coverage")
+            if any(a <= col <= c and b <= row <= d for (a,b,c,d), *_ in spans):
+                raise RestrictionConeError("absent AST target is covered by a source formula span")
+            cell = cells.get(coordinate)
+            if cell is not None and (len(cell) or (cell.text or '').strip() or set(cell.attrib) - {'r', 's'}):
+                raise RestrictionConeError("absent AST target contains source value or formula")
+            item = {"coordinate": target, "kind": "source_proved_blank_omitted_from_ast",
+                    "source_sha256": self.expected_sha256, "worksheet_part": part,
+                    "worksheet_sha256": digest, **self._mapping,
+                    "xml_state": "absent" if cell is None else "style_only",
+                    "cell_attributes": None if cell is None else dict(sorted(cell.attrib.items()))}
+            item['binding_sha256'] = object_hash(item)
+            records.append(item)
+        return records
+
+
+def _enclosing_static_ranges(graph, offset, runtime_targets_map, cone, blank_proof=None):
     """Independently prove full spans of signed integer literal OFFSET endpoints."""
     records = []
     for edge in graph.out_edges.get(offset.id, ()):
@@ -674,9 +893,13 @@ def _enclosing_static_ranges(graph, offset, runtime_targets_map, cone):
                 or len(runtime) != len(set(runtime))
                 or set(runtime) != set(targets) or not set(targets) <= cone):
             raise RestrictionConeError("static range runtime closure disagrees with endpoints")
-        if any(target not in graph.nodes or not graph.nodes[target].is_cell for target in targets):
+        missing = [target for target in targets if target not in graph.nodes]
+        if any(target in graph.nodes and not graph.nodes[target].is_cell for target in targets):
+            raise RestrictionConeError("static range target is not an AST cell")
+        if missing and blank_proof is None:
             raise RestrictionConeError("static range target is absent from AST")
-        if any(graph.nodes[target].kind == "formula"
+        blanks = blank_proof.prove(missing) if missing else []
+        if any(target in graph.nodes and graph.nodes[target].kind == "formula"
                and (graph.nodes[target].parse_status not in {"", "ok"}
                     or graph.root_of(target) is None) for target in targets):
             raise RestrictionConeError("static range formula target is omitted from AST")
@@ -684,6 +907,8 @@ def _enclosing_static_ranges(graph, offset, runtime_targets_map, cone):
                   "start": start.id, "base": base.id, "displacement": displacements,
                   "endpoint": endpoint,
                   "static_targets": targets, "runtime_targets": runtime}
+        if blanks:
+            record["source_blank_targets"] = blanks
         record["binding_sha256"] = object_hash(record)
         records.append(record)
     return sorted(records, key=lambda record: record["range_operation"])
@@ -785,12 +1010,18 @@ def build_certificate(
     if not isinstance(runtime_radj, dict):
         raise RestrictionConeError("runtime proof graph is absent")
     cone = _proof_cone(outputs, runtime_radj)
-    matches = _match_event_nodes(graph, events)
+    source_relative = source_manifest.get("layout", {}).get("source_workbook")
+    source_digest = source_manifest.get("bindings", {}).get("source_sha256")
+    same_row = _SameRowTableProof(source_dir / source_relative if isinstance(source_relative, str) else None, source_digest)
+    matches = _match_event_nodes(graph, events, same_row)
     runtime_targets_map = proof.get("resolved_operation_targets")
     if not isinstance(runtime_targets_map, dict):
         raise RestrictionConeError(
             "per-operation runtime resolved_targets ledger is absent"
         )
+    source_relative = source_manifest.get("layout", {}).get("source_workbook")
+    source_digest = source_manifest.get("bindings", {}).get("source_sha256")
+    blank_proof = _SourceBlankProof(source_dir / source_relative if isinstance(source_relative, str) else None, source_digest)
     dynamic_details = {}
     for index, (event, ast_nodes) in enumerate(zip(events, matches)):
         function = str(event.get("function", "")).upper()
@@ -852,7 +1083,7 @@ def build_certificate(
         }
         dynamic_details[index] = {
             "enclosing_static_ranges": (_enclosing_static_ranges(
-                graph, op_node, runtime_targets_map, cone) if function == "OFFSET" else []),
+                graph, op_node, runtime_targets_map, cone, blank_proof) if function == "OFFSET" else []),
             "static_targets": list(targets),
             "runtime_targets": list(raw_runtime),
             "arguments": arguments,
@@ -913,7 +1144,18 @@ def build_certificate(
         resolution_status = "confirmed"
         disposition = "confirmed_false_external_detection"
         function = str(event.get("function", "")).upper()
-        if event.get("event") == "volatile_function":
+        if event.get("event") == "structured_reference":
+            static_targets = [ast_nodes[1]]
+            if in_cone:
+                if ast_nodes[1] not in _proof_cone([location], runtime_radj):
+                    raise RestrictionConeError("same-row source target missing from runtime closure")
+                runtime_targets = static_targets
+                resolution_status = "exact_source_ast_runtime_reference"
+                disposition = "certified_same_row_table_reference"
+            else:
+                resolution_status = "outside_output_cone"
+                disposition = "same_row_reference_outside_output_cone"
+        elif event.get("event") == "volatile_function":
             if function in {"TODAY", "NOW", "CELL"}:
                 if in_cone:
                     raise RestrictionConeError(

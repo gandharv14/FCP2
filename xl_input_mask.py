@@ -520,10 +520,47 @@ def _xml_escape(text):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def _assumptions_sheet_xml(rows):
+def _assumptions_number_style(parts):
+    """Choose an explicit General format without changing existing style IDs.
+
+    Style zero can be a date or time format. New numeric input cells must not
+    inherit it: readers would convert the original numeric constant to a date.
+    Existing stylesheet bytes are retained unless a General style is absent.
+    """
+    from xml.etree import ElementTree as ET
+    path = "xl/styles.xml"
+    if path not in parts:
+        return None  # OOXML's default without a stylesheet is General.
+    raw = parts[path]
+    root = ET.fromstring(raw)
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    xfs = root.find(ns + "cellXfs")
+    if xfs is None:
+        raise ValueError("stylesheet lacks cellXfs for generated numeric inputs")
+    for index, xf in enumerate(xfs):
+        if xf.tag == ns + "xf" and xf.get("numFmtId", "0") == "0":
+            return index
+    # Append only; no original cell's style index or format changes.
+    tag = re.search(rb'<(?P<prefix>[A-Za-z_][\w.-]*:)?cellXfs\b[^>]*>', raw)
+    if tag is None:
+        raise ValueError("cannot locate cellXfs in stylesheet")
+    prefix = tag.group("prefix") or b""
+    opening = re.sub(rb'\s+count="[^"]*"', b"", tag.group(0))
+    opening = opening[:-1] + b' count="' + str(len(xfs) + 1).encode() + b'">'
+    raw = raw[:tag.start()] + opening + raw[tag.end():]
+    closing = b"</" + prefix + b"cellXfs>"
+    if raw.count(closing) != 1:
+        raise ValueError("ambiguous cellXfs closing element")
+    added = b"<" + prefix + b'xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+    parts[path] = raw.replace(closing, added + closing, 1)
+    return len(xfs)
+
+
+def _assumptions_sheet_xml(rows, number_style=None):
     def cell(ref, value):
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return '<c r="%s"><v>%.17g</v></c>' % (ref, value)
+            style = '' if number_style is None else ' s="%d"' % number_style
+            return '<c r="%s"%s><v>%.17g</v></c>' % (ref, style, value)
         return ('<c r="%s" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
                 % (ref, _xml_escape(value)))
 
@@ -565,6 +602,7 @@ def inject_assumptions(out_path, rows, existing_sheets):
         items = [(item, src.read(item.filename)) for item in src.infolist()]
 
     parts = {item.filename: data for item, data in items}
+    number_style = _assumptions_number_style(parts)
     workbook = parts["xl/workbook.xml"]
     rels = parts["xl/_rels/workbook.xml.rels"]
     types = parts["[Content_Types].xml"]
@@ -607,7 +645,7 @@ def inject_assumptions(out_path, rows, existing_sheets):
         # identical baselines invalidate hash-bound audits and model reviews.
         assumptions_info = zipfile.ZipInfo(ASSUMPTIONS_PART, date_time=(1980, 1, 1, 0, 0, 0))
         assumptions_info.compress_type = zipfile.ZIP_DEFLATED
-        out.writestr(assumptions_info, _assumptions_sheet_xml(rows))
+        out.writestr(assumptions_info, _assumptions_sheet_xml(rows, number_style))
     os.replace(tmp, out_path)
     return name
 

@@ -187,3 +187,92 @@ def test_segment_releases_disk_index_after_interrupted_projection(tmp_path, monk
     with pytest.raises(KeyboardInterrupt):
         xl_segment.segment('book', args)
     assert created and all(not path.parent.exists() for path in created)
+
+
+def test_sealed_graph_keeps_one_read_snapshot_and_releases_it(tmp_path):
+    import sqlite3
+    fixture(tmp_path)
+    with model.load(tmp_path, 'book', storage='disk') as graph:
+        connection = graph._store.connection
+        assert connection.in_transaction
+        expected = signature(graph)
+        for _ in range(3):
+            assert signature(graph) == expected
+            assert connection.in_transaction
+        with pytest.raises(sqlite3.OperationalError, match='readonly'):
+            connection.execute("UPDATE nodes SET value='999'")
+        assert signature(graph) == expected
+        database = graph._store.path
+    assert not database.exists()
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        connection.execute('SELECT 1')
+
+
+def test_cached_node_membership_avoids_sql_without_accepting_edge_keys(tmp_path):
+    import sqlite3
+    fixture(tmp_path)
+    with model.load(tmp_path, 'book', storage='disk') as graph:
+        key = next(iter(graph.nodes)); graph.nodes[key]; graph.edges[0]
+        queries = []
+        graph._store.connection.set_trace_callback(queries.append)
+        for _ in range(100):
+            assert key in graph.nodes
+        assert queries == []
+        assert 'definitely-absent' not in graph.nodes
+        assert len(queries) == 1
+        # The shared bounded cache also stores edge tuples. Such an entry must
+        # never become a positive node identity merely because it is cached.
+        with pytest.raises(sqlite3.ProgrammingError):
+            ('edge', 0) in graph.nodes
+    with pytest.raises(ValueError, match='closed'):
+        key in graph.nodes
+
+
+def test_hot_adjacency_has_no_repeated_sql_and_cannot_change_records(tmp_path):
+    fixture(tmp_path)
+    with model.load(tmp_path, 'book', storage='disk') as graph:
+        key = "1 O'Brien!B1"
+        edges = graph.in_edges[key]
+        expected = [asdict(e) for e in edges]
+        assert len(expected) == 1
+        queries = []
+        graph._store.connection.set_trace_callback(queries.append)
+        for _ in range(100):
+            selected = graph.in_edges[key]
+            assert len(selected) == 1
+            assert asdict(selected[0]) == expected[0]
+            assert asdict(selected[-1]) == expected[0]
+            assert [asdict(e) for e in selected[:]] == expected
+        assert queries == []
+        with pytest.raises(TypeError, match='read-only'):
+            edges[0].source = 'other'
+        with pytest.raises(IndexError):
+            edges[1]
+        graph.close()
+        assert not graph._store.adjacency_cache
+        with pytest.raises(ValueError, match='closed'):
+            list(edges)
+        with pytest.raises(ValueError, match='closed'):
+            graph.in_edges[key]
+
+
+def test_adjacency_eviction_and_large_lists_keep_exact_original_order(tmp_path, monkeypatch):
+    from xl_seg import disk_model
+    fixture(tmp_path)
+    monkeypatch.setattr(disk_model, 'ADJACENCY_CACHE_ENTRIES', 2)
+    monkeypatch.setattr(disk_model, 'MAX_CACHED_ADJACENCY', 1)
+    with model.load(tmp_path, 'book', storage='memory') as memory, model.load(tmp_path, 'book', storage='disk') as graph:
+        large = []
+        for mapping, reference in ((graph.in_edges,memory.in_edges), (graph.out_edges,memory.out_edges)):
+            for _ in range(2):
+                for key, expected in reference.items():
+                    actual = mapping[key]
+                    assert [asdict(e) for e in actual] == [asdict(e) for e in expected]
+                    assert len(graph._store.adjacency_cache) <= 2
+                    if len(expected)>1:
+                        large.append(key)
+                        assert actual._small_rows is None
+                for key in ('absent-1','absent-2','absent-3'):
+                    assert mapping.get(key, ()) == ()
+                    assert len(graph._store.adjacency_cache) <= 2
+        assert large

@@ -4,6 +4,7 @@ Capture hashes and call journals must be selected by the root from its actual
 observations. They are not provider signatures or agent-nominated attestations.
 """
 import copy
+import hashlib
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from datetime import datetime
@@ -25,6 +26,8 @@ class ProfileCall:
     producer: Call
     reviewer: Call
     captures: tuple
+    producer_recovery: dict | None = None
+    producer_derivation: dict | None = None
 
 class _Links(HTMLParser):
     def __init__(self):
@@ -37,9 +40,27 @@ def modules(root=ROOT):
     return (skill_module(root,'profile-mcp-sources','validate_source_profiles'),
             skill_module(root,'profile-mcp-sources','assemble_profiles'))
 
+def bounded_display(label,canonical):
+    prefix=label[:137].rsplit(' ',1)[0] or label[:137]
+    suffix=hashlib.sha256(canonical.encode()).hexdigest()[:16].translate(str.maketrans('0123456789abcdef','abcdefghijklmnop'))
+    return prefix.rstrip()+'… ['+suffix+']'
+
+
+def same_captured_source(source,original):
+    """A display-only projection preserves the exact captured source context."""
+    if source==original:return True
+    if set(original)!={'canonical_url','source_name','source_kind'} or set(source)!=set(original)|{'reviewed_source_names'}:return False
+    names=source['reviewed_source_names']
+    if not isinstance(names,list)or not names or any(not isinstance(x,str)or not x for x in names)or names!=sorted(set(names)):return False
+    label='; '.join(names)
+    return (len(label)>160 and label==original['source_name']
+        and all(source[k]==original[k]for k in ('canonical_url','source_kind'))
+        and source['source_name']==bounded_display(label,source['canonical_url']))
+
+
 def worklist(spec, forbidden, *, root=ROOT):
     validator,_ = modules(root)
-    rows = {}
+    rows = {}; aliases = {}
     for variable in spec['variables']:
         for source in variable['sources']:
             url = source.get('url')
@@ -54,13 +75,29 @@ def worklist(spec, forbidden, *, root=ROOT):
             row = dict(source_name=source['name'],source_kind=source.get('kind',''),canonical_url=canonical)
             require(all(isinstance(v,str) and v for v in row.values()),'incomplete redacted source')
             require(all(not validator.CELL_RE.search(row[k]) and validator.leaked_value(row[k],forbidden) is None for k in ('source_name','source_kind')),'private data in source display name or kind')
-            # A duplicate URL may have multiple internal IDs; neither IDs nor
-            # private audit notes are sent. Conflicting public labels stay closed.
-            require(canonical not in rows or rows[canonical] == row,'ambiguous public source labels')
-            rows[canonical] = row
+            # A public URL identifies one capture target. Preserve every reviewed
+            # label verbatim; internal source IDs and numerical bindings stay fixed.
+            require(canonical not in rows or rows[canonical]['source_kind']==row['source_kind'],'ambiguous public source kinds')
+            aliases.setdefault(canonical,set()).add(row['source_name']);rows[canonical]=row
+    for canonical,names in aliases.items():
+        label='; '.join(sorted(names))
+        require(not validator.CELL_RE.search(label) and validator.leaked_value(label,forbidden)is None,'private data in combined source display name')
+        if len(label)>160:
+            # The profile schema bounds the display name, while the request must
+            # preserve every reviewed label and caveat as source context.
+            display=bounded_display(label,canonical)
+            require(not validator.CELL_RE.search(display) and validator.leaked_value(display,forbidden)is None,'private data in bounded source display name')
+            rows[canonical]=dict(rows[canonical],source_name=display,reviewed_source_names=sorted(names))
+        else:rows[canonical]=dict(rows[canonical],source_name=label)
+    for url,row in rows.items():
+        if 'reviewed_source_names'in row:
+            require(all(url==other or row['source_name']!=value['source_name']for other,value in rows.items()),'bounded source display identity collision')
     return [rows[k] for k in sorted(rows)]
 
 def captured_pages(bindings, canonical, forbidden, *, root=ROOT):
+    if bindings and any(read(binding).get('schema_version') == 'harbor-retained-public-page/v1' for binding in bindings):
+        from scripts.batch.harbor_public_projection_recovery import pages
+        return pages(bindings, canonical, forbidden)
     # Preserve strict v1 behavior. V2 raw bodies are never sent to a model;
     # the owning current projection is independently re-derived from bytes.
     if bindings and any(read(binding).get('schema_version') == 'harbor-public-capture/v2' for binding in bindings):
@@ -107,9 +144,28 @@ def accepted_profile(call, source, forbidden, *, policy, root=ROOT):
     validator,assembler=modules(root)
     pages,evidence=captured_pages(call.captures,call.canonical_url,forbidden,root=root)
     require(read(call.captures[-1])['completed_at_ns'] <= read(call.producer.submitted)['submitted_at_ns'],'producer predates public captures')
-    producer=validate_call(call.producer,request('producer',{'source':source,'public_pages':pages},policy,root=root),policy=policy)
+    expected=request('producer',{'source':source,'public_pages':pages},policy,root=root)
+    if call.producer_recovery is not None:
+        from scripts.batch import harbor_profile_correction as Q
+        expected=Q.request(call.producer_recovery,source,root=root,policy=policy)
+        q,_,_,_,_,_,old=Q.validate(call.producer_recovery,root=root,source=source,policy=policy)
+        submitted=read(call.producer.submitted)
+        require(submitted['semantic_ordinal']==submitted['semantic_limit']==2 and submitted['attempt_id']==q['attempt_id'] and submitted['scope']==read(old.call.submitted)['scope'] and read(old.call.completed)['completed_at_ns']<=submitted['submitted_at_ns'],'remaining producer order or budget differs')
+        from scripts.batch import harbor_model_executor as E
+        attempt=Path(call.producer.request['path']).parent
+        require(attempt==Path(old.call.request['path']).parent.parent/'attempt-02' and read(record(attempt/'prior-attempts.json'))==[old.outcome],'remaining producer journal detached from original attempt')
+        sealed=E.inspect_locked(attempt,read(record(attempt/'plan.json')),expected)
+        require(sealed.status=='completed' and sealed.call==call.producer,'remaining producer completion differs')
+        evidence.extend([call.producer_recovery,old.outcome,old.call.request,old.call.submitted,old.call.response,old.call.completed])
+    producer=validate_call(call.producer,expected,policy=policy)
     original=producer['review']
     require(original['review']=={'status':'pending','reviewer':None,'reviewed_at':None,'notes':None},'producer self-accepted profile')
+    if call.producer_derivation is not None:
+        from scripts.batch import harbor_profile_derivation as D
+        derived,actual,original,mapping=D.validate(call.producer_derivation,root=root,source=source,policy=policy)
+        require(actual.call==call.producer and derived['producer_correction']==call.producer_recovery,
+                'derived fragment detached from original completed producer')
+        evidence.extend([call.producer_derivation,derived['original_plan'],derived['stop'],derived['presentation_helper']])
     produced=assembler.validate_fragment(Path(call.producer.response['path']),original)
     reviewer=validate_call(call.reviewer,request('reviewer',{'fragment':original,'public_pages':pages},policy,root=root),policy=policy)
     require_independent(reviewer,[producer])
@@ -136,7 +192,7 @@ def accepted_profile(call, source, forbidden, *, policy, root=ROOT):
     for item in (call.producer,call.reviewer):
         evidence += [item.request,item.submitted,item.response,item.completed]
         if item.parsed:evidence.append(item.parsed)
-    return {'profile':accepted,'accepted':review['status']=='accepted','evidence':evidence,'model_calls':2}
+    return {'profile':accepted,'accepted':review['status']=='accepted','evidence':evidence,'model_calls':2+int(call.producer_recovery is not None)}
 
 @dataclass(frozen=True)
 class ProfileSelection:
@@ -146,6 +202,7 @@ class ProfileSelection:
     mapping: dict
     calls: tuple
     policy: Policy
+    skips: tuple = ()
 
 def validate_profiles(selection, *, root=ROOT):
     """Closed profile document and mapping, with zero-call generic derivation."""
@@ -157,9 +214,17 @@ def validate_profiles(selection, *, root=ROOT):
     document=read(s.profiles)
     require(not validator.validate_document(document,forbidden=forbidden,inventory_path=Path(s.inventory['path']),spec_path=Path(s.phase1['path'])),'profile document capture/hash/redaction failed')
     urls=[c.canonical_url for c in s.calls]
-    require(len(urls)==len(set(urls)) and set(urls)=={r['canonical_url'] for r in sources},'profile calls do not exactly cover public worklist')
+    skipped_urls=[r['canonical_url']for r in s.skips]
+    require(all(set(r)=={'canonical_url','captures'}for r in s.skips) and len(skipped_urls)==len(set(skipped_urls)) and not set(urls)&set(skipped_urls),'duplicate or mixed skipped profile selection')
+    require(len(urls)==len(set(urls)) and set(urls)|set(skipped_urls)=={r['canonical_url'] for r in sources},'profile calls and verified skips do not exactly cover public worklist')
     by_url={c.canonical_url:c for c in s.calls}; projected=[];evidence=[s.phase1,s.inventory,s.profiles,s.mapping]
+    skip_by_url={r['canonical_url']:r for r in s.skips}
     for source in sources:
+        if source['canonical_url']in skip_by_url:
+            from scripts.batch.harbor_profile_skips import validate
+            result=validate(source,skip_by_url[source['canonical_url']]['captures'],forbidden,phase1=s.phase1,inventory=s.inventory)
+            errors=[];validator.validate_profile(result['profile'],0,errors,forbidden);require(not errors,'verified skipped fragment failed original schema')
+            projected.append(result['profile']);evidence.extend(result['evidence']);continue
         result=accepted_profile(by_url[source['canonical_url']],source,forbidden,policy=s.policy,root=root)
         projected.append(result['profile']);evidence.extend(result['evidence'])
     require(len({p['source_id'] for p in projected})==len(projected),'duplicate profile source identity')
@@ -184,4 +249,4 @@ def validate_profiles(selection, *, root=ROOT):
             mappings[sid]=row
     expected={'schema_version':'harbor-source-profile-mapping/v1','phase_1_spec_sha256':s.phase1['sha256'],'profiles_sha256':s.profiles['sha256'],'mappings':[mappings[k] for k in sorted(mappings)]}
     require(read(s.mapping)==expected,'profile mapping is incomplete or changed')
-    return {'public_sources':len(sources),'accepted_profiles':len(profiles),'model_calls':2*len(s.calls),'confidence':'high' if len(profiles)==len(sources) else 'medium','evidence':evidence,'phase1_sha256':s.phase1['sha256'],'mapping':expected}
+    return {'public_sources':len(sources),'skipped_profiles':len(s.skips),'skip_reasons':[p['skip_reason']for p in projected if p['status']=='skipped'],'accepted_profiles':len(profiles),'model_calls':sum(2+int(c.producer_recovery is not None)for c in s.calls),'confidence':'high' if len(profiles)==len(sources) else 'medium','evidence':evidence,'phase1_sha256':s.phase1['sha256'],'mapping':expected}

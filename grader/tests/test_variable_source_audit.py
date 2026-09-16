@@ -147,7 +147,7 @@ class VariableSourceAuditTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             env_file = Path(temp) / ".env"
             env_file.write_text(
-                "lbx_api_key=stale-key\n"
+                "lbx_labelbox_api_key=fallback-key\n"
                 "aligerr_org_key=org-key\n"
                 "rl_api_key=current-key\n",
                 encoding="utf-8",

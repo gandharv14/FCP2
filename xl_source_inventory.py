@@ -383,11 +383,77 @@ def transformed_workbook_record(workbook_id, original, candidate, curation, rece
     return record
 
 
+def macro_projected_workbook_record(workbook_id, original, candidate, receipt):
+    """Retain original XLSM identity beside a fully verified OOXML projection."""
+    original,candidate=map(lambda p:Path(p).resolve(),(original,candidate))
+    if original.stem!=workbook_id or candidate.stem!=workbook_id:
+        raise SourceInventoryError('macro projection workbook identity differs')
+    record=_derived_workbook_record(workbook_id,candidate,candidate.parent,None)
+    record['transformation']={
+        'schema_version':'source-vba-projection-lineage/v1',
+        'original_source':_record(original,original.parent),
+        'original_path':str(original),'candidate_path':str(candidate),
+        'receipt':receipt,'receipt_sha256':_object_hash(receipt)}
+    _validate_transformation(record)
+    return record
+
+
+def metadata_remediated_workbook_record(workbook_id, original, candidate, plan, receipt):
+    """Bind original source identity to independently verified dead-name cleanup."""
+    original, candidate = map(lambda p: Path(p).resolve(), (original, candidate))
+    record = _derived_workbook_record(workbook_id, candidate, candidate.parent, None)
+    record["transformation"] = {
+        "schema_version": "source-dead-name-remediation-lineage/v1",
+        "original_source": _record(original, original.parent),
+        "original_path": str(original), "candidate_path": str(candidate),
+        "plan": plan, "plan_sha256": _object_hash(plan),
+        "receipt": receipt, "receipt_sha256": _object_hash(receipt),
+    }
+    _validate_transformation(record)
+    return record
+
+
 def _validate_transformation(record):
     lineage = record.get("transformation")
     if lineage is None:
         return
     try:
+        if isinstance(lineage, dict) and lineage.get("schema_version") == "source-dead-name-remediation-lineage/v1":
+            if (set(lineage) != {"schema_version", "original_source", "original_path", "candidate_path", "plan", "plan_sha256", "receipt", "receipt_sha256"}
+                    or record.get("conversion") is not None
+                    or not _valid_file_record(lineage["original_source"])
+                    or lineage["plan_sha256"] != _object_hash(lineage["plan"])
+                    or lineage["receipt_sha256"] != _object_hash(lineage["receipt"])):
+                raise ValueError("invalid dead-name lineage contract")
+            original, candidate = Path(lineage["original_path"]), Path(lineage["candidate_path"])
+            if (not original.is_absolute() or not candidate.is_absolute()
+                    or original.stem != record["workbook_id"] or candidate.stem != record["workbook_id"]
+                    or _record(original, original.parent) != lineage["original_source"]
+                    or _record(candidate, candidate.parent) != {k: record[k] for k in ("path", "sha256", "size_bytes")}):
+                raise ValueError("dead-name lineage source identity changed")
+            plan = lineage["plan"]
+            if (not isinstance(plan, dict) or plan.get("status") != "eligible"
+                    or plan.get("unresolved") != [] or not plan.get("actions")
+                    or any(action.get("kind") != "remove_dead_defined_name" for action in plan["actions"])):
+                raise ValueError("lineage requires only proven dead-name cleanup")
+            from xl_volatile_formula_remediation import verify_manifest
+            verify_manifest(original, candidate, plan, lineage["receipt"])
+            return
+        if isinstance(lineage,dict) and lineage.get('schema_version')=='source-vba-projection-lineage/v1':
+            if (set(lineage)!={'schema_version','original_source','original_path','candidate_path','receipt','receipt_sha256'}
+                    or record.get('conversion') is not None
+                    or not _valid_file_record(lineage['original_source'])
+                    or lineage['receipt_sha256']!=_object_hash(lineage['receipt'])):
+                raise ValueError('invalid macro lineage contract')
+            original,candidate=Path(lineage['original_path']),Path(lineage['candidate_path'])
+            if (not original.is_absolute() or not candidate.is_absolute()
+                    or original.stem!=record['workbook_id'] or candidate.stem!=record['workbook_id']
+                    or _record(original,original.parent)!=lineage['original_source']
+                    or _record(candidate,candidate.parent)!={k:record[k]for k in('path','sha256','size_bytes')}):
+                raise ValueError('macro lineage source identity changed')
+            from xl_macro_source_projection import verify
+            verify(original,candidate,lineage['receipt'])
+            return
         if isinstance(lineage, dict) and lineage.get("schema_version") == "source-transformation-lineage/v2":
             from xl_table_quarantine_inventory import validate_quarantine_transformation
             validate_quarantine_transformation(record)
@@ -407,8 +473,8 @@ def _validate_transformation(record):
                     key: record[key] for key in ("path", "sha256", "size_bytes")}):
             raise ValueError("lineage source bytes changed")
         receipt = lineage["receipt"]
-        from xl_presentation_tables import POLICY, verify_materialization
-        if receipt.get("policy_version") != POLICY:
+        from xl_presentation_tables import POLICY, COMPOSED_POLICY, verify_materialization
+        if receipt.get("policy_version") not in {POLICY, COMPOSED_POLICY}:
             raise ValueError("unsupported transformation policy")
         verify_materialization(original, candidate, curation, receipt)
     except (KeyError, TypeError, OSError, ValueError) as exc:

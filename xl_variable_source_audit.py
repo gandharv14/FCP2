@@ -1072,7 +1072,7 @@ def _generate_audit(
 
     if not api_key:
         raise RuntimeError(
-            "no lbx_api_key found; use --no-variable-source-audit to opt out"
+            "no lbx_labelbox_api_key found; use --no-variable-source-audit to opt out"
         )
 
     scope = _attempt_scope_config(inventory_hash, endpoint, model, project_id)

@@ -25,6 +25,7 @@ from scripts.batch.harbor_transition_codec import encode,decode
 
 SCHEMA='harbor-direct-audit-package-recovery/v1'
 PAUSE_SCHEMA='harbor-direct-audit-package-recovery/v2'
+SOURCE_ID_SCHEMA='harbor-source-id-package-recovery/v1'
 BEFORE_PRODUCER='623ae14732f6ab0b2c78ede9859cae3d759908ec118264fffda7b0cdd0653f74'
 BEFORE_PACKAGER='3bd3a52b849956364275a51c890640648173a7c1737aac0c7b07fc92fbe634cb'
 AFTER_PRODUCER='d1e695a9c39d8455e6011bab7553b5a2661414a918cbd4d44ede4fb59c21562f'
@@ -37,7 +38,16 @@ ROOT=C.ROOT
 def keep(path,value):return W.keep(path,value)
 
 
-def code():
+def source_runtime(integration):
+    import importlib.util
+    value=read(integration);row=value['helper'];E.checked_bytes(row)
+    spec=importlib.util.spec_from_file_location('declared_package_source_id',row['path']);module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
+    require(module.SCHEMA==SOURCE_ID_SCHEMA and record(module.__file__)==row,'declared source-ID integration differs')
+    return module
+
+
+def code(integration=None):
+    if integration is not None:return source_runtime(integration).code(sys.modules[__name__],integration)
     require(record(P.__file__)['sha256']==AFTER_PRODUCER and record(ROOT/'xl_output_task.py')['sha256']==AFTER_PACKAGER,'current reviewed packaging repair changed')
     paths=[Path(__file__),Path(P.__file__),ROOT/'xl_output_task.py',Path(F.__file__),Path(C.__file__),Path(W.__file__),Path(notes.__file__)]
     from scripts.batch import harbor_pause_recovery, harbor_tracker_lifecycle
@@ -45,6 +55,10 @@ def code():
     paths.append(Path(harbor_package_current_prefix.__file__))
     paths.extend(Path(m.__file__) for m in (harbor_pause_recovery,harbor_tracker_lifecycle,harbor_parallel_policy))
     return [record(p) for p in paths]
+
+
+def guard_seconds(integration=None):
+    return SECONDS if integration is None else source_runtime(integration).profile(sys.modules[__name__],integration)[0]['guard_seconds']
 
 
 def checked_tree(directory):
@@ -64,8 +78,9 @@ def commands(content,work,taxonomy):
     return {k:list(map(str,v)) for k,v in values.items()}
 
 
-def failure(descriptor,checkpoint,outcome,s,current):
+def failure(descriptor,checkpoint,outcome,s,current,*,integration=None):
     """Only the observed cached-only failure, with exact fixed command identity."""
+    if integration is not None:return source_runtime(integration).failure(sys.modules[__name__],integration,descriptor,checkpoint,outcome,s,current)
     declared=read(outcome)
     require(set(declared)=={'status','resource','automatic_retry','source_invalidity_claimed','terminal_verdict'} and declared['status']=='RECONCILIATION_REQUIRED' and declared['automatic_retry'] is False and declared['source_invalidity_claimed'] is False and declared['terminal_verdict'] is None,'completed selected failed guard required')
     resource=read(declared['resource']);intent=read(resource['intent'])
@@ -101,13 +116,16 @@ def failure(descriptor,checkpoint,outcome,s,current):
     return notes.evidence_list([descriptor,checkpoint,outcome,declared['resource'],resource['intent'],resource['log'],intent['executable'],*checked_tree(old)])
 
 
-def context(descriptor,checkpoint,lease,*,pause_completion=None,prefix_receipt=None):
+def context(descriptor,checkpoint,lease,*,pause_completion=None,prefix_receipt=None,integration=None):
     s,_,controls=C.selected(descriptor);require(read(descriptor).get('refresh') is not None,'explicit completed F refresh required')
     prior=read(checkpoint)
     require(prior.get('descriptor')==descriptor and prior.get('status')=='STEP_COMPLETE' and prior.get('step')=='normalization_phase2','exact completed coordinator phase2 checkpoint required')
     original_lease=C.decode(prior['lease'])
     facade,before=W._active(s,lease)
-    if pause_completion is None:
+    if integration is not None:
+        require(pause_completion is None and prefix_receipt is None,'source-ID takeover cannot mix pause history')
+        source_runtime(integration).lease(sys.modules[__name__],integration,descriptor,checkpoint,original_lease,before,lease)
+    elif pause_completion is None:
         require(original_lease==lease,'selected lease differs from completed phase2 checkpoint; explicit lease continuation required')
     else:
         from scripts.batch import harbor_pause_recovery as pause
@@ -117,7 +135,7 @@ def context(descriptor,checkpoint,lease,*,pause_completion=None,prefix_receipt=N
                 'phase2 checkpoint does not bind the exact pre-pause tracker')
         pause.continuation_chain(stop['before'],asdict(original_lease),before,lease,
             completion=pause_completion,tracker_path=s.bootstrap.policy.tracker_root/(s.bootstrap.workbook+'.json'))
-    require(before['leases']['task_agent']['expires_at']-time.time_ns()>(SECONDS+30)*10**9,'renew lease explicitly before preparing recovery')
+    require(before['leases']['task_agent']['expires_at']-time.time_ns()>(guard_seconds(integration)+30)*10**9,'renew lease explicitly before preparing recovery')
     current=decode(prior['selection']);refresh=read(descriptor)['refresh']
     if prefix_receipt is None:
         for item in prior['evidence']:E.checked_bytes(item)
@@ -137,36 +155,42 @@ def context(descriptor,checkpoint,lease,*,pause_completion=None,prefix_receipt=N
     return s,before,current,refresh,controls
 
 
-def prepare(descriptor,checkpoint,outcome,lease,directory,*,pause_completion=None,prefix_receipt=None):
-    current_code=code();s,before,current,refresh,controls=context(descriptor,checkpoint,lease,pause_completion=pause_completion,prefix_receipt=prefix_receipt)
+def prepare(descriptor,checkpoint,outcome,lease,directory,*,pause_completion=None,prefix_receipt=None,integration=None):
+    current_code=code(integration);s,before,current,refresh,controls=context(descriptor,checkpoint,lease,pause_completion=pause_completion,prefix_receipt=prefix_receipt,integration=integration)
     require(not current.content.stage.exists(),'authorized task stage must be absent before fresh packaging')
-    evidence=failure(descriptor,checkpoint,outcome,s,current)
-    directory=E.safe(directory);protected=[s.run,s.bootstrap.run,s.bootstrap.policy.tracker_root,s.campaign.root,s.campaign.slot_root,current.content.stage,Path(descriptor['path']).parent]
+    evidence=failure(descriptor,checkpoint,outcome,s,current,integration=integration)
+    directory=E.safe(directory)
+    if integration is not None:source_runtime(integration).destination(sys.modules[__name__],integration,directory,current)
+    protected=[s.run,s.bootstrap.run,s.bootstrap.policy.tracker_root,s.campaign.root,s.campaign.slot_root,current.content.stage,Path(descriptor['path']).parent]
     require(all(directory!=p and directory not in p.parents and p not in directory.parents for p in protected),'recovery namespace overlaps retained or protected evidence')
     require(not directory.exists(),'recovery preparation exists; select exact prepared checkpoint')
     directory.mkdir(parents=True,mode=0o700)
     E.retain(directory/'before.json',(s.bootstrap.policy.tracker_root/(s.bootstrap.workbook+'.json')).read_bytes())
     extra={} if pause_completion is None else dict(pause_completion=pause_completion)
     if prefix_receipt is not None:extra['prefix_receipt']=prefix_receipt
-    return keep(directory/'prepared.json',dict(**extra,schema_version=SCHEMA if pause_completion is None else PAUSE_SCHEMA,descriptor=descriptor,checkpoint=checkpoint,failed_outcome=outcome,lease=C.encode(lease),before=record(directory/'before.json'),selection=encode(current),refresh=refresh,code=current_code,failed_evidence=evidence,model_calls=0,budget_reset=False))
+    if integration is not None:extra['integration']=integration
+    return keep(directory/'prepared.json',dict(**extra,schema_version=SOURCE_ID_SCHEMA if integration is not None else SCHEMA if pause_completion is None else PAUSE_SCHEMA,descriptor=descriptor,checkpoint=checkpoint,failed_outcome=outcome,lease=C.encode(lease),before=record(directory/'before.json'),selection=encode(current),refresh=refresh,code=current_code,failed_evidence=evidence,model_calls=0,budget_reset=False))
 
 
 def validate(prepared,*,active=True):
     p=read(prepared)
-    extra={'pause_completion'} if p.get('schema_version')==PAUSE_SCHEMA else set()
+    extra={'integration'} if p.get('schema_version')==SOURCE_ID_SCHEMA else {'pause_completion'} if p.get('schema_version')==PAUSE_SCHEMA else set()
     if p.get('schema_version')==PAUSE_SCHEMA and 'prefix_receipt' in p:extra.add('prefix_receipt')
-    require(set(p)=={'schema_version','descriptor','checkpoint','failed_outcome','lease','before','selection','refresh','code','failed_evidence','model_calls','budget_reset'}|extra and p['schema_version'] in {SCHEMA,PAUSE_SCHEMA} and p['model_calls']==0 and p['budget_reset'] is False,'invalid recovery descriptor')
-    if extra:
+    require(set(p)=={'schema_version','descriptor','checkpoint','failed_outcome','lease','before','selection','refresh','code','failed_evidence','model_calls','budget_reset'}|extra and p['schema_version'] in {SCHEMA,PAUSE_SCHEMA,SOURCE_ID_SCHEMA} and p['model_calls']==0 and p['budget_reset'] is False,'invalid recovery descriptor')
+    if 'pause_completion'in extra:
         from scripts.batch import harbor_pause_recovery as pause
         pause.validate_completion(p['pause_completion'])
-    require(p['code']==code(),'recovery code changed')
+    require(p['code']==code(p.get('integration')),'recovery code changed')
     for item in [p['before'],*p['failed_evidence']]:E.checked_bytes(item)
     s,_,controls=C.selected(p['descriptor']);current=decode(p['selection']);lease=C.decode(p['lease'])
     if active:
-        actual=context(p['descriptor'],p['checkpoint'],lease,pause_completion=p.get('pause_completion'),prefix_receipt=p.get('prefix_receipt'))
+        actual=context(p['descriptor'],p['checkpoint'],lease,pause_completion=p.get('pause_completion'),prefix_receipt=p.get('prefix_receipt'),integration=p.get('integration'))
         require(actual[2]==current and actual[3]==p['refresh'],'recovery prefix changed')
         require(record(s.bootstrap.policy.tracker_root/(s.bootstrap.workbook+'.json'))['sha256']==p['before']['sha256'],'recovery exact tracker CAS changed')
     else:
+        if p.get('integration') is not None:
+            original_lease=C.decode(read(p['checkpoint'])['lease'])
+            source_runtime(p['integration']).lease(sys.modules[__name__],p['integration'],p['descriptor'],p['checkpoint'],original_lease,read(p['before']),lease)
         if p.get('pause_completion') is not None:
             receipt=read(p['pause_completion']);stop=read(receipt['event']['stopped_owner_proof'])
             prior_lease=C.decode(read(p['checkpoint'])['lease'])
@@ -177,7 +201,7 @@ def validate(prepared,*,active=True):
             from scripts import harbor_package_current_prefix as prefix
             prefix.validate(p['prefix_receipt'],s,p['descriptor'],p['checkpoint'],read(p['before']),current,allow_environment=True)
         F.checks(s,read(p['before']),current,'normalization_phase2')
-    require(failure(p['descriptor'],p['checkpoint'],p['failed_outcome'],s,current)==p['failed_evidence'],'failed evidence closure changed')
+    require(failure(p['descriptor'],p['checkpoint'],p['failed_outcome'],s,current,integration=p.get('integration'))==p['failed_evidence'],'failed evidence closure changed')
     return p,s,current,lease,controls
 
 
@@ -194,6 +218,7 @@ def completed_package(prepared,*,active=True):
         result=read(record(root/(label+'.result.json')));intent=read(record(root/(label+'.intent.json')))
         require(result==dict(returncode=0,log=record(root/(label+'.log'))) and intent['model_calls_permitted'] is False,'package command did not complete')
         require(intent==dict(argv=[sys.executable,*expected_commands[label]],entry=record(expected_commands[label][0]),model_calls_permitted=False),'completed command identity changed')
+    if p.get('integration') is not None:source_runtime(p['integration']).completed_commands(sys.modules[__name__],p['integration'],root)
     c=replace(c,stage_sha256=sha);current=replace(selection,content=c)
     before=read(p['before']);result=W.lanes.check_completed_gate(before,W.lanes.CompletionEvidence('environment',current),W._context(s))
     require(result['passed'] and result.get('confidence','high')=='high','current complete environment proof failed')
@@ -206,17 +231,25 @@ def execute(prepared,*,dispatch_commands=False,fault=lambda _:None):
     if not work.exists():
         require(not current.content.stage.exists(),'stage appeared before packaging')
         if not dispatch_commands:return dict(status='PREPARED',prepared=prepared,commands_executed=False)
-        keep(directory/'package-launch.json',dict(prepared=prepared,work=str(work),stage=str(current.content.stage),code=code(),models=False,containers=False))
-        P.package(current.content,current.public_profiles,work,s.taxonomy)
+        keep(directory/'package-launch.json',dict(prepared=prepared,work=str(work),stage=str(current.content.stage),code=code(p.get('integration')),models=False,containers=False))
+        if p.get('integration') is None:P.package(current.content,current.public_profiles,work,s.taxonomy)
+        else:
+            with source_runtime(p['integration']).installed(sys.modules[__name__],p['integration']):
+                P.package(current.content,current.public_profiles,work,s.taxonomy)
         fault('after_package')
     else:
         require((directory/'package-launch.json').exists() and (work/'complete.json').is_file(),'partial or unknown package cannot be replayed')
-        require(read(record(directory/'package-launch.json'))==dict(prepared=prepared,work=str(work),stage=str(current.content.stage),code=code(),models=False,containers=False),'package launch identity changed')
+        require(read(record(directory/'package-launch.json'))==dict(prepared=prepared,work=str(work),stage=str(current.content.stage),code=code(p.get('integration')),models=False,containers=False),'package launch identity changed')
     p,s,current,lease,receipt,proof=completed_package(prepared)
     complete=keep(directory/'package-validated.json',dict(prepared=prepared,selection=encode(current),receipt=receipt,evidence=proof['evidence']))
     if (directory/'gate-intent.json').exists():raise ValueError('environment CAS was attempted; explicit reconciliation required')
     keep(directory/'gate-intent.json',dict(prepared=prepared,package=complete,before=p['before']))
-    result=W._gate(s,lease,'environment',current);fault('after_gate')
+    result=W._gate(s,lease,'environment',current)
+    if p.get('integration') is not None:
+        tracker=s.bootstrap.policy.tracker_root/(s.bootstrap.workbook+'.json')
+        E.retain(directory/'after.json',tracker.read_bytes())
+        validate_gate_state(read(p['before']),read(record(directory/'after.json')),proof)
+    fault('after_gate')
     require(result['status']=='STEP_COMPLETE','current owning environment lane did not complete')
     result={**result,'status':'ENVIRONMENT_READY','lease':C.encode(result['lease']),'selection':encode(current),'descriptor':p['descriptor'],'evidence':[prepared,complete,*result['evidence']]}
     saved=keep(directory/'result.json',result);fault('after_result')
@@ -226,14 +259,7 @@ def execute(prepared,*,dispatch_commands=False,fault=lambda _:None):
     return result
 
 
-def reconcile(prepared):
-    """Complete checkpoint publication only after the exact single owning CAS."""
-    p,s,current,oldlease,receipt,proof=completed_package(prepared,active=False)
-    directory=Path(prepared['path']).parent
-    validated=record(directory/'package-validated.json')
-    require(read(validated)==dict(prepared=prepared,selection=encode(current),receipt=receipt,evidence=proof['evidence']),'package validation checkpoint changed')
-    require(read(record(directory/'gate-intent.json'))==dict(prepared=prepared,package=validated,before=p['before']),'owning CAS intent absent or changed')
-    before=read(p['before']);tracker=s.bootstrap.policy.tracker_root/(s.bootstrap.workbook+'.json');actual=read(record(tracker))
+def validate_gate_state(before,actual,proof):
     expected=copy.deepcopy(before);lane=proof['lane'];level=proof.get('confidence','high')
     expected['bindings'].update(proof['bindings']);row=expected['lane_state'][lane]
     row.update(state='passed',current_confidence=level,current_gate=proof['gate'],evidence_paths=notes.evidence_list(proof['evidence']))
@@ -247,6 +273,17 @@ def reconcile(prepared):
     expected['confidence_history'].append(copy.deepcopy(expected['current_confidence']))
     expected['revision']+=1;expected['updated_at']=actual['updated_at'];expected['leases']['task_agent']['heartbeat_at']=actual['updated_at']
     require(actual==expected and actual['updated_at']>=before['updated_at'],'tracker is not the exact single owning environment CAS')
+
+
+def reconcile(prepared):
+    """Complete checkpoint publication only after the exact single owning CAS."""
+    p,s,current,oldlease,receipt,proof=completed_package(prepared,active=False)
+    directory=Path(prepared['path']).parent
+    validated=record(directory/'package-validated.json')
+    require(read(validated)==dict(prepared=prepared,selection=encode(current),receipt=receipt,evidence=proof['evidence']),'package validation checkpoint changed')
+    require(read(record(directory/'gate-intent.json'))==dict(prepared=prepared,package=validated,before=p['before']),'owning CAS intent absent or changed')
+    before=read(p['before']);tracker=s.bootstrap.policy.tracker_root/(s.bootstrap.workbook+'.json');actual=read(record(tracker))
+    validate_gate_state(before,actual,proof)
     lease=replace(oldlease,revision=actual['revision'],sha256=record(tracker)['sha256']);W._active(s,lease)
     result=dict(status='ENVIRONMENT_READY',step='environment',lease=C.encode(lease),selection=encode(current),descriptor=p['descriptor'],evidence=[prepared,validated,*proof['evidence']],publication_ready=False)
     saved=keep(directory/'result.json',result)
@@ -257,15 +294,17 @@ def reconcile(prepared):
 
 
 def child(intent):
-    v=read(intent);require(v['schema_version']==SCHEMA and v['code']==code(),'recovery launch code changed')
-    require(v['timeout_seconds']==SECONDS and v['memory_limit_bytes']==MEMORY and v['executable']==record(Path(sys.executable).resolve()),'recovery runtime/limits changed')
+    v=read(intent);require(v['schema_version']==SCHEMA and v['code']==code(v.get('integration')),'recovery launch code changed')
+    require(v['timeout_seconds']==guard_seconds(v.get('integration')) and v['memory_limit_bytes']==MEMORY and v['executable']==record(Path(sys.executable).resolve()),'recovery runtime/limits changed')
     directory=Path(intent['path']).parent;args=v['arguments']
+    selected_integration=args.get('integration') if v['action']=='prepare' else read(args['prepared']).get('integration')
+    require(v.get('integration')==selected_integration,'child integration differs from selected arguments')
     if v.get('parallel') is not None:
         descriptor=args['descriptor'] if v['action']=='prepare' else read(args['prepared'])['descriptor']
         parallel_controls(descriptor,v['parallel'])
     if v['action']=='prepare':
-        require(set(args) in ({'descriptor','checkpoint','outcome','lease'},{'descriptor','checkpoint','outcome','lease','pause_completion'},{'descriptor','checkpoint','outcome','lease','pause_completion','prefix_receipt'}) and v['dispatch_commands'] is False,'exact preparation inputs required')
-        result=prepare(args['descriptor'],args['checkpoint'],args['outcome'],C.decode(read(args['lease'])),directory/'recovery',pause_completion=args.get('pause_completion'),prefix_receipt=args.get('prefix_receipt'))
+        require(set(args) in ({'descriptor','checkpoint','outcome','lease'},{'descriptor','checkpoint','outcome','lease','pause_completion'},{'descriptor','checkpoint','outcome','lease','pause_completion','prefix_receipt'},{'descriptor','checkpoint','outcome','lease','integration'}) and v['dispatch_commands'] is False,'exact preparation inputs required')
+        result=prepare(args['descriptor'],args['checkpoint'],args['outcome'],C.decode(read(args['lease'])),directory/'recovery',pause_completion=args.get('pause_completion'),prefix_receipt=args.get('prefix_receipt'),integration=args.get('integration'))
     else:
         require(set(args)=={'prepared'},'exact prepared recovery required')
         if v['action']=='execute':result=execute(args['prepared'],dispatch_commands=v['dispatch_commands'])
@@ -287,9 +326,11 @@ def run(action,arguments,controls,directory,*,dispatch_commands=False,parallel=N
     require(action in {'prepare','execute','reconcile'} and type(dispatch_commands) is bool,'explicit action required')
     require(not dispatch_commands or action=='execute','only execute may run packaging commands')
     required={'descriptor','checkpoint','outcome','lease'} if action=='prepare' else {'prepared'}
-    require(set(arguments)==required or action=='prepare' and set(arguments) in (required|{'pause_completion'},required|{'pause_completion','prefix_receipt'}),'exact root-selected argument records required')
+    require(set(arguments)==required or action=='prepare' and set(arguments) in (required|{'pause_completion'},required|{'pause_completion','prefix_receipt'},required|{'integration'}),'exact root-selected argument records required')
     for item in arguments.values():E.checked_bytes(item)
     descriptor=arguments['descriptor'] if action=='prepare' else read(arguments['prepared'])['descriptor']
+    integration=arguments.get('integration')if action=='prepare'else read(arguments['prepared']).get('integration')
+    seconds=guard_seconds(integration)
     selected_worker,_,selected_controls=C.selected(descriptor)
     if parallel is None:
         require(not (selected_worker.bootstrap.policy.tracker_root.parent/'parallel-policy/activation.json').exists(),'activated parallel policy must be explicitly selected')
@@ -305,11 +346,13 @@ def run(action,arguments,controls,directory,*,dispatch_commands=False,parallel=N
     try:
         fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);directory.mkdir(parents=True,mode=0o700)
         extra={} if parallel is None else dict(parallel=parallel)
-        intent=keep(directory/'intent.json',dict(**extra,schema_version=SCHEMA,action=action,arguments=arguments,dispatch_commands=dispatch_commands,code=code(),executable=record(Path(sys.executable).resolve()),timeout_seconds=SECONDS,memory_limit_bytes=MEMORY))
+        if integration is not None:extra['integration']=integration
+        intent=keep(directory/'intent.json',dict(**extra,schema_version=SCHEMA,action=action,arguments=arguments,dispatch_commands=dispatch_commands,code=code(integration),executable=record(Path(sys.executable).resolve()),timeout_seconds=seconds,memory_limit_bytes=MEMORY))
         metrics={};rc=None;failure_=None;logpath=directory/'step.log'
         try:
             with logpath.open('xb') as log:
-                rc=C._run_in_process_group([sys.executable,'-B',str(Path(__file__).resolve()),'_child',intent['path'],intent['sha256']],stdout=log,timeout_seconds=SECONDS,grace_seconds=3,memory_limit_bytes=MEMORY,metrics=metrics,cwd=ROOT,env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1','PYTHONPATH':str(ROOT)},guardian_lock_fds=(fd,))
+                command=[sys.executable,'-B',str(Path(__file__).resolve()),'_child',intent['path'],intent['sha256']] if integration is None else source_runtime(integration).child_command(sys.modules[__name__],integration,intent)
+                rc=C._run_in_process_group(command,stdout=log,timeout_seconds=seconds,grace_seconds=3,memory_limit_bytes=MEMORY,metrics=metrics,cwd=ROOT,env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1','PYTHONPATH':str(ROOT)},guardian_lock_fds=(fd,))
                 log.flush();os.fsync(log.fileno())
         except Exception as exc:failure_=dict(type=type(exc).__name__,message_sha256=E.sha(str(exc).encode()))
         resource=keep(directory/'resource.json',dict(intent=intent,returncode=rc,metrics=metrics,log=record(logpath),failure=failure_))
@@ -323,11 +366,11 @@ def main(argv=None):
     if argv and argv[0]=='_child':
         require(len(argv)==3,'exact child intent required');child(dict(path=argv[1],sha256=argv[2]));return 0
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('action',choices=('prepare','execute','reconcile'))
-    for field in ('descriptor','checkpoint','outcome','lease','prepared','pause-completion','prefix-receipt','contract','activation'):
+    for field in ('descriptor','checkpoint','outcome','lease','prepared','pause-completion','prefix-receipt','integration','contract','activation'):
         parser.add_argument('--'+field);parser.add_argument('--'+field+'-sha256')
     parser.add_argument('--journal',required=True);parser.add_argument('--slot-lock',required=True);parser.add_argument('--dispatch-commands',action='store_true')
     a=parser.parse_args(argv);arguments={}
-    for name in ('descriptor','checkpoint','outcome','lease','prepared','pause_completion','prefix_receipt','contract','activation'):
+    for name in ('descriptor','checkpoint','outcome','lease','prepared','pause_completion','prefix_receipt','integration','contract','activation'):
         path,sha=getattr(a,name),getattr(a,name+'_sha256');require((path is None)==(sha is None),'path and explicit hash required together')
         if path is not None:arguments[name]=dict(path=path,sha256=sha)
     parallel=None

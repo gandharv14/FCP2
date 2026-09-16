@@ -4,10 +4,16 @@ import subprocess,sys
 import pytest
 ROOT=Path(__file__).resolve().parents[1]
 PROGRAM=r'''
-import runpy,importlib.util,json,copy
+import importlib.util,json,copy,hashlib
 from pathlib import Path
 F=Path.cwd()/'diagnostics/requested-fixes-20260910'
-d=runpy.run_path(str(F/'continue_0274_post_partition.py'))
+from scripts.batch import harbor_transition_codec as codec
+def binding(path):
+ path=Path(path);return {'path':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
+def checked(bound):
+ assert binding(bound['path'])==bound
+ return json.loads(Path(bound['path']).read_text())
+d={'binding':binding,'checked':checked,'codec':codec,'INITIAL':{'path':str(F/'0274-partition-consume-reconciliation/result.json'),'sha256':'56ad06b119aa3ff4f5417d8b4e5a406c1342e51425570b5b58bf53610f2a711b'}}
 mod=Path.cwd()/'scripts/batch/harbor_dialogue_source_warnings.py'
 sp=importlib.util.spec_from_file_location('source_warnings_new',mod);m=importlib.util.module_from_spec(sp);sp.loader.exec_module(m)
 p=Path.cwd()/'diagnostics/authoring-resume-20260910/authoring/0274/instruction-role-repair/producer/dialogue';r=p/'round-01'
@@ -30,12 +36,12 @@ elif mode=='source':
  value=copy.deepcopy(d['checked'](b[1]));value['claims'][1]['reviewer_only']['evidence']='=SUBTOTAL(8,E12:E21)';change(1,value)
 elif mode=='prefix':change(3,Path(b[3]['path']).read_text().replace('**Analyst:** Consolidated IS:','**Analyst:** Wrong sheet:',1))
 try:
- proof=m.validate(*b,task_dir=s.content.stage,root=d['root'])
+ proof=m.validate(*b,task_dir=s.content.stage,root=Path.cwd())
  if mode=='tamper':
-  proof['claim_count']-=1;m.revalidate(proof,d['checked'](b[0]),d['checked'](b[1]),Path(b[2]['path']).read_text(),root=d['root'])
+  proof['claim_count']-=1;m.revalidate(proof,d['checked'](b[0]),d['checked'](b[1]),Path(b[2]['path']).read_text(),root=Path.cwd())
  assert mode=='positive','negative case accepted: '+mode
  assert proof['claim_count']==150 and len(proof['warnings'])==11 and 'passed' not in proof
- assert m.revalidate(proof,d['checked'](b[0]),d['checked'](b[1]),Path(b[2]['path']).read_text(),root=d['root'])==proof
+ assert m.revalidate(proof,d['checked'](b[0]),d['checked'](b[1]),Path(b[2]['path']).read_text(),root=Path.cwd())==proof
 except (ValueError,AssertionError) as exc:
  if mode=='positive' or str(exc).startswith('negative case accepted'):raise
 print('PASS',mode)

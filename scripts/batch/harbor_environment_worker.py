@@ -11,6 +11,7 @@ from scripts.batch import harbor_workbook_bootstrap as bootstrap
 from scripts.batch import harbor_model_executor as executor
 from scripts.batch import harbor_audit_bridge as audit_bridge
 from scripts.batch import harbor_normalization_producer as normalization
+from scripts.batch import harbor_normalization_routing as normalization_routing
 from scripts.batch import harbor_profile_producer as profiles
 from scripts.batch import harbor_environment_producer as environment
 from scripts.batch import harbor_readiness as static
@@ -128,16 +129,14 @@ def _audit(s,lease,baseline,*,dispatch,credential):
 
 def _normalization(s,content,*,dispatch,credential):
     ns=normalization.Selection(content.workbook,content.bindings,content.normalization_run,content.model_policy,s.normalization_budget)
-    prepared=normalization.prepare(ns);call=None
-    if read(prepared)['request'] is not None:
-        pc=normalization.prepared_call(ns,prepared)
-        if not dispatch and not executor.location(pc,s.campaign).exists():return None
-        observed=normalization.dispatch(ns,prepared,s.campaign,credential=credential) if dispatch else executor.inspect(pc,s.campaign)
-        if observed.status!='completed':raise audit_bridge.AuditTransportStop('normalization transport '+observed.status)
-        call=observed.call
-    result=normalization.emit_phase1(ns,prepared,call);value=read(result);run=content.normalization_run
+    produced=normalization_routing.produce(ns,s.campaign,dispatch=dispatch,credential=credential)
+    if produced is None:return None
+    if isinstance(produced,normalization_routing.Progress):return produced
+    prepared,result,call=produced.prepared,produced.result,produced.call
+    value=read(result);run=content.normalization_run
     bindings={**content.bindings,'normalization_draft':record(run/'draft.json'),'normalizer':record(run/f'normalize_{content.workbook}.py'),'normalization_prepared_manifest':prepared,'normalized_phase1':value['phase1'],'normalized_final':value['outputs']['normalized.json'],'normalization_report':value['outputs']['normalization_report.json'],'normalization_exclusions':value['outputs']['exclusions.json']}
-    if read(prepared)['request'] is not None:bindings['normalization_prepared_request']=read(prepared)['request']
+    if produced.partitioned:bindings['normalization_partitioned_review']=value['normalization_partitioned_review']
+    elif read(prepared)['request'] is not None:bindings['normalization_prepared_request']=read(prepared)['request']
     return replace(content,bindings=bindings,normalization_prepared=prepared,normalization_call=call),result
 
 
@@ -200,6 +199,9 @@ def advance(s,lease,*,dispatch=False,credential=None,captures=None):
             elif kind=='normalization_phase1':
                 emitted=_normalization(s,content,dispatch=dispatch,credential=credential)
                 if emitted is None:return _status(s,'PENDING_MODEL',lease,step=kind)
+                if isinstance(emitted,normalization_routing.Progress):
+                    return _status(s,'PENDING_MODEL',lease,step=kind,selection=selection,
+                                   evidence=[emitted.receipt])
                 content,receipt=emitted;selection=_selection(content);evidence=[receipt]
             elif kind=='source_profile':
                 outcome=_profiles(s,content,captures,dispatch=dispatch,credential=credential)

@@ -101,7 +101,13 @@ def _selection(selection):
         proof=adoption.validate(generated,workbook=s.workbook,original=record(original['path']),history_roots=p.history_roots,known_ids={x['workbook_id'] for x in admission.read_inventory(p.original_inventory['path'])['sources']})
         require(proof['ledger']==binding and proof['source_manifest']==s.source_manifest and proof['segmentation_manifest']==s.segmentation_manifest and proof['curation']==current==row['retained_curation'],'generated curation selected bindings differ')
     else:
-        require(current['sha256']==row['retained_curation']['sha256']==build['bindings']['curation_sha256'],'retained curation bytes changed')
+        from scripts.batch import harbor_legacy_research_history as legacy
+        legacy_proof=legacy.selected(p,s.workbook)
+        if legacy_proof is not None:
+            require(s.refresh is None and current==row['retained_curation'],'legacy source selection differs')
+            legacy.source_handoff(legacy_proof,dict(workbook=s.workbook,ledger=binding,source_manifest=s.source_manifest,segmentation_manifest=s.segmentation_manifest))
+        else:
+            require(current['sha256']==row['retained_curation']['sha256']==build['bindings']['curation_sha256'],'retained curation bytes changed')
     return row,ledger,binding,packets,current
 
 
@@ -241,18 +247,21 @@ def audit_plan(selection,prepared,baseline_receipt,lease,*,inherited_budget=None
     own=str(s.policy.tracker_root/(s.workbook+'.json'))
     history=[r for r in histories.get(s.workbook,[]) if r['path']!=own]
     require(history==saved['history'],'audit/history evidence changed; reconcile before model dispatch')
-    admission.validate_prior_audit_budget(history,inherited_budget,s.workbook)
+    from scripts.batch import harbor_legacy_research_history as legacy
+    legacy_proof=legacy.selected(s.policy,s.workbook)
+    if legacy_proof is None:admission.validate_prior_audit_budget(history,inherited_budget,s.workbook)
     import xl_variable_source_audit as audit
     require(s.model_policy.endpoint==audit.PROD_ENDPOINT.rstrip('/')+'/chat/completions','auditor endpoint differs from configured model policy')
     segment,meta=audit.resolve_segmentation_directory(seg.parents[2],s.workbook,segmentation_generation_id=seg.name,source_generation_root=source.parents[2],source_generation_id=source.name)
     inventory=audit.build_inventory(s.workbook,bindings['baseline_inputs']['path'],segment,segmentation=meta)
+    legacy_budget=legacy.budget(legacy_proof,history,inventory,workbook=s.workbook,inherited_budget=inherited_budget)if legacy_proof else None
     counts=audit._inherited_batch_counts(inherited_budget,inventory)
     require(all(n<2 for n in counts.values()),'prior audit batch budget exhausted; completed-audit applicability or explicit reconciliation required')
     audit_root=s.run/'audit';target=audit_root/(s.workbook+'-variable-sources')
     require(not target.exists(),'audit output already attempted; use owning retained checkpoint, never fresh scope')
     argv=[str(ROOT/'xl_variable_source_audit.py'),s.workbook,'--inputs-root',str(Path(bindings['baseline_inputs']['path']).parent),'--seg-root',str(seg.parents[2]),'--segmentation-generation-id',seg.name,'--source-generation-root',str(source.parents[2]),'--source-generation-id',source.name,'--audit-root',str(audit_root),'--env-file',str(env_file),'--model',s.model_policy.model,'--endpoint',audit.PROD_ENDPOINT,'--project-id',s.model_policy.project_id,'--semantic-attempt-limit','2']
     if inherited_budget:argv+=['--inherited-budget',inherited_budget['path'],'--inherited-budget-sha256',inherited_budget['sha256']]
-    return dict(schema_version='harbor-bootstrap-audit-plan/v1',argv=[sys.executable,*argv],entry=record(ROOT/'xl_variable_source_audit.py'),prepared=prepared,baseline=baseline_receipt,history=history,inherited_budget=inherited_budget,batch_consumed=counts,inventory_sha256=journal.sha(journal.canonical(inventory)),actual_model_calls=0,requires_root_model_slot=True,lane_approval=False)
+    return dict(schema_version='harbor-bootstrap-audit-plan/v1',argv=[sys.executable,*argv],entry=record(ROOT/'xl_variable_source_audit.py'),prepared=prepared,baseline=baseline_receipt,history=history,inherited_budget=inherited_budget,batch_consumed=counts,inventory_sha256=journal.sha(journal.canonical(inventory)),actual_model_calls=0,requires_root_model_slot=True,lane_approval=False,**({'legacy_research':legacy_budget}if legacy_budget else {}))
 
 
 def revalidate_audit_plan(selection,prepared,baseline_receipt,lease,plan,*,inherited_budget=None,env_file=Path('.env')):

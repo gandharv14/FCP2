@@ -263,3 +263,49 @@ def test_worker_rejects_expected_evidence_drift_before_source_work(completed, mo
     with pytest.raises(ValueError,match='changed after checkpoint binding'):build.worker(args,source)
     assert not constructor.called
     assert json.loads(path.read_text())['build_history']==ledger['build_history']
+
+
+@pytest.mark.parametrize('case', ['same', 'other', 'missing', 'invalid'])
+def test_required_source_generation_never_falls_back_to_ast(completed, monkeypatch, tmp_path, case):
+    import xl_source_recalc
+    import xl_segment
+    args, source, ledger, gen = completed
+    args.recalc_root = None
+    args.require_source_generation = gen.name if case in {'same','missing'} else ('0'*64 if case=='other' else 'invalid')
+    ledger.update(route='pass',state='READY')
+    ledger['build'].update(curation_path=str(tmp_path/'absent.toml'),state='RUNNING',stage='source')
+    ledger['build']['bindings']['code_sha256']='current'
+    if case=='missing': ledger['build_history']=[]
+    path=Path(args.run_root)/'workbooks/0001/ledger.json';path.parent.mkdir(parents=True);path.write_text(json.dumps(ledger))
+    monkeypatch.setattr(build,'code_hash',lambda:'current')
+    constructor=Mock(side_effect=AssertionError('required checkpoint must never rebuild AST'))
+    monkeypatch.setattr(xl_source_recalc,'prepare_source_generation',constructor)
+    segment=Mock(side_effect=RuntimeError('validated source reached segmentation'))
+    monkeypatch.setattr(xl_segment,'segment',segment)
+    expected=RuntimeError if case=='same' else ValueError
+    message='validated source reached segmentation' if case=='same' else 'AST rebuild forbidden'
+    with pytest.raises(expected,match=message):build.worker(args,source)
+    assert not constructor.called
+    after=json.loads(path.read_text())
+    assert after['build_history']==ledger['build_history']
+    assert after['build']['attempts']==2
+    assert segment.call_count==(1 if case=='same' else 0)
+
+
+def test_required_generation_reaches_guarded_child_and_consumes_next_attempt(completed, monkeypatch, tmp_path):
+    args,source,ledger,gen=completed
+    prior=copy.deepcopy(ledger['build_history'][0]);source['format']='.xlsx'
+    old={'source':source,'state':'READY','route':'pass','build':prior,'build_history':[]}
+    path=Path(args.run_root)/'workbooks/0001/ledger.json';path.parent.mkdir(parents=True);path.write_text(json.dumps(old))
+    args.inventory=str(tmp_path/'inventory.json');args.curation_root=str(tmp_path/'curations');args.recalc_root=None
+    args.code_root=str(tmp_path);args.timeout=900;args.memory_mb=8192;args.require_source_generation=gen.name
+    observed=[]
+    def stop(command,**kw):
+        observed.append((command,kw));return 124
+    monkeypatch.setattr(build,'_run_in_process_group',stop)
+    result=build.execute_one(args,source,'new-code')
+    assert result['attempts']==2 and result['state']=='STOPPED'
+    after=json.loads(path.read_text());assert after['build_history']==[prior]
+    command,kw=observed[0]
+    assert command[command.index('--require-source-generation')+1]==gen.name
+    assert kw['timeout_seconds']==900 and kw['memory_limit_bytes']==8*1024**3

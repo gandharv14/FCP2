@@ -240,3 +240,41 @@ def test_unused_today_cache_does_not_prove_original_as_of_meaning(tmp_path):
     assert all(action["kind"] != "freeze_cached_today" for action in plan["actions"])
     with pytest.raises(RemediationError, match="not eligible"):
         apply_plan(source, plan, tmp_path / "candidate.xlsx")
+
+
+@pytest.mark.parametrize('formula', ['TODAY()', '+TODAY()'])
+def test_dead_name_cleanup_preserves_supported_clock_and_cache(tmp_path, formula):
+    import re
+    source=tmp_path/'source.xlsx';original=tmp_path/'original.xlsx';output=tmp_path/'output.xlsx'
+    _workbook(original,today=True)
+    with zipfile.ZipFile(original)as archive,zipfile.ZipFile(source,'w')as target:
+        for info in archive.infolist():
+            raw=archive.read(info.filename)
+            if info.filename=='xl/worksheets/sheet1.xml':
+                text=raw.decode();text=re.sub(r'<f(?:\s[^>]*)?>.*?</f>|<f[^>]*/>',lambda m:'<f>'+formula+'</f>'if 'TODAY()'in m.group()else '',text);raw=text.encode()
+            target.writestr(info,raw)
+    before=source.read_bytes();plan=build_plan(source)
+    assert plan['status']=='eligible'and plan['action_counts']=={'dead-defined-name/v1':1}
+    assert len(plan['preserved_worksheet_restrictions'])==1
+    receipt=apply_plan(source,plan,output);assert verify_manifest(source,output,plan,receipt)['route']=='restricted_pass'
+    assert source.read_bytes()==before and set(receipt['changed_members'])=={'xl/workbook.xml'}
+    with zipfile.ZipFile(source)as a,zipfile.ZipFile(output)as b:
+        assert a.read('xl/worksheets/sheet1.xml')==b.read('xl/worksheets/sheet1.xml')
+        assert formula.encode()in b.read('xl/worksheets/sheet1.xml')and b'<v>45200</v>'in b.read('xl/worksheets/sheet1.xml')
+    changed=copy.deepcopy(plan);changed['preserved_worksheet_restrictions'][0]['formula_sha256']='0'*64
+    with pytest.raises(RemediationError):apply_plan(source,changed,tmp_path/'forged.xlsx')
+
+
+@pytest.mark.parametrize('formula',['TODAY()+1','NOW()','RAND()','INDIRECT(A1)'])
+def test_name_cleanup_does_not_admit_an_unproven_clock_expression(tmp_path,formula):
+    import re
+    old=tmp_path/'old.xlsx';source=tmp_path/'source.xlsx';_workbook(old,today=True)
+    with zipfile.ZipFile(old)as a,zipfile.ZipFile(source,'w')as b:
+        for info in a.infolist():
+            raw=a.read(info.filename)
+            if info.filename=='xl/worksheets/sheet1.xml':
+                raw=re.sub(r'<f(?:\s[^>]*)?>.*?</f>|<f[^>]*/>',lambda m:'<f>'+formula+'</f>'if 'TODAY()'in m.group()else '',raw.decode()).encode()
+            b.writestr(info,raw)
+    plan=build_plan(source)
+    assert plan['status']=='ineligible'and plan['unresolved']
+    assert 'preserved_worksheet_restrictions'not in plan

@@ -230,3 +230,34 @@ def test_semantic_continuation_cannot_detach_or_replay_code_repair(failed):
     with pytest.raises(ValueError,match='code bytes changed'):
         retry.validate(worker,before)
     assert len(calls)==3
+
+@pytest.mark.parametrize('fault',[None,'handoff','foreign_adoption'])
+def test_actual_semantic_cas_preserves_aggregate_predecessor_history(failed,monkeypatch,fault):
+    from types import SimpleNamespace
+    from scripts.fleet import instruction_model_continue as H
+    worker,s,lease,blocked,t,_,_,_=failed
+    adoption=w.keep(worker.run/'adoption.json',{'blocked':blocked})
+    worker=replace(worker,disclosure_repair=adoption)
+    # The fixture already supplies original completed Calls/steps; this test
+    # isolates the new historical cycle while running the actual semantic CAS.
+    monkeypatch.setattr(retry,'_history',lambda *a:[])
+    worker,s,lease,permit=retry.authorize(worker,s,lease,blocked=blocked)
+    before=p.read(record(worker.context.tracker_root/'0245.json'))
+    receipt=dict(implementation='impl',history_reader='history',round_plan='round',round_result='result',review_plan='review',aggregate='aggregate',initial='initial',prior_continuations={},historical_records=[])
+    seen=[]
+    A=SimpleNamespace(__file__='impl',record=lambda _: 'impl',selected=lambda _:True,E=SimpleNamespace(checked_bytes=lambda x:None))
+    A.read=lambda row:receipt if row==adoption else p.read(row)
+    def validate(w,b):
+        assert w.dialogue_semantic_retry is None
+        seen.append(w);return receipt
+    A.validate=validate
+    def original_history(w,b):return H.adoption_history(A,None,w,b)[1]
+    monkeypatch.setattr(retry,'_history',original_history)
+    if fault=='handoff':before['handoffs']=[]
+    elif fault=='foreign_adoption':worker=replace(worker,disclosure_repair={'path':'foreign','sha256':'b'*64})
+    if fault:
+        with pytest.raises(ValueError):H.adoption_history(A,None,worker,before)
+    else:
+        assert H.adoption_history(A,None,worker,before)[0]==receipt and len(seen)==2
+        assert worker.dialogue_semantic_retry is not None
+    assert retry._history is original_history

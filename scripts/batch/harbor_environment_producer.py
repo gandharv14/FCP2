@@ -45,7 +45,7 @@ def finish_normalization(content, profiles, output, *, fault_hook=lambda _: None
             'phase2 journal and normalization run must be disjoint')
     lanes.profile_context(profiles,content)
     validation=validate_profiles(profiles)
-    require(validation['confidence']=='high','source profile is not independently accepted')
+    require(validation['confidence']=='high' or (validation['confidence']=='medium' and validation.get('skipped_profiles',0)>0 and validation['accepted_profiles']+validation['skipped_profiles']==validation['public_sources']),'source profile gap lacks verified generic fallback')
     b=content.bindings
     for key in ('normalization_draft','normalized_phase1','source_file','baseline_inputs'):
         record_=b[key];journal.checked_bytes(record_)

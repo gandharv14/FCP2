@@ -26,6 +26,13 @@ def validate(context,request,policy,*,original_renderer_code=None):
         identity=code_identity(original_renderer_code);generator_sha=identity['original_generator']['sha256']
     require(plan['schema_version']=='harbor-bootstrap-audit-plan/v1' and plan['entry']['sha256']==generator_sha,'current or exactly reviewed original audit plan required')
     prepared=read(plan['prepared']);baseline=read(plan['baseline'])
+    from scripts.batch import harbor_legacy_research_history as legacy
+    selected=prepared.get('selection',{}).get('policy',{})
+    from types import SimpleNamespace
+    old=legacy.selected(SimpleNamespace(campaign_evidence=selected.get('campaign_evidence',[])),inventory['metadata']['workbook'])
+    if old is not None:
+        require(plan.get('legacy_research')==legacy.budget(old,plan['history'],inventory,workbook=inventory['metadata']['workbook'],inherited_budget=plan['inherited_budget']),'legacy research consumption or additional allowance differs')
+    else:require('legacy_research'not in plan,'unselected legacy research budget')
     require(prepared['validated']['workbook']==inventory['metadata']['workbook'],'root audit workbook differs')
     checked_record(baseline['bindings']['original_raw_source'])
     # Root's plan uses its pretty canonical digest; the owning auditor uses its

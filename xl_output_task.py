@@ -873,6 +873,7 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
         "created_at": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     if proof_contract is not None:
+        from xl_seg.proof_graph import read as read_proof_relation
         proof_path = out_dir / "tests" / "segmentation_proof.json"
         proof_path.write_text(
             json.dumps(proof_contract, indent=2, sort_keys=True),
@@ -886,7 +887,8 @@ def emit(out_dir, workbook, family, artifact, instruction, targets, outputs,
                 len(proof_contract.get("declared_static_inputs") or []),
             "segmentation_runtime_edges": sum(
                 len(sources)
-                for sources in (proof_contract.get("runtime_radj") or {}).values()
+                for sources in read_proof_relation(
+                    proof_contract.get("runtime_radj") or {}).values()
             ),
             "segmentation_closure_stabilized": True,
         })

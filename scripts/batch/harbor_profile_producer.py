@@ -24,8 +24,10 @@ from scripts.batch.harbor_admission import read,record,require
 from scripts.batch.harbor_model_review_provenance import Policy,Call,validate_call
 from scripts.batch.harbor_tracker_lifecycle import checked_record
 
-SCHEMA='harbor-profile-production/v1'
+SCHEMA='harbor-profile-production/v2'
 INPUT_SCHEMA='harbor-profile-production-input/v1'
+CORRECTION_INPUT='harbor-profile-production-input/v2'
+DERIVATION_INPUT='harbor-profile-production-input/v3'
 
 
 def save(path,value):executor.save(path,value);return record(path)
@@ -38,8 +40,11 @@ def retained(path,value):
 
 def input_context(binding):
     value=read(binding)
-    require(set(value)=={'schema_version','workbook_id','original_source','phase1','inventory','captures','policy','campaign'},'profile input schema changed')
-    require(value['schema_version']==INPUT_SCHEMA,'unsupported profile input schema')
+    fields={'schema_version','workbook_id','original_source','phase1','inventory','captures','policy','campaign'}
+    derived=value.get('schema_version')==DERIVATION_INPUT
+    corrected=value.get('schema_version')in(CORRECTION_INPUT,DERIVATION_INPUT)
+    require(set(value)==(fields|{'producer_recovery','producer_derivation'}if derived else fields|{'producer_recovery'}if corrected else fields),'profile input schema changed')
+    require(value['schema_version']in(INPUT_SCHEMA,CORRECTION_INPUT,DERIVATION_INPUT),'unsupported profile input schema')
     workbook=value['workbook_id'];require(isinstance(workbook,str) and len(workbook)==4 and workbook.isdigit(),'four-digit workbook ID required')
     for key in ('original_source','phase1','inventory','captures'):checked_record(value[key])
     spec=read(value['phase1']);run=Path(value['phase1']['path']).parent
@@ -55,6 +60,15 @@ def input_context(binding):
     require(all(isinstance(row,dict) and set(row)=={'canonical_url','captures'} for row in sources),'invalid capture source entry')
     urls=[row['canonical_url'] for row in sources]
     require(len(urls)==len(set(urls)) and set(urls)=={r['canonical_url'] for r in worklist},'actual captures do not exactly match redacted worklist')
+    if corrected:
+        from scripts.batch import harbor_profile_correction as Q
+        selected_input=dict(value)
+        if derived:
+            from scripts.batch import harbor_profile_derivation as D
+            selected_input.pop('producer_derivation');selected_input['schema_version']=CORRECTION_INPUT
+            d,*_=D.validate(value['producer_derivation'],root=ROOT,policy=policy)
+            require(d['producer_correction']==value['producer_recovery'],'profile derivation changed correction ancestry')
+        Q.check_input(value['producer_recovery'],selected_input,root=ROOT)
     return value,spec,run,policy,campaign,forbidden,worklist,{row['canonical_url']:row['captures'] for row in sources}
 
 
@@ -81,9 +95,9 @@ def safe_capture_failure(records):
 
 def code_bindings():
     validator,assembler=profiles.modules(ROOT)
-    from scripts.batch import harbor_model_review_provenance
+    from scripts.batch import harbor_model_review_provenance,harbor_profile_skips,harbor_profile_correction,harbor_profile_derivation,harbor_profile_presentation
     return [record(Path(path)) for path in (
-        __file__,profiles.__file__,executor.__file__,harbor_model_review_provenance.__file__,
+        __file__,profiles.__file__,executor.__file__,harbor_profile_correction.__file__,harbor_profile_derivation.__file__,harbor_profile_presentation.__file__,harbor_model_review_provenance.__file__,harbor_profile_skips.__file__,harbor_profile_skips.capture.__file__,
         validator.__file__,assembler.__file__,
         ROOT/'.cursor/skills/harbor-source-profiler/SKILL.md',
         ROOT/'.cursor/skills/profile-mcp-sources/SKILL.md',
@@ -91,30 +105,44 @@ def code_bindings():
         ROOT/'.cursor/skills/profile-mcp-sources/source_profiles.schema.json')]
 
 
+def producer_request(value,source,pages,policy):
+    if 'producer_recovery'in value:
+        from scripts.batch import harbor_profile_correction as Q
+        selected=Q.validate(value['producer_recovery'],root=ROOT)[3]
+        if source['canonical_url']==selected['canonical_url']:
+            return Q.request(value['producer_recovery'],source,root=ROOT,policy=policy)
+    return profiles.request('producer',{'source':source,'public_pages':pages},policy,root=ROOT)
+
+
 def prepare(input_binding,output):
     value,spec,run,policy,campaign,forbidden,worklist,captures=input_context(input_binding)
     output=executor.safe(output);output.mkdir(exist_ok=False)
     worklist_binding=save(output/'worklist.json',worklist)
-    pages={};blocked=[]
+    pages={};blocked=[];skips=[]
     for source in worklist:
         url=source['canonical_url']
         try:pages[url]=profiles.captured_pages(captures[url],url,forbidden,root=ROOT)[0]
         except (ValueError,OSError,UnicodeError) as exc:
-            blocked.append({'canonical_url':url,'code':safe_capture_failure(captures[url]),'error_type':type(exc).__name__,'error_sha256':hashlib.sha256(str(exc).encode()).hexdigest(),'automatic_retry':False})
+            from scripts.batch.harbor_profile_skips import validate
+            try:validate(source,captures[url],forbidden,phase1=value['phase1'],inventory=value['inventory'])
+            except (ValueError,OSError,UnicodeError,KeyError,TypeError):
+                blocked.append({'canonical_url':url,'code':safe_capture_failure(captures[url]),'error_type':type(exc).__name__,'error_sha256':hashlib.sha256(str(exc).encode()).hexdigest(),'automatic_retry':False})
+            else:skips.append({'canonical_url':url,'captures':captures[url]})
     jobs=[]
     if not blocked:
         for source in worklist:
+            if source['canonical_url']not in pages:continue
             key=hashlib.sha256(source['canonical_url'].encode()).hexdigest()[:24]
             folder=output/key;folder.mkdir()
-            request=save(folder/'producer-request.json',profiles.request('producer',{'source':source,'public_pages':pages[source['canonical_url']]},policy,root=ROOT))
+            request=save(folder/'producer-request.json',producer_request(value,source,pages[source['canonical_url']],policy))
             jobs.append({'source':source,'key':key,'captures':captures[source['canonical_url']],'producer_request':request,'producer_attempt_id':str(uuid.uuid4()),'reviewer_attempt_id':str(uuid.uuid4())})
     code=code_bindings()
-    plan={'schema_version':SCHEMA,'input':input_binding,'worklist':worklist_binding,'code':code,'jobs':jobs,'blocked':blocked,'status':'STOPPED' if blocked else 'PREPARED','model_dispatches':0,'automatic_semantic_retry':False}
+    plan={'schema_version':SCHEMA,'input':input_binding,'worklist':worklist_binding,'code':code,'jobs':jobs,'skips':skips,'blocked':blocked,'status':'STOPPED' if blocked else 'PREPARED','model_dispatches':0,'automatic_semantic_retry':False}
     return save(output/'plan.json',plan)
 
 
 def checked_plan(binding):
-    plan=read(binding);require(set(plan)=={'schema_version','input','worklist','code','jobs','blocked','status','model_dispatches','automatic_semantic_retry'} and plan['schema_version']==SCHEMA,'unsupported profile plan')
+    plan=read(binding);require(set(plan)=={'schema_version','input','worklist','code','jobs','skips','blocked','status','model_dispatches','automatic_semantic_retry'} and plan['schema_version']==SCHEMA,'unsupported profile plan')
     require(plan['model_dispatches']==0 and plan['automatic_semantic_retry'] is False,'preparation cannot claim consumed calls or automatic retries')
     require(plan['code']==code_bindings(),'profile generator/validator/executor code changed')
     value,spec,run,policy,campaign,forbidden,worklist,captures=input_context(plan['input'])
@@ -123,11 +151,18 @@ def checked_plan(binding):
     if plan['blocked']:
         require(plan['jobs']==[],'blocked plan must have no dispatchable jobs')
         return plan,(value,spec,run,policy,campaign,forbidden,worklist,captures)
-    require([j['source'] for j in plan['jobs']]==worklist,'planned sources changed or omitted')
+    skipped={r['canonical_url']:r for r in plan['skips']}
+    require(len(skipped)==len(plan['skips']) and all(set(r)=={'canonical_url','captures'}for r in plan['skips']),'duplicate or malformed skipped source')
+    from scripts.batch.harbor_profile_skips import validate
+    for source in worklist:
+        if source['canonical_url']in skipped:
+            r=skipped[source['canonical_url']];require(r['captures']==captures[r['canonical_url']],'skipped captures changed');validate(source,r['captures'],forbidden,phase1=value['phase1'],inventory=value['inventory'])
+    require(set(skipped)<={r['canonical_url']for r in worklist},'foreign skipped source')
+    require([j['source'] for j in plan['jobs']]==[r for r in worklist if r['canonical_url']not in skipped],'planned sources changed or omitted')
     for job in plan['jobs']:
         url=job['source']['canonical_url'];require(job['captures']==captures[url],'actual capture bindings changed')
         pages,_=profiles.captured_pages(captures[url],url,forbidden,root=ROOT)
-        require(read(job['producer_request'])==profiles.request('producer',{'source':job['source'],'public_pages':pages},policy,root=ROOT),'producer request differs from exact public context')
+        require(read(job['producer_request'])==producer_request(value,job['source'],pages,policy),'producer request differs from exact public context')
         require(job['key']==hashlib.sha256(url.encode()).hexdigest()[:24],'source scope changed')
         for name in ('producer_attempt_id','reviewer_attempt_id'):require(str(uuid.UUID(job[name]))==job[name],'invalid retained attempt identity')
     return plan,(value,spec,run,policy,campaign,forbidden,worklist,captures)
@@ -137,7 +172,13 @@ def prepared(plan_binding,value,policy,job,role,request):
     # Stable original-workbook/source/role scope prevents a new output directory
     # from acquiring a fresh first-attempt budget in the same campaign.
     scope=executor.SemanticScope(value['workbook_id'],value['original_source']['sha256'],'harbor-source-profiler','profile-'+job['key']+'-'+role)
-    return executor.PreparedCall(request,policy,scope,1,2 if role=='producer' else 1,job[role+'_attempt_id'],(plan_binding,value['phase1'],value['inventory'],value['captures']),response_mode='json_object')
+    ordinal=1;attempt_id=job[role+'_attempt_id'];evidence=(plan_binding,value['phase1'],value['inventory'],value['captures'])
+    if role=='producer'and 'producer_recovery'in value:
+        from scripts.batch import harbor_profile_correction as Q
+        q,_,prior,*_=Q.validate(value['producer_recovery'],root=ROOT)
+        if job['key']==prior['key']:
+            ordinal=2;attempt_id=q['attempt_id'];evidence+= (value['producer_recovery'],)
+    return executor.PreparedCall(request,policy,scope,ordinal,2 if role=='producer' else 1,attempt_id,evidence,response_mode='json_object')
 
 
 def call(prepared,campaign,*,dispatch,credential):
@@ -178,15 +219,30 @@ def run(plan_binding,*,dispatch=False,credential=None):
     plan,context=checked_plan(plan_binding);value,spec,run_dir,policy,campaign,forbidden,worklist,captures=context
     root=Path(plan_binding['path']).parent
     if plan['blocked']:return {'status':'STOPPED','blocking':plan['blocked'],'model_dispatches':0,'evidence':[plan_binding]}
-    calls=[];fragments=[];outcomes=[]
+    calls=[];fragments=[];outcomes=[];skipped_profiles=[]
+    from scripts.batch.harbor_profile_skips import validate as validate_skip
+    for row in plan['skips']:
+        source=next(r for r in worklist if r['canonical_url']==row['canonical_url'])
+        profile=validate_skip(source,row['captures'],forbidden,phase1=value['phase1'],inventory=value['inventory'])['profile'];skipped_profiles.append(profile)
+        fragments.append(retained(root/(profile['source_id']+'-fragment.json'),profile))
     for job in plan['jobs']:
-        folder=root/job['key'];prod=prepared(plan_binding,value,policy,job,'producer',job['producer_request'])
-        result=call(prod,campaign,dispatch=dispatch,credential=credential)
-        if result is None:return {'status':'PENDING_PRODUCER','source':job['key'],'prepared':asdict(prod),'evidence':[plan_binding]}
-        outcomes.append(result.outcome)
-        if result.status!='completed':return {'status':'STOPPED','code':'producer_'+result.status,'evidence':outcomes,'automatic_retry':False}
-        try:fragment=producer_fragment(result.call,read(job['producer_request']),job['source'],forbidden,policy)
-        except (Exception,SystemExit) as exc:return stopped(root,'producer_fragment_invalid',exc,plan_binding,outcomes)
+        folder=root/job['key'];derived=value.get('producer_derivation')
+        if derived is not None and read(read(derived)['original_plan'])['jobs'][0]['key']!=job['key']:derived=None
+        if derived is not None:
+            from scripts.batch import harbor_profile_derivation as D
+            declaration,result,fragment,projection=D.validate(derived,root=ROOT,source=job['source'],policy=policy)
+            retained(folder/'derived-fragment.json',dict(schema_version='harbor-derived-profile-fragment/v1',
+                declaration=derived,original_completed=result.outcome,original_response=result.call.response,
+                fragment=fragment,projection=projection,independent_review_status='pending'))
+            outcomes.append(result.outcome)
+        else:
+            folder=root/job['key'];prod=prepared(plan_binding,value,policy,job,'producer',job['producer_request'])
+            result=call(prod,campaign,dispatch=dispatch,credential=credential)
+            if result is None:return {'status':'PENDING_PRODUCER','source':job['key'],'prepared':asdict(prod),'evidence':[plan_binding]}
+            outcomes.append(result.outcome)
+            if result.status!='completed':return {'status':'STOPPED','code':'producer_'+result.status,'evidence':outcomes,'automatic_retry':False}
+            try:fragment=producer_fragment(result.call,read(job['producer_request']),job['source'],forbidden,policy)
+            except (Exception,SystemExit) as exc:return stopped(root,'producer_fragment_invalid',exc,plan_binding,outcomes)
         pages,_=profiles.captured_pages(job['captures'],job['source']['canonical_url'],forbidden,root=ROOT)
         reviewer_request=retained(folder/'reviewer-request.json',profiles.request('reviewer',{'fragment':fragment,'public_pages':pages},policy,root=ROOT))
         rev=prepared(plan_binding,value,policy,job,'reviewer',reviewer_request)
@@ -194,7 +250,7 @@ def run(plan_binding,*,dispatch=False,credential=None):
         if reviewed is None:return {'status':'PENDING_REVIEWER','source':job['key'],'prepared':asdict(rev),'evidence':outcomes}
         outcomes.append(reviewed.outcome)
         if reviewed.status!='completed':return {'status':'STOPPED','code':'reviewer_'+reviewed.status,'evidence':outcomes,'automatic_retry':False}
-        combined=profiles.ProfileCall(job['source']['canonical_url'],result.call,reviewed.call,tuple(job['captures']))
+        combined=profiles.ProfileCall(job['source']['canonical_url'],result.call,reviewed.call,tuple(job['captures']),value.get('producer_recovery') if derived is not None or prod.ordinal==2 else None,derived)
         try:checked=profiles.accepted_profile(combined,job['source'],forbidden,policy=policy,root=ROOT)
         except (Exception,SystemExit) as exc:return stopped(root,'independent_profile_invalid',exc,plan_binding,outcomes)
         if not checked['accepted']:return stopped(root,'independent_profile_rejected',ValueError('independent reviewer rejected profile'),plan_binding,outcomes)
@@ -207,20 +263,20 @@ def run(plan_binding,*,dispatch=False,credential=None):
         assembler.cmd_init(SimpleNamespace(out=candidate,force=False,created_at=None,spec=Path(value['phase1']['path']),inventory=Path(value['inventory']['path'])))
     # An interrupted init/merge resumes only an existing valid subset of these
     # exact independently accepted profiles. Any unrelated content stays closed.
-    expected=[profiles.accepted_profile(c,j['source'],forbidden,policy=policy,root=ROOT)['profile'] for c,j in zip(calls,plan['jobs'])]
+    expected=skipped_profiles+[profiles.accepted_profile(c,j['source'],forbidden,policy=policy,root=ROOT)['profile'] for c,j in zip(calls,plan['jobs'])]
     existing=read(record(candidate))
     require(not validator.validate_document(existing,forbidden=forbidden,inventory_path=Path(value['inventory']['path']),spec_path=Path(value['phase1']['path'])),'partial assembler envelope is invalid')
     require(all(p in expected for p in existing['profiles']),'partial assembler contains unrelated profiles')
     if fragments:
         require(assembler.cmd_merge(SimpleNamespace(doc=candidate,fragment=[Path(f['path']) for f in fragments]))==0,'owning profile assembler rejected fragments')
-    expected=[profiles.accepted_profile(c,j['source'],forbidden,policy=policy,root=ROOT)['profile'] for c,j in zip(calls,plan['jobs'])]
+    expected=skipped_profiles+[profiles.accepted_profile(c,j['source'],forbidden,policy=policy,root=ROOT)['profile'] for c,j in zip(calls,plan['jobs'])]
     require(read(record(candidate))['profiles']==sorted(expected,key=lambda p:p['source_id']),'assembled profile catalog differs from actual accepted fragments')
     try:
         document=read(record(candidate));map_value=mapping(spec,document,value['phase1']['sha256'],record(candidate)['sha256'])
         mapping_record=retained(root/'assembled-mapping.json',map_value)
-        selection=profiles.ProfileSelection(value['phase1'],value['inventory'],record(candidate),mapping_record,tuple(calls),policy)
+        selection=profiles.ProfileSelection(value['phase1'],value['inventory'],record(candidate),mapping_record,tuple(calls),policy,tuple(plan['skips']))
         validated=profiles.validate_profiles(selection,root=ROOT)
-        require(validated['confidence']=='high','profile confidence is not high')
+        require(validated['confidence']=='high' or (validated['confidence']=='medium' and validated['skipped_profiles']==len(plan['skips'])>0),'unsupported profile fallback confidence')
     except (Exception,SystemExit) as exc:return stopped(root,'profile_mapping_or_final_validation',exc,plan_binding,outcomes)
     checked_plan(plan_binding)
     final_profiles=run_dir/'source_profiles.json';final_mapping=run_dir/'source_profile_mapping.json'
@@ -228,11 +284,11 @@ def run(plan_binding,*,dispatch=False,credential=None):
         raw=source.read_bytes()
         if destination.exists():require(destination.read_bytes()==raw,'existing profile output differs; explicit archival required')
         else:executor.retain(destination,raw)
-    final=profiles.ProfileSelection(value['phase1'],value['inventory'],record(final_profiles),record(final_mapping),tuple(calls),policy)
+    final=profiles.ProfileSelection(value['phase1'],value['inventory'],record(final_profiles),record(final_mapping),tuple(calls),policy,tuple(plan['skips']))
     final_proof=profiles.validate_profiles(final,root=ROOT)
-    receipt={'schema_version':SCHEMA,'status':'COMPLETE','plan':plan_binding,'selection':asdict(final),'outcomes':outcomes,'model_calls':len(calls)*2,'confidence':final_proof['confidence'],'tracker_mutated':False}
+    receipt={'schema_version':SCHEMA,'status':'COMPLETE','plan':plan_binding,'selection':asdict(final),'outcomes':outcomes,'model_calls':sum(2+int(c.producer_recovery is not None)for c in calls),'confidence':final_proof['confidence'],'tracker_mutated':False}
     complete=retained(root/'complete.json',receipt)
-    return {'status':'COMPLETE','receipt':complete,'selection':final,'model_calls':len(calls)*2}
+    return {'status':'COMPLETE','receipt':complete,'selection':final,'model_calls':sum(2+int(c.producer_recovery is not None)for c in calls)}
 
 
 def stopped(root,code,error,plan,outcomes):

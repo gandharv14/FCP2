@@ -270,6 +270,69 @@ def value_matches_target(value: Any, target: ValueTarget) -> bool:
     return isinstance(value, str) and normalized_text(value) in string_candidates
 
 
+@dataclass(frozen=True)
+class _ValueSignature:
+    """Scan-local parsed value; no workbook evidence or results are cached."""
+
+    boolean: bool | None
+    date: dt.date | None
+    number: decimal.Decimal | None
+    text: str | None
+    represented: tuple[decimal.Decimal, ...]
+
+
+def _value_signature(value: Any) -> _ValueSignature:
+    represented = ()
+    if isinstance(value, str):
+        parsed = _numeric_string(value)
+        if parsed is not None:
+            number, is_percent = parsed
+            represented = (number, number / decimal.Decimal(100)) if is_percent else (number,)
+    return _ValueSignature(
+        value if isinstance(value, bool) else None,
+        _as_date(value), _as_decimal(value),
+        normalized_text(value) if isinstance(value, str) else None,
+        represented,
+    )
+
+
+@dataclass(frozen=True)
+class _PreparedTarget:
+    target: ValueTarget
+    booleans: tuple[bool, ...]
+    dates: tuple[dt.date, ...]
+    numbers: tuple[decimal.Decimal, ...]
+    strings: tuple[str, ...]
+
+    @classmethod
+    def prepare(cls, target: ValueTarget) -> "_PreparedTarget":
+        candidates = (target.raw, target.mcp)
+        dates = tuple(_as_date(candidate) for candidate in candidates)
+        numbers = tuple(_as_decimal(candidate) for candidate in candidates)
+        return cls(target,
+            tuple(candidate for candidate in candidates if isinstance(candidate, bool)),
+            tuple(date for date in dates if date is not None),
+            tuple(number for number in numbers if number is not None),
+            tuple(normalized_text(candidate) for candidate, date in zip(candidates, dates)
+                  if isinstance(candidate, str) and date is None))
+
+    def matches(self, value: _ValueSignature) -> bool:
+        # Preserve the public reference matcher's typed, date, numeric,
+        # percent, and text alternatives, including its numeric tolerance.
+        if self.booleans:
+            if value.boolean is not None and value.boolean in self.booleans:
+                return True
+            if value.text is not None and value.text in tuple(str(x).casefold() for x in self.booleans):
+                return True
+        if value.date is not None and value.date in self.dates:
+            return True
+        if value.number is not None and any(_decimals_equal(value.number, candidate) for candidate in self.numbers):
+            return True
+        if any(_decimals_equal(form, candidate) for form in value.represented for candidate in self.numbers):
+            return True
+        return value.text is not None and value.text in self.strings
+
+
 RENDERING_KINDS = (
     "raw_number",
     "formatted_text",
@@ -541,6 +604,7 @@ def check_workbook(
     try:
         expanded_mask = set(expand_refs(mask_refs))
         targets = value_targets(audit)
+        prepared_targets = [_PreparedTarget.prepare(target) for target in targets]
         audit_refs: set[str] = set()
         manifest_errors: list[str] = []
         for entry in audit:
@@ -557,27 +621,35 @@ def check_workbook(
             for ref in sorted(audit_refs - expanded_mask):
                 manifest_errors.append("audit ref absent from mask: %s" % display_ref(ref))
 
-        not_blank: list[dict[str, Any]] = []
+        # A read-only worksheet coordinate lookup reparses its XML. Capture
+        # masked values during the leak scan instead of reparsing once per mask.
+        # Keep the original lookup for coordinates outside the yielded extent:
+        # workbook dimension metadata can underreport rows or columns.
+        from openpyxl.utils.cell import coordinate_to_tuple
+        mask_by_row: dict[str, dict[int, list[tuple[int, str]]]] = {}
         for ref in sorted(expanded_mask):
             sheet, _, coordinate = ref.rpartition("!")
-            if sheet not in book.sheetnames:
-                not_blank.append({"cell": display_ref(ref), "value": "<unknown sheet>"})
-                continue
-            value = book[sheet][coordinate].value
-            if value is not None:
-                not_blank.append({"cell": display_ref(ref), "value": repr(value)})
+            row, column = coordinate_to_tuple(coordinate)
+            mask_by_row.setdefault(sheet, {}).setdefault(row, []).append((column, ref))
+        masked_values: dict[str, Any] = {}
 
         found: dict[tuple[str, str], dict[str, Any]] = {}
         for sheet in book.worksheets:
-            for row in sheet.iter_rows():
+            selected_rows = mask_by_row.get(sheet.title, {})
+            for row_index, row in enumerate(sheet.iter_rows(), 1):
+                for column, ref in selected_rows.get(row_index, ()):
+                    if column <= len(row):
+                        masked_values[ref] = row[column - 1].value
                 for cell in row:
                     if cell.value is None:
                         continue
                     ref = "%s!%s" % (sheet.title, cell.coordinate)
                     if ref in expanded_mask:
                         continue
-                    for target in targets:
-                        if value_matches_target(cell.value, target):
+                    signature = _value_signature(cell.value)
+                    for prepared_target in prepared_targets:
+                        target = prepared_target.target
+                        if prepared_target.matches(signature):
                             key = (ref, target.variable_id)
                             found[key] = {
                                 "cell": display_ref(ref),
@@ -587,6 +659,16 @@ def check_workbook(
                                     cell.value, target
                                 ),
                             }
+
+        not_blank: list[dict[str, Any]] = []
+        for ref in sorted(expanded_mask):
+            sheet, _, coordinate = ref.rpartition("!")
+            if sheet not in book.sheetnames:
+                not_blank.append({"cell": display_ref(ref), "value": "<unknown sheet>"})
+                continue
+            value = masked_values[ref] if ref in masked_values else book[sheet][coordinate].value
+            if value is not None:
+                not_blank.append({"cell": display_ref(ref), "value": repr(value)})
 
         found_keys = set(found)
         approved_keys = found_keys & set(allowlist)

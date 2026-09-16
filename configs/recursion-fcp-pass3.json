@@ -1,0 +1,393 @@
+{
+  "status": "opus_max_57_terminal_with_four_unscored_failures_fifteen_tasks_prepared",
+  "labelboxProjectId": "cmt3hsyg401o1073mdwttb3w0",
+  "labelboxProjectName": "FCP Project",
+  "tasksRoot": "/Users/gandharvmahajan/Documents/AlignerrProjects/xAI/FCP_2/tasks_outputs",
+  "apiBaseUrl": "https://api.recursion.labelbox.com",
+  "cliPackage": "@labelbox/recursion-cli@0.0.50",
+  "evaluationMetadata": {
+    "schemaVersion": 1,
+    "attemptsPerProblem": 3,
+    "successThreshold": 1
+  },
+  "requestedSolvers": [
+    {
+      "modelDisplayName": "Opus 5 max",
+      "harness": "claude-code",
+      "verifiedModelId": "claude-opus-5",
+      "lockedRunConfigVersionId": "528e881f-a0bd-4a0e-bac0-a80ef5cbeba5",
+      "existingRunConfigId": "f1b2a9fb-8434-4b87-b39f-da712600d451",
+      "verifiedParentVersionId": "528e881f-a0bd-4a0e-bac0-a80ef5cbeba5",
+      "parentVersionNumber": 34,
+      "parentProbeStatus": "PASS",
+      "args": [
+        "--model",
+        "claude-opus-5",
+        "--effort",
+        "max"
+      ],
+      "parentHarnessImageUrl": "us-central1-docker.pkg.dev/lb-ml-dev/fde-runners/runner-fcp-claude-code-opus-5@sha256:dd7cb52a1ad7e29c29717c2ca45b60f4a1e9eb1ce283c50045e82a7eaf280316",
+      "runtimeProbes": [
+        "plain: succeeded",
+        "research: succeeded"
+      ],
+      "thinkingLevel": "max",
+      "envVars": {
+        "ANTHROPIC_MODEL": "claude-opus-5",
+        "CLAUDE_CODE_EFFORT_LEVEL": "max",
+        "ANTHROPIC_SMALL_FAST_MODEL": "claude-opus-5",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-5",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-opus-5",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-opus-5"
+      }
+    }
+  ],
+  "environmentId": "70c0c824-7efb-4562-8482-185398e78b53",
+  "requirements": [
+    "Use only claude-opus-5 with --effort max and CLAUDE_CODE_EFFORT_LEVEL=max; route auxiliary and subagent calls to the same model. Reject stale solver configs before submission.",
+    "Verify the Recursion environment is linked to the requested Labelbox project.",
+    "Verify model routing, harness arguments, environment variables, images, and successful runtime probes before locking configs.",
+    "Pin current instruction, workbook, research runtime and grader using the generation manifest.",
+    "Track coverage by generation and solver config, not task ID alone.",
+    "Run three independent attempts for each model; infrastructure retries are not extra samples.",
+    "Use the verified repository full discrete pass definition and successThreshold=1.",
+    "This is a preparation contract, not a submit-ready Recursion API payload."
+  ],
+  "environmentVerification": "Confirmed in the Labelbox project Environment tab on 2026-09-14.",
+  "parentTaskSetSha256": "88539d26b937391ad0a019ac0d11a37cf2de9e02b07a350535eb89bfa77c068e",
+  "parentConfigCaveat": "Use the verified Opus max parent in requestedSolvers. Preserve generation-specific image layers and inherit its current project credential attachment.",
+  "credentialKeyName": "lbx_labelbox_api_key",
+  "accessVerifiedAt": "2026-09-14T19:20:36.156587+00:00",
+  "automation": {
+    "id": "evaluate-new-fcp-tasks-on-recursion",
+    "status": "ACTIVE",
+    "intervalMinutes": 30,
+    "automaticEvaluationAuthorized": true,
+    "modelPolicy": "Opus 5 max only / Claude Code"
+  },
+  "activeCampaign": "ca3cd4ddd877f888",
+  "graderMode": "discrete",
+  "activeEvaluations": [
+    {
+      "id": "90c6cebe-f785-4df9-bb82-ed245b95d6bb",
+      "models": [
+        "opus"
+      ],
+      "taskGenerations": 2,
+      "attempts": 6,
+      "concurrency": 75,
+      "campaign": "aebe8305d269d60e"
+    },
+    {
+      "id": "8afe0434-87fe-449d-8ee6-e22996b5646b",
+      "models": [
+        "opus"
+      ],
+      "taskGenerations": 2,
+      "attempts": 6,
+      "concurrency": 75,
+      "campaign": "34c51c3abe1ac1a4"
+    },
+    {
+      "id": "fe69bb2c-9cc9-450f-90b3-387be2ddedeb",
+      "models": [
+        "gemini"
+      ],
+      "taskGenerations": 2,
+      "attempts": 6,
+      "concurrency": 75,
+      "campaign": "34c51c3abe1ac1a4"
+    },
+    {
+      "id": "62679161-0698-465d-a9e5-959159b787e2",
+      "models": [
+        "opus"
+      ],
+      "taskGenerations": 2,
+      "attempts": 6,
+      "concurrency": 75,
+      "campaign": "34c51c3abe1ac1a4"
+    },
+    {
+      "id": "6f6611bc-2919-46d8-b3bf-29fbf8fbe4e4",
+      "models": [
+        "gemini"
+      ],
+      "taskGenerations": 2,
+      "attempts": 6,
+      "concurrency": 75,
+      "campaign": "34c51c3abe1ac1a4"
+    },
+    {
+      "id": "9e69a296-514c-4408-8b2b-c42ca62953d2",
+      "models": [
+        "opus"
+      ],
+      "taskGenerations": 2,
+      "attempts": 6,
+      "concurrency": 75,
+      "campaign": "75188f9381f40589"
+    },
+    {
+      "id": "b659af57-9f26-4978-9960-cc29ed8af7d2",
+      "models": [
+        "opus"
+      ],
+      "taskGenerations": 1,
+      "attempts": 3,
+      "concurrency": 75,
+      "campaign": "75188f9381f40589"
+    },
+    {
+      "id": "8fa7b698-5874-439a-8259-fd0cab018090",
+      "models": [
+        "gemini"
+      ],
+      "taskGenerations": 2,
+      "attempts": 6,
+      "concurrency": 75,
+      "campaign": "75188f9381f40589"
+    },
+    {
+      "id": "0f271bb5-2fc9-4c20-870e-4327b529767f",
+      "models": [
+        "gemini"
+      ],
+      "taskGenerations": 1,
+      "attempts": 3,
+      "concurrency": 75,
+      "campaign": "75188f9381f40589"
+    },
+    {
+      "id": "80f031f3-1f69-4d7b-9caf-6119961bd280",
+      "models": [
+        "opus"
+      ],
+      "taskGenerations": 1,
+      "attempts": 3,
+      "concurrency": 75,
+      "campaign": "288277d74615a8ce"
+    },
+    {
+      "id": "8186f50a-c2c3-4ded-8df0-0855e188e95d",
+      "models": [
+        "opus"
+      ],
+      "taskGenerations": 1,
+      "attempts": 3,
+      "concurrency": 75,
+      "campaign": "288277d74615a8ce"
+    },
+    {
+      "id": "abce1bb2-7e06-490b-80d3-d6d54c95f124",
+      "models": [
+        "gemini"
+      ],
+      "taskGenerations": 1,
+      "attempts": 3,
+      "concurrency": 75,
+      "campaign": "288277d74615a8ce"
+    },
+    {
+      "id": "df63ad73-f6b3-43b9-b530-038170979630",
+      "models": [
+        "gemini"
+      ],
+      "taskGenerations": 1,
+      "attempts": 3,
+      "concurrency": 75,
+      "campaign": "288277d74615a8ce"
+    },
+    {
+      "id": "a6ddeee2-1555-4570-8cd6-595e339c7db3",
+      "models": [
+        "opus"
+      ],
+      "taskGenerations": 23,
+      "attempts": 69,
+      "concurrency": 75,
+      "campaign": "ca3cd4ddd877f888"
+    },
+    {
+      "id": "fdf9aef3-80ba-4b96-ae97-4c9352fb8392",
+      "models": [
+        "opus"
+      ],
+      "taskGenerations": 22,
+      "attempts": 66,
+      "concurrency": 75,
+      "campaign": "ca3cd4ddd877f888"
+    },
+    {
+      "id": "5ea0be40-d687-4544-8fd7-53b3a13eb800",
+      "models": [
+        "gemini"
+      ],
+      "taskGenerations": 23,
+      "attempts": 69,
+      "concurrency": 75,
+      "campaign": "ca3cd4ddd877f888"
+    },
+    {
+      "id": "84f91c66-9a76-4947-8c15-45af2d0d3412",
+      "models": [
+        "gemini"
+      ],
+      "taskGenerations": 22,
+      "attempts": 66,
+      "concurrency": 75,
+      "campaign": "ca3cd4ddd877f888"
+    }
+  ],
+  "blocker": {
+    "tasks": [
+      "0079",
+      "0070",
+      "0177",
+      "0171",
+      "0187",
+      "0095",
+      "0102",
+      "0136",
+      "0291",
+      "0488",
+      "0046",
+      "0217",
+      "0064",
+      "0293",
+      "0312"
+    ],
+    "reason": "Private task publication remains held by automatic review. Existing questions cover six prepared tasks; later 0102, 0136, 0291, 0488, 0046, 0217, 0064, 0293 and 0312 are prepared under the same hold without additional repeated questions.",
+    "details": "reports/recursion/opus-max-20260915/three-task-publication-review.json",
+    "additionalReview": "reports/recursion/campaigns/31fd947db89c198c/preparation-review.json",
+    "latestReview": "reports/recursion/campaigns/e806625fc6f70f6e/preparation-review.json"
+  },
+  "opusCredential": {
+    "status": "approved_stored_attached_verified",
+    "sourceKey": "anthropic_api_key",
+    "customerSecretId": "bc7920a3-3d41-4090-a02c-37587ae944fa",
+    "scope": "FCP environment",
+    "lockedVersionId": "528e881f-a0bd-4a0e-bac0-a80ef5cbeba5"
+  },
+  "concurrencyPerModel": 150,
+  "perEvaluationConcurrencyLimit": 75,
+  "concurrencyStrategy": "Two disjoint task partitions per model, each at 75; aggregate campaign-family budget 150 per model.",
+  "supersededEvaluations": [
+    {
+      "id": "d5cabb04-80b4-451d-b858-77bac3bab74f",
+      "models": [
+        "gemini"
+      ],
+      "receipt": "evaluation-gemini"
+    },
+    {
+      "id": "94888f8e-ef1d-4d87-b2e4-19c43c23a8fa",
+      "models": [
+        "opus"
+      ],
+      "receipt": "evaluation-opus"
+    }
+  ],
+  "pendingCampaigns": [
+    "2d7bdb608174038c",
+    "cc2d99a09687fdc4",
+    "071ce1609fb3f255",
+    "31fd947db89c198c",
+    "0787bf753672d579",
+    "db47055c9d2d0515",
+    "afa5f11387f76294",
+    "3ef85bcd9b9cc900",
+    "92112b54e0fce069",
+    "2af5dbc57e1e2406",
+    "04f2979cd29d72b6",
+    "7aaf1f108933d254",
+    "e806625fc6f70f6e"
+  ],
+  "registryStandingApproval": "reports/recursion/registry-standing-approval.json",
+  "solverPolicy": {
+    "models": [
+      "claude-opus-5"
+    ],
+    "effort": "max",
+    "auxiliaryModels": "claude-opus-5",
+    "smokeVerification": "passed",
+    "effectiveDate": "2026-09-15",
+    "evidence": "reports/recursion/opus-max-20260915/probe-status.json",
+    "bulkDefaultVersionId": "528e881f-a0bd-4a0e-bac0-a80ef5cbeba5",
+    "interactiveMenu": "locked_to_v34_only"
+  },
+  "opusMaxRerun": {
+    "path": "reports/recursion/opus-max-20260915",
+    "tasks": 809,
+    "submittedTasks": 752,
+    "pendingApprovalTasks": 0,
+    "evaluationIds": [
+      "ba3ecbfb-a4b9-46fc-b220-31edd2727196",
+      "5fa7a7de-7a28-423e-a760-b6d948bed94e"
+    ],
+    "scoreCommand": "python3 scripts/recursion_opus_max_scores.py",
+    "submittedEvaluationsTerminal": true,
+    "scoreSummaryPath": "reports/recursion/opus-max-20260915/score-summary.json"
+  },
+  "opusMaxRemaining": {
+    "path": "reports/recursion/opus-max-20260915/groups",
+    "approvedTasks": 60,
+    "approvedEvaluationAttempts": 180,
+    "resumeCommand": ".venv/bin/python scripts/recursion_opus_max_remaining.py",
+    "scoreCommand": ".venv/bin/python scripts/recursion_opus_max_remaining_scores.py",
+    "publicationReviewBlockedTasks": [
+      "0079",
+      "0070",
+      "0177"
+    ],
+    "approvalPath": "reports/recursion/opus-max-20260915/remaining-approval.json",
+    "submittedTasks": 57,
+    "submittedAttempts": 171,
+    "evaluationIds": [
+      "b616c5bd-d17b-4013-9e48-5ddd41678dfe",
+      "c61fbf34-889f-4fe7-81ae-5a56ac2da896",
+      "ce1cef54-4abb-4e9d-92fb-e5436b545892",
+      "fbee0534-6e0b-42ea-885f-f34999150775",
+      "5560d807-1fb8-40eb-ab8d-504ce69bb998"
+    ],
+    "scoreSummaryPath": "reports/recursion/opus-max-20260915/remaining-score-summary.json",
+    "latestResults": {
+      "checkedAt": "2026-09-15T22:46:38.808623+00:00",
+      "taskCount": 60,
+      "submittedTasks": 57,
+      "states": {
+        "awaiting_publication_approval": 3,
+        "scored": 53,
+        "unscored_error": 4
+      },
+      "attemptStatuses": {
+        "completed": 167,
+        "failed": 4
+      },
+      "completeTriples": 53,
+      "passingTriples": 17,
+      "passAt3": null,
+      "submittedEvaluationsTerminal": true
+    },
+    "suspectedStalledRunIds": [],
+    "submittedEvaluationsTerminal": true,
+    "unscoredFailedRunIds": [
+      "6be05d0f-a74e-4a93-aaf5-5047d304c3d3",
+      "9ddb924b-8098-480a-83f8-b5057026092c",
+      "e94ac51d-16f6-426c-93e3-d4b1f23bf9ad",
+      "13cd7640-faa6-4cae-8be0-4c67255f6517"
+    ]
+  },
+  "historicalBlockers": [
+    {
+      "model": "Gemini 3.8 Flash",
+      "taskId": "0570",
+      "reason": "Solver timeout has no score; in-place regrade cannot clone failed source run. One replacement solver attempt proposed, pending retry-policy decision.",
+      "proposal": "reports/recursion/campaigns/ca3cd4ddd877f888/failure-diagnostics/gemini-replacement-proposal.json"
+    }
+  ],
+  "supersededPendingCampaigns": [
+    "aebe8305d269d60e"
+  ]
+}

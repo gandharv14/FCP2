@@ -20,8 +20,10 @@ from __future__ import annotations
 import argparse
 import collections
 import copy
+import decimal
 import hashlib
 import json
+import math
 import os
 import pprint
 import re
@@ -191,6 +193,41 @@ def atomic_json(path, payload):
 
 
 def analyse(wb, source_file, expected_source_sha256, *, runs_root="runs", inputs_root="inputs_out"):
+    return _analyse(wb, source_file, expected_source_sha256, runs_root=runs_root,
+                    inputs_root=inputs_root, baseline_primitives=True)
+
+
+def historical_source_analysis(wb, source_file, expected_source_sha256, *, runs_root="runs", inputs_root="inputs_out"):
+    """Reconstruct retained pre-baseline-index review evidence, never new work.
+
+    Owning refinement validators compare this result with the exact original
+    submitted analysis. All current production continues through ``analyse``.
+    """
+    return _analyse(wb, source_file, expected_source_sha256, runs_root=runs_root,
+                    inputs_root=inputs_root, baseline_primitives=False)
+
+
+_VISIBLE_NUMBER = re.compile(
+    r"(?<![A-Za-z0-9.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)"
+    r"(?:\.\d+)?(?:[eE][-+]?\d+)?%?(?![A-Za-z0-9.])")
+
+
+def visible_numeric_values(text):
+    """Index explicit numeric renderings in delivered text without masking it.
+
+    Percent text exposes both its written number and its ratio. These are the
+    same closed number boundaries used by the final workbook leak scanner.
+    A disclosed label must remain visible, so its matches are exclusion-only.
+    """
+    for match in _VISIBLE_NUMBER.finditer(text):
+        token=match.group();percent=token.endswith('%')
+        value=decimal.Decimal(token.rstrip('%').replace(',',''))
+        for number in (value,value/100) if percent else (value,):
+            numeric=float(number)
+            if math.isfinite(numeric):yield numeric
+
+
+def _analyse(wb, source_file, expected_source_sha256, *, runs_root, inputs_root, baseline_primitives):
     run = Path(runs_root) / f"{wb}-variable-sources"
     draft = json.loads((run / "draft.json").read_text(encoding="utf-8"))
     source = Path(source_file)
@@ -228,8 +265,30 @@ def analyse(wb, source_file, expected_source_sha256, *, runs_root="runs", inputs
             k = vkey(c.value)
             if k is not None and s in BI.sheetnames and BI[s][c.coordinate].value is not None:
                 val_index[k].append(f"{s}!{c.coordinate}")
+    # Baseline preparation can introduce visible primitives on new sheets,
+    # notably extracted Embedded Assumptions. They can reveal a research answer
+    # even though no cell at that location exists in the source workbook.
+    source_value_refs = {key:set(refs) for key,refs in val_index.items()}
+    baseline_only_refs = set()
+    for sheet in BI if baseline_primitives else ():
+        for cell in sheet._cells.values():
+            if cell.data_type == 'f':
+                continue
+            key = vkey(cell.value)
+            if key is not None:
+                reference = f"{sheet.title}!{cell.coordinate}"
+                val_index[key].append(reference)
+                if reference not in source_value_refs.get(key,set()):
+                    baseline_only_refs.add(reference)
+            if isinstance(cell.value,str):
+                reference=f"{sheet.title}!{cell.coordinate}"
+                for number in visible_numeric_values(cell.value):
+                    val_index[vkey(number)].append(reference)
+                    # Even a picklist label carries source meaning; do not
+                    # erase its text to conceal a number embedded inside it.
+                    baseline_only_refs.add(reference)
     # Each typed-value relationship is stored once, shared by every candidate.
-    val_index = {k: sorted(refs) for k, refs in val_index.items()}
+    val_index = {k: sorted(set(refs)) for k, refs in val_index.items()}
 
     baseline = resolve_workbook_artifact(inputs_root, wb, "%s-inputs")
     evidence = {"draft_sha256": _sha256(run / "draft.json"),
@@ -301,7 +360,9 @@ def analyse(wb, source_file, expected_source_sha256, *, runs_root="runs", inputs
                     if other in covered or other in extra_set:
                         continue
                     osh, _ = other.rsplit("!", 1)
-                    if PICKLIST.search(osh): extra_set.add(other)
+                    # A sheet label cannot prove a newly generated primitive
+                    # is the same semantic input as an unrelated source value.
+                    if PICKLIST.search(osh) and other not in baseline_only_refs: extra_set.add(other)
                     else: leaks.append(other)
                 closure_cache[cache_key] = (sorted(extra_set), sorted(set(leaks)))
             extra, leaks = closure_cache[cache_key]
@@ -451,21 +512,36 @@ def coalesce_same_atom_aliases(variables, included):
         if len(rows)==1:
             merged.append(copy.deepcopy(rows[0]));mapping[rows[0]["id"]]=rows[0]["id"];continue
         comparable=[]
+        # Repeated source routes can place their source caption in the notes
+        # column. Preserve every caption; other note differences still fail.
+        notes = {row.get("source_notes") for row in rows}
+        attribution_union = len(notes) > 1 and all(
+            isinstance(row.get("source_notes"), str) and row["source_notes"].strip()
+            and row["source_notes"] in {source.get("name") for source in row["sources"]}
+            for row in rows
+        )
         for row in rows:
-            item={k:v for k,v in row.items() if k not in {"id","sources"}}
+            ignored = {"id", "sources"} | ({"source_notes"} if attribution_union else set())
+            item={k:v for k,v in row.items() if k not in ignored}
             item["cells"]=sorted(item["cells"])
             if "extra_cells" in item:item["extra_cells"]=sorted(item["extra_cells"])
             comparable.append(canonical(item))
         if len(set(comparable))!=1:
             raise ValueError("same physical atom has conflicting semantic dimensions/value/question/notes; diagnosis required")
         chosen=min(rows,key=lambda row:row["id"]);value=copy.deepcopy(chosen)
+        if attribution_union:
+            value["source_notes"] = "\n".join(sorted(notes))
         sources={canonical(source):copy.deepcopy(source) for row in rows for source in row["sources"]}
         value["sources"]=[sources[k] for k in sorted(sources)];merged.append(value)
         aliases=[]
         for row in sorted(rows,key=lambda row:row["id"]):
             mapping[row["id"]]=chosen["id"]
             aliases.append(dict(id=row["id"],sources=copy.deepcopy(row["sources"]),definition_sha256=hashlib.sha256(canonical(row)).hexdigest()))
-        provenance.append(dict(canonical_id=chosen["id"],cells=list(key),aliases=aliases))
+        group = dict(canonical_id=chosen["id"],cells=list(key),aliases=aliases)
+        if attribution_union:
+            group["source_note_union"] = [dict(id=row["id"], source_notes=row["source_notes"])
+                                          for row in sorted(rows, key=lambda row: row["id"])]
+        provenance.append(group)
     projected={draft:list(dict.fromkeys(mapping[vid] for vid in ids)) for draft,ids in included.items()}
     if set(mapping)!={v["id"] for v in variables}:raise ValueError("alias provenance does not cover emitted identities")
     return merged,projected,dict(schema_version="same-physical-atom-aliases/v1",original_entries=len(variables),canonical_atoms=len(merged),groups=provenance)

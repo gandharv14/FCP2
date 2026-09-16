@@ -185,3 +185,78 @@ def test_profile_lane_context_is_bound_before_final_spec(tmp_path,change):
     if change is None:profile_context(p,s)
     else:
         with pytest.raises(ValueError):profile_context(p,s)
+
+
+def test_same_url_preserves_all_reviewed_aliases_and_caveats():
+    import copy
+    url='https://example.org/public-data'
+    a=dict(name='Monthly archive; transcription unverified',kind='statistics',url=url,id='original-a')
+    b=dict(name='Class A statements; reconcile independently',kind='statistics',url=url,id='original-b')
+    spec={'variables':[{'sources':[a,b,a]}]};before=copy.deepcopy(spec)
+    result=r.worklist(spec,set())
+    assert result==[dict(source_name='Class A statements; reconcile independently; Monthly archive; transcription unverified',source_kind='statistics',canonical_url=url)]
+    assert spec==before
+    assert r.worklist({'variables':[{'sources':[b,a]}]},set())==result
+
+
+def test_same_url_conflicting_kind_remains_closed():
+    a=dict(name='Monthly archive',kind='statistics',url='https://example.org/public-data')
+    with pytest.raises(Exception,match='source kinds'):
+        r.worklist({'variables':[{'sources':[a,dict(a,kind='company')]}]},set())
+
+
+def test_aliases_do_not_merge_distinct_urls():
+    a=dict(name='Monthly archive',kind='statistics',url='https://example.org/monthly')
+    b=dict(a,url='https://example.org/annual')
+    assert len(r.worklist({'variables':[{'sources':[a,b]}]},set()))==2
+
+
+def test_alias_private_cell_reference_still_rejected():
+    a=dict(name='Monthly archive',kind='statistics',url='https://example.org/public-data')
+    with pytest.raises(Exception,match='private data'):
+        r.worklist({'variables':[{'sources':[a,dict(a,name='Use Sheet1!A123')]}]},set())
+
+
+def test_long_public_source_display_preserves_full_reviewed_context():
+    name='Independent public energy reports '+('complete source description '*8)+'Exact period and series mapping must be verified.'
+    source=dict(name=name,kind='external',url='https://example.com/reports')
+    row,=r.worklist({'variables':[{'sources':[source]}]},set())
+    assert len(row['source_name'])<=160 and '… ['in row['source_name']
+    assert name.startswith(row['source_name'].split('… [')[0])
+    assert row['reviewed_source_names']==[name]
+    assert row['canonical_url']==source['url'] and row['source_kind']=='external'
+    assert source['name']==name
+
+
+def test_long_merged_labels_retain_every_caveat_and_stable_order():
+    sources=[dict(name='Public statistics '+('reviewed description '*7)+suffix,kind='external',url='https://example.com/')for suffix in ('Second caveat','First caveat')]
+    spec=lambda rows:{'variables':[{'sources':rows}]}
+    first=r.worklist(spec(sources),set());assert first==r.worklist(spec(sources[::-1]),set())
+    assert first[0]['reviewed_source_names']==sorted(s['name']for s in sources)
+    assert len(first[0]['source_name'])<=160
+    sources[1]['name']+=' private 987654321'
+    with pytest.raises(ValueError):r.worklist(spec(sources),{'987654321'})
+
+
+def test_long_unicode_equal_prefixes_keep_distinct_url_identity():
+    name=('Électricité publiée avec détails complets '*8)
+    sources=[dict(name=name,kind='external',url='https://example.com/'+path)for path in ('alpha','beta')]
+    rows=r.worklist({'variables':[{'sources':sources}]},set())
+    assert len({x['source_name']for x in rows})==2
+    assert all(len(x['source_name'])<=160 and x['reviewed_source_names']==[name]for x in rows)
+
+
+def test_bounded_name_collision_is_rejected(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(r.hashlib,'sha256',lambda value:SimpleNamespace(hexdigest=lambda:'a'*64))
+    name='Shared description '*20
+    sources=[dict(name=name,kind='external',url='https://example.com/'+path)for path in ('alpha','beta')]
+    with pytest.raises(ValueError,match='identity collision'):r.worklist({'variables':[{'sources':sources}]},set())
+
+
+def test_captured_source_display_equivalence_preserves_all_prior_context():
+    old=dict(source_name='Detailed public source '*12,source_kind='external',canonical_url='https://example.com/')
+    new=dict(old,source_name=r.bounded_display(old['source_name'],old['canonical_url']),reviewed_source_names=[old['source_name']])
+    assert r.same_captured_source(new,old)
+    for changed in (dict(new,canonical_url='https://other.example.com/'),dict(new,source_kind='internal'),dict(new,reviewed_source_names=['omitted caveats']),dict(new,source_name='arbitrary')):
+        assert not r.same_captured_source(changed,old)

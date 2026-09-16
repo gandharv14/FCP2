@@ -14,7 +14,7 @@ CELL_PHRASE_RE = re.compile(
     r"(?P<sheet>'(?:[^']|'')+'|[A-Za-z0-9_][A-Za-z0-9_ .&-]*)!"
     r"(?P<a>\$?[A-Z]{1,3}\$?\d{1,7})"
     r"(?::(?P<b>\$?[A-Z]{1,3}\$?\d{1,7}))?"
-    rf"(?:\s+on the rows? labelled\s+(?P<label>{QUOTED_LABEL}(?:\s*(?:,\s*(?:and\s+)?|and\s+){QUOTED_LABEL})*))?",
+    rf"(?:\s+on the row(?P<label_plural>s)? labelled\s+(?P<label>{QUOTED_LABEL}(?(label_plural)(?:\s*(?:,\s*(?:and\s+)?|and\s+){QUOTED_LABEL})*)))?",
     re.I,
 )
 ABS_REF_RE = re.compile(r"\$([A-Z]{1,3})\$?(\d{1,7})", re.I)
@@ -389,11 +389,22 @@ class _Parser:
             self.eat("with ")
             b = self.parse_operand()
             return {"op": "join", "args": [a, b]}
-        if self.eat("round "):
-            a = self.parse_operand()
-            self.eat("to the nearest multiple of ")
-            b = self.parse_operand()
-            return {"op": "round", "args": [a, b]}
+        if self.peek("round "):
+            mark = self.i
+            self.eat("round ")
+            if self.peek("("):
+                a = self.parse_operand()
+                if self.eat("to the nearest multiple of ") and self.peek("("):
+                    b = self.parse_operand()
+                    return {"op": "round", "args": [a, b]}
+                if self.eat("to ") and self.peek("("):
+                    b = self.parse_operand()
+                    if self.eat("decimal places"):
+                        return {"op": "round_decimal", "args": [a, b]}
+            # Generic function prose ("round applied to ...") is not MROUND.
+            # Preserve it verbatim rather than inventing a missing operand.
+            self.i = mark
+            return self.parse_atom()
         if self.peek("("):
             mark = self.i
             left = self.parse_operand()
@@ -431,7 +442,14 @@ def _plain(node: dict) -> str:
 
 
 def _wrap(node: dict) -> str:
-    text = _clause_text(node)
+    # A nested product is an operand, not another instruction to execute after
+    # its parent expression. Keep both factors together when describing it.
+    args = node.get("args") or []
+    if (node.get("op") == "mul" and len(args) == 2
+            and not any(_is_neg_one(arg) for arg in args)):
+        text = f"the product of {_wrap(args[0])} and {_wrap(args[1])}"
+    else:
+        text = _clause_text(node)
     if not text:
         return ""
     if _simple(node) or node.get("op") == "atom":
@@ -468,6 +486,10 @@ def _join_and(parts: list[str]) -> str:
 
 def _locked_role(node: dict, role: str) -> str:
     text = _plain(node)
+    # A branch or comparison role describes the whole value. Renaming one
+    # operand inside a compound expression changes its reference identity.
+    if node.get("op") != "atom":
+        return text
     if "locked input" not in text.lower():
         return text
     return re.sub(
@@ -567,6 +589,8 @@ def _linearize(node: dict) -> tuple[str, list[str]]:
         return f"join {_plain(args[0])} with {_plain(args[1])}", []
     if op == "round":
         return f"round {_plain(args[0])} to the nearest multiple of {_plain(args[1])}", []
+    if op == "round_decimal":
+        return f"round {_plain(args[0])} to {_plain(args[1])} decimal places", []
     if op in CMP:
         role = (
             "lower bound"

@@ -1042,14 +1042,14 @@ def validate_source_generation(
         if identity != expected_identity:
             failures.append("identity")
         try:
-            from xl_source_health import inspect_workbook, validate_report
+            from xl_source_health import inspect_workbook, validate_report, matches_observed_report
 
             source_path = directory / source_relative
             validate_report(health_document, source_path)
-            if health_document != inspect_workbook(
+            if not matches_observed_report(health_document, inspect_workbook(
                 source_path,
                 policy_version=health_document.get("policy_version"),
-            ):
+            ), source_path):
                 raise ValueError("source health does not match fresh observation")
             request_document = _read_json(
                 directory / "request.json", "source evidence request"

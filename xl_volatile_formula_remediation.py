@@ -1,8 +1,8 @@
 """Deterministically remediate a closed set of volatile Excel constructs.
 
-The tool edits OOXML formula/name spans only, preserves cached values and all
-untouched package-member bytes, and fails closed when a volatile construct is
-not mechanically proven safe.
+The tool edits proved OOXML formula/name spans and unused external-book graphs,
+preserves cached values and all untouched package-member bytes, and fails closed
+when a construct is not mechanically proven safe.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from openpyxl.utils.cell import (
     column_index_from_string,
     coordinate_from_string,
     coordinate_to_tuple,
+    get_column_letter,
     range_boundaries,
 )
 
@@ -41,7 +42,7 @@ from xl_source_health import (
 PLAN_SCHEMA = "volatile-formula-remediation-plan/v1"
 MANIFEST_SCHEMA = "volatile-formula-remediation-manifest/v1"
 INSTALL_SCHEMA = "volatile-formula-remediation-install/v1"
-TOOL_VERSION = "volatile-formula-remediation/v3"
+TOOL_VERSION = "volatile-formula-remediation/v14"
 MAX_ACTIONS = 100_000
 REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 DOC_REL_NS = (
@@ -63,11 +64,21 @@ INDIRECT_RE = re.compile(
 )
 OFFSET_BLANK_COLUMN_RE = re.compile(
     r"""(?ix)
-    (?:_xlfn\.)?OFFSET\s*\(
-      \s*(?P<reference>\$?[A-Z]{1,3}\$?[1-9][0-9]*)\s*,\s*
-      (?P<rows>\$?[A-Z]{1,3}\$?[1-9][0-9]*|[-+]?[0-9]+)\s*,\s*
+    (?<![A-Z0-9_.])(?:_xlfn\.)?OFFSET\s*\(
+      \s*(?P<qualifier>(?:\x27(?:[^\x27\[\]]|\x27\x27)+\x27|[A-Z_][A-Z0-9_.]*)!)?(?P<reference>\$?[A-Z]{1,3}\$?[1-9][0-9]*)\s*,\s*
+      (?P<rows>\$?[A-Z]{1,3}\$?[1-9][0-9]*|[-+]?[0-9]+|[A-Z_][A-Z0-9_.]*)\s*,\s*(?P<zero_column>0)?\s*
     \)
     """
+)
+OFFSET_IDENTITY_RE = re.compile(
+    r"(?ix)(?<![A-Z0-9_.])(?:_xlfn\.)?OFFSET\s*\(\s*"
+    r"(?P<reference>\$?[A-Z]{1,3}\$?[1-9][0-9]*)\s*,\s*0\s*,\s*0\s*\)"
+)
+OFFSET_CONSTANT_RE = re.compile(
+    r"(?ix)(?<![A-Z0-9_.])(?:_xlfn\.)?OFFSET\s*\(\s*"
+    r"(?P<reference>(?P<column_absolute>\$?)(?P<column>[A-Z]{1,3})"
+    r"(?P<row_absolute>\$?)(?P<row>[1-9][0-9]*))\s*,\s*"
+    r"(?P<rows>[-+]?[0-9]+)\s*,\s*(?P<columns>[-+]?[0-9]+)\s*\)"
 )
 TODAY_RE = re.compile(r"(?i)^\s*(?:_xlfn\.)?TODAY\s*\(\s*\)\s*$")
 CELL_BLOCK_RE = re.compile(
@@ -369,13 +380,31 @@ def _expanded_formulas(
     return result
 
 
-def _name_tokens(value: str, available: set[str]) -> set[str]:
+def _name_tokens(value: str, available: set[str], *, literal_builtin_names=frozenset()) -> set[str]:
     # Excel string literals do not contain executable name references.
     code = re.sub(r'"(?:[^"]|"")*"', " ", value)
+    # A quoted worksheet qualifier is not a defined name. Keep the operand
+    # after !, which can itself be a legitimate sheet-scoped defined name.
+    code = re.sub(r"'(?:[^']|'')*'\s*!", " !", code)
+    # The old token regex split $B$17 into B and 17, making an unrelated
+    # defined name B appear live. Mask only complete in-bounds A1 addresses;
+    # out-of-grid identifiers can be legitimate defined names.
+    def cell_reference(match):
+        column, row = match.group(1), int(match.group(2))
+        if column_index_from_string(column.upper()) <= 16384 and row <= 1048576:
+            return " "
+        return match.group(0)
+    code = re.sub(
+        r"(?i)(?<![A-Z0-9_.\\$])\$?([A-Z]{1,3})\$?([1-9][0-9]*)(?![A-Z0-9_.\\$])",
+        cell_reference, code,
+    )
     return {
         match.group(1).casefold()
         for match in NAME_TOKEN_RE.finditer(code)
         if match.group(1).casefold() in available
+        and not (match.group(1).casefold() in literal_builtin_names
+                 and re.match(r'\s*\(', code[match.end():])
+                 and not code[:match.start()].rstrip().endswith('!'))
     }
 
 
@@ -398,18 +427,46 @@ def _defined_name_plan(
     for record in records:
         by_name[record["name"].casefold()].append(record)
 
+    # Built-in print settings are live presentation metadata, but an error
+    # literal cannot describe a print region. Only remove these broken entries
+    # when no computation anywhere refers to the name, including other names.
+    explicitly_referenced = set()
+    all_formulas = [*external_formula_texts, *(r['text'] for r in records)]
+    # A workbook-global external print area cannot select a local sheet's
+    # printable cells. Remove only literal rectangles, with no possible
+    # computational name use. Local print settings remain untouched.
+    dynamic_names = any(re.search(r'(?i)(?:INDIRECT|OFFSET|EVALUATE|GET\.CELL)\s*\(', f)
+                        for f in all_formulas)
+    # YEAR(date) invokes a built-in, whereas YEAR or Sheet!YEAR reads a name.
+    # Limit disambiguation to global names containing a literal external cell;
+    # callable/LAMBDA names, local scopes and dynamic resolution stay live.
+    from openpyxl.utils import FORMULAE
+    literal_builtin_names = set()
+    if not dynamic_names:
+        for name, definitions in by_name.items():
+            if name.upper() in FORMULAE and all(
+                    r['local_sheet_id'] is None and re.fullmatch(
+                        r"(?:\[[1-9][0-9]*\][A-Za-z_][A-Za-z0-9_ .]*|'\[[1-9][0-9]*\](?:[^']|'')+')!"
+                        r"\$?[A-Z]{1,3}\$?[1-9][0-9]*", r['text'].strip())
+                    for r in definitions):
+                literal_builtin_names.add(name)
+    def references(formula):
+        return _name_tokens(formula, available, literal_builtin_names=literal_builtin_names)
+    for formula in all_formulas:
+        explicitly_referenced.update(references(formula))
+
     live = {
         name for name in available
         if name.startswith("_xlnm.")
     }
     for formula in external_formula_texts:
-        live.update(_name_tokens(formula, available))
+        live.update(references(formula))
 
     queue = deque(sorted(live))
     while queue:
         name = queue.popleft()
         for record in by_name.get(name, []):
-            for dependency in _name_tokens(record["text"], available):
+            for dependency in references(record["text"]):
                 if dependency not in live:
                     live.add(dependency)
                     queue.append(dependency)
@@ -423,6 +480,34 @@ def _defined_name_plan(
             "defined-name XML spans do not match parsed defined-name records"
         )
     for record, raw_match in zip(records, raw_matches):
+        external_print = re.fullmatch(
+            r"(?:\[[1-9][0-9]*\][A-Za-z_][A-Za-z0-9_ .]*|'\[[1-9][0-9]*\](?:[^']|'')+')!"
+            r"\$([A-Z]{1,3})\$([1-9][0-9]*):\$([A-Z]{1,3})\$([1-9][0-9]*)",
+            record['text'].strip())
+        if (record['name'].casefold() == '_xlnm.print_area'
+                and record['local_sheet_id'] is None and external_print
+                and not dynamic_names and record['name'].casefold() not in explicitly_referenced
+                and all(column_index_from_string(external_print.group(i)) <= 16384 for i in (1, 3))
+                and all(int(external_print.group(i)) <= 1048576 for i in (2, 4))):
+            removals.append({
+                'kind': 'remove_dead_defined_name', 'part': 'xl/workbook.xml',
+                'index': record['index'], 'name': record['name'],
+                'local_sheet_id': None,
+                'before_sha256': sha256_bytes(raw_match.group(0).encode('utf-8')),
+                'rule_id': 'unreferenced-global-external-print-area/v1',
+            })
+            continue
+        if (record['name'].casefold() in {'_xlnm.print_area', '_xlnm.print_titles'}
+                and record['text'].strip().upper() in {'#REF!', '#N/A'}
+                and record['name'].casefold() not in explicitly_referenced):
+            removals.append({
+                'kind': 'remove_dead_defined_name', 'part': 'xl/workbook.xml',
+                'index': record['index'], 'name': record['name'],
+                'local_sheet_id': record['local_sheet_id'],
+                'before_sha256': sha256_bytes(raw_match.group(0).encode('utf-8')),
+                'rule_id': 'unreferenced-error-print-setting/v1',
+            })
+            continue
         events = _formula_restriction_events(
             record["text"],
             scope="defined_name",
@@ -460,21 +545,16 @@ def _formula_texts_from_other_parts(
     worksheet_parts: set[str],
 ) -> list[str]:
     values = []
-    formula_element = re.compile(
-        r"<(?:[A-Za-z_][\w.-]*:)?(?:f|formula|formula1|formula2)\b[^>]*>"
-        r"(.*?)</(?:[A-Za-z_][\w.-]*:)?(?:f|formula|formula1|formula2)>",
-        re.DOTALL | re.IGNORECASE,
-    )
     for name, raw in members.items():
-        if name == "xl/workbook.xml" or name in worksheet_parts:
+        if name == "xl/workbook.xml":
             continue
         if not name.endswith(".xml"):
             continue
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        values.extend(html.unescape(match.group(1)) for match in formula_element.finditer(text))
+        # A regex opening at <f .../> can swallow several cells up to the next
+        # </f>, making XML element names appear to be live defined names.
+        root = ElementTree.fromstring(raw)
+        values.extend(node.text or '' for node in root.iter()
+                      if node.tag.rsplit('}', 1)[-1].casefold() in {'f', 'formula', 'formula1', 'formula2'})
     return values
 
 
@@ -565,25 +645,254 @@ def _sub_executable(pattern, replacement, formula):
                        else replacement(m), formula)
 
 
-def _rewrite_offset(formula: str) -> tuple[str, int]:
+def _rewrite_offset(formula: str, *, named_rows=(), used_named=None, used_zero=None, sheet_name=None, used_qualified=None) -> tuple[str, int]:
     substitutions = 0
 
     def replace(match: re.Match) -> str:
         nonlocal substitutions
         reference = match.group("reference")
         rows = match.group("rows")
+        zero = match.group("zero_column") is not None
+        qualifier = match.group('qualifier') or ''
+        if qualifier:
+            name = qualifier[:-1]
+            if name.startswith("'"):name = name[1:-1].replace("''", "'")
+            if not zero or sheet_name is None or name != sheet_name:
+                return match.group(0)
+        if zero:
+            # Only the existing dynamic scalar-cell row rule gains the
+            # equivalent literal-zero column spelling. Names and expressions
+            # require their own source-backed policy.
+            if re.fullmatch(r'(?i)\$?[A-Z]{1,3}\$?[1-9][0-9]*', rows) is None:
+                return match.group(0)
+            row_coordinate = rows.replace('$', '').upper()
+            row_number, row_column = coordinate_to_tuple(row_coordinate)
+            if not (1 <= row_number <= 1048576 and 1 <= row_column <= 16384):
+                return match.group(0)
+        if re.fullmatch(r'(?i)\$?[A-Z]{1,3}\$?[1-9][0-9]*|[-+]?[0-9]+', rows) is None:
+            if rows.casefold() not in named_rows:
+                return match.group(0)
+            if used_named is not None:
+                used_named.add(rows.casefold())
         column = re.match(r"(\$?)[A-Z]{1,3}", reference, re.IGNORECASE)
         if column is None:
             raise RemediationError(f"OFFSET reference is not scalar A1: {reference}")
         column_ref = column.group(0)
+        base_row = int(re.search(r'[1-9][0-9]*$', reference).group(0))
+        if not (1 <= column_index_from_string(column_ref.replace('$', '').upper()) <= 16384 and 1 <= base_row <= 1048576):
+            return match.group(0)
         substitutions += 1
+        if qualifier and used_qualified is not None:used_qualified.add(qualifier)
+        if zero and used_zero is not None:
+            used_zero.add(True)
         return (
-            f"INDEX({column_ref}:{column_ref},"
-            f"ROW({reference})+({rows}))"
+            f"INDEX({qualifier}{column_ref}:{column_ref},"
+            f"ROW({qualifier}{reference})+({rows}))"
         )
 
     rewritten = _sub_executable(OFFSET_BLANK_COLUMN_RE, replace, formula)
     return rewritten, substitutions
+
+
+def _scalar_named_rows(members, sheet_name):
+    """Resolve Excel local-over-global names only to one same-workbook cell."""
+    workbook = ElementTree.fromstring(members['xl/workbook.xml'])
+    sheets = [name for name, _ in _sheet_parts(members)]
+    if sheet_name not in sheets:
+        return {}
+    scope = str(sheets.index(sheet_name)); groups = defaultdict(list)
+    for node in workbook.findall('.//{*}definedName'):
+        name = node.attrib.get('name', '')
+        if re.fullmatch(r'(?i)[A-Z_][A-Z0-9_.]*', name) and name.casefold() not in {'r','c','true','false'}:
+            if node.attrib.get('localSheetId') in (None, scope):
+                groups[name.casefold()].append(node)
+    result = {}
+    pattern = r"(?:'(?P<quoted>(?:[^']|'')+)'|(?P<plain>[A-Za-z_][A-Za-z0-9_.]*))!(?P<cell>\$?[A-Za-z]{1,3}\$?[1-9][0-9]*)"
+    for name, nodes in groups.items():
+        local = [n for n in nodes if n.attrib.get('localSheetId') == scope]
+        selected = local if local else [n for n in nodes if 'localSheetId' not in n.attrib]
+        if len(selected) != 1:
+            continue
+        node = selected[0]; raw = node.text or ''; match = re.fullmatch(pattern, raw)
+        if not match:
+            continue
+        target_sheet = (match['quoted'].replace("''", "'") if match['quoted'] is not None else match['plain'])
+        matching = [n for n in sheets if n.casefold() == target_sheet.casefold()]
+        if len(matching) != 1 or any(c in target_sheet for c in '[]'):
+            continue
+        cell = match['cell']; cell_match = re.fullmatch(r'\$?([A-Za-z]{1,3})\$?([1-9][0-9]*)', cell)
+        if not(1 <= column_index_from_string(cell_match[1].upper()) <= 16384 and 1 <= int(cell_match[2]) <= 1048576):
+            continue
+        result[name] = dict(name=node.attrib['name'], local_sheet_id=node.attrib.get('localSheetId'),
+                            definition=raw, sheet=matching[0], cell=cell)
+    return result
+
+
+def _source_sheet_name(formula: str, sheet_name: str) -> str | None:
+    """Resolve only a complete current-sheet-name extraction from source metadata.
+
+    No saved cache, filesystem basename, or current Excel session participates.
+    Every CELL reference must be the same local, in-grid scalar reference.
+    """
+    pieces = re.findall(r'"(?:[^"]|"")*"|[^"]+', formula)
+    if ''.join(pieces) != formula:
+        return None
+    compact = ''.join(p if p.startswith('"') else re.sub(r'\s+', '', p)
+                      for p in pieces)
+    cell = r'CELL\("filename",(?P<reference>\$?[A-Z]{1,3}\$?[1-9][0-9]*)\)'
+    same = r'CELL\("filename",(?P=reference)\)'
+    boundary = r'FIND\("\]",' + same + r'\)'
+    length = r'(?:255|LEN\(' + same + r'\)-' + boundary + r')'
+    match = re.fullmatch(r'MID\(' + cell + ',' + boundary + r'\+1,' + length + r'\)',
+                         compact, re.IGNORECASE)
+    if match is None or not 0 < len(sheet_name) <= 31:
+        return None
+    reference = match['reference'].replace('$', '')
+    row, column = coordinate_to_tuple(reference)
+    if row > 1048576 or column > 16384:
+        return None
+    return '"' + sheet_name.replace('"', '""') + '"'
+
+
+def _rewrite_identity_offset(formula: str) -> tuple[str, int]:
+    """An unchanged, scalar reference stays a reference, including in ranges.
+
+    Only literal zero displacements with omitted size arguments are admitted.
+    Relative/absolute addressing is preserved for shared-formula translation.
+    """
+    substitutions = 0
+
+    def replace(match: re.Match) -> str:
+        nonlocal substitutions
+        reference = match.group("reference")
+        column, row = coordinate_from_string(reference.replace("$", "").upper())
+        if column_index_from_string(column) > 16384 or row > 1048576:
+            return match.group(0)
+        substitutions += 1
+        return reference
+
+    return _sub_executable(OFFSET_IDENTITY_RE, replace, formula), substitutions
+
+
+def _rewrite_constant_offset(formula: str) -> tuple[str, int]:
+    """Resolve an integer displacement of a scalar reference, never its value."""
+    substitutions = 0
+
+    def replace(match: re.Match) -> str:
+        nonlocal substitutions
+        column = column_index_from_string(match.group('column').upper())
+        row = int(match.group('row'))
+        if not (1 <= column <= 16384 and 1 <= row <= 1048576):
+            return match.group(0)
+        target_column = column + int(match.group('columns'))
+        target_row = row + int(match.group('rows'))
+        if not (1 <= target_column <= 16384 and 1 <= target_row <= 1048576):
+            return match.group(0)
+        substitutions += 1
+        return (match.group('column_absolute') + get_column_letter(target_column)
+                + match.group('row_absolute') + str(target_row))
+
+    return _sub_executable(OFFSET_CONSTANT_RE, replace, formula), substitutions
+
+
+def _dead_external_package(members: dict[str, bytes], removals: list[dict],
+                           formula_actions: list[dict] = ()) -> list[dict]:
+    """Remove a complete unused external-book graph, with no link renumbering.
+
+    Be deliberately conservative: any bracket in retained XML text/attributes,
+    dynamic reference formula, unknown relationship or binary workbook part
+    keeps the entire external graph. Formula/name/cache bytes remain intact.
+    """
+    parts = {p for p in members if p.startswith('xl/externalLinks/')}
+    if not parts:
+        return []
+    workbook = _rewrite_defined_names(members['xl/workbook.xml'].decode(), removals)
+    root = ElementTree.fromstring(workbook)
+    refs = root.findall('{*}externalReferences')
+    if len(refs) != 1 or any(n.tag.rsplit('}', 1)[-1] != 'externalReference' for n in refs[0]):
+        return []
+    ids = [n.get('{'+DOC_REL_NS+'}id') for n in refs[0]]
+    if not ids or None in ids or len(set(ids)) != len(ids):
+        return []
+    relpart = 'xl/_rels/workbook.xml.rels'
+    rels = ElementTree.fromstring(members[relpart])
+    selected = [n for n in rels if n.get('Id') in ids]
+    if len(selected) != len(ids):
+        return []
+    books = set()
+    for node in selected:
+        target = posixpath.normpath(posixpath.join('xl', node.get('Target', '')))
+        if (node.get('Type') != DOC_REL_NS+'/externalLink' or node.get('TargetMode', '') not in ('', 'Internal')
+                or not re.fullmatch(r'xl/externalLinks/externalLink[1-9][0-9]*\.xml', target)):
+            return []
+        books.add(target)
+    expected = books | {posixpath.join(posixpath.dirname(p), '_rels', posixpath.basename(p)+'.rels') for p in books}
+    if parts != expected or len(books) != len(ids):
+        return []
+    for book in books:
+        tree = ElementTree.fromstring(members[book])
+        children = list(tree)
+        if len(children) != 1 or children[0].tag.rsplit('}', 1)[-1] != 'externalBook':
+            return []
+        relation = ElementTree.fromstring(members[posixpath.join(posixpath.dirname(book), '_rels', posixpath.basename(book)+'.rels')])
+        if (len(relation) != 1 or relation[0].get('Type') not in {
+                    DOC_REL_NS+'/externalLinkPath',
+                    'http://schemas.microsoft.com/office/2006/relationships/xlExternalLinkPath/xlPathMissing'}
+                or relation[0].get('TargetMode') != 'External'
+                or children[0].get('{'+DOC_REL_NS+'}id') != relation[0].get('Id')):
+            return []
+    # Closed byte-span edits avoid XML reserialization of unrelated evidence.
+    def subtract(raw, tag, predicate, count):
+        pattern = re.compile(r'<(?:[\w.-]+:)?'+tag+r'\b[^>]*/>')
+        matches = [m for m in pattern.finditer(raw) if predicate(ElementTree.fromstring(m.group()))]
+        if len(matches) != count:
+            raise RemediationError('external package XML span mismatch')
+        for m in reversed(matches):
+            raw = raw[:m.start()] + raw[m.end():]
+        return raw
+    span = re.compile(r'<(?:[\w.-]+:)?externalReferences\b[^>]*>.*?</(?:[\w.-]+:)?externalReferences>', re.S)
+    if len(span.findall(workbook)) != 1:
+        return []
+    updated = {'xl/workbook.xml': span.sub('', workbook)}
+    updated[relpart] = subtract(members[relpart].decode(), 'Relationship', lambda n: n.get('Id') in ids, len(ids))
+    updated['[Content_Types].xml'] = subtract(members['[Content_Types].xml'].decode(), 'Override',
+        lambda n: n.get('PartName', '').lstrip('/') in books, len(books))
+    # Assess the exact closed rewrites that this same plan will apply. An
+    # already-proven scalar OFFSET must not keep an otherwise unused graph.
+    # Unchanged dynamic references and all non-formula package uses still block.
+    projected = {}
+    grouped = defaultdict(list)
+    for action in formula_actions:
+        if action['part'].startswith('xl/worksheets/'):
+            grouped[action['part']].append(action)
+    for part, actions in grouped.items():
+        projected[part] = _rewrite_sheet(members[part].decode(), actions)
+    for part, raw in members.items():
+        if part in parts:
+            continue
+        if part.startswith('xl/media/') and part.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff')):
+            continue
+        if re.fullmatch(r'xl/printerSettings/printerSettings[1-9][0-9]*\.bin', part):
+            continue
+        if part.startswith('xl/') and not part.endswith(('.xml', '.rels')):
+            return []
+        if not part.endswith(('.xml', '.rels')):
+            continue
+        tree = ElementTree.fromstring(updated.get(part, projected.get(part, raw)))
+        for node in tree.iter():
+            # Number-format brackets and cell-style names are display syntax.
+            display_text = node.tag == '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t'
+            values = ['' if display_text else node.text or '', *(v for k, v in node.attrib.items()
+                      if not (node.tag.rsplit('}', 1)[-1] == 'numFmt' and k == 'formatCode')
+                      and not (part == 'xl/styles.xml' and k == 'name'
+                               and node.tag == '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}cellStyle'))]
+            if any('[' in v or 'externalLinks/' in v or '/externalLink' in v for v in values):
+                return []
+            if re.search(r'(?i)(?:INDIRECT|OFFSET)\s*\(', node.text or ''):
+                return []
+    return [dict(kind='prune_dead_external_package', rule_id='dead-external-book-package/v1', part='xl/workbook.xml',
+                 before_members={p: sha256_bytes(members[p]) for p in sorted(parts | set(updated))},
+                 removed_members=sorted(parts), replacement_members=updated)]
 
 
 def build_plan(source_path: str | Path) -> dict:
@@ -598,6 +907,11 @@ def build_plan(source_path: str | Path) -> dict:
     }
     part_by_sheet = dict(sheets)
     expanded = _expanded_formulas(sheet_xml)
+    shared_groups = defaultdict(list)
+    for (sheet_name, coordinate), record in expanded.items():
+        if record['attributes'].get('t') == 'shared':
+            shared_groups[(sheet_name, record['attributes'].get('si'))].append(
+                (coordinate, record['expanded']))
     static_values = _static_cell_values(sheet_xml, _shared_strings(members))
     sheet_names = {sheet_name for sheet_name, _ in sheets}
     workbook_root = ElementTree.fromstring(members["xl/workbook.xml"])
@@ -620,6 +934,7 @@ def build_plan(source_path: str | Path) -> dict:
         key for key, record in expanded.items()
         if re.search(r"(?i)(?:_xlfn\.)?INDIRECT\s*\(", record["expanded"])
     }
+    named_rows_cache = {}
     for key, record in sorted(expanded.items()):
         sheet_name, coordinate = key
         formula = record["expanded"]
@@ -664,21 +979,83 @@ def build_plan(source_path: str | Path) -> dict:
         raw_formula = record["text"]
         if not raw_formula.strip():
             continue
+        # FIND selects the first closing bracket in CELL's saved path. A
+        # bracket in a directory or workbook filename would change the result.
+        sheet_literal = (None if ']' in str(source)
+                         else _source_sheet_name(raw_formula, sheet_name))
+        attributes = record['attributes']
+        if (sheet_literal is not None and attributes.get('t') != 'shared'
+                and (attributes.get('t') != 'array' or attributes.get('ref') == coordinate)):
+            actions.append({
+                'kind': 'replace_formula',
+                'rule_id': 'cell-filename-current-sheet-name/v1',
+                'part': part_by_sheet[sheet_name], 'sheet': sheet_name,
+                'coordinate': coordinate,
+                'raw_formula_sha256': sha256_bytes(raw_formula.encode('utf-8')),
+                'expanded_formula_sha256': sha256_bytes(formula.encode('utf-8')),
+                'after_formula': sheet_literal,
+                'after_formula_sha256': sha256_bytes(sheet_literal.encode('utf-8')),
+                'make_ordinary': True, 'substitutions': 1,
+            })
+            continue
         if re.search(r"(?i)(?:_xlfn\.)?OFFSET\s*\(", raw_formula):
-            rewritten, substitutions = _rewrite_offset(raw_formula)
+            rewritten, identities = _rewrite_identity_offset(raw_formula)
+            rewritten, constants = _rewrite_constant_offset(rewritten)
+            if sheet_name not in named_rows_cache:
+                named_rows_cache[sheet_name] = _scalar_named_rows(members, sheet_name)
+            named_rows = named_rows_cache[sheet_name]; used_named = set(); used_zero = set(); used_qualified = set()
+            rewritten, substitutions = _rewrite_offset(rewritten, named_rows=named_rows, used_named=used_named, used_zero=used_zero, sheet_name=sheet_name, used_qualified=used_qualified)
+            substitutions += identities + constants
+            if used_zero and attributes.get('t') == 'array' and attributes.get('ref') != coordinate:
+                unresolved.append(dict(kind='offset_array_scope_unresolved',
+                    location=f'{sheet_name}!{coordinate}',
+                    reason='dynamic scalar-cell OFFSET does not authorize a multi-cell array rewrite'))
+                continue
+            if (used_named or used_zero) and record['attributes'].get('t') == 'shared':
+                group = shared_groups[(sheet_name, record['attributes'].get('si'))]
+                for shared_coordinate, shared_formula in group:
+                    shared_formula, _ = _rewrite_identity_offset(shared_formula)
+                    shared_formula, _ = _rewrite_constant_offset(shared_formula)
+                    shared_used = set(); shared_zero = set(); shared_qualified = set()
+                    shared_after, _ = _rewrite_offset(shared_formula, named_rows=named_rows, used_named=shared_used, used_zero=shared_zero, sheet_name=sheet_name, used_qualified=shared_qualified)
+                    if shared_used != used_named or shared_zero != used_zero or shared_qualified != used_qualified or re.search(r'(?i)(?:_xlfn\.)?OFFSET\s*\(', shared_after):
+                        unresolved.append(dict(kind='offset_shared_boundary_unresolved',
+                            location=f'{sheet_name}!{shared_coordinate}',
+                            reason='shared dynamic-row OFFSET does not retain valid scalar references',
+                            formula_sha256=sha256_bytes(shared_formula.encode('utf-8'))))
+            if constants and record['attributes'].get('t') == 'shared':
+                # A valid displaced target does not make an invalid original
+                # base reference valid. Check every existing shared destination
+                # before retaining the group's shared representation.
+                group = shared_groups[(sheet_name, record['attributes'].get('si'))]
+                for shared_coordinate, shared_formula in group:
+                    shared_formula, _ = _rewrite_identity_offset(shared_formula)
+                    _, shared_constants = _rewrite_constant_offset(shared_formula)
+                    if shared_constants != constants:
+                        unresolved.append({
+                            'kind': 'offset_shared_boundary_unresolved',
+                            'location': f'{sheet_name}!{shared_coordinate}',
+                            'reason': 'shared copy does not retain valid scalar base and target references',
+                            'formula_sha256': sha256_bytes(shared_formula.encode('utf-8')),
+                        })
             if substitutions == 0 or re.search(
                 r"(?i)(?:_xlfn\.)?OFFSET\s*\(", rewritten
             ):
                 unresolved.append({
                     "kind": "offset_unresolved",
                     "location": f"{sheet_name}!{coordinate}",
-                    "reason": "only scalar OFFSET(reference, rows, blank-column) is eligible",
+                    "reason": "only scalar OFFSET with literal integer displacements or the blank-column rule is eligible",
                     "formula_sha256": sha256_bytes(raw_formula.encode("utf-8")),
                 })
                 continue
             actions.append({
                 "kind": "replace_formula",
-                "rule_id": "offset-blank-column-to-index/v1",
+                "rule_id": ("offset-same-sheet-scalar-cell-row-zero-column/v1" if used_qualified
+                            else "offset-scalar-cell-row-zero-column/v1" if used_zero
+                            else "offset-blank-column-scalar-name/v1" if used_named
+                            else "offset-constant-scalar-and-blank-column/v3" if constants
+                            else "offset-scalar-identity-and-blank-column/v2" if identities
+                            else "offset-blank-column-to-index/v1"),
                 "part": part_by_sheet[sheet_name],
                 "sheet": sheet_name,
                 "coordinate": coordinate,
@@ -688,6 +1065,8 @@ def build_plan(source_path: str | Path) -> dict:
                 "after_formula_sha256": sha256_bytes(rewritten.encode("utf-8")),
                 "make_ordinary": False,
                 "substitutions": substitutions,
+                **({'named_row_operands': {n:named_rows[n] for n in sorted(used_named)}} if used_named else {}),
+                **({'same_sheet_qualifiers': sorted(used_qualified)} if used_qualified else {}),
             })
             continue
 
@@ -711,6 +1090,7 @@ def build_plan(source_path: str | Path) -> dict:
                 "formula_sha256": sha256_bytes(raw_formula.encode("utf-8")),
             })
 
+    actions.extend(_dead_external_package(members, removals, actions))
     actions.sort(
         key=lambda item: (
             item["part"],
@@ -728,6 +1108,33 @@ def build_plan(source_path: str | Path) -> dict:
             "maximum": MAX_ACTIONS,
         })
     before_health = inspect_workbook(source)
+    # Removing proven-unused names need not freeze or rewrite a worksheet's
+    # clock. Keep its exact formula, cache and metadata, and leave qualification
+    # to the restricted-source runtime/output-cone certificate. This is only a
+    # metadata cleanup: mixed formula rewrites retain the existing closed rules.
+    preserved = []
+    if (actions and unresolved
+            and all(a['kind'] == 'remove_dead_defined_name' for a in actions)
+            and all(u['kind'] in {'today_unresolved', 'volatile_formula_unresolved'}
+                    for u in unresolved)):
+        for item in unresolved:
+            location = item['location']
+            originals = [record for (sheet, cell), record in expanded.items()
+                         if sheet + '!' + cell == location]
+            events = [e for e in before_health.get('restriction_events', [])
+                      if e.get('location') == location]
+            if (len(originals) != 1
+                    or not re.fullmatch(r'(?i)\s*\+?\s*(?:_xlfn\.)?TODAY\s*\(\s*\)\s*', originals[0]['expanded'])
+                    or len(events) != 1 or events[0].get('allowed') is not True
+                    or events[0].get('scope') != 'worksheet'
+                    or events[0].get('reason') != 'worksheet_today'):
+                preserved = []
+                break
+            preserved.append(dict(location=location, formula_sha256=item['formula_sha256'],
+                                  restriction_event=events[0],
+                                  disposition='unchanged_requires_runtime_cone_certificate'))
+        if len(preserved) == len(unresolved):
+            unresolved = []
     counts = Counter(action["rule_id"] for action in actions)
     plan = {
         "schema_version": PLAN_SCHEMA,
@@ -746,6 +1153,7 @@ def build_plan(source_path: str | Path) -> dict:
         "action_counts": dict(sorted(counts.items())),
         "unresolved": unresolved,
         "status": "eligible" if actions and not unresolved else "ineligible",
+        **({'preserved_worksheet_restrictions': preserved} if preserved else {}),
     }
     return {**plan, "plan_sha256": _unsigned_hash(plan, "plan_sha256")}
 
@@ -849,7 +1257,8 @@ def _write_package(
     try:
         with zipfile.ZipFile(temporary_path, "w") as archive:
             for info in infos:
-                archive.writestr(copy.copy(info), members[info.filename])
+                if info.filename in members:
+                    archive.writestr(copy.copy(info), members[info.filename])
         with temporary_path.open("rb") as handle:
             os.fsync(handle.fileno())
         if output.exists():
@@ -877,8 +1286,12 @@ def apply_plan(
     infos, before = _package(source)
     after = dict(before)
     grouped: dict[str, list[dict]] = defaultdict(list)
+    package_actions = []
     for action in plan["actions"]:
-        grouped[action["part"]].append(action)
+        if action['kind'] == 'prune_dead_external_package':
+            package_actions.append(action)
+        else:
+            grouped[action["part"]].append(action)
     changed = {}
     for part, actions in sorted(grouped.items()):
         original = before[part]
@@ -893,6 +1306,15 @@ def apply_plan(
                 "before_sha256": sha256_bytes(original),
                 "after_sha256": sha256_bytes(after[part]),
             }
+    removed = {}
+    for action in package_actions:
+        if any(sha256_bytes(before[p]) != h for p, h in action['before_members'].items()):
+            raise RemediationError('external package action changed')
+        for part, xml in action['replacement_members'].items():
+            after[part] = xml.encode('utf-8')
+            changed[part] = dict(before_sha256=sha256_bytes(before[part]), after_sha256=sha256_bytes(after[part]))
+        for part in action['removed_members']:
+            removed[part] = sha256_bytes(after.pop(part))
     if not changed:
         raise RemediationError("eligible plan produced no changed OOXML members")
     if _value_ledger(before) != _value_ledger(after):
@@ -919,7 +1341,7 @@ def apply_plan(
                 f"remediated source route is {after_health['route']}: "
                 f"{after_health['reason_codes']}"
             )
-        untouched = sorted(set(before) - set(changed))
+        untouched = sorted(set(before) - set(changed) - set(removed))
         if any(before[name] != after[name] for name in untouched):
             raise RemediationError("untouched OOXML member changed")
         action_evidence = [
@@ -939,6 +1361,8 @@ def apply_plan(
                     "after_formula_sha256",
                     "cached_value_sha256",
                     "substitutions",
+                    "before_members",
+                    "removed_members",
                 )
                 if key in action
             }
@@ -967,6 +1391,7 @@ def apply_plan(
             "actions": action_evidence,
             "action_counts": plan["action_counts"],
             "changed_members": changed,
+            "removed_members": removed,
             "member_count": len(before),
             "untouched_member_count": len(untouched),
             "untouched_members_sha256": object_hash({
@@ -1008,8 +1433,16 @@ def verify_manifest(
         raise RemediationError("remediation manifest bindings changed")
     _, before = _package(source)
     _, after = _package(output)
-    if set(before) != set(after):
+    removed = {p: h for a in plan['actions'] if a['kind'] == 'prune_dead_external_package'
+               for p, h in a['before_members'].items() if p in a['removed_members']}
+    if set(before) - set(after) != set(removed) or set(after) - set(before):
         raise RemediationError("OOXML member set changed")
+    if removed != manifest.get('removed_members', {}) or any(sha256_bytes(before[p]) != h for p, h in removed.items()):
+        raise RemediationError('removed external package evidence changed')
+    for action in plan['actions']:
+        if action['kind'] == 'prune_dead_external_package':
+            if any(after.get(p) != xml.encode('utf-8') for p, xml in action['replacement_members'].items()):
+                raise RemediationError('external package replacement differs from original plan')
     if _value_ledger(before) != _value_ledger(after):
         raise RemediationError("formula cache/value ledger changed")
     changed = {
@@ -1017,7 +1450,7 @@ def verify_manifest(
             "before_sha256": sha256_bytes(before[name]),
             "after_sha256": sha256_bytes(after[name]),
         }
-        for name in before if before[name] != after[name]
+        for name in after if before[name] != after[name]
     }
     if changed != manifest["changed_members"]:
         raise RemediationError("changed OOXML member proof does not match")

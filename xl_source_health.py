@@ -65,6 +65,7 @@ RESTRICTION_PROFILE = {
     "schema_version": "source-restriction-profile/v3",
     "allowlist": [
         "confirmed_false_external_detection",
+        "exact_same_row_table_reference",
         "worksheet_cell_filename",
         "worksheet_indirect_a1",
         "worksheet_now",
@@ -75,6 +76,8 @@ RESTRICTION_PROFILE = {
 PREVIOUS_RESTRICTION_PROFILE = {
     **RESTRICTION_PROFILE,
     "schema_version": "source-restriction-profile/v2",
+    "allowlist": [reason for reason in RESTRICTION_PROFILE["allowlist"]
+                  if reason != "exact_same_row_table_reference"],
 }
 _FUNCTION_RE = re.compile(
     r"(?i)(?<![A-Z0-9_.])(?:_xlfn\.)?("
@@ -222,6 +225,7 @@ def _formula_restriction_events(
     *,
     scope: str,
     location: str,
+    table_context=None,
 ) -> list[dict]:
     """Classify formula tokens without confusing strings and structured refs."""
     events = []
@@ -278,8 +282,28 @@ def _formula_restriction_events(
             "token": formula[match.start():match.end()],
             "token_offset": match.start(),
         })
+    resolved_table_spans = []
+    if scope == "worksheet" and table_context is not None:
+        sheet = location.rpartition("!")[0]
+        for match in re.finditer(
+            r"(?<![\w.\\!'\]])[A-Za-z_\\][A-Za-z0-9_.\\]*"
+            r"\[\[#This Row\],\[[^\[\]]+\]\]", code, re.IGNORECASE
+        ):
+            token = formula[match.start():match.end()]
+            target = table_context._same_row_table_reference(token, sheet, location)
+            if target is None or any(a <= match.start() < b for a, b in external_spans):
+                continue
+            resolved_table_spans.append((match.start(), match.end()))
+            events.append({
+                "allowed": True, "event": "structured_reference",
+                "location": location, "reason": "exact_same_row_table_reference",
+                "scope": scope, "token": token, "token_offset": match.start(),
+                "resolved_cell": list(target[0]),
+            })
     for match in re.finditer(r"\[[^\]]+\]", code):
         if any(start <= match.start() < end for start, end in external_spans):
+            continue
+        if any(start <= match.start() < end for start, end in resolved_table_spans):
             continue
         content = match.group(0)[1:-1]
         previous = code[match.start() - 1] if match.start() else ""
@@ -494,6 +518,42 @@ def _workbook_sheet_parts(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     return parts
 
 
+def _table_reference_context(archive, sheet_parts):
+    """Read table relationships and reuse the AST's exact geometry checks."""
+    from types import SimpleNamespace
+    from openpyxl.worksheet.table import Table
+    from xl_ast_graph import AstGraph
+    context = AstGraph(Path("."), verbose=False)
+    for sheet, part in sheet_parts:
+        root = _parse_xml(archive, part)
+        declared = root.findall(".//{*}tablePart")
+        if not declared:
+            continue
+        directory, name = posixpath.split(part)
+        relations = _parse_xml(archive, posixpath.join(directory, "_rels", name + ".rels"))
+        indexed = {}
+        for relation in relations.findall(f"{{{_REL_NS}}}Relationship"):
+            key = relation.attrib.get("Id")
+            if key in indexed:
+                raise SourceHealthError("ambiguous table relationship")
+            indexed[key] = relation.attrib
+        tables = {}
+        for number, declaration in enumerate(declared):
+            key = declaration.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            relation = indexed.get(key, {})
+            if (not relation.get("Type", "").endswith("/table")
+                    or relation.get("TargetMode", "Internal") != "Internal"):
+                raise SourceHealthError("unsupported table relationship")
+            target = relation.get("Target", "")
+            path = posixpath.normpath(target.lstrip("/") if target.startswith("/")
+                                     else posixpath.join(directory, target))
+            if not target or not path.startswith("xl/") or "\\" in path:
+                raise SourceHealthError("table relationship escapes workbook parts")
+            tables[number] = Table.from_tree(_parse_xml(archive, path))
+        context._collect_tables(SimpleNamespace(title=sheet, tables=tables))
+    return context
+
+
 def _calculation_record(path: Path) -> dict:
     metadata = workbook_calculation_metadata(path)
     return {
@@ -624,6 +684,7 @@ def inspect_workbook(
             if "xl/workbook.xml" not in names or "[Content_Types].xml" not in names:
                 raise SourceHealthError("required OOXML workbook parts are missing")
             sheet_parts = _workbook_sheet_parts(archive)
+            table_context = _table_reference_context(archive, sheet_parts) if current_policy else None
             formula_count = 0
             cache_present = 0
             cache_populated = 0
@@ -792,6 +853,7 @@ def inspect_workbook(
                         text,
                         scope="worksheet",
                         location=coordinate,
+                        table_context=table_context,
                     )
                     restriction_events.extend(formula_events)
                     functions = sorted({
@@ -1181,6 +1243,28 @@ def inspect_workbook(
 
 
 observe_workbook = inspect_workbook
+
+
+def matches_observed_report(retained: dict, observed: dict, source_path: str | Path) -> bool:
+    """Compare authentic reports across the added blank-string cache counter.
+
+    Old reports omitted this counter. Only an actual current zero observation
+    permits that omission; both original report hashes and source identity are
+    validated before comparing every other field. No report is rewritten.
+    """
+    validate_report(retained, source_path)
+    validate_report(observed, source_path)
+    if retained == observed:
+        return True
+    name = "formula_caches_blank_string"
+    old_counts, new_counts = retained.get("counts"), observed.get("counts")
+    if (not isinstance(old_counts, dict) or not isinstance(new_counts, dict)
+            or name in old_counts or type(new_counts.get(name)) is not int
+            or new_counts[name] != 0):
+        return False
+    expected = {**retained, "counts": {**old_counts, name: 0}}
+    expected["report_sha256"] = _report_id(expected)
+    return expected == observed
 
 
 def validate_report(report: dict, source_path: str | Path | None = None) -> dict:

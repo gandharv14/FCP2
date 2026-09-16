@@ -25,7 +25,7 @@ import json
 import random
 import sys
 import time
-import tracemalloc
+from xl_seg.verification_metrics import VerificationMetrics
 from pathlib import Path
 
 from xl_seg import adjudicate, bands, condense, diagnostics, emit, evaluate, frontier, lineage
@@ -45,10 +45,10 @@ PROOF_EDGE_ESTIMATED_BYTES = 256
 class ProofResourceExhaustion(MemoryError):
     reason_code = "resource_exhaustion"
 
-    def __init__(self, count):
+    def __init__(self, count, *, resource="materialized_proof_edges"):
         self.report = {
             "reason_code": self.reason_code,
-            "resource": "materialized_proof_edges",
+            "resource": resource,
             "observed_edge_count_lower_bound": count,
             "edge_limit": MAX_MATERIALIZED_PROOF_EDGES,
             "estimated_allocation_bytes_lower_bound": count * PROOF_EDGE_ESTIMATED_BYTES,
@@ -68,6 +68,30 @@ def _check_proof_edge_budget(radj, cone):
                 if count > MAX_MATERIALIZED_PROOF_EDGES:
                     raise ProofResourceExhaustion(count)
     return count
+
+
+def _proof_attempted_reads(journal, cone):
+    """Bound the emitted journal independently of the active runtime graph."""
+    count = 0
+    for consumers in journal.values():
+        for consumer in consumers:
+            if consumer is not None and consumer in cone:
+                count += 1
+                if count > MAX_MATERIALIZED_PROOF_EDGES:
+                    from xl_seg.active_graph import ReadRelation, Rows
+                    from xl_seg import proof_graph
+                    if type(journal) in (dict, ReadRelation, Rows, proof_graph.Relation):
+                        return proof_graph.encode(proof_graph.freeze(journal, members=cone))
+                    raise ProofResourceExhaustion(
+                        count, resource="materialized_attempted_read_edges"
+                    )
+    # No output lists or sorted rows are allocated until the exact count passes.
+    out = {}
+    for source, consumers in sorted(journal.items()):
+        selected = sorted(c for c in consumers if c is not None and c in cone)
+        if selected:
+            out[source] = selected
+    return out
 
 
 def _eligible_proof_input(cg, cell):
@@ -119,7 +143,14 @@ def _proof_cone(outputs, radj):
 
 
 def _proof_edge_signature(radj, cone):
-    _check_proof_edge_budget(radj, cone)
+    try:
+        _check_proof_edge_budget(radj, cone)
+    except ProofResourceExhaustion as exhausted:
+        from xl_seg import proof_graph
+        try:
+            return proof_graph.Signature(proof_graph.freeze(radj, keys=cone, members=cone))
+        except TypeError:
+            raise exhausted
     return tuple(sorted(
         (source, target)
         for target in cone
@@ -150,7 +181,19 @@ def _resolved_target_signature(result, cone, graph=None):
 
 def _active_cycle_groups(cone, radj):
     """Find exact active SCCs in the stabilized output proof graph."""
-    _check_proof_edge_budget(radj, cone)
+    try:
+        _check_proof_edge_budget(radj, cone)
+    except ProofResourceExhaustion as exhausted:
+        from xl_seg import proof_graph
+        try:
+            reverse = proof_graph.freeze(radj, keys=cone, members=cone)
+        except TypeError:
+            raise exhausted
+        # Transposition preserves SCC membership. Iterate sorted grouped rows
+        # directly; never allocate a second copy of the edge cross product.
+        groups = evaluate.strongly_connected(sorted(cone), reverse)
+        return sorted(tuple(sorted(group)) for group in groups
+                      if len(group) > 1 or group[0] in reverse.get(group[0], ()))
     adjacency = {cell: set() for cell in cone}
     for target in cone:
         for source in radj.get(target, ()):
@@ -360,16 +403,21 @@ def stabilize_runtime_proof(
         )
         if target in final_cone
     }
+    from xl_seg import proof_graph
+    if isinstance(final_edges, proof_graph.Signature):
+        encoded_radj = proof_graph.encode(proof_graph.freeze(final_radj, keys=final_cone, members=final_cone))
+    else:
+        encoded_radj = {
+            target: sorted(source for source in sources if source in final_cone)
+            for target, sources in sorted(final_radj.items()) if target in final_cone
+        }
+    attempted_reads = _proof_attempted_reads(getattr(result, "read_attempts", None) or {}, final_cone)
     proof = {
-        "schema_version": 1,
+        "schema_version": 2 if 'schema_version' in encoded_radj or 'schema_version' in attempted_reads else 1,
         "declared_static_inputs": sorted(declared_inputs),
         "effective_inputs": sorted(proof_inputs),
         "runtime_added_inputs": sorted(proof_inputs - initial_proof_inputs),
-        "runtime_radj": {
-            target: sorted(source for source in sources if source in final_cone)
-            for target, sources in sorted(final_radj.items())
-            if target in final_cone
-        },
+        "runtime_radj": encoded_radj,
         "runtime_address_radj": address_radj,
         "resolved_targets": {
             target: list(sources)
@@ -389,19 +437,7 @@ def stabilize_runtime_proof(
             if graph.nodes.get(operation) is not None
             and graph.nodes[operation].owner in final_cone
         },
-        "attempted_reads": {
-            source: sorted(
-                consumer for consumer in consumers
-                if consumer is not None and consumer in final_cone
-            )
-            for source, consumers in sorted(
-                (getattr(result, "read_attempts", None) or {}).items()
-            )
-            if any(
-                consumer is not None and consumer in final_cone
-                for consumer in consumers
-            )
-        },
+        "attempted_reads": attempted_reads,
         "closure": {
             "stabilized": stabilized,
             "targets_stable": stabilized and final_targets == previous_targets,
@@ -481,7 +517,7 @@ def segment(wb: str, args) -> dict:
                 key = adjudicate.read_key(Path(args.env_file))
                 if not key:
                     raise SystemExit(
-                        f"--llm needs anthropic_api_key or lbx_api_key in {args.env_file}")
+                        f"--llm needs anthropic_api_key or lbx_labelbox_api_key in {args.env_file}")
                 proxy = adjudicate.via_proxy(Path(args.env_file))
                 decisions = adjudicate.adjudicate(
                     wb, candidates[: args.top], key, args.model, proxy=proxy)
@@ -562,45 +598,36 @@ def segment(wb: str, args) -> dict:
         proof_radj = None
         proof = None
         evaluator_benchmark = {}
-        already_tracing = tracemalloc.is_tracing()
-        if not already_tracing:
-            tracemalloc.start()
-        memory_before, _ = tracemalloc.get_traced_memory()
-        tracemalloc.reset_peak()
-        verification_started = time.perf_counter()
-        if not args.no_verify:
-            calculation = evaluate.workbook_calculation_metadata(source)
-            result, proof_inputs, proof_radj, proof = stabilize_runtime_proof(
-                graph,
-                cg,
-                input_cells,
-                output_cells,
-                calculation=calculation,
-            )
-            evaluator_benchmark = dict(getattr(result, "benchmark", {}) or {})
-            values = result.values
-            # The expected cache is not opened until bounded discovery and the
-            # final fresh strict proof have both completed.
-            expected_cache = (
-                evaluate.workbook_expected_cache(source) if source.exists() else None
-            )
-            verify = _verify(
-                cg, result, proof_inputs, output_cells, part, cd, bg, args,
-                expected_cache=expected_cache,
-                calculation=calculation,
-                source_path=source,
-                ast_dir=ast_dir,
-                curation_path=curation_path,
-                proof=proof,
-                curated_output_cells=ordered_curated_cells,
-            )
-            if expected_cache is not None and hasattr(expected_cache, "close"):
-                expected_cache.close()
-        verification_runtime_s = time.perf_counter() - verification_started
-        _, memory_peak = tracemalloc.get_traced_memory()
-        peak_memory_bytes = max(0, int(memory_peak - memory_before))
-        if not already_tracing:
-            tracemalloc.stop()
+        with VerificationMetrics(trace_allocations=getattr(args, "trace_allocations", False)) as metrics:
+            if not args.no_verify:
+                calculation = evaluate.workbook_calculation_metadata(source)
+                result, proof_inputs, proof_radj, proof = stabilize_runtime_proof(
+                    graph,
+                    cg,
+                    input_cells,
+                    output_cells,
+                    calculation=calculation,
+                )
+                evaluator_benchmark = dict(getattr(result, "benchmark", {}) or {})
+                values = result.values
+                # The expected cache is not opened until bounded discovery and the
+                # final fresh strict proof have both completed.
+                expected_cache = (
+                    evaluate.workbook_expected_cache(source) if source.exists() else None
+                )
+                verify = _verify(
+                    cg, result, proof_inputs, output_cells, part, cd, bg, args,
+                    expected_cache=expected_cache,
+                    calculation=calculation,
+                    source_path=source,
+                    ast_dir=ast_dir,
+                    curation_path=curation_path,
+                    proof=proof,
+                    curated_output_cells=ordered_curated_cells,
+                )
+                if expected_cache is not None and hasattr(expected_cache, "close"):
+                    expected_cache.close()
+
 
         literals = [
             {**rec, "bucket": part.bucket.get(cd.comp_of.get(rec["band"]), partition.SCAFFOLD)}
@@ -708,8 +735,7 @@ def segment(wb: str, args) -> dict:
 
         payload["elapsed_s"] = round(time.time() - started, 2)
         payload["benchmark"] = {
-            "verifier_runtime_s": verification_runtime_s,
-            "peak_memory_bytes": peak_memory_bytes,
+            **metrics.result,
             "evaluator": evaluator_benchmark,
         }
         payload["generation"] = {
@@ -902,10 +928,13 @@ def _verify(
 
     runtime_radj = result.runtime_radj or {}
     stabilized_radj = (proof or {}).get("runtime_radj")
+    if stabilized_radj is not None:
+        from xl_seg.proof_graph import read
+        stabilized_radj = read(stabilized_radj)
     effective_radj = {}
     for target in cg.info:
         if stabilized_radj is not None:
-            effective_radj[target] = set(stabilized_radj.get(target, ()))
+            effective_radj[target] = stabilized_radj.get(target, ())
         else:
             from xl_seg.group_adjacency import Neighbors
             effective_radj[target] = Neighbors(None, frozenset(),
@@ -913,7 +942,7 @@ def _verify(
                  else frozenset(runtime_radj.get(target, ())), cg.radj.get(target, frozenset())))
     if stabilized_radj is not None:
         for target, sources in stabilized_radj.items():
-            effective_radj[target] = set(sources)
+            effective_radj[target] = sources
 
     cone, stack = set(output_cells), list(output_cells)
     while stack:
@@ -1559,6 +1588,8 @@ def main(argv=None):
     parser.add_argument("--model", default=adjudicate.DEFAULT_MODEL)
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--no-verify", action="store_true")
+    parser.add_argument("--trace-allocations", action="store_true",
+                        help="profile Python allocations (adds substantial runtime overhead)")
     args = parser.parse_args(argv)
     if (
         args.source_generation_path or args.source_generation_id

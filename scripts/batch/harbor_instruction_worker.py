@@ -146,8 +146,9 @@ def step_directory(worker, phase):
 
 
 def task(worker, selection, tracker):
+    from scripts.batch.harbor_disclosure_command_repair import producer_run
     return producer.Task(tracker, selection.content.stage, static.tree(selection.content.stage),
-                         worker.run/'producer', selection.content.model_policy, worker.root,worker.code_repair,
+                         producer_run(worker), selection.content.model_policy, worker.root,worker.code_repair,
                          selection.content.dialogue_scope_receipt if selection.content.dialogue_scope_receipt is not None
                          and read(selection.content.dialogue_scope_receipt).get('schema_version')=='dialogue-discovery-code-equivalence/v1' else None,**({'disclosure_revision':worker.disclosure_revision} if worker.disclosure_revision is not None else {}),
                          **({'dialogue_pre_review_repair':worker.dialogue_pre_review_repair} if worker.dialogue_pre_review_repair is not None else {}),
@@ -250,6 +251,9 @@ def _runtime(worker, selection, directory):
 
 
 def _operation(worker, selection, lease, phase, directory, *, models, containers, commands, credential, lock_fd):
+    from scripts.batch import harbor_disclosure_command_repair as command_repair
+    if phase=='disclosure-build' and command_repair.selected(worker):
+        return command_repair.remaining_operation(worker,selection,lease,directory,commands=commands,lock_fd=lock_fd)
     if worker.warning_requalification is not None and phase=='dialogue-review':
         from scripts.batch.harbor_dialogue_warning_requalification import apply_review
         return apply_review(worker,selection,lease,directory)
@@ -460,10 +464,13 @@ def _step(worker, selection, lease, *, phase, checkpoint, **options):
         structural=validate(worker,before)
         require(structural['initial']==record(initial),'structural refresh changed initial history')
     elif worker.retry is not None:
-        from scripts.batch.harbor_nat_retry import validate
+        if worker.warning_requalification is not None and read(worker.warning_requalification).get('nat_first_round')is not None:
+            from scripts.batch.harbor_nat_warning_history import retained_retry as validate
+        else:
+            from scripts.batch.harbor_nat_retry import validate
         retry = validate(worker, before)
         require(retry['initial'] == record(initial), 'retry initial evidence changed')
-    elif worker.code_repair is None and worker.disclosure_repair is None and renewal is None and worker.disclosure_revision is None:
+    elif worker.code_repair is None and worker.disclosure_repair is None and renewal is None and worker.disclosure_revision is None and worker.warning_requalification is None:
         require(saved['code']==code(worker),'worker or owning implementation changed; root revalidation required')
     if worker.disclosure_repair is not None:
         from scripts.batch.harbor_disclosure_review_resume import validate
@@ -526,6 +533,9 @@ def _step(worker, selection, lease, *, phase, checkpoint, **options):
     if worker.dialogue_pre_review_repair is not None and worker.dialogue_semantic_retry is None and finished and finished[-1]=='dialogue-paraphraser':
         preceding=worker.dialogue_pre_review_repair
     required=record(pending_now[-1]) if pending_now else preceding
+    if worker.code_repair is not None and not pending_now and next_phase=='disclosure-build':
+        from scripts.batch.harbor_disclosure_command_repair import selected as command_repair_selected
+        if command_repair_selected(worker):required=worker.code_repair
     if retry is not None and next_phase == 'nat-writer' and not pending_now:
         required = worker.retry
     if semantic is None and structural is not None and next_phase==structural['phase'] and not pending_now:
@@ -547,7 +557,8 @@ def _step(worker, selection, lease, *, phase, checkpoint, **options):
     if semantic is not None and expected=='dialogue-writer':predecessor=semantic
     if worker.warning_requalification is not None and expected=='dialogue-review':predecessor=read(worker.warning_requalification)
     if (worker.disclosure_revision is not None or worker.disclosure_repair is not None) and expected=='disclosure-review':predecessor=read(worker.disclosure_revision or worker.disclosure_repair)
-    if renewal is not None and preceding==renewal['checkpoint'] and checkpoint==worker.lease_renewal:
+    if renewal is not None and preceding==renewal['checkpoint'] and (checkpoint==worker.lease_renewal or
+            (pending_now and read(read(checkpoint)['intent'])['previous']==worker.lease_renewal)):
         predecessor=read(worker.lease_renewal)
     require(codec.encode(selection)==predecessor['selection'] and asdict(lease)==predecessor['lease'],'caller did not select exact previous worker checkpoint')
     directory=step_directory(worker,expected);directory.mkdir(parents=True,exist_ok=True)

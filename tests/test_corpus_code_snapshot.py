@@ -116,6 +116,21 @@ def test_git_checkout_discovers_sources_but_rejects_empty_result(tmp_path,monkey
     assert not (tmp_path/'empty').exists()
 
 
+def test_generated_evidence_is_not_copied_as_pipeline_code(tmp_path,monkeypatch):
+    root=tmp_path/'repo';root.mkdir()
+    for name in ('scripts/worker.py','verification_manifests/policy.json',
+                 'reports/validation.json','diagnostics/attempt/response.json'):
+        path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('{}')
+    monkeypatch.setattr(corpus,'ROOT',root)
+    monkeypatch.setattr(corpus.subprocess,'check_output',lambda *a,**k:
+        b'scripts/worker.py\0verification_manifests/policy.json\0reports/validation.json\0diagnostics/attempt/response.json\0')
+    before={str(p.relative_to(root)):p.read_bytes()for p in root.rglob('*')if p.is_file()}
+    frozen,_=corpus.snapshot_code(tmp_path/'snapshots')
+    assert set(corpus.code_files())=={'scripts/worker.py','verification_manifests/policy.json'}
+    assert not(frozen/'reports').exists()and not(frozen/'diagnostics').exists()
+    assert {str(p.relative_to(root)):p.read_bytes()for p in root.rglob('*')if p.is_file()}==before
+
+
 def test_frozen_subprocess_can_snapshot_and_launch_without_git(tmp_path):
     import os
     root=tmp_path/'frozen';root.mkdir()

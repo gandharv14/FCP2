@@ -38,8 +38,29 @@ def _approved(prepared):
     paths=[p for p in manifest['code'] if p.endswith(suffix)]
     _require(len(paths)==1,'ambiguous active normalization root')
     root=Path(paths[0]).parents[2]
-    binding=dict(path=str(root.parent/SNAPSHOT_NAME),sha256=APPROVED_SNAPSHOT_SHA256)
-    snapshot=_read(binding)['snapshot']
+    selected=os.environ.get('HARBOR_FLEET_NORMALIZATION_PROFILE')
+    extra={}
+    if selected:
+        profile_binding=json.loads(selected);profile=_read(profile_binding)
+        required={'schema_version','prepared','snapshot','authorization'}
+        _require(set(profile) in (required,required|{'retained_partition'})
+                 and profile['schema_version']=='harbor-normalization-snapshot-selection/v1'
+                 and profile['prepared']==prepared,'exact prepared normalization profile required')
+        # A new root selection names the existing inventory; it never creates
+        # the old hardcoded filename or changes an old approval/hash.
+        authority=profile['authorization'];_require(_record(authority['path'])==authority,'normalization selection authority changed')
+        binding=profile['snapshot'];snapshot=_read(binding)
+        extra={profile_binding['path']:profile_binding['sha256'],authority['path']:authority['sha256']}
+        if profile.get('retained_partition'):
+            history=profile['retained_partition']
+            _require(set(history)=={'loader','plan'},'closed retained partition reader required')
+            for row in history.values():_require(_record(row['path'])==row,'retained partition dependency changed')
+            selected_plan=_read(history['plan'])
+            _require(selected_plan['prepared']==prepared and selected_plan['version']==root.name,'retained partition belongs to another prepared producer')
+            extra.update({r['path']:r['sha256'] for r in history.values()})
+    else:
+        binding=dict(path=str(root.parent/SNAPSHOT_NAME),sha256=APPROVED_SNAPSHOT_SHA256)
+        snapshot=_read(binding)['snapshot']
     _require(snapshot['root']==str(root),'untrusted normalization snapshot root')
     rows=snapshot['files'];seen=set();files={}
     actual=set()
@@ -56,6 +77,7 @@ def _approved(prepared):
         files[entry['path']]=entry['sha256']
     _require(actual==seen,'normalization snapshot file inventory changed')
     _require(all(files.get(path)==sha for path,sha in manifest['code'].items()),'prepared code not completely in approved snapshot')
+    files.update(extra)
     return root,binding,files
 
 
@@ -69,6 +91,22 @@ def _child(request):
     from scripts.batch import harbor_normalization_partitioned as P
     from scripts.batch import harbor_normalization_producer as N
     _require(Path(P.__file__).resolve()==root/'scripts/batch/harbor_normalization_partitioned.py','wrong active normalizer imported')
+    selected_profile=os.environ.get('HARBOR_FLEET_NORMALIZATION_PROFILE')
+    if selected_profile:
+        profile=_read(json.loads(selected_profile));history=profile.get('retained_partition')
+        if history:
+            # Reuse the original completed-partition reader selected when the
+            # real Calls were produced. Its loader only reconstructs history;
+            # no dispatcher, eligibility probe or transport function is run.
+            import importlib.util
+            _require(_record(history['loader']['path'])==history['loader'],'partition loader changed')
+            spec=importlib.util.spec_from_file_location('_normalization_retained_partition',history['loader']['path'])
+            loader=importlib.util.module_from_spec(spec);sys.modules[spec.name]=loader;spec.loader.exec_module(loader)
+            loaded=loader.load(history['plan'])
+            _require(isinstance(loaded,tuple) and len(loaded)==6 and loaded[0]['prepared']==prepared,'retained partition loader contract differs')
+            facade=loaded[4]
+            _require(facade.__name__==P.__name__ and facade.undispatched_reader_witness is not None,'unselected completed partition facade')
+            P=facade
     selected=P.selection(prepared)
     _require(asdict(selected.policy)==value['policy'],'normalization model policy changed')
     _,rows=N.analyse(selected)
@@ -88,7 +126,17 @@ def _invoke(root,payload):
                 request_binding['path'],request_binding['sha256']],stdout=output,timeout_seconds=900,
                 grace_seconds=3,memory_limit_bytes=8*1024**3,metrics=metrics,cwd=root,
                 env={**os.environ,'PYTHONPATH':str(root),'PYTHONDONTWRITEBYTECODE':'1'})
-        _require(rc==0,'active normalization validator rejected selected evidence')
+        if rc!=0:
+            failed=Path(tempfile.mkdtemp(prefix='normalization-validation-failed-')).resolve()
+            for name,raw in [('request.json',request.read_bytes()),('response.log',response.read_bytes())]:
+                target=failed/name
+                with target.open('xb') as handle:handle.write(raw)
+                target.chmod(0o600)
+            failure=dict(returncode=rc,request=_record(failed/'request.json'),response=_record(failed/'response.log'),
+                         metrics=metrics,models_dispatched=0,automatic_retry=False)
+            saved=failed/'failure.json';saved.write_text(json.dumps(failure,sort_keys=True));saved.chmod(0o600)
+            raise ValueError('active normalization validator rejected selected evidence; retained '+str(saved)+
+                             '\n'+response.read_text(errors='replace')[-4000:])
         return json.loads(response.read_text())
 
 

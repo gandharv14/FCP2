@@ -68,7 +68,7 @@ def read_bytes(binding):
     return E.checked_bytes(binding)
 
 
-def changes(binding,root):
+def changes(binding,root,*,projection=None):
     from scripts.batch.harbor_dialogue_warning_requalification import ALLOWED as DIALOGUE
     allowed=DIALOGUE|{'scripts/batch/harbor_model_executor.py','scripts/batch/harbor_model_review_provenance.py',
         'scripts/batch/harbor_disclosure_payload_repair.py','scripts/batch/harbor_disclosure_review_resume.py',
@@ -93,6 +93,16 @@ def changes(binding,root):
     # Without a payload delta, permit only this owning adapter's compatibility
     # update; do not turn a same-code recovery into a general code rebase.
     payload_changed='scripts/batch/harbor_disclosure_payload_repair.py' in changed
+    if 'scripts/batch/harbor_disclosure_evidence.py' in changed:
+        require(projection==payload.RECORD_PROJECTION and payload_changed,
+                'record evidence code requires explicit lossless records projection')
+        require(set(changed)<={'.pipeline-code.json',
+            'scripts/batch/harbor_disclosure_payload_repair.py',
+            'scripts/batch/harbor_disclosure_evidence.py',
+            'scripts/batch/harbor_instruction_producer.py',
+            'scripts/batch/harbor_disclosure_review_resume.py'},
+            'record serialization cannot include unrelated instruction changes')
+        allowed=allowed|{'scripts/batch/harbor_disclosure_evidence.py'}
     adapter_only=set(changed)<={'scripts/batch/harbor_disclosure_review_resume.py',guard}
     require(set(changed)<=allowed and (payload_changed or adapter_only),
             'unrelated disclosure repair code transition')
@@ -128,7 +138,7 @@ def authorize(worker,selection,lease,*,blocked,old_snapshot,directory,takeover=N
         for path,digest in intent['code'].items():
             require(Path(path).is_relative_to(Path(read(old_snapshot)['root'])) and record(path)['sha256']==digest,
                     'failed request code snapshot changed')
-        changed=changes(old_snapshot,worker.root)
+        changed=changes(old_snapshot,worker.root,projection=projection)
         proof=prefix(before,selection,worker.context,stop='disclosure')
         payload._rejected(original.prepared,worker.campaign)
         require(context['stage_tree']==w.static.tree(selection.content.stage),'retained disclosure stage changed')
@@ -183,7 +193,8 @@ def validate(worker,before):
         require(repair.get('prior_continuations',{}).get('disclosure_repair')==worker.disclosure_repair
                 and repair['current_code']==w.code(worker),'disclosure code repair history detached')
         return validate_historical_integrity(worker,before)[0]
-    require(receipt['code_changes']==changes(receipt['old_snapshot'],worker.root),'disclosure continuation code changed')
+    projection=read(receipt['physical_repair']).get('projection')
+    require(receipt['code_changes']==changes(receipt['old_snapshot'],worker.root,projection=projection),'disclosure continuation code changed')
     require(receipt['physical_count']==1 and receipt['semantic_budget_reset'] is False,'disclosure retry budget changed')
     for binding in [receipt['blocked'],receipt['predecessor'],receipt['tracker'],*receipt['retained_prefix'],*receipt['takeover_records']]:read_bytes(binding)
     request=w.request_saved(Path(receipt['request']['path']));read_bytes(receipt['request'])

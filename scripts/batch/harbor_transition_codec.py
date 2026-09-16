@@ -27,7 +27,8 @@ def encode(value):
         registry=classes();name=type(value).__name__
         require(registry.get(name) is type(value),'unsupported evidence class')
         return {'type':name,'value':{f.name:encode(getattr(value,f.name)) for f in fields(value)
-            if not (name=='SemanticSelection' and f.name in {'dialogue_pre_review_repair','disclosure_partition_aggregate','dialogue_partition_aggregate'} and getattr(value,f.name) is None)}}
+            if not (name=='ProfileSelection' and f.name=='skips' and getattr(value,f.name)==())
+            and not (name=='SemanticSelection' and f.name in {'dialogue_pre_review_repair','disclosure_partition_aggregate','dialogue_partition_aggregate'} and getattr(value,f.name) is None)}}
     raise ValueError('unsupported transaction evidence type')
 
 def decode(value):
@@ -53,6 +54,8 @@ def decode(value):
     # remain closed; new encodings always carry the optional binding.
     if kind=='Selection' and isinstance(v,dict) and set(v)=={f.name for f in fields(cls)}-{'dialogue_scope_receipt'}:
         v={**v,'dialogue_scope_receipt':{'type':'scalar','value':None}}
+    if kind=='ProfileSelection' and isinstance(v,dict) and set(v)=={f.name for f in fields(cls)}-{'skips'}:
+        v={**v,'skips':{'type':'tuple','value':[]}}
     if kind=='SemanticSelection' and isinstance(v,dict):
         optional={'disclosure_revision','dialogue_pre_review_repair','disclosure_partition_aggregate','dialogue_partition_aggregate'}
         required={f.name for f in fields(cls)}-optional

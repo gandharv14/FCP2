@@ -4,6 +4,7 @@ Root constructs AdmissionPolicy from the selected campaign. Agent data cannot
 supply authority callbacks, clocks, probe commands, requested IDs or namespaces.
 """
 from dataclasses import dataclass
+from collections import Counter
 import importlib.metadata
 import json
 import os
@@ -128,6 +129,15 @@ MARKERS = {'task.toml', 'task.json', 'task.yaml', 'task.yml', 'release-manifest.
 
 def survey_namespaces(roots, known_ids):
     """Re-scan the configured known namespaces; never trust historical absence."""
+    if os.environ.get('HARBOR_FLEET_LEGACY_RESEARCH_PATH'):
+        from scripts.batch.harbor_legacy_research_history import projected_survey
+        return projected_survey(roots,known_ids)
+    if os.environ.get('HARBOR_FLEET_CONTINUATION_HISTORY_PATH'):
+        from scripts.fleet.continuation_history import projected_survey
+        return projected_survey(roots, known_ids)
+    if os.environ.get('HARBOR_FLEET_HISTORY_PATH'):
+        from scripts.fleet.history import projected_survey
+        return projected_survey(roots, known_ids)
     excluded, histories, seen = {}, {}, set()
     def identity(path):
         for part in reversed(Path(path).parts):
@@ -147,10 +157,13 @@ def survey_namespaces(roots, known_ids):
                 dirs[:] = []; continue
             seen.add(base)
             links={n for n in dirs+files if n not in PRUNE and (base/n).is_symlink()}
+            from scripts.batch.harbor_source_history_links import verified_inspection_links
+            source_links = verified_inspection_links(base, known_ids, MARKERS) if links else set()
             for name in links:
                 # Compatibility task links are positive prior-identity evidence;
                 # never follow them outside the configured namespace.
-                exclude(identity(base/name),base/name)
+                if name not in source_links:
+                    exclude(identity(base/name),base/name)
             dirs[:] = sorted(n for n in dirs if n not in PRUNE and n not in links)
             files=[n for n in files if n not in links and n not in PRUNE]
             wb = identity(base)
@@ -215,7 +228,9 @@ class DispatcherAdmission:
         require(len(rows) == policy.expected_original_count, 'original denominator changed')
         self.sources = {r['workbook_id']: r for r in rows}
         require(set(policy.requested_ids) <= self.sources.keys(), 'unknown requested identity')
-        require(len({r['sha256'] for r in rows}) == len(rows), 'ambiguous duplicate original bytes')
+        counts = Counter(r['sha256'] for r in rows)
+        require(all(counts[self.sources[wb]['sha256']] == 1 for wb in policy.requested_ids),
+                'ambiguous duplicate selected original bytes')
         require(len({r['path'] for r in rows}) == len(rows), 'ambiguous original path')
         schema.safe_path(policy.tracker_root)
 
@@ -261,6 +276,7 @@ class DispatcherAdmission:
         return source,raw,health,evidence
 
     def _check(self, workbook, raw=None, generation=None, normalization=()):
+        require(not os.environ.get('HARBOR_FLEET_CONTINUATION_HISTORY_PATH'),'continued history cannot authorize fresh admission')
         p=self.policy
         require((p.batch,p.requested_ids,str(p.tracker_root),p.mode)==self.identity,'configured cohort changed')
         require(workbook in p.requested_ids, 'workbook outside exact requested cohort')
@@ -276,7 +292,7 @@ class DispatcherAdmission:
         if any(Path(x['path']).parent.name=='workbooks' for x in history):
             from scripts.batch import harbor_pre_audit_history as preaudit
             proofs=[b for b in p.campaign_evidence
-                    if (v:=read(b)).get('schema_version')==preaudit.SCHEMA
+                    if (v:=read(b)).get('schema_version')in(preaudit.SCHEMA,'harbor-legacy-completed-research/v1','harbor-legacy-package-authoring/v1','harbor-legacy-staged-authoring/v1','harbor-legacy-opaque-authoring/v1')
                     and v.get('workbook')==workbook]
             require(len(proofs)==1,'prior tracker requires explicit lossless resume')
             preaudit.validate(proofs[0],workbook=workbook,
@@ -360,7 +376,14 @@ def _policy_from_general_cohort(manifest, candidate_binding, *, batch, tracker_r
     require(len(rows) == denominator, 'original denominator changed')
     originals = {row['workbook_id']: row for row in rows}
     require(set(ids) <= originals.keys(), 'unknown requested identity')
-    require(len({row['sha256'] for row in rows}) == len(rows), 'ambiguous duplicate original bytes')
+    # Preserve the full source denominator, including held duplicate originals.
+    # An unrelated duplicate must not block an otherwise unambiguous candidate;
+    # a selected source still cannot have any byte-identical alias in inventory.
+    source_counts = {}
+    for row in rows:
+        source_counts[row['sha256']] = source_counts.get(row['sha256'], 0) + 1
+    require(all(source_counts[originals[wb]['sha256']] == 1 for wb in ids),
+            'ambiguous duplicate selected original bytes')
     require(len({row['path'] for row in rows}) == len(rows), 'ambiguous original path')
     require(bool(history_roots), 'known history namespaces must be configured')
     survey_binding = manifest['survey']

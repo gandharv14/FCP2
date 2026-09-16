@@ -5,6 +5,7 @@ supply a current runtime/prefix and frozen previous snapshot. Original receipts
 remain immutable; a separate review step applies the exact reviewed draft.
 """
 from dataclasses import asdict, replace
+from contextlib import contextmanager
 from pathlib import Path
 import copy
 import fcntl
@@ -33,6 +34,11 @@ ALLOWED.update({'scripts/batch/harbor_instruction_lease_renewal.py',
                 'scripts/batch/harbor_disclosure_revision.py',
                 'scripts/batch/harbor_disclosure_request_recovery.py'})
 ALLOWED.update({'scripts/batch/harbor_dialogue_source_warnings.py','scripts/batch/harbor_complete_readiness.py'})
+ALLOWED.add('scripts/batch/harbor_dialogue_first_round_warning.py')
+ALLOWED.add('.pipeline-code.json')
+ALLOWED.add('scripts/batch/harbor_normalization_validator_bridge.py')
+ALLOWED.add('scripts/batch/harbor_nat_warning_history.py')
+ALLOWED.add('scripts/batch/harbor_completed_lanes.py')
 PHASES=('dialogue-review','final-runtime','dialogue-commit','enqueue')
 REVISED_CONTINUATIONS=('disclosure_revision','disclosure_repair','lease_renewal')
 
@@ -40,6 +46,60 @@ REVISED_CONTINUATIONS=('disclosure_revision','disclosure_repair','lease_renewal'
 def revised_continuations(worker):
     return {name:getattr(worker,name) for name in REVISED_CONTINUATIONS
             if getattr(worker,name,None) is not None}
+
+
+def preparation_active(worker,selection,lease,old_snapshot):
+    from scripts.batch import harbor_instruction_worker as w
+    if worker.dialogue_semantic_retry is not None and worker.lease_renewal is not None:
+        with semantic_history_scope(worker,old_snapshot):
+            return w.active(worker,selection,lease)
+    return w.active(worker,selection,lease)
+
+
+@contextmanager
+def semantic_history_scope(worker,old_snapshot):
+    """Only the selected worker's historical renewal uses its authenticated root."""
+    from scripts.batch import harbor_instruction_lease_renewal as renewal
+    require(worker.dialogue_semantic_retry is not None,'completed semantic history required')
+    changes(old_snapshot,worker.root)
+    historical=replace(worker,root=Path(read(old_snapshot)['root']),warning_requalification=None)
+    inventory=renewal._historical_inventory(historical,old_snapshot)
+    complete=read(worker.dialogue_semantic_retry);permit=read(complete['permit'])
+    require(complete['schema_version']==permit['schema_version']==semantic.SCHEMA
+            and permit['worker_run']==str(worker.run) and permit['code']==inventory,
+            'warning snapshot does not own completed semantic implementation')
+    from scripts.batch import harbor_instruction_worker as w
+    original=renewal.validate;original_code=w.code
+    def historical_code(selected):
+        return inventory if selected==historical else original_code(selected)
+    def checked(selected,before):
+        if selected==worker or selected==historical:
+            return renewal.validate_historical_integrity(historical,before,old_snapshot)
+        return original(selected,before)
+    renewal.validate=checked;w.code=historical_code
+    try:yield historical
+    finally:renewal.validate=original;w.code=original_code
+
+
+def semantic_history(worker,before,old_snapshot):
+    if worker.lease_renewal is None:
+        return semantic.validate_completed_integrity(replace(worker,warning_requalification=None),before)
+    with semantic_history_scope(worker,old_snapshot) as historical:
+        return semantic.validate_completed_integrity(historical,before)
+
+
+def completed_semantic_history(worker,before):
+    from scripts.batch import harbor_instruction_worker as w
+    p=read(worker.warning_requalification)
+    require(p['schema_version']==SCHEMA and p['worker_run']==str(worker.run)
+            and p['initial']==record(worker.run/'initial.json') and p['code']==w.code(worker)
+            and p['semantic']==worker.dialogue_semantic_retry and p.get('code_repair')==worker.code_repair
+            and p['original']==before['bindings']['original_raw_source']
+            and p.get('prior_continuations')==revised_continuations(worker)
+            and p['round']==2 and p['model_calls']==0 and p['semantic_budget_reset'] is False
+            and p['code_changes']==changes(p['old_snapshot'],worker.root),
+            'warning detached completed semantic history')
+    return semantic_history(worker,before,p['old_snapshot'])
 
 
 def revised_history(worker,before,old_snapshot):
@@ -61,12 +121,32 @@ def historical_lease(worker,before):
     """Authenticate the retained renewal before validating its old code inventory."""
     from scripts.batch import harbor_instruction_worker as w
     p=read(worker.warning_requalification)
+    if getattr(worker,'dialogue_semantic_retry',None) is not None:
+        completed_semantic_history(worker,before)
+        from scripts.batch import harbor_instruction_lease_renewal as renewal
+        with semantic_history_scope(worker,p['old_snapshot']) as historical:
+            return renewal.validate_historical_integrity(historical,before,p['old_snapshot'])
     require(p['schema_version']==SCHEMA and p['worker_run']==str(worker.run)
             and p['initial']==record(worker.run/'initial.json') and p['code']==w.code(worker)
             and p.get('prior_continuations')==revised_continuations(worker)
             and p['semantic'] is None and p.get('code_repair') is None,
             'warning detached revised disclosure or renewal history')
     require(p['code_changes']==changes(p['old_snapshot'],worker.root),'warning historical code transition changed')
+    if p.get('ordinary_first_round') is not None:
+        from scripts.batch import harbor_dialogue_first_round_warning as first
+        proof=first.validate_history(worker,before,p)
+        if worker.lease_renewal is None:
+            require('lease_renewal' not in proof and 'renewal_history' not in proof,
+                    'ordinary warning invented renewal history')
+            return proof
+        # The lease adapter contract is the authenticated renewal permit.
+        # The ordinary-history envelope also includes author/review evidence;
+        # returning that envelope loses the checkpoint used by the worker.
+        require(worker.lease_renewal is not None
+                and proof.get('lease_renewal')==worker.lease_renewal
+                and isinstance(proof.get('renewal_history'),dict),
+                'ordinary warning lacks authenticated renewal history')
+        return proof['renewal_history']
     return revised_history(worker,before,p['old_snapshot'])
 
 
@@ -100,8 +180,13 @@ def changes(binding,root):
         if path.is_file() and '__pycache__' not in path.parts:
             name=str(path.relative_to(root))
             if name not in expected:changed.append(name)
-    require(set(changed)<=ALLOWED and '.cursor/skills/additional-assumptions-dialogue/scripts/validate_dialogue.py' in changed,
+    require(set(changed)<=ALLOWED and bool(set(changed)&{
+        '.cursor/skills/additional-assumptions-dialogue/scripts/validate_dialogue.py',
+        'scripts/batch/harbor_dialogue_source_warnings.py'}),
             'unrelated code change in warning requalification')
+    if '.pipeline-code.json' in changed:
+        from scripts.batch.harbor_dialogue_first_round_warning import validate_code_manifest
+        validate_code_manifest(root)
     return sorted(changed)
 
 
@@ -114,13 +199,21 @@ def authorize(worker,selection,lease,*,blocked,old_snapshot,directory,takeover=N
 
 def _authorize(worker,selection,lease,*,blocked,old_snapshot,directory,takeover):
     from scripts.batch import harbor_instruction_worker as w
+    from scripts.batch import harbor_dialogue_first_round_warning as first
+    from scripts.batch import harbor_nat_warning_history as nat
+    ordinary=first.ordinary(worker)
+    nat_first=nat.eligible(worker)
     require(worker.warning_requalification is None and worker.pretransport_recovery is None
             and (worker.dialogue_semantic_retry is not None or worker.code_repair is not None
-                 or worker.disclosure_revision is not None),
+                 or worker.disclosure_revision is not None or ordinary or nat_first),
             'warning requalification requires exact semantic or repaired first-round history')
-    _,before,tracker=w.active(worker,selection,lease)
-    if worker.dialogue_semantic_retry is not None:
-        history=semantic.validate_completed_integrity(worker,before);round_=2;historical_code=history['code']
+    _,before,tracker=preparation_active(worker,selection,lease,old_snapshot)
+    if nat_first:
+        history=nat.history(worker,before,old_snapshot);round_=1;historical_code=history['code']
+    elif ordinary:
+        history=first.history(worker,before,old_snapshot);round_=1;historical_code=history['code']
+    elif worker.dialogue_semantic_retry is not None:
+        history=semantic_history(worker,before,old_snapshot);round_=2;historical_code=history['code']
     elif worker.code_repair is not None:
         history,_=repair.validate_historical_integrity(worker,before);round_=1;historical_code=history['current_code']
     else:
@@ -151,7 +244,12 @@ def _authorize(worker,selection,lease,*,blocked,old_snapshot,directory,takeover)
     require(all(Path(p).is_relative_to(Path(read(old_snapshot)['root'])) for p in historical_code),
             'previous snapshot does not own semantic code')
     for path,digest in historical_code.items():require(record(path)['sha256']==digest,'historical semantic code changed')
-    proof=repair.prefix(before,selection,worker.context)
+    # Only an unchanged retained observation may name its frozen producer root.
+    # The runtime gate also requires identical current validator inputs/code.
+    historical_runtime=(Path(read(old_snapshot)['root'])
+        if selection.runtime==previous.runtime and selection.observation==previous.observation else None)
+    proof=repair.prefix(before,selection,worker.context,
+        **({'runtime_root':historical_runtime} if historical_runtime is not None else {}))
     t=w.task(worker,selection,tracker);run=t.run/('dialogue/round-%02d'%round_)
     requests={kind:w.request_saved(w.step_directory(worker,kind)/'request.json')
               for kind in ('dialogue-writer','dialogue-paraphraser','dialogue-review')}
@@ -194,7 +292,7 @@ def _authorize(worker,selection,lease,*,blocked,old_snapshot,directory,takeover)
     for result in proof:
         for bound in result['result']['evidence']:
             retained.append({'original':bound,'retained':w.snapshot(directory/'prefix'/('%05d.blob'%len(retained)),bound)})
-    require(w.active(worker,selection,lease)[1]==before and record(tracker['path'])==tracker,
+    require(preparation_active(worker,selection,lease,old_snapshot)[1]==before and record(tracker['path'])==tracker,
             'tracker changed during warning requalification')
     permit=producer.put(directory/'permit.json',dict(schema_version=SCHEMA,worker_run=str(worker.run),
         initial=record(worker.run/'initial.json'),semantic=worker.dialogue_semantic_retry,code_repair=worker.code_repair,blocked=blocked,
@@ -203,9 +301,11 @@ def _authorize(worker,selection,lease,*,blocked,old_snapshot,directory,takeover)
         claims=claims,draft=draft,review=review,original_receipt=old_receipt,calls={k:asdict(v) for k,v in calls.items()},
         warnings=warnings,notes=notes,retained_prefix=retained,round=round_,semantic_budget_reset=False,model_calls=0,
         lease_takeover=takeover,takeover_records=takeover_records,
+        **({'ordinary_first_round':history} if ordinary else {}),
+        **({'nat_first_round':history} if nat_first else {}),
         **({'source_warning_proof':source_proof} if source_proof is not None else {}),
-        **({'prior_continuations':revised_continuations(worker)}
-           if worker.dialogue_semantic_retry is None and worker.code_repair is None else {})))
+        **({'prior_continuations':{'retry':worker.retry} if nat_first else revised_continuations(worker)}
+           if worker.code_repair is None or worker.dialogue_semantic_retry is not None else {})))
     return replace(worker,warning_requalification=permit),selection,lease,permit
 
 
@@ -221,6 +321,9 @@ def validate(worker,before):
     elif worker.code_repair is not None:
         require(p.get('code_repair')==worker.code_repair,'warning repaired history differs')
         repair.validate_historical_integrity(worker,before)
+    elif p.get('nat_first_round')is not None:
+        from scripts.batch import harbor_nat_warning_history as nat
+        nat.validate(worker,before,p)
     else:
         prior=p.get('prior_continuations',{}).get('lease_renewal')
         if worker.lease_renewal!=prior:

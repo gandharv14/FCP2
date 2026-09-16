@@ -254,3 +254,58 @@ def test_three_prefix_ancestry_keeps_original_checkpoints_and_profiles(refreshed
     assert read(third)['checkpoint']==record(Path(second['path']).parent/'continuation/normalization_phase2.json')
     assert read(third)['selection']==encode(result['selection'])
     assert not (s.run/'source_profile.json').exists()
+
+
+def test_interrupted_phase2_checkpoint_requires_owning_gate_before_packaging(worker,monkeypatch,tmp_path):
+    """Durable emission is not a gate commit; resume never re-emits or skips it."""
+    s,lease,current,prior=phase1(worker,monkeypatch)
+    proof=F.prepare(s,lease,prior,current,'normalization_phase1',tmp_path/'refresh')
+    lease,_,_=F.commit(s,lease,proof)
+    profile=F.advance(s,lease,proof,tmp_path/'profile')
+    assert profile['status']=='STEP_COMPLETE' and profile['step']=='source_profile'
+    lease=profile['lease'];tracker=s.bootstrap.policy.tracker_root/'0001.json'
+    before=read(record(tracker));budget=s.normalization_budget
+    original_gate=W._gate
+    def interrupted(worker,active,kind,selected):
+        if kind=='normalization_phase2':
+            raise RuntimeError('simulated interruption after emission before gate commit')
+        return original_gate(worker,active,kind,selected)
+    monkeypatch.setattr(W,'_gate',interrupted)
+    with pytest.raises(RuntimeError,match='after emission'):
+        F.advance(s,lease,proof,tmp_path/'interrupted')
+    checkpoint=Path(proof['path']).parent/'continuation/normalization_phase2.json'
+    retained=checkpoint.read_bytes()
+    assert read(record(tracker))==before
+    calls=[]
+    def gate(worker,active,kind,selected):
+        calls.append(kind)
+        return original_gate(worker,active,kind,selected)
+    monkeypatch.setattr(W,'_gate',gate)
+    monkeypatch.setattr(W.environment,'finish_normalization',lambda *a,**k:pytest.fail('retained phase2 must not re-emit'))
+    def package(*a,**k):raise RuntimeError('next packaging stage reached')
+    monkeypatch.setattr(W.environment,'package',package)
+    complete=F.advance(s,lease,proof,tmp_path/'resumed-gate')
+    assert complete['status']=='STEP_COMPLETE' and complete['step']=='normalization_phase2'
+    after=read(record(tracker));lane='harbor-normalization-engineer'
+    assert calls==['normalization_phase2'] and after['lane_state'][lane]['phase']=='phase2_complete'
+    assert len(after['lane_state'][lane]['confidence_history'])==len(before['lane_state'][lane]['confidence_history'])+1
+    assert after['lane_state'][lane]['attempt']==before['lane_state'][lane]['attempt']==1
+    assert s.normalization_budget==budget and checkpoint.read_bytes()==retained
+    with pytest.raises(RuntimeError,match='next packaging'):
+        F.advance(s,complete['lease'],proof,tmp_path/'next')
+    assert calls==['normalization_phase2'] and read(record(tracker))==after
+
+
+def test_historical_prefix_checks_every_duplicate_witness_before_combining(refreshed_profile,tmp_path):
+    import copy
+    s,lease,current,prior,old,descriptor=refreshed_profile
+    witnesses=copy.deepcopy(read(old)['mutable_witnesses']);assert witnesses
+    duplicate=copy.deepcopy(witnesses[0]);p=tmp_path/'duplicate-managed-output'
+    p.write_bytes(Path(duplicate['copy']['path']).read_bytes());duplicate['copy']=record(p)
+    tracker=s.bootstrap.policy.tracker_root/'0001.json';before=tracker.read_bytes()
+    selected,kind,checkpoint=F.predecessor(s,prior,[duplicate],current=current)
+    assert selected==current and kind=='source_profile'
+    # The old last-writer dictionary would hide this extra copy behind local.
+    p.write_bytes(b'corrupted retained copy')
+    with pytest.raises(ValueError):F.predecessor(s,prior,[duplicate],current=current)
+    assert tracker.read_bytes()==before

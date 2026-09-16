@@ -130,7 +130,11 @@ def redact(text, forbidden):
     def numeric(match):
         number = Decimal(match.group().replace(',', ''))
         percent = match.string[match.end():].startswith('%')
-        return '[redacted]' if number in numbers or (percent and number/100 in numbers) else match.group()
+        # The independent validator also checks literal numeric fragments, e.g.
+        # forbidden "1" at the start of "1,327.163". Remove the whole token
+        # when that stricter check matches; retain the original response bytes.
+        return '[redacted]' if (number in numbers or (percent and number/100 in numbers)
+            or v.leaked_value(match.group(), forbidden) is not None) else match.group()
     text = re.sub(pattern, numeric, text)
     for item in sorted(strings, key=lambda x: (-len(x), x)):
         text = re.sub(re.escape(item), '[redacted]', text, flags=re.I)

@@ -476,7 +476,7 @@ def main(argv=None):
 
     api_key = read_env_key(args.env_file)
     if not api_key:
-        sys.exit("no lbx_api_key found in %s or environment" % args.env_file)
+        sys.exit("no lbx_labelbox_api_key found in %s or environment" % args.env_file)
     config = {
         "model": args.model,
         "base_url": "https://litellm.lb-dev.xyz" if args.dev else PROD_ENDPOINT,

@@ -186,3 +186,26 @@ def test_revised_warning_requires_exact_history_and_both_historical_validators(t
     else:
         assert q.historical_lease(worker,{})=={'current_code':{}}
         assert inspected==['renewal','revision']
+
+@pytest.mark.parametrize('renewed',[False,True])
+def test_ordinary_warning_history_can_have_no_instruction_renewal(tmp_path,monkeypatch,renewed):
+    from types import SimpleNamespace
+    from scripts.batch import harbor_dialogue_first_round_warning as first
+    run=tmp_path/'run';run.mkdir();initial=p.put(run/'initial.json',{})
+    lease={'path':'/retained-renewal','sha256':'r'} if renewed else None
+    worker=SimpleNamespace(root=tmp_path,run=run,lease_renewal=lease,disclosure_revision=None,disclosure_repair=None)
+    history={'original':'full validated history'}
+    if renewed:history.update(lease_renewal=lease,renewal_history={'checkpoint':'original'})
+    permit=p.put(tmp_path/'warning.json',dict(schema_version=q.SCHEMA,worker_run=str(run),initial=initial,code={},
+        prior_continuations={'lease_renewal':lease} if renewed else {},semantic=None,code_repair=None,
+        code_changes=[],old_snapshot={},ordinary_first_round=history))
+    worker.warning_requalification=permit
+    monkeypatch.setattr(w,'code',lambda _:{});monkeypatch.setattr(q,'changes',lambda *a:[])
+    calls=[]
+    def validate(worker,before,permit):calls.append(permit);return history
+    monkeypatch.setattr(first,'validate_history',validate)
+    assert q.historical_lease(worker,{})==(history['renewal_history'] if renewed else history)
+    assert len(calls)==1
+    if not renewed:
+        history['renewal_history']={}
+        with pytest.raises(ValueError,match='invented'):q.historical_lease(worker,{})

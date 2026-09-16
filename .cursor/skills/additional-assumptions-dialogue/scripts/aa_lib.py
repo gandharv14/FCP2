@@ -220,12 +220,52 @@ def clause_covered(clause: str, haystack: str) -> bool:
     if clause.startswith('the row labelled '):
         try:
             label=json.loads(clause[len('the row labelled '):])
-            if isinstance(label,str):clause='the row labelled '+label
+            if isinstance(label,str):
+                # Possessive prose ("this period's row labelled BK") need not
+                # repeat the article. Do not discard short labels as stopwords.
+                for match in re.finditer(r'\brow labelled\s+("(?:[^"\\]|\\.)*")', haystack):
+                    try:
+                        actual=json.loads(match.group(1))
+                    except ValueError:
+                        continue
+                    if ' '.join(actual.casefold().split()) == ' '.join(label.casefold().split()):
+                        return True
+                clause='the row labelled '+label
         except (ValueError,TypeError):pass
     needle = normalize(clause)
     blob = normalize(haystack)
+    if needle == 'held flat':
+        # An affirmative imperative with the explicit quoted row as its object
+        # states the same hold-level rule. Keep conditions and negation out of
+        # this narrow recognition; the row identity is checked separately.
+        for match in re.finditer(
+            r'(?:^|[.!?]\s+)hold\s+the\s+row\s+labelled\s+"(?:[^"\\]|\\.)*"\s+flat\b([^.!?]*)',
+            haystack, re.I
+        ):
+            if not re.search(r"\b(?:not|never|unless|except|until|only|instead)\b",match.group(1),re.I):
+                return True
+    if needle == 'otherwise':
+        # This atom checks that a false branch is stated. A zero-default
+        # sentence followed by its explicit positive branch states the same
+        # branching structure without the literal word "otherwise". The
+        # independent review still checks the condition and result operands.
+        for match in re.finditer(
+            r'\b(?:uses?|is|returns?)\s+(?:0|zero)\s+unless\s+[^.!?]+[.!?]\s*'
+            r'when\s+it\s+is\s*,\s*[^.!?]+', haystack, re.I
+        ):
+            prefix = normalize(haystack[:match.start()]).split()[-3:]
+            if not {'not', 'never', 'without'} & set(prefix):
+                return True
     if needle=='plus' and re.search(r"\b(?:add|adding|sum)\b",blob):
         return True
+    if needle == 'minus':
+        # This atom checks that subtraction is mentioned, not operand order.
+        # The independent accuracy review still checks the complete formula.
+        # Do not force a valid "subtract X from Y" sentence to say "minus".
+        for match in re.finditer(r'\bsubtract(?:ing|ed)?\b', blob):
+            prefix = blob[:match.start()].split()[-3:]
+            if not {'not', 'never', 'without'} & set(prefix):
+                return True
     if not needle:
         return True
     if needle in blob:

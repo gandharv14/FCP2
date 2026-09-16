@@ -186,6 +186,8 @@ class Graph:
 
     def root_of(self, cell_id: str) -> str | None:
         """The single AST node (or referenced cell) that produces a formula's value."""
+        if self._store is not None:
+            return self._store.root_of(cell_id)
         incoming = self.in_edges.get(cell_id, ())
         return incoming[0].source if len(incoming) == 1 else None
 

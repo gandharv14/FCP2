@@ -114,10 +114,10 @@ def must_say_atoms(spoken: str, sheet: str = "", row_label: str = "") -> list[st
     for match in re.finditer(r'\bthe named range\s+"([^"\n]+)"', blob, re.I):
         add(f'the named range "{match.group(1)}"')
     rows = re.compile(
-        rf'\brows? label(?:led|ed)\s+({QUOTED_LABEL}'
-        rf'(?:\s*(?:,\s*(?:and\s+)?|and\s+){QUOTED_LABEL})*)', re.I)
+        rf'\brow(?P<plural>s)? label(?:led|ed)\s+(?P<labels>{QUOTED_LABEL}'
+        rf'(?(plural)(?:\s*(?:,\s*(?:and\s+)?|and\s+){QUOTED_LABEL})*))', re.I)
     for match in rows.finditer(blob):
-        for label in all_labels(match.group(1)):
+        for label in all_labels(match.group('labels')):
             if label.strip() not in NON_LABEL_LITERALS:
                 add(f'the row labelled {quote_label(label)}')
     for scope in ("only for this cell", "only within the specified columns",

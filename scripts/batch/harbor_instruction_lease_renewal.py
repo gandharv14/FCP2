@@ -12,7 +12,9 @@ SCHEMA='harbor-instruction-lease-renewal/v1'
 ALLOWED={'scripts/batch/harbor_instruction_lease_renewal.py',
          'scripts/batch/harbor_instruction_worker.py','scripts/harbor_instruction_campaign.py',
          'scripts/batch/harbor_disclosure_review_resume.py',
-         'scripts/batch/harbor_nat_retry.py','scripts/batch/harbor_dialogue_semantic_retry.py'}
+         'scripts/batch/harbor_nat_retry.py','scripts/batch/harbor_dialogue_semantic_retry.py',
+         'scripts/batch/harbor_continuation_allowance.py', 'scripts/batch/harbor_tracker_lifecycle.py',
+         'scripts/batch/harbor_lease_takeover.py'}
 CONTINUATIONS=('retry','dialogue_retry','boundary_recovery','dialogue_semantic_retry',
                'pretransport_recovery','code_repair','warning_requalification','disclosure_repair','lease_renewal','disclosure_revision','dialogue_pre_review_repair')
 
@@ -29,8 +31,29 @@ def changes(binding,root):
     return delta
 
 
-def historical_code(snapshot,checkpoint):
+def command_repair_history(worker,snapshot,checkpoint):
+    """Authenticate the exact two-root code selection of a completed repair."""
+    from scripts.batch import harbor_disclosure_command_repair as K
+    require(K.selected(worker),'unsupported mixed-root renewal')
+    selected=read(read(worker.code_repair)['profile'])
+    permit=K.validate(worker,read(record(worker.context.tracker_root/(selected['workbook']+'.json'))))
+    profile=read(permit['profile']);require(snapshot==profile['snapshot'],'renewal snapshot differs from selected command repair')
+    inventories={}
+    for row in (profile['old_snapshot'],profile['snapshot']):
+        value=read(row);root=Path(value['root']).resolve();expected={x['relative']:x['sha256']for x in value['files']}
+        require(len(expected)==len(value['files']),'duplicate retained code inventory')
+        actual={str(p.relative_to(root)):record(p)['sha256']for p in root.rglob('*')if p.is_file()and '__pycache__'not in p.parts}
+        require(actual==expected,'retained command code inventory changed');inventories[root]=expected
+    require(len(inventories)==2,'distinct retained and selected code roots required')
+    code=read(read(checkpoint)['intent'])['code'];require(code and code==permit['current_code'],'completed repair code differs from permit')
+    for path,digest in code.items():
+        source=Path(path).resolve();roots=[r for r in inventories if source.is_relative_to(r)]
+        require(len(roots)==1 and inventories[roots[0]].get(str(source.relative_to(roots[0])))==digest and record(source)['sha256']==digest,'completed repair code outside exact inventories')
+
+
+def historical_code(snapshot,checkpoint,worker=None):
     """The nominated old root must be the actual last completed producer root."""
+    if worker is not None and worker.code_repair is not None:return command_repair_history(worker,snapshot,checkpoint)
     old=read(snapshot);root=Path(old['root']).resolve()
     expected={row['relative']:row['sha256'] for row in old['files']}
     code=read(read(checkpoint)['intent'])['code']
@@ -41,22 +64,26 @@ def historical_code(snapshot,checkpoint):
         relative=str(source.relative_to(root))
         require(expected.get(relative)==digest and record(source)['sha256']==digest,'completed intent code differs from historical snapshot')
 
-def _boundary(worker,selection,lease,checkpoint):
+def _checkpoint_history(worker,selection,lease,checkpoint,*,historical):
     from scripts.batch import harbor_instruction_worker as w
     completed=[]
     for phase in w.STEPS:
         if worker.dialogue_pre_review_repair is not None and worker.dialogue_semantic_retry is None and phase=='dialogue-paraphraser':
             from scripts.batch.harbor_dialogue_pre_review_repair import validate
             validate(worker,read(record(worker.context.tracker_root/(selection.content.workbook+'.json'))))
-            completed.append((phase,worker.dialogue_pre_review_repair));continue
+            completed.append((phase,worker.dialogue_pre_review_repair))
+            if historical and completed[-1][1]==checkpoint:break
+            continue
         path=w.step_directory(worker,phase)/'complete.json'
         if not path.exists():break
         value=read(record(path));require(value['status']=='completed' and value['step']==phase,'noncompleted renewal boundary')
         completed.append((phase,record(path)))
+        if historical and completed[-1][1]==checkpoint:break
     require(completed and completed[-1][1]==checkpoint,'renewal requires exact latest successful checkpoint')
     require(len(completed)<len(w.STEPS),'published chain cannot renew')
     phase=w.STEPS[len(completed)]
-    require(not w.step_directory(worker,phase).exists(),'pending or uncertain next step cannot renew')
+    if not historical:
+        require(not w.step_directory(worker,phase).exists(),'pending or uncertain next step cannot renew')
     saved=read(checkpoint)
     require(saved['selection']==codec.encode(selection) and saved['lease']==asdict(lease),'renewal selection or lease changed')
     records=[checkpoint]
@@ -74,6 +101,22 @@ def _boundary(worker,selection,lease,checkpoint):
             from scripts.batch.harbor_complete_readiness import evidence_records
             records.extend([record(request),req.context,*evidence_records(result.call),result.outcome])
     return phase,records
+
+
+def completed_history(worker,selection,lease,checkpoint):
+    """Validate the completed prefix through an exact historical checkpoint.
+
+    Later pending, failed or completed steps do not invalidate that prefix.
+    This performs no current-custody or renewal-eligibility check and grants no
+    permission to replay a request, renew a lease, or resume an uncertain step.
+    Callers must independently validate their current continuation authority.
+    """
+    return _checkpoint_history(worker,selection,lease,checkpoint,historical=True)
+
+
+def _boundary(worker,selection,lease,checkpoint):
+    """Require the latest completed checkpoint and an unused next operation."""
+    return _checkpoint_history(worker,selection,lease,checkpoint,historical=False)
 
 def _prefix(before,selection,worker,phase):
     from scripts.batch.harbor_instruction_repair import prefix
@@ -113,7 +156,7 @@ def _accepted_authors(worker,selection,index):
         v=p.skill_module(worker.root,'additional-assumptions-dialogue','validate_dialogue')
         require(v.check_draft(p.text(record(directory/('round-%02d'%round)/'draft.md')),claims,t.stage,source_workbook=p.dialogue_source_workbook(t))['passed'],'renewal draft failed mechanical validation')
 
-def authorize(worker,selection,lease,checkpoint,old_snapshot,*,duration_ns=3600*10**9,clock=time.time_ns):
+def authorize(worker,selection,lease,checkpoint,old_snapshot,*,duration_ns=3600*10**9,allowance=None,clock=time.time_ns):
     """Renew once under owning CAS. Interrupted CAS is retained, never repeated."""
     from scripts.batch import harbor_instruction_worker as w
     from scripts import harbor_campaign as base
@@ -123,18 +166,26 @@ def authorize(worker,selection,lease,checkpoint,old_snapshot,*,duration_ns=3600*
         _,before,tracker=w.active(worker,selection,lease)
         phase,history=_boundary(worker,selection,lease,checkpoint)
         require(before['leases']['task_agent']['expires_at']>clock(),'expired lease requires takeover')
-        require(type(duration_ns) is int and 0<duration_ns<=base.DURATION,'invalid renewal duration')
-        historical_code(old_snapshot,checkpoint)
+        maximum=base.DURATION
+        if allowance is not None:
+            from scripts.batch.harbor_continuation_allowance import lease_limits
+            _,maximum=lease_limits(allowance,before,at=clock())
+        require(type(duration_ns) is int and 0<duration_ns<=maximum,'invalid renewal duration')
+        historical_code(old_snapshot,checkpoint,worker)
         delta=changes(old_snapshot,worker.root)
         if worker.lease_renewal is not None:validate(worker,before)
         import importlib
         for field,module in (('retry','harbor_nat_retry'),('dialogue_semantic_retry','harbor_dialogue_semantic_retry'),('dialogue_retry','harbor_dialogue_retry'),('boundary_recovery','harbor_nat_boundary_resume')):
             if getattr(worker,field) is not None:importlib.import_module('scripts.batch.'+module).validate(worker,before)
-        require(worker.pretransport_recovery is None and worker.code_repair is None,'specialized repair requires its own reviewed renewal integration')
+        require(worker.pretransport_recovery is None,'specialized pretransport repair requires its own reviewed renewal integration')
+        if worker.code_repair is not None:
+            from scripts.batch import harbor_disclosure_command_repair as command_repair
+            require(command_repair.selected(worker),'unsupported code repair renewal')
+            command_repair.validate(worker,before)
         if worker.warning_requalification is not None:
             from scripts.batch.harbor_dialogue_warning_requalification import validate as validate_warning
             require(read(worker.warning_requalification).get('prior_continuations',{}).get('disclosure_revision')==worker.disclosure_revision
-                    and worker.disclosure_revision is not None,'warning renewal requires revised disclosure history')
+                    and (worker.disclosure_revision is not None or read(worker.warning_requalification).get('ordinary_first_round') is not None),'warning renewal requires authenticated first-round history')
             validate_warning(worker,before)
         if worker.dialogue_pre_review_repair is not None:
             if worker.dialogue_semantic_retry is not None:
@@ -166,10 +217,13 @@ def authorize(worker,selection,lease,checkpoint,old_snapshot,*,duration_ns=3600*
             selection=codec.encode(selection),lease=asdict(lease),tracker=previous,
             old_snapshot=old_snapshot,code_changes=delta,current_code=w.code(worker),
             prior_continuations=continuations(worker),history=history,retained=retained,
-            prefix=proof,prefix_retained=prefix_retained,duration_ns=duration_ns,semantic_budget_reset=False))
+            prefix=proof,prefix_retained=prefix_retained,duration_ns=duration_ns,semantic_budget_reset=False,
+            **({'allowance':allowance} if allowance is not None else {})))
         # Recheck the exact bytes after the potentially expensive read-only gates.
         require(record(tracker['path'])==tracker,'tracker changed during renewal validation')
-        result=lifecycle.lease_operation(Path(tracker['path']),authority=base._authorize(Path(tracker['path']),lease.owner,lease.revision,lease.token),
+        authority=base._authorize(Path(tracker['path']),lease.owner,lease.revision,lease.token)
+        if allowance is not None:authority=replace(authority,max_duration_ns=maximum,allowance=allowance)
+        result=lifecycle.lease_operation(Path(tracker['path']),authority=authority,
             operation='renew',lease_kind='task_agent',owner=lease.owner,scope='workbook:'+before['workbook_id'],
             token=lease.token,duration_ns=duration_ns,expected_revision=lease.revision,expected_sha256=lease.sha256,clock=clock)
         renewed=replace(lease,revision=result['revision'],sha256=result['sha256'])
@@ -230,6 +284,9 @@ def _retained_lease_adapter(worker,before):
             return historical_lease(worker,before)
     if worker.disclosure_revision is not None:
         revision=read(worker.disclosure_revision)
+        if revision.get('source_revision') is not None and revision.get('prior_continuations',{}).get('lease_renewal')==worker.lease_renewal:
+            from scripts.batch.harbor_disclosure_source_revision import historical_lease
+            return historical_lease(worker,before)
         if revision.get('schema_version')=='harbor-disclosure-manifest-revision/v1' and revision.get('prior_continuations',{}).get('lease_renewal')==worker.lease_renewal:
             from scripts.batch.harbor_disclosure_manifest_revision import historical_lease
             return historical_lease(worker,before)
@@ -254,7 +311,7 @@ def _validate(worker,before,seen,*,historical_code_inventory=None):
     require(permit['current_code']==expected_code and permit['code_changes']==changes(permit['old_snapshot'],worker.root),'renewal implementation changed')
     require(permit['semantic_budget_reset'] is False and complete['selection']==permit['selection'],'renewal changed selection or budget')
     require(permit['checkpoint'] in permit['history'],'renewal checkpoint detached from retained history')
-    historical_code(permit['old_snapshot'],permit['checkpoint'])
+    historical_code(permit['old_snapshot'],permit['checkpoint'],worker)
     checkpoint=read(permit['checkpoint'])
     require(checkpoint['status']=='completed' and checkpoint['selection']==permit['selection'] and checkpoint['lease']==permit['lease'],'renewal checkpoint changed')
     prior=read(permit['tracker']);after=read(complete['tracker'])
@@ -263,6 +320,7 @@ def _validate(worker,before,seen,*,historical_code_inventory=None):
     require(before['workbook_id']==after['workbook_id'] and before['bindings']['original_raw_source']==after['bindings']['original_raw_source'],'renewal source changed')
     require(before['revision']>=after['revision'] and before['handoffs'][:len(after['handoffs'])]==after['handoffs'],'renewal tracker ancestry changed')
     require(after['leases']['task_agent']['expires_at']-after['leases']['task_agent']['heartbeat_at']==permit['duration_ns'],'renewal duration changed')
+    _allowance_event(permit,after)
     for binding in permit['history']:w.executor.checked_bytes(binding)
     for binding in [*permit['retained'],*permit['prefix_retained']]:
         w.executor.checked_bytes(binding['retained'])
@@ -275,6 +333,16 @@ def _validate(worker,before,seen,*,historical_code_inventory=None):
         historical=replace(worker,**{k:prior.get(k) for k in CONTINUATIONS if k!='lease_renewal'},lease_renewal=previous)
         _validate(historical,before,seen,historical_code_inventory=historical_code_inventory)
     return permit
+
+def _allowance_event(permit,after):
+    event=after['handoffs'][-1]
+    require(event.get('allowance')==permit.get('allowance'),'renewal allowance detached from lifecycle event')
+    if permit.get('allowance') is not None:
+        from scripts.batch.harbor_continuation_allowance import lease_limits
+        _,maximum=lease_limits(permit['allowance'],after,at=event['at'])
+        require(permit['duration_ns']<=maximum,'renewal exceeded selected allowance')
+        lifecycle.validate_lifecycle(after)
+
 
 def validate(worker,before):
     return _validate(worker,before,set())
@@ -307,13 +375,14 @@ def recover(worker,permit_binding):
         _renewal_chain(permit['tracker'],permit['lease'],before,lease)
         require(lease.revision==old.revision+1,'no exact committed renewal to recover')
         require(before['leases']['task_agent']['expires_at']-before['leases']['task_agent']['heartbeat_at']==permit['duration_ns'],'recovered renewal duration changed')
+        _allowance_event(permit,before)
         if (directory/'complete.json').exists():
             result=record(directory/'complete.json');validate(replace(worker,lease_renewal=result),before);return result
         selection=codec.decode(permit['selection'])
         w.active(worker,selection,lease)
         require(permit['current_code']==w.code(worker) and permit['code_changes']==changes(permit['old_snapshot'],worker.root),'recovery implementation changed')
         require(permit['prior_continuations']==continuations(worker),'recovery continuation history changed')
-        historical_code(permit['old_snapshot'],permit['checkpoint'])
+        historical_code(permit['old_snapshot'],permit['checkpoint'],worker)
         _boundary(worker,selection,old,permit['checkpoint'])
         _prefix(before,selection,worker,permit['phase'])
         for row in permit['history']:w.executor.checked_bytes(row)

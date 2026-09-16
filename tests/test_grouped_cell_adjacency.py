@@ -131,5 +131,5 @@ def test_divergence_roots_lazy_union_retains_runtime_self_reference(monkeypatch)
  cg=SimpleNamespace(radj={'bad':static},info={'bad':SimpleNamespace(node=SimpleNamespace(kind='formula',value=1),is_literal=False)})
  result=SimpleNamespace(runtime_radj={'bad':{'bad'}},values={'bad':2})
  assert x._divergence_roots(cg,result,['bad'])=={'bad':'bad'}
- assert seen[0][0] is None and seen[0][1][0] is static
+ assert seen[0][0] is None and seen[0][1][1] is static
  assert set(seen[0][2])=={'input','bad'}

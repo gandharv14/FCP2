@@ -28,7 +28,16 @@ ALLOWED={'.cursor/skills/additional-assumptions-dialogue/scripts/extract_claims.
          'scripts/batch/harbor_instruction_repair.py'}
 
 
-def prefix(before,selection,context,*,stop='dialogue'):
+def prefix(before,selection,context,*,stop='dialogue',runtime_root=None):
+    # A repair re-enters several completed lanes over the same immutable pair.
+    # Reuse the existing authenticated proof only within this invocation; every
+    # reuse still checks evidence bytes, builder, signer and generation members.
+    from scripts.batch.harbor_completed_lanes import pair_validation_scope
+    with pair_validation_scope():
+        return _prefix_current(before,selection,context,stop=stop,runtime_root=runtime_root)
+
+
+def _prefix_current(before,selection,context,*,stop='dialogue',runtime_root=None):
     view=copy.deepcopy(before);results=[]
     for row in view['lane_state'].values():row.update(state='pending',phase=None)
     for kind,lane in STEPS:
@@ -38,7 +47,8 @@ def prefix(before,selection,context,*,stop='dialogue'):
             result=notes.check_gate(view,notes.GateEvidence(kind,
                 record(Path(generation['path'])/'generation-manifest.json'),
                 selection.content.normalization_records),context)
-        else:result=check_completed_gate(view,CompletionEvidence(kind,selection),context)
+        else:result=check_completed_gate(view,CompletionEvidence(kind,selection),context,
+            **({'runtime_root':runtime_root} if kind=='verification' and runtime_root is not None else {}))
         require(result['passed'],'repaired-code prefix failed: '+kind)
         results.append(dict(kind=kind,result=result))
         view['bindings'].update(result['bindings'])
@@ -139,6 +149,8 @@ def authorize(worker,selection,lease,*,old_snapshot,directory):
 
 
 def validate(worker,before):
+    from scripts.batch import harbor_disclosure_command_repair as command_repair
+    if command_repair.selected(worker):return command_repair.validate(worker,before)
     receipt=read(worker.code_repair)
     require(receipt['schema_version']==SCHEMA and receipt['phase'] in ('dialogue-init','nat-review')
             and receipt['worker_run']==str(worker.run),'foreign instruction repair')
@@ -168,6 +180,15 @@ def validate_historical_integrity(worker, before):
     Historical producer code is checked as bytes and is never executed.
     """
     receipt = read(worker.code_repair)
+    from scripts.batch import harbor_disclosure_command_repair as command_repair
+    if receipt.get('schema_version') == command_repair.SCHEMA:
+        # The recorded repair type owns its source, snapshot and command proof.
+        # A later dialogue round does not turn it into an extraction repair.
+        permit = command_repair.validate(worker, before)
+        from scripts.batch.harbor_complete_readiness import evidence_records
+        return permit, [worker.code_repair,
+            *(permit[k] for k in ('profile', 'initial', 'original', 'tracker')),
+            *evidence_records(read(permit['profile']))]
     require(receipt['schema_version'] == SCHEMA and receipt['phase'] in ('dialogue-init', 'nat-review')
             and receipt['worker_run'] == str(worker.run), 'foreign historical instruction repair')
     require(receipt['initial'] == record(worker.run/'initial.json')

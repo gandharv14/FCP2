@@ -15,7 +15,9 @@ def inprocess(monkeypatch):
     monkeypatch.setattr(C.shutil,'disk_usage',lambda _:SimpleNamespace(free=8*1024**3))
     calls=[]
     def guarded(command,**kwargs):
-        assert kwargs['timeout_seconds']==3300 and kwargs['memory_limit_bytes']==8*1024**3
+        intent=read(record(Path(command[-2])))
+        prior=read(intent['arguments']['checkpoint']) if intent['action']=='step' else {}
+        assert kwargs['timeout_seconds']==(1350 if prior.get('next_step')=='final-runtime' else 3300) and kwargs['memory_limit_bytes']==8*1024**3
         assert len(kwargs['guardian_lock_fds'])==1 and os.fstat(kwargs['guardian_lock_fds'][0])
         calls.append(command);C.child(dict(path=command[-2],sha256=command[-1]));return 0
     monkeypatch.setattr(C.base,'_run_in_process_group',guarded);return calls
@@ -242,3 +244,43 @@ def test_cli_pairs_explicit_hashes_and_capabilities_without_dispatch(monkeypatch
     seen.clear();argv.remove('--descriptor-sha256');argv.remove('a'*64)
     with pytest.raises(ValueError,match='paired'):C.main(argv)
     assert not seen
+
+
+def test_final_runtime_can_finish_before_renewal_with_two_thousand_seconds(instruction,inprocess,monkeypatch):
+    seen=[]
+    def op(w,s,l,phase,directory,**kw):seen.append(phase);return s,l,None
+    monkeypatch.setattr(C.worker,'_operation',op)
+    previous=None
+    for i,phase in enumerate(C.worker.STEPS):
+        if phase=='final-runtime':break
+        outcome,result=execute(instruction,i,previous);previous=outcome['result']
+    active=C.worker.active
+    def short(*args):
+        facade,before,tracker=active(*args)
+        before['leases']['task_agent']['expires_at']=time.time_ns()+2000*10**9
+        return facade,before,tracker
+    monkeypatch.setattr(C.worker,'active',short)
+    outcome,result=execute(instruction,i,previous,containers=True)
+    assert result['status']=='STEP_COMPLETE' and result['next_step']=='dialogue-commit'
+    assert seen[-1]=='final-runtime'
+    resource=read(outcome['resource']);intent=read(resource['intent'])
+    assert intent['timeout_seconds']==1350 and intent['memory_limit_bytes']==8*1024**3
+
+
+@pytest.mark.parametrize('remaining',[1379,1380])
+def test_short_final_runtime_lease_does_not_start_work(instruction,inprocess,monkeypatch,remaining):
+    def op(w,s,l,phase,directory,**kw):return s,l,None
+    monkeypatch.setattr(C.worker,'_operation',op);previous=None
+    for i,phase in enumerate(C.worker.STEPS):
+        if phase=='final-runtime':break
+        outcome,result=execute(instruction,i,previous);previous=outcome['result']
+    active=C.worker.active
+    def short(*args):
+        facade,before,tracker=active(*args)
+        before['leases']['task_agent']['expires_at']=time.time_ns()+remaining*10**9
+        return facade,before,tracker
+    monkeypatch.setattr(C.worker,'active',short)
+    monkeypatch.setattr(C.worker,'step',lambda *a,**k:pytest.fail('no runtime work below headroom'))
+    outcome,result=execute(instruction,i,previous,containers=True)
+    assert result['status']=='LEASE_RENEWAL_REQUIRED'
+    assert not C.worker.step_directory(instruction[0],'final-runtime').exists()

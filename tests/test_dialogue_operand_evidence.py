@@ -42,6 +42,38 @@ def project(context):
     source,stage,key,claims,draft=context
     return operands.project(claims,draft,source=record(source),answer_key=record(key),task_dir=stage)
 
+
+@pytest.mark.parametrize('sheet',["'Topline Build - 2020 Revenue'", "'Director''s Sheet'", 'Sheet1'])
+def test_qualified_ref_error_survives_actual_relative_translation(sheet):
+    formula=f'=IF($D$16=1,CHOOSE($D$15,{sheet}!I13,{sheet}!#REF!),J$2)'
+    t=operands.SourceFormulaTranslator(formula,origin='J107')
+    assert t.translate_formula('J107')==formula
+    assert t.translate_formula('K108')==f'=IF($D$16=1,CHOOSE($D$15,{sheet}!J14,{sheet}!#REF!),K$2)'
+
+
+@pytest.mark.parametrize('change',[None,'different_error','different_sheet','missing_error','changed_reference','changed_literal'])
+def test_qualified_error_projection_preserves_all_original_scope_checks(context,change):
+    from openpyxl import load_workbook
+    source,stage,key,claims,draft=context
+    original="=IF(A3,-100,'Other Sheet'!#REF!)"
+    copied="=IF(B3,-100,'Other Sheet'!#REF!)"
+    if change=='different_error':copied=copied.replace('#REF!','#VALUE!')
+    elif change=='different_sheet':copied=copied.replace('Other Sheet','Foreign Sheet')
+    elif change=='missing_error':copied=copied.replace("'Other Sheet'!#REF!",'')
+    elif change=='changed_reference':copied=copied.replace('B3','B4')
+    elif change=='changed_literal':copied=copied.replace('-100','-99')
+    book=load_workbook(source);book['S']['A1']=original;book['S']['B1']=copied;book.save(source)
+    claims['claims'][0]['reviewer_only']['evidence']=original
+    disclosure=stage/'tests/disclosure.json';value=json.loads(disclosure.read_text())
+    value['golden_sha256']=record(source)['sha256'];disclosure.write_text(json.dumps(value))
+    if change is None:
+        result=project((source,stage,key,claims,draft))
+        assert result['semantic_review_required'] and not result['target_values_disclosed']
+        assert result['claims'][0]['operands'][0]['value']==-100
+    else:
+        with pytest.raises(ValueError,match='source method copied formula changed'):
+            project((source,stage,key,claims,draft))
+
 def test_signed_exact_source_operand_is_review_evidence_not_target_or_approval(context):
     r=project(context);item=r['claims'][0]['operands'][0]
     assert item['value']==-100 and item['licensed_occurrences']==1
@@ -131,3 +163,42 @@ def test_actual_project_accepts_only_proved_restatement(context):
     assert len(item['observed_occurrences'])==2 and item['restatement_warning']
     with pytest.raises(ValueError,match='extra target occurrence'):
         project((source,stage,key,claims,draft+' The answer is zero.'))
+
+@pytest.fixture
+def legacy_increment(tmp_path):
+    import copy
+    d=skill_module(ROOT,'task-disclosure','disclose');extract=skill_module(ROOT,'additional-assumptions-dialogue','extract_claims')
+    stage=tmp_path/'task';(stage/'environment').mkdir(parents=True);(stage/'tests').mkdir()
+    source=tmp_path/'source.xlsx';book=Workbook();s=book.active;s.title='S';s['C28']='WACC';s['C31']=.10;s['C32']='=C31+0.01';s['C33']='=C32+0.01';book.save(source)
+    s['C32']=None;s['C33']=None;delivered=stage/'environment/model-inputs.xlsx';book.save(delivered)
+    G,V=d.Book(source),d.Book(delivered);rec=d.column_increment_record(G,V,['S!C32','S!C33']);assert rec is not None
+    # Extraction normally follows render's status decision.
+    rec['disposition']='disclose';rec['rendered']='Source increment'
+    claim=extract.build_claim(rec,1);assert claim['reviewer_only']['evidence']=='=C31+0.01';claim['reviewer_only']['evidence']=''
+    key=stage/'tests/answer_key.json';key.write_text(json.dumps({'targets':{'S!Z9':7}}))
+    (stage/'tests/disclosure.json').write_text(json.dumps(dict(golden=str(source),golden_sha256=record(source)['sha256'],records=[rec])))
+    draft='<!-- claim:'+claim['record_id']+' -->\n**Analyst:** What is the convention?\n\n**VP:** Use this period plus 0.01.\n'
+    return source,stage,key,{'claims':[claim]},draft
+
+@pytest.mark.parametrize('fault',[None,'source','claim','record','family','heading','graded_closure'])
+def test_legacy_increment_rederived_from_real_formula_family(legacy_increment,fault):
+    import copy
+    from openpyxl import load_workbook
+    source,stage,key,claims,draft=legacy_increment;before=copy.deepcopy(claims)
+    if fault in ('source','family','heading'):
+        book=load_workbook(source)
+        if fault=='source':book['S']['C32']='=C31+0.02'
+        elif fault=='family':book['S']['C34']='=C33+0.01'
+        else:book['S']['C28']='Foreign'
+        book.save(source)
+        path=stage/'tests/disclosure.json';p=json.loads(path.read_text());p['golden_sha256']=record(source)['sha256'];path.write_text(json.dumps(p))
+    elif fault=='claim':claims['claims'][0]['must_say'].append('invented condition')
+    elif fault=='record':
+        path=stage/'tests/disclosure.json';p=json.loads(path.read_text());p['records'].append(copy.deepcopy(p['records'][0]));path.write_text(json.dumps(p))
+    elif fault=='graded_closure':key.write_text(json.dumps({'targets':{'S!C31':.10}}))
+    if fault:
+        with pytest.raises(ValueError):project((source,stage,key,claims,draft))
+    else:
+        result=project(legacy_increment);item=result['claims'][0]['operands'][0]
+        assert item['value']==.01 and item['licensed_occurrences']==1 and len(item['source_evidence'])==2
+        assert item['within_occurrence_budget'] and not item['target_collision'] and claims==before

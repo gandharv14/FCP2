@@ -79,3 +79,47 @@ def test_source_label_exemption_requires_exact_provenance(d,source_label,tmp_pat
 def test_verified_label_does_not_allow_extra_body_answer(d,source_label,tmp_path):
     gold,rec,section=source_label
     assert d.audit_text(section.rstrip()+' Use 1.\n',tmp_path,records=[rec],gold=gold)==['numeric literal 1 matches target 1.0']
+
+@pytest.fixture
+def verified_method(d,tmp_path):
+    wb=openpyxl.Workbook();ws=wb.active;ws.title='Debt'
+    ws['A1']='Note 1 Amount';ws['C1']=7;ws['A2']='Interest';ws['E2']=4
+    ws['F2']='=IFERROR($C$1+E2+$C$1+1,0)';ws['G2']='=IFERROR($C$1+F2+$C$1+1,0)'
+    path=tmp_path/'source.xlsx';wb.save(path);gold=d.Book(path)
+    (tmp_path/'tests').mkdir();(tmp_path/'tests/answer_key.json').write_text('{"targets":{"Debt!Z9":1.0}}')
+    cells=['Debt!F2','Debt!G2'];band=dict(band=d.compact_cells([d.pretty(c)for c in cells]),cell_keys=cells,label='Interest',pattern='copied')
+    profile=d.formula_profile(gold,band);assert profile['complete']
+    fields=d.custom_sentence_fields(profile,gold,lock_cells=cells);assert fields.pop('_coverage_complete')
+    rec=d.record('method_interest','out_of_catalogue',cells,profile['formula'],[],'source method',fields=fields)
+    rec.update(source='custom_method_detector',disposition='disclosed',coverage_complete=True,method_profile={k:v for k,v in profile.items()if k!='ast'})
+    section=d.render_section([rec]);return gold,rec,section
+
+
+def test_method_numeric_metadata_and_constant_are_exact_source_spans(d,verified_method,tmp_path):
+    gold,rec,section=verified_method
+    assert 'occurrence 1'in section and 'Note 1 Amount'in section
+    assert d.verified_method_numeric_offsets(section,tmp_path,[rec],gold)
+    assert d.audit_text(section,tmp_path,records=[rec],gold=gold)==[]
+    assert d.audit_text(section.rstrip()+' The answer is 1.\n',tmp_path,records=[rec],gold=gold)==['numeric literal 1 matches target 1.0']
+
+@pytest.mark.parametrize('defect',['formula','fields','profile','source','closure','target','foreign-bullet'])
+def test_method_numeric_offsets_reject_detached_source_or_extra_prose(d,verified_method,tmp_path,defect):
+    gold,rec,section=verified_method;closure=None
+    if defect=='formula':gold.formula['Debt!F2']='=2'
+    elif defect=='fields':rec['fields']['steps']+=' The answer is 1.';section=d.render_section([rec])
+    elif defect=='profile':rec['method_profile']['numbers'].append(1)
+    elif defect=='source':rec['source']='unknown'
+    elif defect=='closure':closure={'Debt!C1'}
+    elif defect=='target':(tmp_path/'tests/answer_key.json').write_text('{"targets":{"Debt!C1":1.0}}')
+    else:section=section.replace('- `Debt!F2:G2`:','- `Other!F2:G2`:')
+    assert not d.verified_method_numeric_offsets(section,tmp_path,[rec],gold,closure)
+
+
+def test_plain_source_band_and_markdown_locator_are_exact_equivalents(d,verified_method,tmp_path):
+    gold,rec,_=verified_method
+    rec['method_profile']['band']=rec['method_profile']['band'][1:-1]
+    rec['fields']['band']=rec['fields']['band'][1:-1]
+    section=d.render_section([rec])
+    assert d.verified_method_numeric_offsets(section,tmp_path,[rec],gold)
+    rec['method_profile']['band']='Debt!Z9'
+    assert not d.verified_method_numeric_offsets(section,tmp_path,[rec],gold)

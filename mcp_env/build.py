@@ -683,6 +683,11 @@ def alternate_unit(unit: str, index: int) -> str:
 
 def source_id(source: dict[str, Any]) -> str:
     if source.get("id"):
+        explicit = re.sub(r"[^a-z0-9]+", "-", str(source["id"]).lower()).strip("-")
+        if len(explicit) > 72:
+            # Keep the full explicit identity when a readable prefix exceeds
+            # the document-id bound. Truncation alone can merge real sources.
+            return explicit[:55] + "-" + hashlib.sha256(explicit.encode()).hexdigest()[:16]
         return slug(str(source["id"]))
     parsed = urlparse(source["url"])
     return slug(parsed.netloc or parsed.path or source["name"])

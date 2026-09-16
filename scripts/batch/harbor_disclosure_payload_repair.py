@@ -15,7 +15,8 @@ from scripts.batch import harbor_model_executor as E
 
 SCHEMA='harbor-disclosure-payload-repair/v1'
 # Exact predecessor differs only by this relocation-aware historical binding.
-PRIOR_IMPLEMENTATIONS={'d980456a60dd0bf2d8a776c1aa6f1e1de29223bb9da9e6ac4ea08ea10233d090',
+PRIOR_IMPLEMENTATIONS={'2ceea26f21affb85b6ebe80f45ce1502b8abeee5b02fbbe97840e5acdc04b5bc',
+                       'd980456a60dd0bf2d8a776c1aa6f1e1de29223bb9da9e6ac4ea08ea10233d090',
                        'b832346eb162db48e8149777f4c0e1d1b6ee4e7dc81d585c4fd6e9820197518a'}
 
 
@@ -35,6 +36,7 @@ def canonical_cell(key):
 
 
 TABLE_VERSION='lossless-workbook-cell-table/v1'
+RECORD_PROJECTION='complete-workbooks-lossless-records/v2'
 TABLE_COLUMNS=['address','value','number_format_index','data_type','cached_value']
 TABLE_NOTE=('Every sheet and cell is retained in original order. Each cell row uses the declared columns. '
             'number_format_index indexes the exact number_formats array (zero-based). '
@@ -95,9 +97,24 @@ def project(request,*,projection=None):
     messages=request['messages']
     E.require(isinstance(messages,list) and len(messages)==2 and all(isinstance(m,dict) and set(m)=={'role','content'} and isinstance(m['content'],str) for m in messages)
               and [m['role'] for m in messages]==['system','user'],'expected exact system/user disclosure messages')
-    E.require(projection in (None,TABLE_VERSION),'unknown physical projection version')
+    E.require(projection in (None,TABLE_VERSION,RECORD_PROJECTION),'unknown physical projection version')
     result=copy.deepcopy(request)
     body=json.loads(result['messages'][1]['content'])
+    if isinstance(body,dict) and 'evidence_projection' in body:
+        # New owning requests already carry scoped assessments and complete
+        # workbook tables. Preserve that exact six-field protocol: decoding is
+        # validation only, never permission to drop its projection declaration
+        # or filter any second set of facts. This is only a serialization change.
+        E.require(projection in (TABLE_VERSION,RECORD_PROJECTION),'already projected payload requires explicit lossless version')
+        from scripts.batch.harbor_disclosure_evidence import decode_body,compact_records
+        decoded=decode_body(body)
+        if projection==RECORD_PROJECTION:body=compact_records(body)
+        result['messages'][1]['content']=json.dumps(body,ensure_ascii=False,allow_nan=False,separators=(',',':'))
+        restored=json.loads(result['messages'][1]['content'])
+        E.require(E.canonical(restored)==E.canonical(body) and E.canonical(decode_body(restored))==E.canonical(decoded),
+                  'compacted projected payload changed evidence')
+        return result
+    E.require(projection!=RECORD_PROJECTION,'record encoding requires original versioned evidence')
     E.require(set(body)=={'manifest','manifest_sha256','workbooks','instruction','disclosure'},'unexpected disclosure payload')
     disclosure=body['disclosure'];records=disclosure['records'];agents=disclosure['agent_records']
     E.require(isinstance(records,list) and records and isinstance(agents,list) and agents,'disclosure records missing')
@@ -150,11 +167,17 @@ def _rejected(prepared,campaign):
 
 def original_identity(permit):
     value=read(permit)
+    if value.get('schema_version')=='harbor-model-pretransport-recovery/v1':
+        from scripts.batch.harbor_model_pretransport_recovery import original_identity as validated
+        return validated(permit)
     return read(read(value['original_identity']))
 
 
 def validate_prepared(prepared,campaign):
     permit=prepared.physical_repair;value=read(permit)
+    if value.get('schema_version')=='harbor-model-pretransport-recovery/v1':
+        from scripts.batch.harbor_model_pretransport_recovery import validate_prepared as validated
+        return validated(prepared,campaign)
     E.require(value['schema_version']==SCHEMA and value['physical_count']==1 and value['semantic_budget_reset'] is False,'invalid repair ceiling')
     implementation=value['implementation'];E.checked_bytes(implementation)
     E.require(implementation['sha256'] in ({E.record(__file__)['sha256']}|PRIOR_IMPLEMENTATIONS),'payload repair implementation changed')
@@ -162,6 +185,13 @@ def validate_prepared(prepared,campaign):
     E.require(asdict(campaign)=={**value['campaign'],'root':Path(value['campaign']['root']), 'slot_root':Path(value['campaign']['slot_root'])},'original campaign or model slots changed')
     rejected,plan,identity=_rejected(old,campaign)
     E.require((rejected,plan,identity)==(value['original_outcome'],value['original_plan'],value['original_identity']),'original rejection evidence substituted')
+    old_body=json.loads(read(old.request)['messages'][1]['content'])
+    if isinstance(old_body,dict) and 'evidence_projection' in old_body:
+        # Earlier producers rejected this six-field protocol before preparing
+        # any permit. Do not reinterpret their historical code hashes as if
+        # they already supported this prospective serialization branch.
+        E.require(implementation['sha256']==E.record(__file__)['sha256'],
+                  'historical physical producer did not support projected payload')
     expected=replace(old,request=value['request'],physical_repair=permit)
     E.require(prepared==expected,'physical repair changed original semantic identity or budget')
     E.require(read(prepared.request)==project(read(old.request),projection=value.get('projection')),'repaired payload is not the exact complete projection')

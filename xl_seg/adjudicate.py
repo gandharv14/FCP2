@@ -65,13 +65,13 @@ def _env_value(env_file: Path, wanted: str) -> str:
 def read_key(env_file: Path) -> str:
     """Direct Anthropic key when present, otherwise the LiteLLM proxy key."""
     return (_env_value(env_file, "anthropic_api_key")
-            or _env_value(env_file, "lbx_api_key"))
+            or _env_value(env_file, "lbx_labelbox_api_key"))
 
 
 def via_proxy(env_file: Path) -> bool:
     """True when only the gateway key is available."""
     return not _env_value(env_file, "anthropic_api_key") and bool(
-        _env_value(env_file, "lbx_api_key"))
+        _env_value(env_file, "lbx_labelbox_api_key"))
 
 
 def adjudicate(wb: str, candidates, api_key: str, model=DEFAULT_MODEL, timeout=180,

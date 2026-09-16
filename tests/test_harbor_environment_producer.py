@@ -101,7 +101,7 @@ def test_cached_packaging_full_audit_validation_has_no_transport_fallback(tmp_pa
     key=builder.model_config(args())['api_key']
     assert audit.generate_audit('0001',source,seg,run,key)['cache_hit']
     (run/'0001-inputs-variable-sources.md').write_text('changed audit')
-    with pytest.raises(RuntimeError,match='no lbx_api_key'):audit.generate_audit('0001',source,seg,run,key)
+    with pytest.raises(RuntimeError,match='no lbx_labelbox_api_key'):audit.generate_audit('0001',source,seg,run,key)
 
 
 @pytest.mark.parametrize('where',['equal','below_stage','above_stage'])

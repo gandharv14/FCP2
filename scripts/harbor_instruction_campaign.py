@@ -18,6 +18,19 @@ ROOT=base.ROOT
 SCHEMA='harbor-instruction-coordinator/v1'
 RESUMABLE={'INSTRUCTION_READY','STEP_COMPLETE','COMMANDS_REQUIRED','MODEL_REQUIRED','RUNTIME_REQUIRED','RETRY_READY'}
 
+# Runtime itself is bounded to 900 seconds. Allow 450 seconds for local
+# validation and process teardown, without reserving a model-call timeout.
+FINAL_RUNTIME_SECONDS=1350
+
+def guard_seconds(action,arguments):
+    if action=='step':
+        prior=read(arguments['checkpoint'])
+        if prior.get('next_step')=='final-runtime':
+            require(prior.get('schema_version')==SCHEMA and prior.get('status') in RESUMABLE,
+                    'final runtime requires a resumable owning checkpoint')
+            return FINAL_RUNTIME_SECONDS
+    return base.SECONDS
+
 
 def _continuations(retry, dialogue_retry, boundary_recovery, dialogue_semantic_retry=None):
     for value in (retry, dialogue_retry, boundary_recovery, dialogue_semantic_retry):
@@ -30,10 +43,17 @@ def _continuations(retry, dialogue_retry, boundary_recovery, dialogue_semantic_r
             'independent continuation kinds cannot be combined')
 
 
-def _warning_history(semantic,repair,warning,revision=None,disclosure=None,renewal=None):
+def _warning_history(semantic,repair,warning,revision=None,disclosure=None,renewal=None,retry=None):
     if warning is None:return
+    permit=read(warning)
+    if permit.get('nat_first_round')is not None:
+        require(semantic is repair is revision is disclosure is renewal is None and retry is not None
+            and permit.get('schema_version')=='harbor-dialogue-warning-requalification/v1'
+            and permit.get('prior_continuations')=={'retry':retry}
+            and permit['nat_first_round']['retry']==retry,'warning detached NAT retry history')
+        return
     if semantic is None and repair is None:
-        require(revision is not None,'warning requalification requires its semantic history')
+        require(revision is not None or read(warning).get('ordinary_first_round') is not None,'warning requalification requires its semantic history')
         permit=read(warning)
         original_renewal=permit.get('prior_continuations',{}).get('lease_renewal')
         current=renewal;seen=set()
@@ -76,7 +96,7 @@ def worker_encode(w):
         if value is not None:
             result[name] = value
     _disclosure_history(w.disclosure_repair,[w.retry,w.dialogue_retry,w.boundary_recovery,w.dialogue_semantic_retry,w.pretransport_recovery,w.code_repair,w.warning_requalification,w.disclosure_revision])
-    _warning_history(w.dialogue_semantic_retry,w.code_repair,w.warning_requalification,w.disclosure_revision,w.disclosure_repair,w.lease_renewal)
+    _warning_history(w.dialogue_semantic_retry,w.code_repair,w.warning_requalification,w.disclosure_revision,w.disclosure_repair,w.lease_renewal,w.retry)
     return result
 
 
@@ -97,7 +117,7 @@ def worker_decode(value):
     _continuations(None,None,None,value.get('dialogue_pre_review_repair'))
     disclosure=value.get('disclosure_repair')
     _disclosure_history(disclosure,[value['retry'],dialogue,boundary,semantic,pretransport,repair,warning,value.get('disclosure_revision')])
-    _warning_history(semantic,repair,warning,value.get('disclosure_revision'),disclosure,value.get('lease_renewal'))
+    _warning_history(semantic,repair,warning,value.get('disclosure_revision'),disclosure,value.get('lease_renewal'),value['retry'])
     c=value['context'];return worker.Worker(RootContext(Path(c['tracker_root']),c['trusted_public_key']),Path(value['run']),base.decode(value['campaign']),Path(value['root']),value['retry'],dialogue,boundary,semantic,pretransport,code_repair=repair,warning_requalification=warning,disclosure_repair=disclosure,lease_renewal=value.get('lease_renewal'),disclosure_revision=value.get('disclosure_revision'),dialogue_pre_review_repair=value.get('dialogue_pre_review_repair'))
 
 
@@ -123,12 +143,49 @@ def _result(status,descriptor,selection,lease,*,checkpoint=None,next_step=None,e
     return dict(schema_version=SCHEMA,status=status,descriptor=descriptor,selection=codec.encode(selection),lease=base.encode(lease),checkpoint=checkpoint,next_step=next_step,evidence=list(evidence),required_action=required_action,publication_performed=False)
 
 
+def _startup_lease(s,descriptor,prior,selection,lease,run,directory):
+    """Renew live custody before expensive validation, after exact cheap guards.
+
+    This does not certify environment quality. The full original environment
+    checks still follow and a failed check retains the actual renewal receipt.
+    """
+    _,before=base.worker._active(s,lease)
+    require(before['leases']['task_agent']['expires_at']-time.time_ns()>60*10**9,
+            'instruction startup requires at least sixty seconds of live custody')
+    source=selection.content.bindings['original_raw_source']
+    require(before['workbook_id']==s.bootstrap.workbook==selection.content.workbook
+        and before['bindings']['original_raw_source']==source,'startup source differs from live custody')
+    base.executor.checked_bytes(source)
+    protected=(s.run,s.bootstrap.run,s.bootstrap.policy.tracker_root,selection.content.stage,s.campaign.root,s.campaign.slot_root)
+    require(all(run!=p and run not in p.parents and p not in run.parents for p in protected)
+        and not run.exists(),'instruction startup namespace is not unused and isolated')
+    for row in prior['evidence']:base.executor.checked_bytes(row)
+    refresh=read(descriptor).get('refresh')
+    if refresh is None:actual=base.worker._read_checkpoint(s,'environment')
+    else:
+        from scripts.batch import harbor_environment_refresh as refreshed
+        saved=read(refresh);root=Path(refresh['path']).parent
+        require(saved['schema_version']==refreshed.SCHEMA and saved['code']==record(refreshed.__file__)
+            and saved['worker']==record(s.run/'selection.json') and saved['semantic_budget_reset']is False
+            and read(record(root/'committed.json'))['prepared']==refresh,
+            'startup refresh ownership or committed checkpoint differs')
+        if saved['last']=='environment':actual=codec.decode(saved['selection'])
+        else:
+            checkpoint=read(record(root/'continuation/environment.json'))
+            for item in checkpoint['evidence']:base.executor.checked_bytes(item)
+            actual=codec.decode(checkpoint['selection'])
+    require(codec.encode(actual)==prior['selection'],'startup differs from saved environment checkpoint')
+    return base._lease(s,lease,directory)
+
+
 def _start(arguments,controls,directory):
     descriptor=arguments['environment_descriptor'];checkpoint=arguments['checkpoint']
     s,_,expected=base.selected(descriptor);require(expected==controls,'environment controls differ')
     prior=read(checkpoint)
     require(prior.get('descriptor')==descriptor and prior.get('status')=='ENVIRONMENT_READY','exact ENVIRONMENT_READY handoff required')
     lease=base.decode(prior['lease']);selection=codec.decode(prior['selection'])
+    lease=_startup_lease(s,descriptor,prior,selection,lease,
+        base.executor.safe(Path(arguments['worker_run'])),directory)
     refresh=read(descriptor).get('refresh');refresh_evidence=[]
     if refresh is None:
         base.worker._setup(s,lease)
@@ -155,7 +212,7 @@ def _start(arguments,controls,directory):
     protected=(s.run,s.bootstrap.run,s.bootstrap.policy.tracker_root,selection.content.stage,s.campaign.root,s.campaign.slot_root)
     require(all(run!=p and run not in p.parents and p not in run.parents for p in protected),'instruction run overlaps protected evidence')
     require(not run.exists(),'instruction work already exists; select exact prior checkpoint')
-    dep=base._dependency(s,directory);lease=base._lease(s,lease,directory)
+    dep=base._dependency(s,directory)
     w=worker.Worker(base.worker._context(s),run,s.campaign)
     _,before,_=worker.active(w,selection,lease)
     check_completed_gate(before,CompletionEvidence('environment',selection),w.context)
@@ -179,7 +236,11 @@ def _prior(binding,descriptor):
         completion=read(bound)
         from scripts.batch.harbor_dialogue_warning_requalification import SCHEMA as WARNING_SCHEMA
         from scripts.batch.harbor_disclosure_review_resume import SCHEMA as DISCLOSURE_SCHEMA
-        if completion.get('schema_version')=='harbor-dialogue-pre-review-repair/v1':
+        if completion.get('schema_version')=='harbor-disclosure-command-repair/v1':
+            configured=worker_decode(read(descriptor)['worker'])
+            require(configured.code_repair==bound,'disclosure command checkpoint detached from worker')
+            permit=completion
+        elif completion.get('schema_version')=='harbor-dialogue-pre-review-repair/v1':
             configured=worker_decode(read(descriptor)['worker'])
             require(configured.dialogue_pre_review_repair==bound,'pre-review repair checkpoint detached from worker')
             permit=completion
@@ -241,7 +302,7 @@ def _step(arguments,controls,directory,*,models,commands,containers):
     # The installed worker seals exact predecessor lease bytes. Renewing a CAS
     # here would break that proof chain. Return before side effects instead.
     remaining=before['leases']['task_agent']['expires_at']-time.time_ns()
-    if remaining<=(base.SECONDS+30)*10**9:
+    if remaining<=(guard_seconds('step',arguments)+30)*10**9:
         return _result('LEASE_RENEWAL_REQUIRED',descriptor,selection,lease,checkpoint=prior['checkpoint'],next_step=prior['next_step'],evidence=[arguments['checkpoint']],required_action='Root must renew the same owner/token through an explicit worker checkpoint reconciliation; no instruction work was consumed.')
     dep=dependency(recipe,directory);credential=None
     if models:
@@ -257,7 +318,7 @@ def child(intent):
     value=read(intent)
     require(set(value)=={'schema_version','action','arguments','controls','models','commands','containers','code','base_code','executable','memory_limit_bytes','timeout_seconds'} and value['schema_version']==SCHEMA,'closed instruction launch intent required')
     require(value['code']==record(__file__) and value['base_code']==record(base.__file__) and value['executable']==record(Path(sys.executable).resolve()),'coordinator/executable changed after intent')
-    require(value['memory_limit_bytes']==base.MEMORY and value['timeout_seconds']==base.SECONDS and all(type(value[k]) is bool for k in ('models','commands','containers')),'instruction guard/capabilities changed')
+    require(value['memory_limit_bytes']==base.MEMORY and value['timeout_seconds']==guard_seconds(value['action'],value['arguments']) and all(type(value[k]) is bool for k in ('models','commands','containers')),'instruction guard/capabilities changed')
     directory=Path(intent['path']).parent;require(record(directory/'intent.json')==intent,'foreign launch intent')
     controls=base.decode(value['controls']);base._controls(controls)
     if value['action']=='start':
@@ -283,6 +344,7 @@ def run(action,arguments,controls,directory,*,models=False,commands=False,contai
     expected=base.selected(arguments['environment_descriptor'])[2] if action=='start' else selected(arguments['descriptor'])[1]
     require(expected==controls,'root-selected controls changed')
     if models:require(controls.env_file is not None,'explicit credential file required before dispatch')
+    seconds=guard_seconds(action,arguments)
     lockpath=base._controls(controls);directory=base.executor.safe(directory)
     require(not directory.exists(),'attempt exists; retain and select exact completed checkpoint')
     require(directory!=lockpath.parent and directory not in lockpath.parents,'journal overlaps shared slot')
@@ -290,11 +352,11 @@ def run(action,arguments,controls,directory,*,models=False,commands=False,contai
     fd=os.open(lockpath,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
     try:
         fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);directory.mkdir(parents=True,mode=0o700)
-        intent=base.keep(directory/'intent.json',dict(schema_version=SCHEMA,action=action,arguments=arguments,controls=base.encode(controls),models=models,commands=commands,containers=containers,code=record(__file__),base_code=record(base.__file__),executable=record(Path(sys.executable).resolve()),memory_limit_bytes=base.MEMORY,timeout_seconds=base.SECONDS))
+        intent=base.keep(directory/'intent.json',dict(schema_version=SCHEMA,action=action,arguments=arguments,controls=base.encode(controls),models=models,commands=commands,containers=containers,code=record(__file__),base_code=record(base.__file__),executable=record(Path(sys.executable).resolve()),memory_limit_bytes=base.MEMORY,timeout_seconds=seconds))
         metrics={};rc=None;failure=None;logpath=directory/'step.log'
         try:
             with logpath.open('xb') as log:
-                rc=base._run_in_process_group([sys.executable,'-B',str(Path(__file__).resolve()),'_child',intent['path'],intent['sha256']],stdout=log,timeout_seconds=base.SECONDS,grace_seconds=3,memory_limit_bytes=base.MEMORY,metrics=metrics,cwd=ROOT,env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1','PYTHONPATH':str(ROOT)},guardian_lock_fds=(fd,*guardian_lock_fds))
+                rc=base._run_in_process_group([sys.executable,'-B',str(Path(__file__).resolve()),'_child',intent['path'],intent['sha256']],stdout=log,timeout_seconds=seconds,grace_seconds=3,memory_limit_bytes=base.MEMORY,metrics=metrics,cwd=ROOT,env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1','PYTHONPATH':str(ROOT)},guardian_lock_fds=(fd,*guardian_lock_fds))
                 log.flush();os.fsync(log.fileno())
         except Exception as exc:failure=dict(type=type(exc).__name__,message_sha256=base.executor.sha(str(exc).encode()))
         resource=base.keep(directory/'resource.json',dict(intent=intent,returncode=rc,metrics=metrics,log=record(logpath),failure=failure))

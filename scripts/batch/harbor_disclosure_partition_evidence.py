@@ -8,6 +8,7 @@ from pathlib import Path
 import copy
 import hashlib
 import json
+import re
 from collections import Counter
 from openpyxl.utils import range_boundaries
 from scripts.batch import harbor_disclosure_payload_repair as tables
@@ -16,6 +17,12 @@ from scripts.batch import harbor_semantic_readiness as semantic
 from scripts.batch.harbor_admission import record
 
 SCHEMA='disclosure-partition-evidence/v1'
+BOUNDED_SCHEMA='disclosure-partition-evidence/v2'
+BOUNDS_SCHEMA='harbor-disclosure-partition-bounds/v1'
+WIRE_BOUNDS_SCHEMA='harbor-disclosure-partition-bounds/v2'
+WIRE_SCHEMA='disclosure-partition-evidence/v3'
+EMPTY_SCHEMA='disclosure-partition-evidence/v4'
+AUTHORIZATION_SHA256='acffe75c8ed401f66484a5bb6c39a15a0a3e209fc976967da0bddd6125126fd0'
 WORKBOOK_SCHEMA='explicit-workbook-evidence-shard/v1'
 SEMANTICS='selected_refs and blank_refs use cell-reference-runs/v1: [sheet,column_number,start_row,count], all addresses inclusive; expanding and lexically sorting selected_refs defines zero-based dependency_edges indexes. Only selected_refs are described. present_rows use row_columns; number_format_index selects number_formats. Four entries mean cached_value is absent; five mean it is present, including null. Exact source values, formulas, formats and types are retained. blank_refs are explicitly absent from the complete source snapshot. Every other address is unknown in this shard, never implicitly blank. Full snapshot hashes bind all omitted evidence.'
 MAX_BYTES=750000
@@ -27,6 +34,25 @@ def canonical(value):return json.dumps(value,ensure_ascii=False,separators=(',',
 def digest(value):return hashlib.sha256(canonical(value)).hexdigest()
 def require(ok,message):
     if not ok:raise ValueError(message)
+
+def selected_bounds(binding,body,golden_path,delivered_path):
+    """Source-scoped representation limits; never a model/lease authorization."""
+    from scripts.batch.harbor_tracker_lifecycle import checked_record
+    from scripts.batch.harbor_admission import read
+    checked_record(binding);value=read(binding)
+    wire=value.get('schema_version')==WIRE_BOUNDS_SCHEMA
+    require(set(value)==({'schema_version','authorization','full_body_sha256','sources','max_bytes','max_sentences','max_batches'}|({'wire_encoding'}if wire else set()))
+            and value['schema_version']in(BOUNDS_SCHEMA,WIRE_BOUNDS_SCHEMA),'closed partition bounds required')
+    if wire:
+        from scripts.batch import harbor_disclosure_partition_wire as W
+        require(isinstance(value['wire_encoding'],str) and value['wire_encoding']in (W.SCHEMA,getattr(W,'COLUMNAR_SCHEMA',None),getattr(W,'RUN_SCHEMA',None)),'unknown lossless shard encoding')
+    checked_record(value['authorization'])
+    require(value['authorization']['sha256']==AUTHORIZATION_SHA256,'partition bounds authorization differs')
+    require(value['full_body_sha256']==digest(body) and value['sources']=={'golden':record(golden_path),'delivered':record(delivered_path)},'partition bounds source or body differs')
+    require(type(value['max_bytes'])is int and (0 if wire else MAX_BYTES)<value['max_bytes']<=2000000
+            and type(value['max_sentences'])is int and 1<=value['max_sentences']<=MAX_SENTENCES
+            and type(value['max_batches'])is int and 1<=value['max_batches']<=64,'partition bounds exceed supported finite limits')
+    return value
 
 def _refs(row):
     """Uncertain scopes cannot disappear through an empty filter."""
@@ -75,7 +101,7 @@ class _Workbook:
         from xl_ast_graph import AstGraph
         self.path=Path(path);self.binding=record(self.path)
         require(evidence==semantic.workbook_evidence(self.binding),'full workbook evidence differs from current source')
-        self.evidence=evidence;self.cells={};self.sheets={};self.cache={}
+        self.evidence=evidence;self.cells={};self.sheets={};self.cache={};self.named_dependencies={}
         for sheet in evidence['sheets']:
             self.sheets[sheet['sheet']]=sheet
             for cell in sheet['cells']:
@@ -84,20 +110,98 @@ class _Workbook:
         try:self.graph._load();self.graph._collect_names()
         finally:self.graph._release_workbook()
     def close(self):self.graph.close()
+    def static_name(self,token,formula_cell):
+        """Resolve only literal absolute named areas, retaining their source definition."""
+        sheet,name,external=self.graph._split_ref(token)
+        if external is not None:return None
+        lookup=sheet or formula_cell.rsplit('!',1)[0];key=name.upper();scope=None
+        if (lookup,key) in self.graph.names_local:
+            definition=self.graph.names_local[(lookup,key)];scope=lookup
+        elif key in self.graph.names_global:definition=self.graph.names_global[key]
+        else:return None
+        refs=set();bad=False
+        try:
+            from xl_ast_graph import split_areas
+            text=str(definition).strip();text=text[1:].strip()if text.startswith('=')else text
+            areas=split_areas(text);require(bool(areas),'empty named area')
+            for area in areas:
+                target,span,ext=self.graph._split_ref(area)
+                require(ext is None and target in self.sheets and
+                        re.fullmatch(r'\$[A-Za-z]{1,3}\$[1-9][0-9]*(?::\$[A-Za-z]{1,3}\$[1-9][0-9]*)?',span),
+                        'named dependency is not a literal absolute area')
+                lo,row,hi,last=range_boundaries(span.replace('$',''))
+                require(1<=lo<=hi<=16384 and 1<=row<=last<=1048576
+                        and (hi-lo+1)*(last-row+1)<=50000,'named dependency exceeds bounded area')
+                refs.update(self.graph.cell_id(target,r,c)for r in range(row,last+1)for c in range(lo,hi+1))
+                require(len(refs)<=50000,'named dependency union exceeds bound')
+        except Exception:bad=True
+        if not bad:
+            item=dict(name=key,scope_sheet=scope,definition=definition,targets=sorted(refs))
+            self.named_dependencies.setdefault(formula_cell,{})[(scope,key)]=item
+        return refs,bad
+    def static_index(self,node,key):
+        """Resolve a fixed snapshot's named integer case selector, without caches.
+
+        Keep the name definition, literal selector, ROW reference and selected
+        value. Formula-valued, missing or ambiguous selectors remain unknown.
+        """
+        if node.kind!='func' or node.name.upper()!='INDEX' or len(node.args)!=2:return None
+        array,offset=node.args
+        if array.kind!='ref' or offset.kind!='infix' or offset.name!='+' or len(offset.args)!=2:return None
+        row,case=offset.args
+        if row.kind!='func' or row.name.upper()!='ROW' or len(row.args)!=1 or row.args[0].kind!='ref' or case.kind!='ref':return None
+        sheet,span,external=self.graph._split_ref(array.name)
+        match=re.fullmatch(r'\$?([A-Za-z]{1,3}):\$?\1',span)
+        if external is not None or match is None:return None
+        sheet=sheet or key.rsplit('!',1)[0]
+        refsheet,ref,external=self.graph._split_ref(row.args[0].name)
+        refsheet=refsheet or key.rsplit('!',1)[0]
+        owner=re.fullmatch(r'\$?([A-Za-z]{1,3})\$?([1-9][0-9]*)',ref)
+        if external is not None or sheet not in self.sheets or refsheet!=sheet or owner is None or owner[1].upper()!=match[1].upper():return None
+        named=self.static_name(case.name,key)
+        if named is None:return None
+        targets,bad=named
+        if bad or len(targets)!=1:return None
+        selector=next(iter(targets));cell=self.cells.get(selector)
+        if cell is None or cell['data_type']!='n' or type(cell['value'])is not int:return None
+        number=int(owner[2])+cell['value']
+        from openpyxl.utils.cell import column_index_from_string
+        if not 1<=int(owner[2])<=1048576 or not 1<=number<=1048576 or column_index_from_string(match[1])>16384:return None
+        return {selector,sheet+'!'+owner[1].upper()+owner[2],sheet+'!'+match[1].upper()+str(number)}
+
     def dependencies(self,key):
         from xl_ast_graph import parse_formula
         if key in self.cache:return self.cache[key]
         cell=self.cells.get(key);refs=set();unknown=False
         if cell and cell['data_type']=='f':
             try:
-                stack=[parse_formula(cell['value'])]
+                formula=cell['value']
+                if isinstance(formula,dict):
+                    # Workbook evidence preserves array metadata as well as text.
+                    # Only a single-cell owner has the same dependency semantics
+                    # as the original text expression; retain the complete value
+                    # in the shard and leave every other formula object unknown.
+                    require(set(formula)=={'formula_type','text','attributes'}
+                            and formula['formula_type']=='array'
+                            and isinstance(formula['text'],str)
+                            and formula['text'].startswith('=')
+                            and formula['attributes']=={'t':'array','ref':cell['address']}
+                            and key.rsplit('!',1)[-1]==cell['address'],
+                            'unsupported array formula ownership')
+                    formula=formula['text']
+                stack=[parse_formula(formula)]
                 while stack:
-                    node=stack.pop();stack.extend(node.args)
+                    node=stack.pop()
+                    selected_index=self.static_index(node,key)
+                    if selected_index is not None:
+                        refs.update(selected_index);continue
+                    stack.extend(node.args)
                     if node.kind=='func' and node.name.upper().replace('_XLFN.','') in {'INDIRECT','OFFSET'}:unknown=True
                     if node.kind=='ref':
+                        named=self.static_name(node.name,key)
+                        if named is not None:
+                            found,bad=named;refs.update(found);unknown|=bad;continue
                         sheet_part,span,external=self.graph._split_ref(node.name)
-                        name_sheet=sheet_part or key.rsplit('!',1)[0]
-                        if (name_sheet,span.upper()) in self.graph.names_local or span.upper() in self.graph.names_global:unknown=True
                         if ':' in span and external is None:
                             try:
                                 bounds=range_boundaries(span.replace('$',''))
@@ -147,8 +251,12 @@ class _Workbook:
                 if 'cached_value' in cell:item.append(cell['cached_value'])
                 present.append(item)
             rows.append({**{k:copy.deepcopy(v) for k,v in sheet.items() if k!='cells'},'present_rows':present})
+        metadata={k:copy.deepcopy(v) for k,v in self.evidence.items() if k not in {'sheets','blank_cell_semantics'}}
+        named=[dict(formula_cell=cell,**item)for cell in sorted(selected)
+               for _,item in sorted(self.named_dependencies.get(cell,{}).items(),key=lambda pair:(pair[0][0]or'',pair[0][1]))]
+        if named:metadata['resolved_defined_names']=copy.deepcopy(named)
         return dict(schema_version=WORKBOOK_SCHEMA,semantics=SEMANTICS,source=self.binding,
-                    snapshot_metadata={k:copy.deepcopy(v) for k,v in self.evidence.items() if k not in {'sheets','blank_cell_semantics'}},
+                    snapshot_metadata=metadata,
                     selected_refs=encode_refs(selected),blank_refs=encode_refs(selected-set(self.cells)),sheets=rows,number_formats=formats,row_columns=list(tables.TABLE_COLUMNS),
                     dependency_edges=[[ref_index[a],ref_index[b]] for a,b in sorted(edges)],closure='full_snapshot_fallback' if fallback else 'exact_ast_closure')
 
@@ -171,6 +279,26 @@ def decode_workbook(shard):
     decoded_edges=[[selected[a],selected[b]] for a,b in edges];require(decoded_edges==sorted(decoded_edges),'dependency edge order differs')
     require(shard['closure'] in {'exact_ast_closure','full_snapshot_fallback'},'unknown closure mode')
     return dict(present=present,blank_refs=blank,selected_refs=selected,dependency_edges=decoded_edges,unknown_elsewhere=True)
+
+
+def paired_shards(workbooks,seeds,unknown=False):
+    """Use the same reference closure, reading each workbook's own cell bytes.
+
+    A delivered target can be blank because its formula was intentionally
+    removed. Its dependencies must still be described on that side. Only
+    addresses cross the pair; values, formulas, blanks and dependency edges
+    always come from the selected workbook itself.
+    """
+    require(set(workbooks)=={'golden','delivered'},'exact authenticated workbook pair required')
+    selected=set(seeds)
+    for _ in range(64):
+        shards={name:book.shard(selected,unknown)for name,book in workbooks.items()}
+        scopes={name:set(decode_refs(shard['selected_refs']))for name,shard in shards.items()}
+        union=set().union(*scopes.values())
+        require(selected<=union,'paired reference closure lost selected evidence')
+        if all(refs==union for refs in scopes.values()):return shards
+        selected=union
+    raise ScopeDiagnosisRequired('paired dependency closure exceeded bounded fixed-point iterations')
 
 
 def _manifest(body,root):
@@ -206,13 +334,24 @@ def _instruction(body,root,sentences):
     return body['instruction'].replace(section,projected,1)
 
 
-def plan(body,golden_path,delivered_path,*,root,max_sentences=MAX_SENTENCES,max_bytes=MAX_BYTES):
-    require(type(max_sentences) is int and 1<=max_sentences<=MAX_SENTENCES and type(max_bytes) is int and 1<=max_bytes<=MAX_BYTES,'unapproved shard bounds')
+def plan(body,golden_path,delivered_path,*,root,max_sentences=MAX_SENTENCES,max_bytes=MAX_BYTES,bounds_policy=None,empty_review_contract=None):
+    bounds=selected_bounds(bounds_policy,body,golden_path,delivered_path) if bounds_policy is not None else None
+    wire=bool(bounds and bounds.get('wire_encoding'))
+    if wire:from scripts.batch import harbor_disclosure_partition_wire as W
+    require(type(max_sentences) is int and 1<=max_sentences<=(bounds['max_sentences']if bounds else MAX_SENTENCES) and type(max_bytes) is int and 1<=max_bytes<=(bounds['max_bytes']if bounds else MAX_BYTES),'unapproved shard bounds')
     root=Path(root);agents=_manifest(body,root);workbooks={};result=[]
     require(set(body['workbooks'])=={'golden','delivered'},'complete workbook pair required')
     try:
         for name,path in [('golden',golden_path),('delivered',delivered_path)]:workbooks[name]=_Workbook(path,body['workbooks'][name])
         full_manifest=body['manifest'];root_digest=digest(body)
+        review_scope=None
+        if not full_manifest['sentences']:
+            require(empty_review_contract is not None and not wire,'empty disclosure requires an explicit full-source review contract')
+            from scripts.batch import harbor_disclosure_review_round as rounds
+            selected=rounds.read(empty_review_contract)
+            helper=rounds.bound_module(selected['implementation'])
+            review_scope=helper.review_scope(empty_review_contract,body,workbooks)
+        else:require(empty_review_contract is None,'empty review contract cannot change nonempty partitions')
         hashes=full_manifest['input_hashes']
         require(set(hashes)=={'renderer','instruction','disclosure','golden','delivered'},'manifest input hash fields differ')
         require(hashes['golden']==workbooks['golden'].binding['sha256'] and hashes['delivered']==workbooks['delivered'].binding['sha256'] and hashes['renderer']==record(root/'.cursor/skills/task-disclosure/scripts/disclose.py')['sha256'] and hashes['instruction']==hashlib.sha256(body['instruction'].encode()).hexdigest(),'manifest inputs differ from exact current source')
@@ -222,32 +361,47 @@ def plan(body,golden_path,delivered_path,*,root,max_sentences=MAX_SENTENCES,max_
             seeds=set();unknown=False
             for row in selected+raw:
                 refs,bad=_refs(row);seeds.update(refs);unknown|=bad
-            shards={name:book.shard(seeds,unknown) for name,book in workbooks.items()}
+            if review_scope is not None:
+                seeds=set(review_scope['graded_targets']);unknown=True
+            shards=paired_shards(workbooks,seeds,unknown)
             scope=set(seeds)
             def relevant(row):
                 refs,bad=_refs(row);return bad or bool(refs&scope)
             disclosure={**{k:copy.deepcopy(v) for k,v in body['disclosure'].items() if k not in {'records','agent_records','method_assessments'}},
                         'records':copy.deepcopy(raw),'agent_records':copy.deepcopy(selected),'method_assessments':assessments.filtered(body['disclosure']['method_assessments'],relevant)}
+            if review_scope is not None:disclosure=copy.deepcopy(body['disclosure'])
             subset={**copy.deepcopy(full_manifest),'agent_record_ids':ids,'sentences':copy.deepcopy(sentences)}
             identity={'root_body_sha256':root_digest,'sentence_ids':[s['sentence_id'] for s in sentences]}
+            if review_scope is not None:identity['review_contract']=empty_review_contract
             payload=dict(schema_version=SCHEMA,batch_id='disclosure-batch-'+digest(identity)[:24],root_body_sha256=root_digest,
                          full_manifest_sha256=body['manifest_sha256'],full_manifest_digest=digest(full_manifest),manifest=subset,manifest_sha256=digest(subset),
                          instruction=_instruction(body,root,sentences),instruction_projection={'schema_version':'assigned-disclosure-lines/v1','full_instruction_sha256':hashlib.sha256(body['instruction'].encode()).hexdigest(),'semantics':'All non-disclosure instruction text is unchanged. Only assigned exact disclosure sentences appear; the immutable full instruction remains root evidence.'},disclosure=disclosure,workbooks=shards)
+            if review_scope is not None:
+                payload.update(schema_version=EMPTY_SCHEMA,review_scope=review_scope,instruction=body['instruction'])
             for shard in shards.values():decode_workbook(shard)
+            if wire:
+                payload['schema_version']=WIRE_SCHEMA
+                payload['workbooks']=W.encode(shards) if bounds['wire_encoding']==W.SCHEMA else W.encode(shards,encoding=bounds['wire_encoding'])
             if len(canonical(payload))>max_bytes:
+                if not sentences:raise ScopeDiagnosisRequired('full empty-manifest review exceeds explicit byte bound')
                 if len(sentences)==1:raise ScopeDiagnosisRequired('single sentence exceeds bound: '+json.dumps({'bytes':len(canonical(payload)),'components':{k:len(canonical(v)) for k,v in payload.items()},'disclosure_components':{k:len(canonical(v)) for k,v in disclosure.items()},'closures':{k:v['closure'] for k,v in shards.items()}},sort_keys=True))
                 middle=len(sentences)//2;return batch(sentences[:middle])+batch(sentences[middle:])
             return [payload]
-        for offset in range(0,len(full_manifest['sentences']),max_sentences):result.extend(batch(full_manifest['sentences'][offset:offset+max_sentences]))
+        if review_scope is not None:result.extend(batch([]))
+        for offset in range(0,len(full_manifest['sentences']),max_sentences):
+            result.extend(batch(full_manifest['sentences'][offset:offset+max_sentences]))
+            require(bounds is None or len(result)<=bounds['max_batches'],'partition count exceeds explicit finite bounds')
+        require(bounds is None or len(result)<=bounds['max_batches'],'partition count exceeds explicit finite bounds')
         sentence_ids=[s['sentence_id'] for b in result for s in b['manifest']['sentences']]
         record_ids=[r for b in result for r in b['manifest']['agent_record_ids']]
         require(sentence_ids==[s['sentence_id'] for s in full_manifest['sentences']] and Counter(record_ids)==Counter(full_manifest['agent_record_ids']) and len(record_ids)==len(set(record_ids)),'global coverage differs')
         ownership={}
         for b in result:
-            for name,shard in b['workbooks'].items():
+            pair=W.decode(b['workbooks'])if wire else b['workbooks']
+            for name,shard in pair.items():
                 for ref in decode_refs(shard['selected_refs']):ownership.setdefault((name,ref),b['batch_id'])
-        cross=sorted({(b['batch_id'],name,a,z,ownership[(name,z)]) for b in result for name,shard in b['workbooks'].items() for a,z in decode_workbook(shard)['dependency_edges'] if ownership[(name,z)]!=b['batch_id']})
-        return dict(schema_version=SCHEMA,root_body_sha256=root_digest,full_manifest=copy.deepcopy(full_manifest),full_manifest_sha256=body['manifest_sha256'],
+        cross=sorted({(b['batch_id'],name,a,z,ownership[(name,z)]) for b in result for name,shard in (W.decode(b['workbooks'])if wire else b['workbooks']).items() for a,z in decode_workbook(shard)['dependency_edges'] if ownership[(name,z)]!=b['batch_id']})
+        return dict(schema_version=EMPTY_SCHEMA if review_scope is not None else WIRE_SCHEMA if wire else BOUNDED_SCHEMA if bounds else SCHEMA,**({'bounds_policy':bounds_policy}if bounds else {}),**({'empty_review_contract':empty_review_contract}if review_scope is not None else {}),root_body_sha256=root_digest,full_manifest=copy.deepcopy(full_manifest),full_manifest_sha256=body['manifest_sha256'],
                     source_bindings={name:book.binding for name,book in workbooks.items()},max_sentences=max_sentences,max_bytes=max_bytes,
                     batches=result,coverage={'sentence_ids':sentence_ids,'record_ids':record_ids,'cross_batch_dependencies':[list(x) for x in cross]})
     finally:
@@ -255,7 +409,10 @@ def plan(body,golden_path,delivered_path,*,root,max_sentences=MAX_SENTENCES,max_
 
 
 def validate_plan(value,body,golden_path,delivered_path,*,root):
-    require(isinstance(value,dict) and set(value)=={'schema_version','root_body_sha256','full_manifest','full_manifest_sha256','source_bindings','max_sentences','max_bytes','batches','coverage'},'unknown partition plan fields')
-    expected=plan(body,golden_path,delivered_path,root=root,max_sentences=value['max_sentences'],max_bytes=value['max_bytes'])
+    require(isinstance(value,dict),'partition plan required')
+    empty=value.get('schema_version')==EMPTY_SCHEMA
+    bounded=value.get('schema_version')in(BOUNDED_SCHEMA,WIRE_SCHEMA)or(empty and 'bounds_policy'in value)
+    require(value.get('schema_version')in(SCHEMA,BOUNDED_SCHEMA,WIRE_SCHEMA,EMPTY_SCHEMA) and set(value)==({'schema_version','root_body_sha256','full_manifest','full_manifest_sha256','source_bindings','max_sentences','max_bytes','batches','coverage'}|({'bounds_policy'}if bounded else set())|({'empty_review_contract'}if empty else set())),'unknown partition plan fields')
+    expected=plan(body,golden_path,delivered_path,root=root,max_sentences=value['max_sentences'],max_bytes=value['max_bytes'],bounds_policy=value.get('bounds_policy'),empty_review_contract=value.get('empty_review_contract'))
     require(canonical(value)==canonical(expected),'partition projection/coverage differs from exact current sources')
     return expected

@@ -61,19 +61,29 @@ def old_location(s,campaign):
     return E.safe(campaign.root)/E.sha(E.canonical(asdict(scope(s))))
 
 
-def unused(s,campaign,*,root=None,prepared=None):
+def unused(s,campaign,*,root=None,prepared=None,terminal_rejection=None,scope_locked=False):
     original=old_location(s,campaign)
-    require(not original.exists() or not any(p.name not in {'scope.lock','scope-delegation.json'} for p in original.iterdir()),
-            'original normalization already submitted or uncertain; partition transition forbidden')
-    require(not (E.safe(campaign.root)/'attempt-identities'/(s.budget.attempt_id+'.json')).exists(),
-            'original normalization UUID already reserved')
+    if prepared is not None:
+        selected=read(prepared).get('terminal_rejection')
+        require(terminal_rejection is None or terminal_rejection==selected,'terminal partition authority changed')
+        terminal_rejection=selected
+    if terminal_rejection is not None:
+        from scripts.batch import harbor_normalization_terminal_repair as repair
+        repair.validate(terminal_rejection,s,campaign,scope_locked=scope_locked)
+    else:
+        require(not original.exists() or not any(p.name not in {'scope.lock','scope-delegation.json'} for p in original.iterdir()),
+                'original normalization already submitted or uncertain; partition transition forbidden')
+        require(not (E.safe(campaign.root)/'attempt-identities'/(s.budget.attempt_id+'.json')).exists(),
+                'original normalization UUID already reserved')
     marker=original/'scope-delegation.json'
     if marker.exists():
         value=read(record(marker))
-        require(set(value)=={'schema_version','scope','original_budget','prepared','root'}
+        extra={'terminal_rejection'} if terminal_rejection is not None else set()
+        require(set(value)=={'schema_version','scope','original_budget','prepared','root'}|extra
             and value['schema_version']=='normalization-scope-delegation/v1'
             and value['scope']==asdict(scope(s)) and value['original_budget']==C.json_value(asdict(s.budget)),
             'original scope delegation changed')
+        require(value.get('terminal_rejection')==terminal_rejection,'terminal delegation authority changed')
         checked_record(value['prepared'])
         if root is not None:require(value['root']==str(root),'original scope delegated to another partition plan')
         if prepared is not None:require(value['prepared']==prepared,'original scope delegation selects another plan')
@@ -83,8 +93,10 @@ def unused(s,campaign,*,root=None,prepared=None):
 
 def codes():
     from scripts.batch import harbor_partition_code_applicability as applicability
+    from scripts.batch import harbor_normalization_terminal_repair as repair
     return {**applicability.code_records(),**N.code_bindings(),str(Path(K.__file__).resolve()):record(Path(K.__file__))['sha256'],
             str(Path(__file__).resolve()):record(Path(__file__))['sha256'],
+            str(Path(repair.__file__).resolve()):record(Path(repair.__file__))['sha256'],
             str(Path(E.__file__).resolve()):record(Path(E.__file__))['sha256']}
 
 
@@ -180,7 +192,7 @@ def transition(s,prior_plan,plan,body,rows):
         m=read(legacy['prepared.json'])
         require(m==dict(schema_version='prepared-normalization-review/v1',status='review_required',request=legacy['review-request.json'],
             evidence=legacy['review-evidence.json'],analysis=legacy['analysis.json'],draft=legacy['draft.json'],selection=prior_plan,
-            candidate_count=len(body['candidates']),candidate_references=sorted(r['reference'] for r in body['candidates']),
+            candidate_count=len(body['candidates']),candidate_references=sorted({r['reference'] for r in body['candidates']}),
             policy=asdict(s.policy),budget=C.json_value(asdict(s.budget)),semantic_budget_reset=False),'prior prepared request contract changed')
         require(read(m['request'])==dict(model=s.policy.model,reasoning_effort=s.policy.reasoning_effort,
             messages=[dict(role='system',content=N.PROMPT),dict(role='user',content=N.raw(m['evidence']).decode())]),'prior request text changed')
@@ -193,16 +205,22 @@ def transition(s,prior_plan,plan,body,rows):
         prior_evidence_available='review-evidence.json' in legacy)
 
 
-def prepare(s,campaign,root,*,prior_plan=None):
+def prepare(s,campaign,root,*,prior_plan=None,terminal_rejection=None):
     """Select one immutable partition plan around untouched legacy preparation."""
     require(isinstance(campaign,E.Campaign),'root campaign required')
     plan,draft,rows,body=full_evidence(s);root=E.safe(root)
     require(root!=s.run and s.run not in root.parents and root not in s.run.parents,'partition evidence needs a separate namespace')
     previous=transition(s,prior_plan,plan,body,rows)
     parts=K.partitions(body,lambda value,refs:request(s,value,refs),max_references=K.MAX_REFERENCES)
+    if terminal_rejection is not None:
+        import time
+        from scripts.batch import harbor_normalization_terminal_repair as repair
+        permit,_=repair.validate(terminal_rejection,s,campaign,at=time.time_ns())
+        require(prior_plan==permit['previous_selection'] and len(parts)==permit['partitions'],
+                'terminal partition scope or bounded count changed')
     identity=owner(s,campaign)
     with E.scope_lock(identity), E.scope_lock(old_location(s,campaign)):
-        unused(s,campaign,root=root)
+        unused(s,campaign,root=root,terminal_rejection=terminal_rejection,scope_locked=True)
         root.mkdir(parents=True,exist_ok=True,mode=0o700)
         legacy=_snapshot(s)
         # Both the earlier PENDING_MODEL plan and interrupted over-size evidence
@@ -212,7 +230,7 @@ def prepare(s,campaign,root,*,prior_plan=None):
             expected=dict(schema_version='prepared-normalization-review/v1',status='review_required',
                 request=legacy['review-request.json'],evidence=legacy['review-evidence.json'],analysis=legacy['analysis.json'],
                 draft=legacy['draft.json'],selection=legacy['production-selection.json'],candidate_count=len(body['candidates']),
-                candidate_references=sorted(r['reference'] for r in body['candidates']),policy=asdict(s.policy),
+                candidate_references=sorted({r['reference'] for r in body['candidates']}),policy=asdict(s.policy),
                 budget=C.json_value(asdict(s.budget)),semantic_budget_reset=False)
             require(m==expected,'old prepared plan is not the exact unsubmitted producer request')
             require(read(m['request'])==dict(model=s.policy.model,reasoning_effort=s.policy.reasoning_effort,
@@ -229,10 +247,13 @@ def prepare(s,campaign,root,*,prior_plan=None):
             full_candidate_references=list(dict.fromkeys(r['reference'] for r in body['candidates'])),
             max_references=K.MAX_REFERENCES,max_request_bytes=K.MAX_REQUEST_BYTES,
             logical_limit=2,original_budget=C.json_value(asdict(s.budget)),semantic_budget_reset=False,
-            prior_attempt_submitted=False,root=str(root),lane_approval=False)
+            prior_attempt_submitted=terminal_rejection is not None,root=str(root),lane_approval=False)
+        if terminal_rejection is not None:value['terminal_rejection']=terminal_rejection
         prepared=N.keep(root/'prepared.json',value)
-        N.keep(old_location(s,campaign)/'scope-delegation.json',dict(schema_version='normalization-scope-delegation/v1',
-            scope=asdict(scope(s)),original_budget=C.json_value(asdict(s.budget)),prepared=prepared,root=str(root)))
+        delegation=dict(schema_version='normalization-scope-delegation/v1',
+            scope=asdict(scope(s)),original_budget=C.json_value(asdict(s.budget)),prepared=prepared,root=str(root))
+        if terminal_rejection is not None:delegation['terminal_rejection']=terminal_rejection
+        N.keep(old_location(s,campaign)/'scope-delegation.json',delegation)
         N.keep(identity/'owner.json',dict(schema_version=SCHEMA,prepared=prepared,selection=legacy['production-selection.json']))
         return prepared
 
@@ -247,7 +268,7 @@ def selection(prepared):
 def _current(prepared,*,allow_emitted=False):
     """Revalidate immutable root state and current full evidence without writes."""
     m=read(prepared);s=selection(prepared)
-    require(set(m)=={'schema_version','selection','legacy','previous','campaign','code','partitions',
+    require(set(m)-{'terminal_rejection'}=={'schema_version','selection','legacy','previous','campaign','code','partitions',
         'full_candidate_references','max_references','max_request_bytes','logical_limit','original_budget',
         'semantic_budget_reset','prior_attempt_submitted','root','lane_approval'},'partition preparation fields changed')
     c=m['campaign'];campaign=E.Campaign(Path(c['root']),Path(c['slot_root']),c['model_slots'])
@@ -278,7 +299,13 @@ def _current(prepared,*,allow_emitted=False):
         expected.append(dict(index=index,references=refs,request=binding))
     require(m['partitions']==expected and m['logical_limit']==2 and m['max_references']==K.MAX_REFERENCES
         and m['max_request_bytes']==K.MAX_REQUEST_BYTES and m['semantic_budget_reset'] is False
-        and m['prior_attempt_submitted'] is False and m['lane_approval'] is False,'partition contract changed')
+        and m['prior_attempt_submitted'] is (m.get('terminal_rejection') is not None)
+        and m['lane_approval'] is False,'partition contract changed')
+    if m.get('terminal_rejection') is not None:
+        from scripts.batch import harbor_normalization_terminal_repair as repair
+        permit,_=repair.validate(m['terminal_rejection'],s,campaign)
+        require(previous is not None and previous['prior_plan']==permit['previous_selection']
+                and len(parts)==permit['partitions'],'terminal partition lineage or allowance changed')
     if not allow_emitted:require(not (s.run/'normalization-review.json').exists(),'normalization already aggregated; no additional calls')
     return m,s,campaign,draft,rows
 
@@ -337,8 +364,16 @@ def _review(prepared,index,ordinal,campaign,rows):
 def dispatch(prepared,index,ordinal,*,credential):
     """Root-authorized only; shared executor supplies slots and three retries."""
     m,s,campaign,draft,rows=_current(prepared)
+    if m.get('terminal_rejection') is not None:
+        import time
+        from scripts.batch import harbor_normalization_terminal_repair as repair
+        repair.validate(m['terminal_rejection'],s,campaign,at=time.time_ns())
+        require(E.prepared_plan(_prepared_call(prepared,index,ordinal),campaign)[0]['max_transport_retries']==0,
+                'terminal repair requires single-dispatch transport')
     with E.scope_lock(owner(s,campaign)),E.scope_lock(old_location(s,campaign)):
-        unused(s,campaign,prepared=prepared)
+        unused(s,campaign,prepared=prepared,scope_locked=True)
+        if m.get('terminal_rejection') is not None and ordinal==1:
+            for earlier in range(index):_review(prepared,earlier,1,campaign,rows)
         if ordinal==2:
             # All first-round partitions must be completed before a correction
             # round starts. A passed partition never gets a fishing retry.
@@ -386,10 +421,19 @@ def aggregate(prepared):
             outcome=read(record(p/'outcome.json'))
             for name,sha in outcome['evidence'].items():files.update(records(dict(path=str(p/name),sha256=sha)))
     files.update(codes())
-    return dict(schema_version=SCHEMA,prepared=prepared,review=review,partitions=proofs,
+    result=dict(schema_version=SCHEMA,prepared=prepared,review=review,partitions=proofs,
         dependency_reconciliation=dependency_reconciliation,
         semantic_attempt=max(x['ordinal'] for x in selected),logical_limit=2,
         checked_files=dict(sorted(files.items())),lane_approval=False,semantic_budget_reset=False)
+    if m.get('terminal_rejection') is not None:
+        from scripts.batch import harbor_normalization_terminal_repair as repair
+        permit,retained=repair.validate(m['terminal_rejection'],s,campaign)
+        require(len(proofs)<=permit['maximum_additional_physical_calls'],'additive physical allowance exceeded')
+        result['terminal_rejection']=m['terminal_rejection']
+        result['consumed_physical_attempts']=1+len(proofs)
+        result['checked_files']=dict(sorted({**files,**retained,
+            str(Path(repair.__file__).absolute()):record(Path(repair.__file__).absolute())['sha256']}.items()))
+    return result
 
 
 def validate(binding,*,prepared,source,baseline,draft,rows,policy,bindings):

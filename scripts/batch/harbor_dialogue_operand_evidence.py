@@ -21,6 +21,18 @@ SCHEMA='dialogue-source-operands/v1'
 GUIDANCE='''\nAdditional independently checked source-operand evidence is supplied only to you, the reviewer. It is not an answer key. An operand is not a graded answer merely because it is numeric. Assess the exact per-claim provenance, occurrence budget and target_collision field; do not infer a target collision from appearance. A collision is permitted only for its independently licensed occurrence, never for an extra answer disclosure. This evidence does not override any accuracy, completeness or naturalness requirement. Return your own full review.\n'''
 
 
+class SourceFormulaTranslator(Translator):
+    """Preserve qualified error operands while translating ordinary references."""
+    @classmethod
+    def translate_range(cls, range_str, rdelta, cdelta):
+        # Translator splits at the final exclamation mark in #REF! and drops
+        # the entire token. An error reference has no coordinates to shift.
+        # Keep its exact sheet spelling and error, including escaped quotes.
+        if re.fullmatch(r"(?:'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_.]*)!#REF!", range_str):
+            return range_str
+        return super().translate_range(range_str, rdelta, cdelta)
+
+
 def literal_operands(ast):
     """Signed numeric leaves, consuming a unary sign exactly once."""
     if ast.kind=='const' and ast.name=='number':
@@ -70,6 +82,27 @@ def bound_restatement(ast,prose,value,occurrences):
         'meaning':'Both spans name the same source-proved lower bound; independent semantic review remains required.'}
 
 
+def column_increment_evidence(claim,payload,*,ordinal,source,task_dir,root,disclose):
+    """Re-derive a legacy empty formula field from its complete source record."""
+    reviewer=claim.get('reviewer_only') or {}
+    if reviewer.get('source')!='convention_detector' or reviewer.get('entry')!='column_literal_increment':return None
+    require(reviewer.get('evidence')=='','only the original empty formula field is supported')
+    matches=[r for r in payload['records']if r.get('entry')=='column_literal_increment' and r.get('cell_keys')==reviewer.get('cells')]
+    require(len(matches)==1,'unique complete increment record required')
+    rec=matches[0];extract=skill_module(root,'additional-assumptions-dialogue','extract_claims')
+    expected=extract.build_claim(rec,ordinal)
+    formula=expected['reviewer_only']['evidence']
+    require(isinstance(formula,str) and formula.startswith('='),'source increment formula missing')
+    expected['reviewer_only']['evidence']=''
+    require(expected==claim,'legacy increment claim differs beyond empty formula evidence')
+    gold=disclose.Book(source['path']);delivered=disclose.Book(disclose.find_environment(Path(task_dir)))
+    targets,_=disclose.load_key(Path(task_dir))
+    closure=disclose.graded_closure(gold,{disclose.parse_ref(x,gold.sheets[0])for x in targets})
+    require(disclose.ship_column_literal_increment(dict(rec),dict(gold=gold,delivered=delivered,targets=closure)),
+            'original source increment full-family or graded closure proof failed')
+    return dict(reviewer,evidence=formula,source='custom_method_detector')
+
+
 def project(claims,draft,*,source,answer_key,task_dir,root=ROOT):
     checked_record(source);checked_record(answer_key)
     require(Path(answer_key['path'])==Path(task_dir)/'tests/answer_key.json','root-selected current answer key required')
@@ -86,8 +119,9 @@ def project(claims,draft,*,source,answer_key,task_dir,root=ROOT):
     book=load_workbook(source['path'],read_only=True,data_only=False,keep_links=False)
     rows=[]
     try:
-        for claim in claims['claims']:
-            reviewer=claim.get('reviewer_only') or {};evidence=reviewer.get('evidence') or ''
+        for ordinal,claim in enumerate(claims['claims'],1):
+            reviewer=column_increment_evidence(claim,payload,ordinal=ordinal,source=source,task_dir=task_dir,root=root,disclose=d) or claim.get('reviewer_only') or {}
+            evidence=reviewer.get('evidence') or ''
             row={'record_id':claim['record_id'],'operands':[]}
             if reviewer.get('source')!='custom_method_detector':rows.append(row);continue
             refs=[d.parse_ref(ref,'') for ref in reviewer.get('cells') or []]
@@ -106,7 +140,7 @@ def project(claims,draft,*,source,answer_key,task_dir,root=ROOT):
                 require(sheet==anchor[0] and sheet in book.sheetnames,'method copied scope changed sheet')
                 cell=book[sheet][coordinate]
                 formula=cell.value
-                expected=Translator(original,origin=anchor[1]).translate_formula(coordinate)
+                expected=SourceFormulaTranslator(original,origin=anchor[1]).translate_formula(coordinate)
                 require(cell.data_type=='f' and isinstance(formula,str) and formula==expected,'source method copied formula changed')
                 proof.append({'cell':sheet+'!'+coordinate,'formula_sha256':hashlib.sha256(formula.encode()).hexdigest()})
             budget=literal_operands(parse_formula(original))

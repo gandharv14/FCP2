@@ -61,6 +61,7 @@ class PreparedCall:
     response_mode: str = "json_object"  # Root-selected protocol; never inferred from output.
     audit_context: object = None  # Only the independently projected owning-auditor protocol.
     physical_repair: dict | None = None  # Owning terminal-400 disclosure projection, at most once.
+    review_reservation: dict | None = None  # Explicit cumulative allowance; prior limits stay unchanged.
 
 
 @dataclass(frozen=True)
@@ -149,7 +150,12 @@ def prepared_plan(prepared, campaign, *, original_renderer_code=None):
     require(isinstance(scope.original_sha256,str) and re.fullmatch(r'[0-9a-f]{64}',scope.original_sha256), 'original workbook hash required')
     require(all(isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}',value)
                 for value in (scope.lane,scope.budget_id)), 'owning lane and stable logical budget required')
-    require(type(prepared.ordinal) is int and type(prepared.limit) is int and 1 <= prepared.ordinal <= prepared.limit <= 2, 'original one/two-attempt lane budget required')
+    if prepared.review_reservation is None:
+        require(type(prepared.ordinal) is int and type(prepared.limit) is int and 1 <= prepared.ordinal <= prepared.limit <= 2, 'original one/two-attempt lane budget required')
+    else:
+        from scripts.batch.harbor_continuation_allowance import validate_review_reservation
+        reservation,allowance=validate_review_reservation(prepared.review_reservation,asdict(scope),prepared.ordinal,prepared.limit)
+        require(prepared.physical_repair is None and prepared.audit_context is None,'additional review cannot combine physical/audit recovery')
     require(str(uuid.UUID(prepared.attempt_id)) == prepared.attempt_id, 'canonical attempt UUID required')
     require(isinstance(prepared.budget_evidence, tuple) and bool(prepared.budget_evidence), 'owning lane budget evidence required')
     raw = checked_bytes(prepared.request)
@@ -177,11 +183,18 @@ def prepared_plan(prepared, campaign, *, original_renderer_code=None):
                 budget_evidence=list(prepared.budget_evidence), semantic_budget_reset=False,
                 campaign_root=str(safe(campaign.root)), slot_root=str(safe(campaign.slot_root)),
                 max_transport_retries=MAX_RETRIES, uncertain_completion_policy='retain_incomplete_never_replay')
+    if prepared.review_reservation is not None:
+        plan['review_reservation']=prepared.review_reservation
+        plan['max_transport_retries']=min(MAX_RETRIES,allowance['limits']['transport_retries'])
     if prepared.audit_context is not None:plan['audit_context']=asdict(prepared.audit_context)
     if prepared.physical_repair is not None:
         from scripts.batch.harbor_disclosure_payload_repair import validate_prepared
         validate_prepared(prepared,campaign)
         plan['physical_repair']=prepared.physical_repair;plan['max_transport_retries']=0
+    if os.environ.get('HARBOR_FLEET_URL'):
+        require(campaign.model_slots == 1, 'fleet global model limit must remain one')
+        plan['max_transport_retries']=0
+        plan['fleet_transport_policy']='single-dispatch-durable-global-gate/v1'
     return plan, raw, request, evidence
 
 
@@ -237,6 +250,9 @@ def _audit_context(plan):
 
 
 def inspect_locked(root, plan, expected_request, *, reused=True, original_renderer_code=None):
+    if plan.get('review_reservation') is not None:
+        from scripts.batch.harbor_continuation_allowance import validate_review_reservation
+        validate_review_reservation(plan['review_reservation'],plan['scope'],plan['ordinal'],plan['limit'])
     require((root/'plan.json').read_bytes() == canonical(plan), 'logical call identity/configuration/budget changed')
     if (root/'identity.json').exists():
         identity = strict_json((root/'identity.json').read_bytes())
@@ -349,6 +365,7 @@ def execute(prepared, campaign, *, credential, timeout=600, _failpoint=None):
     before constructing PreparedCall. This journal enforces those selected
     identities and prevents repeated use of a scope/ordinal inside a campaign.
     """
+    require(os.environ.get('HARBOR_FLEET_CONTINUATION_READ_ONLY')!='1','read-only continuation cannot dispatch a model')
     plan, body, expected_request, budget_raw = prepared_plan(prepared, campaign)
     require(isinstance(credential, str) and credential.strip(), 'runtime credential required')
     require(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 600, 'bounded transport timeout required')
@@ -367,12 +384,17 @@ def execute(prepared, campaign, *, credential, timeout=600, _failpoint=None):
             else:save(marker,prepared.physical_repair)
         if root.exists():
             return inspect_locked(root, plan, expected_request)
+        reservation=None
+        if prepared.review_reservation is not None:
+            from scripts.batch.harbor_continuation_allowance import validate_review_reservation,validate
+            reservation,_=validate_review_reservation(prepared.review_reservation,asdict(prepared.scope),prepared.ordinal,prepared.limit)
+            validate(reservation['allowance'],at=time.time_ns())
         previous = []
         for number in range(1, prepared.ordinal):
             prior = root.parent / ('attempt-%02d' % number)
             require((prior/'outcome.json').is_file(), 'prior semantic attempt missing or incomplete')
             prior_plan = strict_json((prior/'plan.json').read_bytes())
-            require(prior_plan['scope'] == asdict(prepared.scope) and prior_plan['limit'] == prepared.limit
+            require(prior_plan['scope'] == asdict(prepared.scope) and (prior_plan['limit'] == prepared.limit or (reservation is not None and number<=reservation['original_limit'] and prior_plan['limit']==reservation['original_limit']))
                     and prior_plan['policy'] == asdict(prepared.policy) and prior_plan['ordinal'] == number
                     and (prior_plan['response_mode'] == prepared.response_mode or (
                         prepared.scope.lane == 'harbor-dialogue-author'
@@ -391,6 +413,7 @@ def execute(prepared, campaign, *, credential, timeout=600, _failpoint=None):
                 require(checked.status == 'completed' and checked.call is not None,
                         'dialogue response protocol transition requires a complete prior call')
             previous.append(record(prior/'outcome.json'))
+        if reservation is not None:require(previous==reservation['prior_records'],'reserved prior review outcomes differ from actual journal')
         root.mkdir(mode=0o700);sync_dir(root.parent)
         save(root/'plan.json', plan)
         retain(root/'request.json', body)
@@ -415,11 +438,15 @@ def execute(prepared, campaign, *, credential, timeout=600, _failpoint=None):
                          semantic_ordinal=prepared.ordinal, semantic_limit=prepared.limit,
                          response_mode=prepared.response_mode, model_slots=campaign.model_slots,
                          budget_evidence=list(prepared.budget_evidence))
+        if prepared.review_reservation is not None:submitted['review_reservation']=prepared.review_reservation
         if prepared.physical_repair is not None:submitted['physical_repair']=prepared.physical_repair
         save(root/'submitted.json', submitted)
         try:
             failpoint('after_submitted')
-            with xl_transport.model_slot():
+            slot_options = (dict(operation_id=prepared.attempt_id + ('-physical-repair-01' if prepared.physical_repair is not None else ''),
+                                 request_sha256=sha(body), outcome_path=root/'outcome.json')
+                            if os.environ.get('HARBOR_FLEET_URL') else {})
+            with xl_transport.model_slot(**slot_options):
                 for index in range(plan['max_transport_retries'] + 1):
                     save(root/('transport-%02d.started.json' % index), dict(index=index,
                         started_at_ns=time.time_ns(), request_sha256=sha(body), attempt_id=prepared.attempt_id))

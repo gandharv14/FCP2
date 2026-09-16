@@ -28,3 +28,23 @@ def test_no_alias_inputs_unchanged_and_duplicate_ids_rejected():
     a=row('a');v,inc,proof=G.coalesce_same_atom_aliases([a],{'d':['a']})
     assert v==[a] and inc=={'d':['a']} and not proof['groups']
     with pytest.raises(ValueError,match='duplicate emitted ID'):G.coalesce_same_atom_aliases([a,a],{'d':['a']})
+
+def test_source_caption_notes_union_preserves_full_provenance():
+    a,b=row('a','General ledger'),row('b','Servicing revenue')
+    a['source_notes']='General ledger';b['source_notes']='Servicing revenue'
+    before=copy.deepcopy([a,b])
+    merged,included,proof=G.coalesce_same_atom_aliases([a,b],{'d':['a','b']})
+    assert [a,b]==before and len(merged)==1
+    assert merged[0]['source_notes']=='General ledger\nServicing revenue'
+    assert merged[0]['value']==123.0 and included=={'d':['a']}
+    assert {s['name']for s in merged[0]['sources']}=={'General ledger','Servicing revenue'}
+    assert proof['groups'][0]['source_note_union']==[
+        dict(id='a',source_notes='General ledger'),dict(id='b',source_notes='Servicing revenue')]
+
+@pytest.mark.parametrize('field,value', [('value',124),('period','2024'),('basis','Forecast'),
+    ('question','What net revenue?'),('source_notes','Excludes a different entity')])
+def test_caption_alias_never_hides_substantive_difference(field,value):
+    a,b=row('a','Ledger'),row('b','Report')
+    a['source_notes']='Ledger';b['source_notes']='Report';b[field]=value
+    with pytest.raises(ValueError,match='conflicting'):
+        G.coalesce_same_atom_aliases([a,b],{'d':['a','b']})

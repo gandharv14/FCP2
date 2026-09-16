@@ -225,16 +225,23 @@ Records from this section ship a value. Their record metadata is `convention`.
 
 - **Id.** `npv_timing`
 - **Question.** Does the first cash flow sit at time zero, or one period out?
-- **Alternatives.** `excel_default_one_period_out` | `t0_added_separately`
+- **Alternatives.** `excel_default_one_period_out` | `t0_added_separately` | `dated_first_date_origin`
 - **Ship when.** The band is not itself a graded cell. Where the `NPV(` call *is* the graded
   answer, stating its shape describes the target directly; preserve the driver instead.
 - **Sentence.**
-  - `excel_default_one_period_out` - "The present value on the row labelled {label} treats its
+  - `excel_default_one_period_out` - "{subject} treats its
     first cash flow as falling one full period out."
   - `t0_added_separately` - "The present value on the row labelled {label} adds the period-zero
     cash flow separately, outside the discounted series."
-- **Detection.** Read the `NPV(` call. A trailing addition outside the closing bracket means
-  the period-zero flow is added separately.
+  - `dated_first_date_origin` - "The present value on the row labelled {label} uses the first
+    supplied cash-flow date as its discounting origin and discounts the other dated cash flows
+    according to elapsed days."
+- **Detection.** Read the parsed function identity. A direct `XNPV` call uses the first supplied
+  date as its origin. For `NPV`, a trailing addition outside the closing bracket means the
+  period-zero flow is added separately. Never apply periodic `NPV` timing to `XNPV`.
+  For an unlabelled source cell with exactly one periodic `NPV` call, name that NPV series
+  by its exact cell locator; do not invent a row label. Multiple or dated calls do not use
+  this locator fallback. Labelled rows retain their original wording.
 - **Seen in.** 0523, 0530; 0596 - declined.
 - **Ownership.** This entry owns the Question for a discounted series whose first flagged period
   anchors the factor at 1, 0596's `DCF` row 80 being the observed case. Recorded so the
@@ -291,6 +298,42 @@ Records from this section ship a value. Their record metadata is `convention`.
   was the whole of the `aggregate_scope` disclosure. On 0632 it was not: 13 genuine two-member
   vertical records survive, `=SUM(K171:K172)` over 'Retained earnings - bop' and 'Net profit'
   among them.
+
+## `column_literal_increment`
+
+- **Id.** `column_literal_increment`
+- **Question.** Which fixed arithmetic increment defines a copied-down scenario column?
+- **Alternatives.** `fixed_step`
+- **Ship when.** A complete contiguous blank family adds or subtracts the same nonzero
+  literal from the immediately preceding cell in the same column. The column's nearest
+  literal text heading must remain visible at the exact same coordinate in the delivered
+  workbook. Every family cell must lack a row label. Bare carries, growth formulas,
+  branches, fixed-row references, partial families and populated cells decline. Neither
+  the stated cells nor any source operand may reach the original graded closure. This
+  does not create an exception for graded targets or disclose a computed answer.
+- **Sentence.**
+  - `fixed_step` - "For {band}, under the column heading {heading} at {heading_cell}, use
+    this {calculation_kind}, shown for {representative}: {steps}."
+- **Detection.** Re-derive the full copied-down family and every reference, operator and
+  literal from the source AST. The heading is column context, never a substituted row
+  label. The representative mechanics are translated down the full stated family.
+
+## `scenario_literal_increment`
+
+- **Id.** `scenario_literal_increment`
+- **Question.** Which fixed arithmetic rule applies across the stated scenario rows?
+- **Alternatives.** `fixed_step`
+- **Ship when.** The complete copied-down family reads each row's immediately preceding
+  column and adds or subtracts the same finite nonzero literal. Its cells must be blank
+  in the delivered workbook, with the exact source heading and unique contiguous scenario
+  labels still visible. The heading must occupy an otherwise empty row immediately above
+  the scenario block. Partial families, changed labels, ambiguous blocks, fixed references,
+  branches and any original graded cell or operand decline.
+- **Sentence.**
+  - `fixed_step` - "For {band}, in the block {heading} at {heading_cell} whose scenario rows
+    are {scenario_rows}, use this {calculation_kind}, shown for {representative}: {steps}."
+- **Detection.** Re-derive every source formula, label, coordinate and complete copied scope.
+  Scenario labels describe source context; no financial role or computed answer is inferred.
 
 ## `projection_rule`
 

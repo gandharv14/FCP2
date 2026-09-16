@@ -54,6 +54,15 @@ def retained_curation(args, source, ledger):
     """Keep an initial selection even if its first transformation was interrupted."""
     wb = source["workbook_id"]
     configured = Path(args.curation_root) / wb / "curation.toml"
+    cache = configured_cache_policy(args, source)
+    if cache is not None:
+        selected = json.loads(Path(cache['path']).read_text())
+        if selected['schema_version'] == 'source-cache-equivalence-selected-scope/v4':
+            from xl_source_scoped_cache import required_curation
+            scope = json.loads(Path(selected['scope']['path']).read_text())
+            path = configured if configured.is_file() else Path(scope['curation']['path'])
+            required_curation(cache, path)
+            return path
     if configured.is_file():
         return configured
     run = Path(args.run_root)
@@ -88,10 +97,10 @@ def retained_curation(args, source, ledger):
 
 def reusable_table_candidate(source, curation, ledger):
     """Reuse a completed transformation only after all current proofs validate."""
-    from xl_presentation_tables import POLICY, verify_materialization
+    from xl_presentation_tables import POLICY, COMPOSED_POLICY, verify_materialization
     for attempt in reversed(ledger.get('build_history', [])):
         record = attempt.get('normalization', {})
-        if record.get('policy_version') != POLICY:
+        if record.get('policy_version') not in {POLICY, COMPOSED_POLICY}:
             continue
         try:
             if (record['original_sha256'] != source['sha256']
@@ -130,6 +139,28 @@ def configured_quarantine(args, source, curation):
     if result["original_sha256"] != source["sha256"]:
         raise ValueError("quarantine original differs from frozen corpus")
     return result
+
+
+def retained_macro_normalization(args,source,ledger,macro_policy):
+    """Keep the exact completed normalization when an AST generation is required."""
+    generation=getattr(args,'require_source_generation',None)
+    if generation is None:return None
+    from xl_macro_source_projection import verify
+    for previous in reversed(ledger.get('build_history',[])):
+        if previous.get('source_generation_id')!=generation:continue
+        value=previous.get('normalization')
+        if not value or value.get('policy_version')!='source-vba-only-projection/v1':
+            raise ValueError('required macro generation lost original normalization')
+        if (previous['bindings'].get('macro_projection_policy_sha256')!=macro_policy['sha256']
+                or value['original_sha256']!=source['sha256']
+                or digest(value['candidate'])!=value['candidate_sha256']
+                or digest(value['manifest'])!=value['manifest_sha256']):
+            raise ValueError('required macro normalization bindings changed')
+        receipt=json.loads(Path(value['manifest']).read_text())
+        if receipt['policy']!=macro_policy:raise ValueError('retained macro policy differs')
+        verify(source['path'],value['candidate'],receipt)
+        return dict(value)
+    raise ValueError('required macro generation has no completed normalization history')
 
 
 def source_checkpoint_bindings(args, source, build, prepared_source):
@@ -174,10 +205,17 @@ def reuse_completed_source(args, source, ledger, prepared_source, restriction_op
                 or digest(prepared_source) != normalization["candidate_sha256"]):
             raise ValueError("normalization evidence changed before source reuse")
         receipt = json.loads(Path(normalization["manifest"]).read_text())
-        if normalization.get("policy_version") == QUARANTINE_POLICY:
+        if normalization.get("policy_version") in {"source-cache-equivalence/v1", "source-cache-equivalence-certified-cycles/v2", "source-cache-equivalence-large-acyclic/v3", "source-cache-equivalence-selected-scope/v4"}:
+            if receipt.get('policy_version')!=normalization['policy_version']:raise ValueError('cache lineage policy version differs')
+            from xl_source_cache_equivalence import verify
+            verify(source["path"],prepared_source,receipt)
+        elif normalization.get("policy_version") == 'source-vba-only-projection/v1':
+            from xl_macro_source_projection import verify
+            verify(source["path"],prepared_source,receipt)
+        elif normalization.get("policy_version") == QUARANTINE_POLICY:
             from xl_table_quarantine_inventory import validate_adoption
             validate_adoption(source["path"], prepared_source, normalization)
-        elif normalization.get("policy_version") in {"presentation-data-tables/v1", "presentation-data-tables/v2"}:
+        elif normalization.get("policy_version") in {"presentation-data-tables/v1", "presentation-data-tables/v2", "presentation-data-tables-remediation/v1"}:
             from xl_presentation_tables import verify_materialization
             verify_materialization(source["path"], prepared_source, normalization["curation"], receipt)
         else:
@@ -243,6 +281,36 @@ def reuse_completed_source(args, source, ledger, prepared_source, restriction_op
             )
             irrelevant = ({"curation_sha256", "inventory_sha256", "inventory_batch_id"}
                           if native_identity else set())
+            # A retained output selection can appear after source construction
+            # and before a segmentation timeout. It does not change the full
+            # AST of an untransformed restricted original. Keep its inventory,
+            # batch and every transformation dependency exact; the original
+            # restriction/publication gates below still revalidate the source.
+            restricted_original = (
+                health.get("route") == "restricted_pass"
+                and request.get("schema_version") == "source-restriction-request/v2"
+                and Path(source["path"]).suffix.casefold() == ".xlsx"
+                and expected["original_sha256"] == expected["prepared_source_sha256"]
+                and not recalc_options
+                and set(restriction_options) == {"inventory", "inventory_batch_id"}
+                and digest(restriction_options["inventory"]) == expected["inventory_sha256"]
+                and restriction_options["inventory_batch_id"] == expected["inventory_batch_id"]
+                and all(attempt.get(kind) is None
+                        for attempt in (current, previous)
+                        for kind in ("normalization", "recalculation"))
+            )
+            if restricted_original:
+                irrelevant = {"curation_sha256"}
+            retained_macro = (
+                normalization is not None
+                and normalization.get('policy_version')=='source-vba-only-projection/v1'
+                and normalization==previous.get('normalization')
+                and not recalc_options
+                and expected['prepared_source_sha256']==normalization['candidate_sha256']
+                and health.get('route') in ('pass','restricted_pass')
+            )
+            if retained_macro:
+                irrelevant = {'curation_sha256'}
 
             def source_dependencies(bindings):
                 if not isinstance(bindings, dict):
@@ -308,6 +376,13 @@ def reuse_completed_source(args, source, ledger, prepared_source, restriction_op
     return None
 
 
+def composed_table_source(source_path, ledger):
+    from xl_presentation_tables import composable_source
+    from xl_source_health import inspect_workbook
+    return ("data_tables_present" in ledger.get("reason_codes", [])
+            and composable_source(inspect_workbook(source_path), source_path))
+
+
 def dead_name_only_plan(source_path, route, *, recalculated=False):
     """Select existing, proven dead-name cleanup for an original restricted source."""
     if recalculated or route != "restricted_pass" or Path(source_path).suffix.casefold() != ".xlsx":
@@ -329,12 +404,91 @@ def dead_name_only_plan(source_path, route, *, recalculated=False):
     return plan
 
 
+def restricted_remediation_plan(source_path, ledger, *, recalculated=False):
+    """Use an existing complete OFFSET/sheet-name proof before requesting recalc."""
+    allowed_reasons = {"mixed_restricted_recalc", "worksheet_offset", "worksheet_cell_filename"}
+    reasons = set(ledger.get("reason_codes", []))
+    if (recalculated or Path(source_path).suffix.casefold() != ".xlsx"
+            or ledger.get("route") != "restricted_recalc_pass"
+            or ledger.get("failure") != "trusted_recalculation_required"
+            or not reasons or not reasons <= allowed_reasons):
+        return None
+    from xl_volatile_formula_remediation import build_plan, RemediationError
+    try:
+        plan = build_plan(source_path)
+    except (OSError, RemediationError):
+        return None
+    rules = {
+        "cell-filename-current-sheet-name/v1",
+        "offset-scalar-identity-and-blank-column/v2",
+        "offset-constant-scalar-and-blank-column/v3",
+        "offset-blank-column-to-index/v1",
+        "offset-blank-column-scalar-name/v1",
+        "offset-scalar-cell-row-zero-column/v1",
+        "offset-same-sheet-scalar-cell-row-zero-column/v1",
+    }
+    actions = plan.get("actions")
+    health = plan.get("before_health", {})
+    if (plan.get("status") != "eligible" or plan.get("unresolved") != []
+            or health.get("route") != ledger["route"]
+            or set(health.get("reason_codes", [])) != reasons
+            or not isinstance(actions, list) or not actions
+            or any(not isinstance(action, dict) or action.get("kind") != "replace_formula"
+                   or action.get("rule_id") not in rules for action in actions)):
+        return None
+    return plan
+
+
 def recalc_evidence_present(args, workbook_id):
     """A shared result root selects only workbooks with explicit job documents."""
     if not args.recalc_root:
         return False
     job = Path(args.recalc_root) / workbook_id
     return any((job / name).exists() for name in ("request.json", "result.json"))
+
+
+def configured_cache_policy(args,source):
+    path=getattr(args,'cache_equivalence_policy',None);sha=getattr(args,'cache_equivalence_policy_sha256',None)
+    if path is sha is None:return None
+    if not path or not sha:raise ValueError('cache policy path/hash must be paired')
+    from xl_source_cache_equivalence import policy
+    row=dict(path=str(Path(path).absolute()),sha256=sha);policy(row,source['path']);return row
+
+
+def configured_macro_policy(args,source):
+    path=getattr(args,'macro_projection_policy',None);sha=getattr(args,'macro_projection_policy_sha256',None)
+    if path is sha is None:return None
+    if not path or not sha:raise ValueError('macro policy path/hash must be paired')
+    if any(getattr(args,name,None) for name in ('cache_equivalence_policy','presentation_redaction_policy','presentation_cache_policy','recalc_root')):
+        raise ValueError('VBA-only policy cannot compose with another transformation')
+    from xl_macro_source_projection import policy
+    row=dict(path=str(Path(path).absolute()),sha256=sha);policy(row,source['path']);return row
+
+
+def configured_redaction_policy(args, source):
+    path = getattr(args, 'presentation_redaction_policy', None)
+    sha = getattr(args, 'presentation_redaction_policy_sha256', None)
+    if path is sha is None:
+        return None
+    if not path or not sha:
+        raise ValueError('presentation redaction policy path/hash must be paired')
+    from xl_presentation_redaction import selected
+    row = dict(path=str(Path(path).absolute()), sha256=sha)
+    selected(row, source['path'])
+    return row
+
+
+def configured_table_cache_policy(args, source):
+    path = getattr(args, 'presentation_cache_policy', None)
+    sha = getattr(args, 'presentation_cache_policy_sha256', None)
+    if path is sha is None:
+        return None
+    if not path or not sha:
+        raise ValueError('table-cache policy path/hash must be paired')
+    from xl_table_scoped_cache import policy
+    row = dict(path=str(Path(path).absolute()), sha256=sha)
+    policy(row, source['path'])
+    return row
 
 
 def worker(args, source):
@@ -357,6 +511,12 @@ def worker(args, source):
             raise ValueError("worker implementation differs from checkpoint binding")
         if digest(source["path"]) != source["sha256"]:
             raise ValueError("original source hash changed")
+        redaction_policy = configured_redaction_policy(args, source)
+        table_cache_policy = configured_table_cache_policy(args, source)
+        if (table_cache_policy['sha256'] if table_cache_policy else None) != build['bindings'].get('presentation_cache_policy_sha256'):
+            raise ValueError('table-cache policy differs from build intent')
+        if (redaction_policy['sha256'] if redaction_policy else None) != build['bindings'].get('presentation_redaction_policy_sha256'):
+            raise ValueError('presentation redaction policy differs from build intent')
         curation = Path(build["curation_path"])
         if (digest(curation) if curation.is_file() else None) != build["bindings"]["curation_sha256"]:
             raise ValueError("retained curation changed after checkpoint binding")
@@ -401,12 +561,48 @@ def worker(args, source):
             recalculated=(bool(recalc_options)
                           or build.get("recalculation") is not None
                           or ledger.get("failure") == "trusted_recalculation_required"))
-        if quarantine:
+        restricted_plan = restricted_remediation_plan(
+            source_path, ledger,
+            recalculated=bool(recalc_options) or build.get("recalculation") is not None)
+        cache_policy=configured_cache_policy(args,source)
+        macro_policy=configured_macro_policy(args,source)
+        if macro_policy is not None:
+            from xl_macro_source_projection import create,verify
+            from xl_source_health import inspect_workbook
+            if quarantine or build['bindings'].get('macro_projection_policy_sha256')!=macro_policy['sha256']:
+                raise ValueError('macro policy differs from exclusive build intent')
+            checkpoint('source_macro_projection')
+            normalization=retained_macro_normalization(args,source,ledger,macro_policy)
+            if normalization is None:
+                transformed=run/'normalization'/wb/f"macro-projection-attempt-{build['attempts']}"
+                candidate,receipt=create(source_path,transformed,macro_policy);verify(source_path,candidate,receipt)
+                normalization=dict(original_sha256=source['sha256'],candidate=str(candidate),candidate_sha256=digest(candidate),manifest=str(transformed/'manifest.json'),manifest_sha256=digest(transformed/'manifest.json'),policy_version=receipt['policy_version'])
+            else:candidate=Path(normalization['candidate'])
+            checkpoint('source_macro_projection',normalization=normalization)
+            source_path=candidate;route=inspect_workbook(candidate)['route']
+        elif cache_policy is not None:
+            from xl_source_cache_equivalence import create,verify
+            from xl_source_health import inspect_workbook
+            if build['bindings'].get('cache_equivalence_policy_sha256')!=cache_policy['sha256']:raise ValueError('cache policy differs from build intent')
+            selected_scope = None
+            if json.loads(Path(cache_policy['path']).read_text())['schema_version'] == 'source-cache-equivalence-selected-scope/v4':
+                from xl_source_scoped_cache import required_curation
+                selected_scope = required_curation(cache_policy, curation)
+            transformed=run/'normalization'/wb/f"cache-equivalence-attempt-{build['attempts']}"
+            checkpoint('source_cache_equivalence')
+            candidate,receipt=create(source_path,transformed,cache_policy);verify(source_path,candidate,receipt)
+            normalization = dict(original_sha256=source['sha256'],candidate=str(candidate),candidate_sha256=digest(candidate),manifest=str(transformed/'manifest.json'),manifest_sha256=digest(transformed/'manifest.json'),policy_version=receipt['policy_version'])
+            if selected_scope is not None:
+                normalization.update(curation=str(curation), ordered_outputs=selected_scope['ordered_outputs'])
+            checkpoint('source_cache_equivalence',normalization=normalization)
+            source_path=candidate;route=inspect_workbook(candidate)['route']
+        elif quarantine:
             from xl_source_health import inspect_workbook
             checkpoint("quarantine_chain", normalization=quarantine)
             source_path = Path(quarantine["candidate"])
             route = inspect_workbook(source_path)["route"]
-        elif set(ledger.get("reason_codes", [])) == {"data_tables_present"}:
+        elif (set(ledger.get("reason_codes", [])) == {"data_tables_present"}
+              or composed_table_source(source_path, ledger)):
             from xl_presentation_tables import materialize, verify_materialization
             from xl_source_health import inspect_workbook
             checkpoint("presentation_tables")
@@ -414,7 +610,9 @@ def worker(args, source):
             if normalization is None:
                 transformed = run / "normalization" / wb / f"tables-attempt-{build['attempts']}"
                 candidate, receipt = materialize(source_path, wb, curation, transformed,
-                                                  allow_initial_curation=True)
+                    allow_initial_curation=True,
+                    remediate=set(ledger.get("reason_codes", [])) != {"data_tables_present"},
+                    redaction_policy=redaction_policy, cache_policy=table_cache_policy)
                 verify_materialization(source_path, candidate, receipt["curation"], receipt)
                 normalization = {
                     "original_sha256": source["sha256"], "candidate": str(candidate),
@@ -425,11 +623,13 @@ def worker(args, source):
             checkpoint("presentation_tables", normalization=normalization)
             source_path = candidate
             route = inspect_workbook(candidate)["route"]
-        elif ledger.get("failure") == "source_policy_unsupported" or dead_name_plan is not None:
+        elif (ledger.get("failure") == "source_policy_unsupported"
+              or dead_name_plan is not None or restricted_plan is not None):
             from xl_volatile_formula_remediation import build_plan, apply_plan, verify_manifest
             from xl_source_health import inspect_workbook
             checkpoint("normalization")
-            plan = dead_name_plan if dead_name_plan is not None else build_plan(source_path)
+            plan = (dead_name_plan if dead_name_plan is not None else
+                    restricted_plan if restricted_plan is not None else build_plan(source_path))
             normalized = run / "normalization" / wb / plan["plan_sha256"]
             normalized.mkdir(parents=True, exist_ok=True)
             atomic_write_json(normalized / "plan.json", plan)
@@ -466,6 +666,11 @@ def worker(args, source):
                                if route in {"restricted_pass", "restricted_recalc_pass"} else {})
         reused = reuse_completed_source(args, source, ledger, source_path,
                                         restriction_options, recalc_options)
+        required_generation = getattr(args, "require_source_generation", None)
+        if required_generation is not None and (
+                not re.fullmatch(r"[0-9a-f]{64}", required_generation)
+                or reused is None or reused[1]["generation_id"] != required_generation):
+            raise ValueError("required completed source generation did not validate; AST rebuild forbidden")
         if reused is None:
             generation, manifest = prepare_source_generation(source_path, wb, run / "sources" / wb,
                 **restriction_options, **recalc_options)
@@ -501,12 +706,16 @@ def worker(args, source):
             recurate=False, llm=False, model="unused", env_file=".env", no_auto_adjudication=True,
             no_verify=False)
         result = segment(wb, options)
+        if build.get('normalization', {}).get('policy_version') == 'source-cache-equivalence-selected-scope/v4':
+            from xl_source_scoped_cache import check_generation
+            check_generation(json.loads(Path(build['normalization']['manifest']).read_text()),
+                out / 'curation.toml', result['verification'])
         if build.get("normalization", {}).get("policy_version") == QUARANTINE_POLICY:
             from xl_table_quarantine_inventory import validate_adoption
             validate_adoption(source["path"], source_path, build["normalization"])
             if result["verification"].get("ordered_output_cells") != build["normalization"]["ordered_outputs"]:
                 raise ValueError("quarantine chain changed the selected target cells")
-        if build.get("normalization", {}).get("policy_version") in {"presentation-data-tables/v1", "presentation-data-tables/v2"}:
+        if build.get("normalization", {}).get("policy_version") in {"presentation-data-tables/v1", "presentation-data-tables/v2", "presentation-data-tables-remediation/v1"}:
             receipt = json.loads(Path(build["normalization"]["manifest"]).read_text())
             if result["verification"].get("ordered_output_cells") != receipt["ordered_outputs"]:
                 raise ValueError("materialization changed the selected target cells")
@@ -549,8 +758,15 @@ def execute_one(args, source, fingerprint):
                       and set(ledger.get("reason_codes", [])) <= {
                           "unsupported_volatile_formulas_present", "external_links_present"})
         remediable |= (source["format"] == ".xlsx" and set(ledger.get("reason_codes", [])) == {"data_tables_present"})
-        remediable |= (ledger.get("failure") == "trusted_recalculation_required" and args.recalc_root
+        remediable |= (source["format"] == ".xlsx" and composed_table_source(source["path"], ledger))
+        remediable |= restricted_remediation_plan(
+            source["path"], ledger, recalculated=recalc_evidence_present(args, wb)) is not None
+        remediable |= (ledger.get("failure") == "trusted_recalculation_required" and bool(args.recalc_root)
                        and (Path(args.recalc_root) / wb / "result.json").is_file())
+        cache_policy=configured_cache_policy(args,source)
+        remediable |= cache_policy is not None
+        macro_policy=configured_macro_policy(args,source)
+        remediable |= macro_policy is not None
         if ledger.get("state") != "READY" and not remediable:
             return {"workbook_id": wb, "state": "STOPPED", "failure": ledger.get("failure", "intake_required")}
         curation = retained_curation(args, source, ledger)
@@ -559,6 +775,14 @@ def execute_one(args, source, fingerprint):
             curation_sha256=digest(curation) if curation.is_file() else None,
             inventory_sha256=digest(args.source_inventory) if args.source_inventory else None,
             inventory_batch_id=args.inventory_batch_id if args.source_inventory else None)
+        if cache_policy is not None:bindings['cache_equivalence_policy_sha256']=cache_policy['sha256']
+        if macro_policy is not None:bindings['macro_projection_policy_sha256']=macro_policy['sha256']
+        redaction_policy = configured_redaction_policy(args, source)
+        table_cache_policy = configured_table_cache_policy(args, source)
+        if table_cache_policy is not None:
+            bindings['presentation_cache_policy_sha256'] = table_cache_policy['sha256']
+        if redaction_policy is not None:
+            bindings['presentation_redaction_policy_sha256'] = redaction_policy['sha256']
         if quarantine:
             bindings["quarantine_adoption_sha256"] = object_hash(quarantine)
         if recalc_evidence_present(args, wb):
@@ -587,10 +811,17 @@ def execute_one(args, source, fingerprint):
                            for k in ("candidate", "manifest")):
                         raise ValueError("normalization evidence changed")
                     receipt = json.loads(Path(normalization["manifest"]).read_text())
-                    if normalization.get("policy_version") == QUARANTINE_POLICY:
+                    if normalization.get("policy_version") in {"source-cache-equivalence/v1", "source-cache-equivalence-certified-cycles/v2", "source-cache-equivalence-large-acyclic/v3", "source-cache-equivalence-selected-scope/v4"}:
+                        if receipt.get('policy_version')!=normalization['policy_version']:raise ValueError('cache lineage policy version differs')
+                        from xl_source_cache_equivalence import verify
+                        verify(source["path"],normalization["candidate"],receipt)
+                    elif normalization.get("policy_version") == 'source-vba-only-projection/v1':
+                        from xl_macro_source_projection import verify
+                        verify(source["path"],normalization["candidate"],receipt)
+                    elif normalization.get("policy_version") == QUARANTINE_POLICY:
                         from xl_table_quarantine_inventory import validate_adoption
                         validate_adoption(source["path"], normalization["candidate"], normalization)
-                    elif normalization.get("policy_version") in {"presentation-data-tables/v1", "presentation-data-tables/v2"}:
+                    elif normalization.get("policy_version") in {"presentation-data-tables/v1", "presentation-data-tables/v2", "presentation-data-tables-remediation/v1"}:
                         from xl_presentation_tables import verify_materialization
                         verify_materialization(source["path"], normalization["candidate"], normalization["curation"], receipt)
                     else:
@@ -603,6 +834,12 @@ def execute_one(args, source, fingerprint):
                     segmentation_root=run / "segments" / wb,
                     source_generation_id=previous["source_generation_id"],
                     segmentation_generation_id=previous["segmentation_generation_id"])
+                if normalization and normalization.get('policy_version') == 'source-cache-equivalence-selected-scope/v4':
+                    from xl_source_scoped_cache import check_generation, required_curation
+                    required_curation(cache_policy, curation)
+                    sg = Path(context['segmentation_dir'])
+                    check_generation(receipt, sg/'curation.toml',
+                        json.loads((sg/'segments.json').read_text())['verification'])
                 # Artifact hashes and a successful segmentation are not a
                 # substitute for current source authorization or signed receipts.
                 # Reuse the exact production source gate without rebuilding ASTs
@@ -681,6 +918,16 @@ def execute_one(args, source, fingerprint):
         atomic_write_json(path, ledger)
         command = [sys.executable, "-m", "scripts.corpus_build", "--inventory", args.inventory,
                    "--run-root", str(run), "--curation-root", args.curation_root, "--worker", wb]
+        if cache_policy is not None:command += ['--cache-equivalence-policy',cache_policy['path'],'--cache-equivalence-policy-sha256',cache_policy['sha256']]
+        if macro_policy is not None:command += ['--macro-projection-policy',macro_policy['path'],'--macro-projection-policy-sha256',macro_policy['sha256']]
+        if redaction_policy is not None:
+            command += ['--presentation-redaction-policy', redaction_policy['path'],
+                        '--presentation-redaction-policy-sha256', redaction_policy['sha256']]
+        if table_cache_policy is not None:
+            command += ['--presentation-cache-policy', table_cache_policy['path'],
+                        '--presentation-cache-policy-sha256', table_cache_policy['sha256']]
+        if getattr(args, "require_source_generation", None) is not None:
+            command += ["--require-source-generation", args.require_source_generation]
         if args.source_inventory:
             command += ["--source-inventory", args.source_inventory, "--inventory-batch-id", args.inventory_batch_id]
         if args.recalc_root:
@@ -748,9 +995,18 @@ def main():
     parser.add_argument("--workers", type=int, choices=range(1, 5), default=4)
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--memory-mb", type=int, default=3072)
+    parser.add_argument("--require-source-generation", help="Require exact completed source reuse; never rebuild an AST")
+    parser.add_argument("--cache-equivalence-policy")
+    parser.add_argument("--cache-equivalence-policy-sha256")
+    parser.add_argument("--macro-projection-policy")
+    parser.add_argument("--macro-projection-policy-sha256")
+    parser.add_argument("--presentation-redaction-policy")
+    parser.add_argument("--presentation-redaction-policy-sha256")
+    parser.add_argument("--presentation-cache-policy")
+    parser.add_argument("--presentation-cache-policy-sha256")
     parser.add_argument("--worker", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    for field in ("inventory", "run_root", "curation_root", "source_inventory", "recalc_root", "trusted_public_key"):
+    for field in ("inventory", "run_root", "curation_root", "source_inventory", "recalc_root", "trusted_public_key", "cache_equivalence_policy", "macro_projection_policy", "presentation_redaction_policy", "presentation_cache_policy"):
         value = getattr(args, field)
         if value:
             setattr(args, field, str(Path(value).absolute()))

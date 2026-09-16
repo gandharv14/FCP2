@@ -1,4 +1,6 @@
 """Fixed later-lane validators and exact serial invocation order; no mutation."""
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 import copy
@@ -52,7 +54,69 @@ def context_check(lane,gate,failure_class,operation):
         raise ContextRejection(lane,gate,failure_class,exc) from exc
 
 
-def pair_and_audit(before,selection,context):
+_PAIR_VALIDATION = ContextVar('harbor_pair_validation', default=None)
+
+
+@contextmanager
+def pair_validation_scope():
+    """Reuse only a successful fixed pair proof within one readiness invocation.
+
+    No persisted verdict or caller-provided proof is accepted. Each reuse checks
+    all evidence bytes and generation membership; exceptions discard the scope.
+    Individual lane semantics and the final complete readiness check still run.
+    """
+    token = _PAIR_VALIDATION.set({})
+    try:
+        yield
+    finally:
+        _PAIR_VALIDATION.reset(token)
+
+
+def _pair_inventory(selection):
+    return tuple((kind, tuple(str(p) for p in sorted(
+        Path(selection.bindings[kind + '_generation']['path']).rglob('*'))
+        if p.is_file() or p.is_symlink())) for kind in ('source', 'segmentation'))
+
+
+def pair_and_audit(before, selection, context):
+    cache = _PAIR_VALIDATION.get()
+    if cache is None:
+        return _pair_and_audit_uncached(before, selection, context)
+    # Full selected bindings include audit, baseline, equivalence and upgrade
+    # identities. Lane flags may advance, but raw and fixed pair identities may
+    # not change during a readiness pass.
+    identity = copy.deepcopy((before['workbook_id'], before['raw_source'],
+        {k: before['bindings'][k] for k in (
+            'original_raw_source', 'source_generation', 'source_file',
+            'segmentation_generation', 'curation')},
+        selection.bindings, selection.normalization_records, context))
+    inventory = _pair_inventory(selection)
+    key_path = Path(context.trusted_public_key)
+    key_present = key_path.exists() or key_path.is_symlink()
+    if cache:
+        require(identity == cache['identity'], 'pair validation inputs changed within readiness')
+        require(inventory == cache['inventory'], 'pair generation membership changed within readiness')
+        require(key_present == cache['key_present'], 'selected signer availability changed within readiness')
+        from scripts.batch.harbor_tracker_lifecycle import check_records
+        check_records(cache['evidence'] + cache['guard_evidence'])
+        return copy.deepcopy(cache['evidence'])
+    # The source gate checks the current AST builder and the selected signer.
+    # These external inputs must remain fixed on reuse as well.
+    from xl_source_publication import _default_builder_paths
+    extra = [record(p) for p in _default_builder_paths()]
+    if key_present:
+        extra.append(record(key_path))
+    result = _pair_and_audit_uncached(before, selection, context)
+    require(inventory == _pair_inventory(selection), 'pair generation changed during validation')
+    require(key_present == (key_path.exists() or key_path.is_symlink()), 'selected signer availability changed during validation')
+    from scripts.batch.harbor_tracker_lifecycle import check_records
+    check_records(result + extra)
+    cache.update(identity=identity, inventory=inventory, key_present=key_present,
+                 evidence=copy.deepcopy(result), guard_evidence=extra)
+    return copy.deepcopy(cache['evidence'])
+
+
+def _pair_and_audit_uncached(before,selection,context):
     b=selection.bindings
     for key in ('original_raw_source','source_generation','source_file','segmentation_generation','curation'):
         require(b[key]==before['bindings'][key],'current immutable pair differs from tracker: '+key)
@@ -164,7 +228,7 @@ def profile_context(profile, content):
         require(pipeline.get(kind+'_generation_id')==b[kind+'_generation']['id'] and pipeline.get(kind+'_manifest_sha256')==b[kind+'_generation']['manifest_sha256'],'profile source/segmentation context differs')
 
 
-def check_completed_gate(before,packet,context,*,runtime_producer=None):
+def check_completed_gate(before,packet,context,*,runtime_producer=None,runtime_root=None):
     from scripts.batch.harbor_complete_readiness import ReadinessSelection,evidence_records,check_disclosure,check_dialogue
     require(isinstance(packet,CompletionEvidence) and isinstance(packet.selection,ReadinessSelection),'root-selected typed gate context required')
     lane=predecessors(before,packet.kind)
@@ -223,7 +287,11 @@ def check_completed_gate(before,packet,context,*,runtime_producer=None):
         from scripts.batch.harbor_runtime_readiness import validate_runtime
         require(p.runtime.workbook==s.workbook and p.runtime.stage==s.stage,'runtime workbook/stage mismatch')
         require(p.runtime.stage_tree==static.tree(s.stage),'runtime stage changed')
-        validate_runtime(p.runtime,p.observation,root=static.ROOT, **(
+        if runtime_root is not None:
+            from scripts.batch.harbor_runtime_readiness import code_bindings
+            require(p.runtime.code==code_bindings(static.ROOT),
+                    'historical runtime differs from current runtime implementation')
+        validate_runtime(p.runtime,p.observation,root=static.ROOT if runtime_root is None else runtime_root, **(
             {'producer_identity':runtime_producer} if runtime_producer is not None else {}))
     elif packet.kind=='dialogue':
         reviewed=check_dialogue(p,root=static.ROOT);evidence.extend(reviewed['evidence']);attempt=reviewed['round']

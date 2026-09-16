@@ -16,7 +16,7 @@ import urllib.request
 
 
 @contextmanager
-def model_slot():
+def _local_model_slot():
     """Hold a campaign-wide process lock for one complete model operation.
 
     The root dispatcher supplies the same absolute directory to every worker.
@@ -49,6 +49,15 @@ def model_slot():
             os.fsync(config_fd)
     finally:
         os.close(config_fd)
+    # A prospective shared host gate replaces only physical serialization.
+    # Validate the original campaign capacity above so historical evidence is
+    # still truthful; never rewrite its capacity file or model request plans.
+    from scripts.fleet import physical_model_capacity
+    physical = physical_model_capacity.selected()
+    if physical is not None:
+        with physical_model_capacity.slot(physical):
+            yield
+        return
     held = None
     try:
         while held is None:
@@ -72,8 +81,25 @@ def model_slot():
             os.close(held)
 
 
+@contextmanager
+def model_slot(*, operation_id=None, request_sha256=None, outcome_path=None):
+    """Optional durable fleet gate supplements the original local process lock."""
+    from scripts.fleet import model_gate
+    with _local_model_slot():
+        if model_gate.configured():
+            if not all((operation_id, request_sha256, outcome_path)):
+                raise ValueError('fleet model calls require durable operation and outcome identity')
+            with model_gate.slot(operation_id=operation_id,request_sha256=request_sha256,outcome_path=outcome_path):
+                yield
+        else:
+            yield
+
+
 def read_response(request, *, timeout):
     """Hold the configured fleet slot across one request and its transport retries."""
+    from scripts.fleet import model_gate
+    if model_gate.configured():
+        return model_gate.read_response(request,timeout=timeout,local_slot=_local_model_slot)
     with model_slot():
         return _read_response(request, timeout=timeout)
 

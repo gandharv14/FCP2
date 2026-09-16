@@ -74,13 +74,30 @@ class Prepared(Sequence):
         return max(2,total-2)
 
 
+def top_labelled_vertical_family(D,gold,band,cells,labels):
+    """Keep an exact copied-down family with one heading and blank lower labels."""
+    if (not 2<=len(cells)<=32 or band.get('orientation')!='vertical'
+            or cells!=band.get('cell_keys') or len(set(cells))!=len(cells)
+            or not labels[0] or band.get('label')!=labels[0] or any(labels[1:])):
+        return False
+    positions=[]
+    for cell in cells:
+        sheet,coord=cell.rsplit('!',1);parsed=D.split_coord(coord)
+        if not parsed or not gold.formula.get(cell):return False
+        positions.append((sheet,*parsed))
+    sheet,col,row=positions[0]
+    if positions!=[(sheet,col,row+i)for i in range(len(cells))]:return False
+    return (all(D.copy_compatible(gold,a,b)for a,b in zip(cells,cells[1:]))
+            and D.full_copied_scope_vertical(gold,cells,set())==cells)
+
+
 def prepare(D,gold,bands):
     result=Prepared();split_cache={};role_cache={}
     for original in bands:
         cells=list(original.get('stated_cell_keys') or original.get('cell_keys') or [])
         labels=[gold.row_label(cell) for cell in cells]
         subbands=[original]
-        if len(cells)>1 and len(set(labels))>1:
+        if len(cells)>1 and len(set(labels))>1 and not top_labelled_vertical_family(D,gold,original,cells,labels):
             byrow=defaultdict(list)
             for cell,label in zip(cells,labels):
                 sheet,coord=cell.rsplit('!',1);parsed=D.split_coord(coord)

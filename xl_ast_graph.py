@@ -75,6 +75,12 @@ _RE_RANGE = re.compile(r"^\$?[A-Z]{1,3}\$?[0-9]{1,7}:\$?[A-Z]{1,3}\$?[0-9]{1,7}$
 _RE_COLS = re.compile(r"^\$?[A-Z]{1,3}:\$?[A-Z]{1,3}$", re.I)
 _RE_ROWS = re.compile(r"^\$?[0-9]{1,7}:\$?[0-9]{1,7}$")
 _RE_EXTERNAL = re.compile(r"^\[([^\]]*)\]")
+_RE_QUALIFIED_ENDPOINT_RANGE = re.compile(
+    r"(?P<left_sheet>'(?:[^']|'')+'|[^'!:\[\]]+)!"
+    r"(?P<left_cell>\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}):"
+    r"(?P<right_sheet>'(?:[^']|'')+'|[^'!:\[\]]+)!"
+    r"(?P<right_cell>\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6})", re.I
+)
 
 
 def is_range_like(body: str) -> bool:
@@ -732,6 +738,7 @@ class AstGraph:
         self.text_rows_by_col = {}
         self.names_global = {}
         self.names_local = {}
+        self.tables = {}
 
         self.nodes = {}
         self.edges = []
@@ -837,6 +844,7 @@ class AstGraph:
         self.sheet_names = list(wb.sheetnames)
 
         for ws in wb.worksheets:
+            self._collect_tables(ws)
             idx = SheetIndex()
             formulas = {}
             # Register owners before visiting cells: some producers write empty
@@ -979,6 +987,58 @@ class AstGraph:
                 if value:
                     self.names_local[(ws.title, str(name).upper())] = value
 
+    def _collect_tables(self, worksheet):
+        """Retain only unambiguous table geometry before releasing openpyxl."""
+        for table in worksheet.tables.values():
+            names = {str(name).casefold() for name in (table.name, table.displayName) if name}
+            value = None
+            try:
+                bounds = range_boundaries(table.ref)
+                first_col, first_row, last_col, last_row = bounds
+                columns = [column.name for column in table.tableColumns]
+                header = 1 if table.headerRowCount is None else table.headerRowCount
+                totals = table.totalsRowCount or 0
+                if (all(type(n) is int and n > 0 for n in bounds)
+                        and header == 1 and totals in (0, 1)
+                        and len(columns) == last_col - first_col + 1
+                        and all(isinstance(name, str) and name for name in columns)
+                        and len({name.casefold() for name in columns}) == len(columns)
+                        and first_row + header <= last_row - totals):
+                    value = dict(sheet=worksheet.title, first_col=first_col, last_col=last_col,
+                                 first_row=first_row + header, last_row=last_row - totals,
+                                 columns={name.casefold(): first_col + offset
+                                          for offset, name in enumerate(columns)})
+            except (TypeError, ValueError):
+                pass  # Unsupported metadata remains an unresolved reference.
+            for name in names:
+                if name in self.tables and self.tables[name] != value:
+                    self.tables[name] = None
+                else:
+                    self.tables[name] = value
+
+    def _same_row_table_reference(self, token, sheet, current_cell):
+        # Deliberately exclude @ shorthand, spans, #All, totals, and escaped
+        # bracket names until their distinct semantics have explicit support.
+        match = re.fullmatch(r"([^\[\]]+)\[\[#This Row\],\[([^\[\]]+)\]\]", token, re.IGNORECASE)
+        if match is None or current_cell is None:
+            return None
+        table = self.tables.get(match.group(1).casefold())
+        if table is None or table['sheet'] != sheet:
+            return None
+        owner_sheet, separator, address = current_cell.rpartition('!')
+        if not separator or owner_sheet != sheet:
+            return None
+        try:
+            col, row, end_col, end_row = range_boundaries(address)
+        except (TypeError, ValueError):
+            return None
+        if (row is None or col is None or (row, col) != (end_row, end_col)
+                or not table['first_row'] <= row <= table['last_row']
+                or not table['first_col'] <= col <= table['last_col']):
+            return None
+        target = table['columns'].get(match.group(2).casefold())
+        return [("cell", sheet, row, target)] if target is not None else None
+
     # -- reference resolution -------------------------------------------
     def _split_ref(self, token):
         """-> (sheet_part or None, body, external_tag or None)"""
@@ -1004,7 +1064,7 @@ class AstGraph:
             i, j = j, i
         return self.sheet_names[i:j + 1]
 
-    def resolve(self, token, cur_sheet, depth=0):
+    def resolve(self, token, cur_sheet, depth=0, *, current_cell=None):
         """Resolve a RANGE token to a list of targets.
 
         Defined names are looked up first, on purpose: range_boundaries("BC") returns
@@ -1014,9 +1074,36 @@ class AstGraph:
         Each target is one of:
           ("cell", sheet, row, col)
           ("range", sheet, ref, n_cells)
+          ("logical", literal)
           ("name", name)
           ("ext", token)
         """
+        # Both endpoints can repeat the same sheet, with independent quoting.
+        # Splitting at the last "!" would mistake this for a 3-D sheet span
+        # and silently discard the entire dependency when no sheet matches.
+        endpoints = _RE_QUALIFIED_ENDPOINT_RANGE.fullmatch(token)
+        if endpoints is not None:
+            left, first, left_external = self._split_ref(
+                endpoints['left_sheet'] + '!' + endpoints['left_cell'])
+            right, last, right_external = self._split_ref(
+                endpoints['right_sheet'] + '!' + endpoints['right_cell'])
+            if left_external is not None or right_external is not None:
+                return [('ext', token)]
+            sheets = [s for s in self.index if s.casefold() == left.casefold()]
+            if left.casefold() != right.casefold() or len(sheets) != 1:
+                return [('name', token)]
+            first_col, first_row, last_col, last_row = range_boundaries(first + ':' + last)
+            if not (1 <= first_col <= EXCEL_MAX_COL and 1 <= last_col <= EXCEL_MAX_COL
+                    and 1 <= first_row <= EXCEL_MAX_ROW and 1 <= last_row <= EXCEL_MAX_ROW):
+                return [('name', token)]
+            first = get_column_letter(min(first_col, last_col)) + str(min(first_row, last_row))
+            last = get_column_letter(max(first_col, last_col)) + str(max(first_row, last_row))
+            quoted = "'" + sheets[0].replace("'", "''") + "'"
+            return self.resolve(quoted + '!' + first + ':' + last, cur_sheet,
+                                depth, current_cell=current_cell)
+        table_target = self._same_row_table_reference(token, cur_sheet, current_cell)
+        if table_target is not None:
+            return table_target
         sheet_part, body, external = self._split_ref(token)
 
         if external is not None:
@@ -1033,6 +1120,8 @@ class AstGraph:
             definition = str(defn).strip()
             if definition.startswith("="):
                 definition = definition[1:].strip()
+            if definition.upper() in ("TRUE", "FALSE"):
+                return [("logical", definition.upper())]
             if "#REF" in definition.upper():
                 return [("name", body)]
             out = []
@@ -1455,7 +1544,7 @@ class AstGraph:
                         (max_col - min_col + 1) * (max_row - min_row + 1),
                     )]
         if items is None:
-            items = self.resolve(token, ctx["sheet"])
+            items = self.resolve(token, ctx["sheet"], current_cell=ctx["cell"])
         # A span-like token must keep its via_range even when only one member
         # cell is populated: the evaluator rebuilds the full span (empty
         # members included) from this text, and losing it hands positional
@@ -1469,7 +1558,11 @@ class AstGraph:
         via = token if multi else ""
         out = []
         for item in items:
-            if item[0] == "cell":
+            if item[0] == "logical":
+                literal = Ast("const", "logical", value=item[1], shape=item[1] == "TRUE")
+                out.extend((node_id, token, "") for node_id, _, _ in self._emit(literal, ctx))
+                continue
+            elif item[0] == "cell":
                 _, sheet, row, col = item
                 src = self._cell_node(sheet, row, col)
             elif item[0] == "range":

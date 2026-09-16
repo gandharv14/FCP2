@@ -14,7 +14,7 @@ from scripts.batch.harbor_admission import read,record,require
 SCHEMA='harbor-expired-lease-takeover/v1'
 STOP='harbor-stopped-root-worker/v1'
 MAX_REPLACEMENTS=3
-HISTORICAL_IMPLEMENTATIONS={'c015d14ff789c15c9d9599919765d7d1c6dd6878712f7f1fce0483236bfacb50', '08aa2a34efb36abe10b6e4c88d05b6f5ddf14529c71d3e236d46bbffffafed00', '5e3616510c2979731447290b8b4163c3d4e1551501c88cd6902ebc174aa2a919'}
+HISTORICAL_IMPLEMENTATIONS={'6ae75d00269413a7ee647f75cf8a4d8f15280eebc1197906ee8f6132411f66f7', '076a453c1f9e9b5eb7ec5f9e90ca989899468c985acfd99221b6291f606e1506', 'c015d14ff789c15c9d9599919765d7d1c6dd6878712f7f1fce0483236bfacb50', '08aa2a34efb36abe10b6e4c88d05b6f5ddf14529c71d3e236d46bbffffafed00', '5e3616510c2979731447290b8b4163c3d4e1551501c88cd6902ebc174aa2a919'}
 MAX_DURATION_NS=7200*10**9
 
 @dataclass(frozen=True)
@@ -29,6 +29,36 @@ class Selection:
     duration_ns: int = MAX_DURATION_NS
     config: dict | None = None
     prior_completion: dict | None = None
+    allowance: dict | None = None
+    controls_migration: dict | None = None
+
+
+def _controls_match(s, executed, configured):
+    if s.controls_migration is None:return executed==configured
+    p=read(s.controls_migration)
+    require(set(p)=={'schema_version','config','workbook','source_sha256','original','executed','authorization','reason'}
+            and p['schema_version']=='harbor-credential-path-migration/v1'
+            and p['config']==s.config and p['workbook']==s.workbook,
+            'closed credential path migration required')
+    life.checked_record(p['authorization'])
+    require(isinstance(p['reason'],str) and p['reason'].strip(),'credential relocation reason required')
+    require(p['original']==configured and p['executed']==executed,'credential migration does not select exact controls')
+    require(set(configured)==set(executed)=={'type','value'} and configured['type']==executed['type']=='Controls',
+            'typed original and executed controls required')
+    old,new=configured['value'],executed['value']
+    require(set(old)==set(new)=={'env_file','slot_lock'} and old['slot_lock']==new['slot_lock'],
+            'credential relocation cannot alter workbook exclusion')
+    for row in (old['env_file'],new['env_file']):
+        require(set(row)=={'type','value'} and row['type']=='path' and isinstance(row['value'],str)
+                and Path(row['value']).is_absolute() and '..' not in Path(row['value']).parts,
+                'absolute credential file path required')
+    return True
+
+
+def _limits(s,before,*,at=None):
+    if s.allowance is None:return MAX_REPLACEMENTS,MAX_DURATION_NS
+    from scripts.batch.harbor_continuation_allowance import lease_limits
+    return lease_limits(s.allowance,before,at=at)
 
 
 def _layout(s):
@@ -40,6 +70,9 @@ def _layout(s):
     require(config['schema_version']=='authoring-root-driver/v1' and config['workbook']==s.workbook
             and config['run_root']==str(c) and s.config['path']==str(c/'config.json'),
             'exact authoring driver configuration required')
+    if 'source_continuation' in config:
+        from scripts.batch.harbor_source_only_continuation import layout
+        return layout(config,c,s.worker_kind)
     from scripts.harbor_campaign import decode
     controls=decode(config['controls'])
     slot=schema.safe_path(controls.slot_lock)
@@ -63,7 +96,7 @@ def _prior_chain(s,before,*,seen=()):
     if s.prior_completion is None:
         require(count==0,'prior takeover completion required; replacement cannot reset by namespace')
         return []
-    require(count>0 and count<MAX_REPLACEMENTS,'replacement chain budget exhausted')
+    require(count>0 and count<_limits(s,before)[0],'replacement chain budget exhausted')
     _,after,lease=validate_completion(s.prior_completion,_seen=seen)
     proof=read(read(s.prior_completion)['stopped_owner_proof'])
     require(proof['selection']['tracker']['path']==s.tracker['path'] and after['workbook_id']==before['workbook_id'],
@@ -111,7 +144,7 @@ def _external_instruction_guard(s,intent,run,tracker_path):
     worker=C.worker_decode(descriptor['worker'])
     require(worker.run==run and worker.context.tracker_root==tracker_path.parent,
             'external guard belongs to another worker')
-    require(descriptor['controls']==read(s.config)['controls']==intent['controls'],
+    require(descriptor['controls']==intent['controls'] and _controls_match(s,intent['controls'],read(s.config)['controls']),
             'external guard controls differ')
     require(descriptor['code']==intent['code']==record(worker.root/'scripts/harbor_instruction_campaign.py')
             and intent['base_code']==record(worker.root/'scripts/harbor_campaign.py'),
@@ -127,11 +160,15 @@ def _external_instruction_guard(s,intent,run,tracker_path):
 
 def _recipe(s,*,historical=None):
     require(type(s) is Selection and s.worker_kind in {'instruction','environment'},'typed root takeover selection required')
-    require(type(s.duration_ns) is int and 0<s.duration_ns<=MAX_DURATION_NS,'root takeover duration invalid')
     c=schema.safe_path(s.campaign_root);require(c.is_absolute() and c.is_dir(),'existing campaign root required')
     path,home,run,slot=_layout(s)
     require(s.tracker['path']==str(path),'canonical root-selected tracker required')
     before=schema.validate_tracker(read(s.tracker) if historical is None else historical);life.validate_lifecycle(before)
+    if s.controls_migration is not None:
+        migration=read(s.controls_migration)
+        require(migration.get('source_sha256')==before['bindings']['original_raw_source']['sha256'],
+                'credential migration belongs to another source')
+    require(type(s.duration_ns) is int and 0<s.duration_ns<=_limits(s,before)[1],'root takeover duration invalid')
     require(schema.sha(life.canonical(before))==s.tracker['sha256'],'root-selected prior tracker differs')
     require(before['workbook_id']==s.workbook and before['execution_state'] not in {'STOPPED','PROMOTED','publication_queued'},'terminal or foreign tracker cannot be taken over')
     old=before['leases']['task_agent'];require(old is not None and old['scope']=='workbook:'+s.workbook,'existing exact task lease required')
@@ -152,7 +189,7 @@ def _recipe(s,*,historical=None):
     for code in code_records:life.checked_record(code)
     if s.config:
         config=read(s.config)
-        require(intent['controls']==config['controls'],'guard workbook slot differs from configured driver')
+        require(_controls_match(s,intent['controls'],config['controls']),'guard workbook slot differs from configured driver')
     require(Path(guard['intent']['path']).parent==Path(s.guard['path']).parent and Path(guard['log']['path']).parent==Path(s.guard['path']).parent,'guard evidence directory differs')
     checkpoint=read(s.checkpoint)
     if s.config:
@@ -170,7 +207,7 @@ def _recipe(s,*,historical=None):
             from scripts.harbor_campaign import decode
             descriptor=read(checkpoint['descriptor']);environment=decode(descriptor['worker'])
             require(environment.bootstrap.workbook==s.workbook and environment.bootstrap.policy.tracker_root==path.parent
-                    and environment.run==run and descriptor['controls']==read(s.config)['controls'],
+                    and environment.run==run and _controls_match(s,descriptor['controls'],read(s.config)['controls']),
                     'environment checkpoint belongs to another configured worker')
     else:
         require(Path(s.checkpoint['path']).is_relative_to(home),'checkpoint belongs to another workbook')
@@ -181,7 +218,7 @@ def _recipe(s,*,historical=None):
     require(set(lease)=={'owner','token','revision','sha256'} and (lease['owner'],lease['token'])==(old['owner'],old['token']) and type(lease['revision']) is int and lease['revision']<=before['revision'] and schema.HEX.fullmatch(lease['sha256']),'checkpoint does not retain this old owner/token')
     # A stopped-worker observation is not a semantic success or retry approval;
     # any later unknown call/failed attempt remains in its owning journal.
-    return before,old,run,[s.guard,guard['intent'],guard['log'],*code_records,s.checkpoint,*([s.config] if s.config else []),*external_records]
+    return before,old,run,[s.guard,guard['intent'],guard['log'],*code_records,s.checkpoint,*([s.config] if s.config else []),*external_records,*([s.controls_migration] if s.controls_migration is not None else [])]
 
 
 def _lock_identity(path,fd):
@@ -212,14 +249,18 @@ def _stop_validate(value,before,old,s,locks):
     return True
 
 
-def _selection_value(s):return {**asdict(s),'campaign_root':str(s.campaign_root)}
+def _selection_value(s):
+    value={**asdict(s),'campaign_root':str(s.campaign_root)}
+    if s.allowance is None:value.pop('allowance')
+    if s.controls_migration is None:value.pop('controls_migration')
+    return value
 
 
 def _selection(value):return Selection(**{**value,'campaign_root':Path(value['campaign_root'])})
 
 
 def validate_completion(binding,*,_seen=()):
-    require(binding["path"] not in _seen and len(_seen)<MAX_REPLACEMENTS,"cyclic or overlong takeover chain")
+    require(binding["path"] not in _seen and len(_seen)<128,"cyclic or overlong takeover chain")
     _seen=(*_seen,binding["path"])
     v=read(binding);require(v['schema_version']==SCHEMA,'unknown takeover completion')
     stop=read(v['stopped_owner_proof']);before=read(stop['before']);after=read(v['after']);s=_selection(stop['selection'])
@@ -235,8 +276,9 @@ def validate_completion(binding,*,_seen=()):
     for b in stop['evidence']:life.checked_record(b)
     prior_count=life.validate_lifecycle(before)
     _prior_chain(s,before,seen=_seen)
-    require(life.validate_lifecycle(after)==prior_count+1<=MAX_REPLACEMENTS,'exactly one bounded lifecycle replacement required')
+    require(life.validate_lifecycle(after)==prior_count+1<=_limits(s,before,at=stop['observed_at'])[0],'exactly one bounded lifecycle replacement required')
     event=after['handoffs'][-1];old=stop['prior_lease'];new=event['after']
+    require(event.get('allowance')==s.allowance,'takeover allowance detached from lifecycle event')
     require(event['schema_version']==life.EVENT_SCHEMA and event['operation']=='replace_expired' and event['lease_kind']=='task_agent' and event['root_actor']=='harbor-orchestrator' and event['prior_tracker_sha256']==stop['before']['sha256'] and event['before']==old and event['stopped_owner_proof']==v['stopped_owner_proof'],'replacement event differs from stopped proof')
     require(type(stop['observed_at']) is int and old['expires_at']<=stop['observed_at']<=event['at'],'stopped observation chronology changed')
     require(type(event['at']) is int and event['at']>=old['expires_at'] and new['token']!=old['token'] and new['owner']==s.owner and new['scope']==old['scope'] and new['acquired_at']==new['heartbeat_at']==event['at'] and new['acquisition_revision']==before['revision']+1 and new['expires_at']==event['at']+s.duration_ns,'replacement identity/chronology changed')
@@ -256,6 +298,7 @@ def _seal(directory,proof,after):
 
 def replace_expired(s,directory,*,clock=time.time_ns,_fault=lambda _:None):
     """Observe both locks then use the existing root lifecycle once; no retry."""
+    require(os.environ.get('HARBOR_FLEET_CONTINUATION_READ_ONLY')!='1','read-only continuation cannot replace a lease')
     directory=schema.safe_path(directory)
     require(directory.parent==_layout(s)[1]/'lease-takeovers','dedicated root takeover directory required')
     require(not directory.exists(),'takeover transaction exists; select exact stopped proof for recovery')
@@ -263,7 +306,8 @@ def replace_expired(s,directory,*,clock=time.time_ns,_fault=lambda _:None):
         before,old,run,evidence=_recipe(s);now=clock()
         require(now>=old['expires_at'],'active owner cannot be replaced')
         prior_records=_prior_chain(s,before)
-        require(life.validate_lifecycle(before)<MAX_REPLACEMENTS,'replacement budget exhausted')
+        allowed_count,allowed_duration=_limits(s,before,at=now)
+        require(life.validate_lifecycle(before)<allowed_count,'replacement budget exhausted')
         directory.mkdir(parents=True)
         retained=producer.put(directory/'before.json',Path(s.tracker['path']).read_bytes())
         proof=producer.put(directory/'stopped-owner.json',dict(schema_version=STOP,selection=_selection_value(s),before=retained,prior_lease=old,evidence=evidence,locks=[_lock_identity(p,fd) for p,fd in locks],observed_at=now,implementation=record(__file__),semantic_budget_reset=False))
@@ -273,7 +317,7 @@ def replace_expired(s,directory,*,clock=time.time_ns,_fault=lambda _:None):
         def stopped(observed,prior,chosen):
             require(chosen==proof,'unexpected stopped proof')
             return _stop_validate(read(chosen),observed,prior,s,locks)
-        result=life.lease_operation(s.tracker['path'],authority=life.RootAuthority('harbor-orchestrator',MAX_DURATION_NS,authority,max_replacements=MAX_REPLACEMENTS),operation='replace_expired',lease_kind='task_agent',owner=s.owner,scope=old['scope'],expected_revision=before['revision'],expected_sha256=s.tracker['sha256'],duration_ns=s.duration_ns,prior_lease=old,stopped_owner_proof=proof,prior_owner_stopped_validator=stopped,clock=clock,fault_hook=_fault)
+        result=life.lease_operation(s.tracker['path'],authority=life.RootAuthority('harbor-orchestrator',allowed_duration,authority,max_replacements=allowed_count,allowance=s.allowance),operation='replace_expired',lease_kind='task_agent',owner=s.owner,scope=old['scope'],expected_revision=before['revision'],expected_sha256=s.tracker['sha256'],duration_ns=s.duration_ns,prior_lease=old,stopped_owner_proof=proof,prior_owner_stopped_validator=stopped,clock=clock,fault_hook=_fault)
         _fault('committed');return _seal(directory,proof,result['tracker'])
 
 

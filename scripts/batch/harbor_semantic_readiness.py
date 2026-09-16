@@ -25,14 +25,18 @@ def workbook_evidence(binding):
         sheets=[]
         for ws in book:
             cells=[]
-            for row in ws.iter_rows():
-                for cell in row:
-                    if cell.value is None:continue
-                    value=typed_cell_value(cell)
-                    item={'address':cell.coordinate,'value':value,'number_format':cell.number_format,'data_type':cell.data_type}
-                    if cell.data_type=='f':item['cached_value']=cached[ws.title][cell.coordinate].value
-                    cells.append(item)
-            sheets.append({'sheet':ws.title,'state':ws.sheet_state,'dimensions':ws.calculate_dimension(),'merged_ranges':[str(x) for x in ws.merged_cells.ranges],'cells':cells})
+            # iter_rows() creates every omitted blank cell in the bounding
+            # rectangle. A single distant formatted cell can allocate billions
+            # of empty Cell objects although the evidence lists populated cells.
+            from openpyxl.utils import get_column_letter
+            dimensions=f'A1:{get_column_letter(ws.max_column)}{ws.max_row}'
+            for _,cell in sorted(ws._cells.items()):
+                if cell.value is None:continue
+                value=typed_cell_value(cell)
+                item={'address':cell.coordinate,'value':value,'number_format':cell.number_format,'data_type':cell.data_type}
+                if cell.data_type=='f':item['cached_value']=cached[ws.title][cell.coordinate].value
+                cells.append(item)
+            sheets.append({'sheet':ws.title,'state':ws.sheet_state,'dimensions':dimensions,'merged_ranges':[str(x) for x in ws.merged_cells.ranges],'cells':cells})
         return _json({'path':str(path),'sha256':binding['sha256'],'blank_cell_semantics':'Every populated cell is listed; omitted addresses have no value.','sheets':sheets})
     finally:book.close();cached.close()
 

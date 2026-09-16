@@ -6,6 +6,7 @@ Only the grouped-row heuristic is replaced by authenticated atomic coverage.
 from pathlib import Path
 import json
 import hashlib
+from contextlib import contextmanager
 from scripts.batch.harbor_admission import record, read, require
 from scripts.batch import harbor_normalization_producer as N
 from scripts.batch import harbor_normalization_compact as K
@@ -35,6 +36,8 @@ def coverage(rows, fresh, prepared, aggregate, *, minimum=1):
 def project(original_guard, witnesses=()):
     import plain_eligibility as policy
     guard=read(original_guard);directory=Path(original_guard['path']).parent
+    if guard.get('schema_version')==N.SCHEMA and 'review_call' in guard:
+        return project_single(original_guard,witnesses)
     require(original_guard==record(directory/'result.json'),'foreign phase1 guard')
     resource=record(directory/'resource.json');r=read(resource);intent=record(directory/'intent.json');i=read(intent)
     require(r['returncode']==0 and r['failure'] is None and r['intent']==intent and i['action']=='emit','phase1 guard did not complete')
@@ -85,10 +88,115 @@ def project(original_guard, witnesses=()):
     return dict(schema_version=SCHEMA,original_guard=original_guard,witnesses=list(witnesses),original_phase1=phase_binding,prepared=prepared,run=str(run),workbook=phase['workbook'],coverage=counts,original_mode=original_mode,source_verified=True,original_inputs_retained=True,review_decisions_changed=False,semantic_budget_reset=False,checked_files=dict(sorted(checked.items())),code={record(__file__)['path']:record(__file__)['sha256'],record(policy.__file__)['path']:record(policy.__file__)['sha256']})
 
 
+def single_coverage(rows,fresh,prepared,review,*,minimum):
+    """A single real review covers atoms just as a partitioned review does."""
+    require(K.equal(K.json_value(rows),K.json_value(fresh)),'complete audit atomic evidence differs')
+    refs=list(dict.fromkeys(row['reference'] for row in rows if row['clean']))
+    require(refs and prepared['candidate_references']==sorted(refs)
+        and prepared['candidate_count']==sum(row['clean'] for row in rows),
+        'single review preparation lost complete candidates')
+    require(set(review['cells'])==set(refs),'independent review coverage incomplete')
+    require(all(cell['eligible'] is False and str(cell.get('reason','')).strip()
+        for cell in review['cells'].values()),'eligible or unexplained research input cannot be downgraded')
+    require(len(refs)>=minimum,'distinct reviewed candidate coverage below floor')
+    return dict(audit_atoms=sum(len(row['cells']) for row in rows),
+        unique_audited_references=len({row['reference'] for row in rows}),
+        reviewed_candidate_references=len(refs),partitions=0)
+
+
+def project_single(phase_binding,witnesses=()):
+    """Authenticate the original ordinary producer and its completed real Call.
+
+    Only grouped row counting changes. Source, audit, budget, review and emitted
+    values are reconstructed by their original owning implementations.
+    """
+    from dataclasses import asdict
+    import plain_eligibility as policy
+    phase=read(phase_binding);prepared=phase['prepared'];m=read(prepared);saved=read(m['selection'])
+    run=Path(saved['run']);b=saved['bindings'];budget=saved['budget']
+    require(phase_binding==record(run/'phase1-result.json') and prepared==record(run/'prepared.json')
+        and m['selection']==record(run/'production-selection.json') and phase['workbook']==saved['workbook'],
+        'ordinary phase1 belongs to another run or workbook')
+    require(phase['status']=='normalization_rejected' and phase['semantic_budget_reset'] is False
+        and phase['lane_approval'] is False and phase['review_call'] is not None,
+        'retained ordinary rejected phase1 with real review required')
+    recipe=N.Selection(saved['workbook'],b,run,N.Policy(**saved['policy']),
+        N.Budget(budget['ordinal'],budget['limit'],budget['attempt_id'],tuple(budget['evidence'])),saved['first_normalization'])
+    current,_=N.selection_data(recipe)
+    require(current==saved,'ordinary source, audit, code or consumed budget changed')
+    draft,rows=N.analyse(recipe)
+    require(draft==read(m['draft']) and m['draft']==record(run/'draft.json'),'ordinary audit draft changed')
+    require(m==dict(schema_version='prepared-normalization-review/v1',status='review_required',
+        request=record(run/'review-request.json'),evidence=record(run/'review-evidence.json'),
+        analysis=record(run/'analysis.json'),draft=record(run/'draft.json'),selection=record(run/'production-selection.json'),
+        candidate_count=sum(row['clean'] for row in rows),
+        candidate_references=sorted({row['reference'] for row in rows if row['clean']}),
+        policy=asdict(recipe.policy),budget=N.json_value(asdict(recipe.budget)),semantic_budget_reset=False),
+        'ordinary prepared manifest or consumed budget changed')
+    require(phase==dict(schema_version=N.SCHEMA,status='normalization_rejected',workbook=recipe.workbook,
+        prepared=prepared,phase1=record(run/'normalized.phase1.json'),outputs=phase['outputs'],
+        first_normalization=record(run/'first_normalization.json'),plain_eligibility=record(run/'plain-eligibility.json'),
+        review_call=phase['review_call'],lane_approval=False,semantic_budget_reset=False,next_gate='orchestrator_failure_review')
+        and set(phase['outputs'])=={'normalized.json','normalization_report.json','exclusions.json'}
+        and all(Path(binding['path'])==run/name for name,binding in phase['outputs'].items()),
+        'ordinary original phase1 shape or output paths changed')
+    call=N.Call(**phase['review_call'])
+    owned=N.normalization_review(call,prepared,source=b['source_file'],baseline=b['baseline_inputs'],
+        draft=m['draft'],rows=rows,bindings=b,policy=recipe.policy)
+    submitted=read(call.submitted)
+    expected_scope=N.executor.SemanticScope(recipe.workbook,b['original_raw_source']['sha256'],N.LANE,'normalization-review')
+    require(submitted.get('attempt_id')==budget['attempt_id'] and submitted.get('semantic_ordinal')==budget['ordinal']
+        and submitted.get('semantic_limit')==budget['limit'] and submitted.get('scope')==asdict(expected_scope),
+        'ordinary review lost its consumed attempt identity')
+    require(read(record(run/'normalization-review.json'))==owned['review'],'ordinary retained review changed')
+    original_mode=policy.evaluate(run,allow_grouped=False)
+    require(original_mode['mode']=='fail' and original_mode['reason'].startswith('draft_rows '),
+        'failure is not solely grouped row floor')
+    require(original_mode['first_atomic_variables']==0 and not original_mode['atomic_variables']
+        and not original_mode['forced_exclusions'] and not original_mode['extraction_codes']
+        and not original_mode['sentinel_row'],'plain prerequisites fail')
+    counts=single_coverage(N.expand_artifact(read(m['analysis'])),rows,m,owned['review'],minimum=original_mode['draft_row_floor'])
+    mutable=list(phase['outputs'].values())
+    require(len(witnesses) in (0,len(mutable)) and (not witnesses or
+        {json.dumps(w['original'],sort_keys=True) for w in witnesses}=={json.dumps(x,sort_keys=True) for x in mutable}),
+        'incomplete or foreign immutable output witnesses')
+    checked={}
+    def retained(binding):
+        matches=[w for w in witnesses if w['original']==binding]
+        require(not matches or (len(matches)==1 and binding in mutable and matches[0]['copy']['sha256']==binding['sha256']),
+            'invalid ordinary output witness')
+        selected=matches[0]['copy'] if matches else binding
+        value=read(selected);checked[selected['path']]=selected['sha256'];return value
+    script,projection=N.expected_outputs(recipe.workbook,draft,rows,run,saved['pipeline_bindings'])
+    require((run/f'normalize_{recipe.workbook}.py').read_text()==script,'ordinary generated normalizer changed')
+    old_exact=all(record(run/name)['sha256']==binding['sha256'] for name,binding in phase['outputs'].items())
+    new_exact=all(path.read_bytes()==(json.dumps(value,indent=2,ensure_ascii=False,sort_keys=True)+'\n').encode() for path,value in projection.items())
+    require(old_exact or new_exact,'ordinary outputs are not complete original phase1 or complete generated phase2')
+    report=retained(phase['outputs']['normalization_report.json'])
+    dispositions=report.get('dispositions') or []
+    require(dispositions and all(d.get('status')=='excluded' and str(d.get('reason') or '').strip() for d in dispositions),
+        'complete ordinary exclusion reasons required')
+    require(read(phase['first_normalization'])['atomic_variables']==0 and read(phase['phase1'])['variables']==[]
+        and retained(phase['outputs']['normalized.json'])['variables']==[],
+        'original positive normalization cannot be downgraded')
+    for binding in [phase_binding,prepared,m['selection'],m['draft'],m['analysis'],m['request'],m['evidence'],
+        *phase['review_call'].values(),phase['first_normalization'],phase['phase1'],
+        *phase['outputs'].values(),phase['plain_eligibility']]:retained(binding)
+    for path,sha in saved['audit_validation_files'].items():
+        require(record(path)['sha256']==sha,'ordinary complete audit evidence changed');checked[path]=sha
+    return dict(schema_version=SCHEMA,original_guard=phase_binding,witnesses=list(witnesses),original_phase1=phase_binding,
+        prepared=prepared,run=str(run),workbook=recipe.workbook,coverage=counts,original_mode=original_mode,
+        source_verified=True,original_inputs_retained=True,review_decisions_changed=False,semantic_budget_reset=False,
+        checked_files=dict(sorted(checked.items())),code={record(__file__)['path']:record(__file__)['sha256'],
+        record(policy.__file__)['path']:record(policy.__file__)['sha256']})
+
+
 def prepare(original_guard,directory):
     directory=Path(directory);require(not directory.exists(),'fresh qualification namespace required')
     project(original_guard);directory.mkdir(parents=True)
-    phase=read(read(original_guard)['phase1']);witnesses=[]
+    first=read(original_guard)
+    phase=first if first.get('schema_version')==N.SCHEMA and 'review_call' in first else read(first['phase1'])
+    witnesses=[]
     for name,binding in phase['outputs'].items():
         read(binding);copy=N.keep(directory/('original-'+name),Path(binding['path']).read_bytes())
         witnesses.append(dict(original=binding,copy=copy))
@@ -221,6 +329,44 @@ def install(binding):
 def validate_sidecar(run):
     selected=read(record(Path(run)/SIDECAR));require(set(selected)=={'schema_version','qualification'} and selected['schema_version']==SCHEMA,'invalid grouped plain sidecar')
     return validate(selected['qualification'],run=run)
+
+
+@contextmanager
+def qualification_scope(binding,policy_code):
+    """Select a verified grouped qualification without modifying its old run.
+
+    The selected policy differs solely in accepting an explicit authenticated
+    qualification instead of requiring its sidecar. All other runs keep their
+    original policy, and every use recomputes the qualification.
+    """
+    import ast,importlib.util,sys
+    import plain_eligibility as policy
+    value=validate(binding,run=Path(read(binding)['run']));run=Path(value['run'])
+    require(record(policy_code['path'])==policy_code,'selected grouped policy bytes changed')
+    original=Path(policy.__file__).read_text()
+    before=["def evaluate(run: Path, *, allow_grouped: bool = True) -> dict:",
+        "    if draft_rows < floor and allow_grouped and (run / 'grouped-plain-qualification.json').exists():\n        from scripts.batch.harbor_grouped_plain_qualification import validate_sidecar\n        grouped = validate_sidecar(run)"]
+    after=["def evaluate(run: Path, *, allow_grouped: bool = True, qualification: dict | None = None) -> dict:",
+        "    if draft_rows < floor and allow_grouped and (qualification is not None or (run / 'grouped-plain-qualification.json').exists()):\n        from scripts.batch.harbor_grouped_plain_qualification import validate, validate_sidecar\n        grouped = validate(qualification,run=run) if qualification is not None else validate_sidecar(run)"]
+    if policy_code!=record(policy.__file__):
+        for old,new in zip(before,after):
+            require(original.count(old)==1,'original grouped policy predicate changed');original=original.replace(old,new)
+        require(ast.dump(ast.parse(original))==ast.dump(ast.parse(Path(policy_code['path']).read_text())),
+            'grouped policy changed beyond explicit receipt selection')
+    name='selected_grouped_plain_policy';spec=importlib.util.spec_from_file_location(name,policy_code['path'])
+    selected=importlib.util.module_from_spec(spec);spec.loader.exec_module(selected)
+    previous=policy.evaluate;canonical='scripts.batch.harbor_grouped_plain_qualification';old_module=sys.modules.get(canonical)
+    def evaluate(actual,*,allow_grouped=True):
+        require(record(policy_code['path'])==policy_code,'selected grouped policy changed during use')
+        if Path(actual)==run and allow_grouped:
+            return selected.evaluate(Path(actual),qualification=binding)
+        return previous(actual,allow_grouped=allow_grouped)
+    sys.modules[canonical]=sys.modules[__name__];policy.evaluate=evaluate
+    try:yield value
+    finally:
+        policy.evaluate=previous
+        if old_module is None:sys.modules.pop(canonical,None)
+        else:sys.modules[canonical]=old_module
 
 
 def validate_successor(binding, *, original_guard):

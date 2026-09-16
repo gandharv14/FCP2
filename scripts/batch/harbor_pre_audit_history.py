@@ -155,6 +155,9 @@ def project(*,workbook,original,tracker,curations,driver,history_roots,known_ids
 
 def validate(proof,*,workbook,original,history_roots,known_ids):
     value=read(proof)
+    if value.get('schema_version')in {'harbor-legacy-completed-research/v1','harbor-legacy-completed-research-build/v1','harbor-legacy-package-authoring/v1','harbor-legacy-staged-authoring/v1','harbor-legacy-opaque-authoring/v1'}:
+        from scripts.batch import harbor_legacy_research_history as legacy
+        return legacy.validate(proof,workbook=workbook,original=original,history_roots=history_roots,known_ids=known_ids)
     require(value.get('schema_version')==SCHEMA and value.get('workbook')==workbook and value.get('original')==original,'pre-audit proof identity differs')
     require(value.get('history_roots')==list(map(lambda x:str(Path(x).absolute()),history_roots)) and value.get('known_ids')==sorted(known_ids),'pre-audit proof namespace or inventory differs')
     expected=project(workbook=workbook,original=original,tracker=value['tracker'],curations=value['curations'],driver=value['driver'],history_roots=history_roots,known_ids=known_ids,historical_path_aliases=value.get('historical_path_aliases'))

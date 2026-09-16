@@ -295,5 +295,5 @@ def check_profiles(selection,*,root=ROOT):
         require(bindings.get(kind+'_generation_id')==b[kind+'_generation']['id'] and bindings.get(kind+'_manifest_sha256')==b[kind+'_generation']['manifest_sha256'],'profile source/segmentation context differs')
     result=validate_profiles(p,root=root)
     require(final.get('source_profiles',[])==static.read(p.profiles)['profiles'],'final spec catalog differs from independently reviewed profiles')
-    require(result.get('confidence')=='high','public profile confidence is not high')
+    require(result.get('confidence')=='high' or (result.get('confidence')=='medium' and result.get('skipped_profiles',0)>0 and result['accepted_profiles']+result['skipped_profiles']==result['public_sources']),'public profile gap lacks verified generic fallback')
     return result

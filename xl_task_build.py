@@ -797,7 +797,7 @@ def read_env_key(env_file):
             key, _, value = line.partition("=")
             name = key.strip().lower()
             if name in {
-                "lbx_api_key",
+                "lbx_labelbox_api_key",
                 "alignerr_org_key",
                 "aligerr_org_key",
                 "rl_api_key",
@@ -808,7 +808,7 @@ def read_env_key(env_file):
                 values.get("rl_api_key")
                 or values.get("alignerr_org_key")
                 or values.get("aligerr_org_key")
-                or values.get("lbx_api_key")
+                or values.get("lbx_labelbox_api_key")
             )
     return (
         os.environ.get("RL_API_KEY")
@@ -817,8 +817,8 @@ def read_env_key(env_file):
         or os.environ.get("alignerr_org_key")
         or os.environ.get("ALIGERR_ORG_KEY")
         or os.environ.get("aligerr_org_key")
-        or os.environ.get("LBX_API_KEY")
-        or os.environ.get("lbx_api_key")
+        or os.environ.get("LBX_LABELBOX_API_KEY")
+        or os.environ.get("lbx_labelbox_api_key")
     )
 
 
@@ -889,8 +889,8 @@ def naturalize(instance, config, log):
         meta["fallback_reason"] = "naturalizer disabled"
         return instance.scenario, meta
     if not config["api_key"]:
-        meta["fallback_reason"] = "no lbx_api_key found"
-        log("    naturalizer skipped: no lbx_api_key in .env or environment")
+        meta["fallback_reason"] = "no lbx_labelbox_api_key found"
+        log("    naturalizer skipped: no lbx_labelbox_api_key in .env or environment")
         return instance.scenario, meta
 
     messages = [{"role": "system", "content": NATURALIZER_SYSTEM},

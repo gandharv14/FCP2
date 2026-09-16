@@ -1,0 +1,38 @@
+"""Prepare finite source→author jobs from exact retained history and native census.
+
+This root-side data builder never enrolls, claims, starts, or qualifies a task.
+The existing pool controller owns fresh admission and once-only starts.
+"""
+from pathlib import Path
+import argparse,json,time
+if __package__ in(None,''):
+ import sys;sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
+from scripts.fleet.migration import binding,checked,retain
+from scripts.fleet.python_entry import command
+from scripts.batch import harbor_legacy_research_history as L,harbor_continuation_allowance as A
+HOSTS=['hhu-server']+['hhu-server-'+str(i)for i in range(2,9)]
+FIELDS={'schema_version','candidates','inventory','history','snapshot','runtime','admission_policy','capacity','physical_model_policy','author_template','native_history','authorization','url','token_file'}
+def require(v,m):
+ if not v:raise ValueError(m)
+def prepare(selection,output):
+ p=checked(selection);require(set(p)==FIELDS and p['schema_version']=='harbor-staged-pipeline-preparation/v1','closed pipeline preparation required');require(set(p['native_history'])==set(HOSTS),'all eight native history scans required')
+ snap=checked(p['snapshot']);rt=checked(p['runtime']);code=Path(snap['root']);inventory=checked(p['inventory']);base=checked(p['author_template']);require(rt['root']==str(code),'runtime differs from selected code');require(binding(p['authorization']['path'])==p['authorization']and p['authorization']['sha256']=='acffe75c8ed401f66484a5bb6c39a15a0a3e209fc976967da0bddd6125126fd0','exact root authorization required')
+ require({str(x.relative_to(code)):binding(x)for x in code.rglob('*')if x.is_file()}==snap['bindings'],'frozen runtime changed');require(checked(p['physical_model_policy'])['slots_per_host']==2,'physical transport capacity must remain two')
+ candidates=p['candidates'];require(candidates and len({x['workbook']for x in candidates})==len(candidates),'duplicate or empty candidate selection')
+ for x in candidates:
+  require(set(x)=={'workbook','host','legacy_research','source'}and x['host']in HOSTS,'closed assigned candidate required');old=L.validate(x['legacy_research']);require(old['workbook']==x['workbook']and old['original']=={k:x['source'][k]for k in('path','sha256')},'candidate/history source differs');require([i for i in inventory['sources']if i['workbook_id']==x['workbook']]==[x['source']],'candidate not exact original inventory')
+  for row in p['native_history'].values():
+   observed=checked(row);require(0<=time.time()-observed['observed_at']<3600,'native history observation stale');require(x['workbook']not in observed['excluded']and not observed['histories'].get(x['workbook']),'prior native task cannot use unused pipeline')
+ out=Path(output).absolute();require(not out.exists(),'preparation namespace consumed');out.mkdir(parents=True,mode=0o700);assign={h:[]for h in HOSTS};rows=[]
+ queue=retain(out/'queue.json',dict(schema_version='authoring-request-queue/v1',created_at=time.time(),status='queued_for_main_authoring_dispatch',authorization=p['authorization'],counts=dict(total=len(candidates)),items=[dict(priority=i+1,workbook_id=x['workbook'],request='new_candidate',queue_state='queued_for_dispatch',original_source=x['source'],history_class='legacy_model_artifacts',preserved_history=L.validate(x['legacy_research'])['histories'][x['workbook']],preserved_curations=L.validate(x['legacy_research'])['curations'])for i,x in enumerate(candidates)]))
+ for x in candidates:
+  wb=x['workbook'];host=x['host'];old=L.validate(x['legacy_research']);b=out/'workbooks'/wb;b.mkdir(parents=True);(b/'allowance').mkdir();limits=dict(takeovers=3,lease_duration_ns=14400*10**9,stage_seconds=7200,memory_bytes=16*1024**3,review_attempts=2,transport_retries=0)
+  allowance=A.issue(b/'allowance',expected_previous=None,selected_scope=A.scope(wb,x['source']['sha256']),limits=limits,authorization=p['authorization'],reason='One same-claim automatic pipeline: retain terminal legacy research, NAT and AA consumption; append the explicitly selected cumulative reconstruction ordinal under7200seconds16GiB, then original fresh authoring with two new NAT attempts and two new dialogue reviews. No source/model replay, no publication; physical model capacity2 preserves original campaign1 metadata.',expires_at_ns=time.time_ns()+86400*10**9,approve=lambda v:v['limits']==limits and v['authorization']==p['authorization'])
+  source=dict(schema_version='fleet-source-first/v3',legacy_research=x['legacy_research'],workbook=wb,helper=binding(code/'scripts/fleet/source_first.py'),snapshot=p['snapshot'],source=x['source'],inventory=p['inventory'],history=p['history'],history_roots=old['history_roots'],native_history_roots=checked(p['native_history'][host])['roots'],home=old['home']+'/source',allowance=allowance,seconds=7200,memory_bytes=16*1024**3,next_attempt=old['new_source_reconstruction_ordinal'],cumulative_reconstruction_limit=old['new_source_reconstruction_ordinal'],models=0,automatic_retry=False);source_row=retain(b/'source-plan.json',source)
+  template={k:v for k,v in base.items()if k!='legacy_research_history'};template.update(workbook=wb,queue=queue,inventory=p['inventory'],history_roots=old['history_roots'],code_root=str(code),home=old['home']+'/authoring',dispatcher=binding(code/'scripts/fleet/advance_authoring_v8.py'),owner='harbor-orchestrator-'+wb+'-'+host,reconstruction=dict(mode='existing',handoff=None,generated_curation=None));template['publication_root']=str(Path(base['publication_root']).parent/wb);author=retain(b/'author-template.json',template)
+  plan=retain(b/'pipeline-plan.json',dict(schema_version='harbor-fleet-staged-pipeline/v1',workbook=wb,source_plan=source_row,author_template=author,home=old['home']+'/pipeline',admission_policy=p['admission_policy'],total_seconds=86400,author_memory_bytes=8*1024**3,automatic_retry=False));driver=binding(code/'scripts/fleet/staged_pipeline.py')
+  job=dict(schema_version='harbor-fleet-worker-job/v1',workbook=wb,source=old['original'],version=snap['fingerprint'],driver=driver,inputs=[plan,source_row,author,p['snapshot'],p['inventory'],p['history'],x['legacy_research'],queue,allowance],command=command(rt['python'],driver['path'],'run','--plan',plan['path'],'--sha256',plan['sha256']),cwd=str(code),run=old['home']+'/worker',result=template['home']+'/result.json',memory_limit_bytes=16*1024**3,timeout_seconds=86400,minimum_disk_bytes=12*1024**3,physical_model_policy=p['physical_model_policy'],operational_allowance=allowance);jb=retain(b/'worker-job.json',job);assign[host].append(jb);rows.append(dict(workbook=wb,host=host,job=jb,source=x['source'],source_plan=source_row,pipeline_plan=plan,legacy_research=x['legacy_research'],capacity_reservation='source-and-author',source_qualified=False))
+ for host in HOSTS:retain(out/(host+'-pool.json'),dict(schema_version='harbor-fleet-pool/v5',capacity=p['capacity'],admission_policy=p['admission_policy'],host=host,code_root=str(code),python=rt['python'],worker=binding(code/'scripts/fleet/worker.py'),url=p['url'],token_file=p['token_file'],jobs=assign[host]))
+ return retain(out/'prepared.json',dict(schema_version='fleet-source-pool-preparation/v1',selection=selection,authorization=p['authorization'],snapshot=p['snapshot'],runtime=p['runtime'],supervisor=binding(code/'scripts/fleet/pool_v5.py'),assignments=assign,rows=rows,models_started=0,workers_started=0))
+if __name__=='__main__':
+ a=argparse.ArgumentParser();a.add_argument('--selection',required=True);a.add_argument('--sha256',required=True);a.add_argument('--output',required=True);p=a.parse_args();print(json.dumps(prepare(dict(path=str(Path(p.selection).absolute()),sha256=p.sha256),p.output)))

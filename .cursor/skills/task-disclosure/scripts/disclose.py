@@ -22,6 +22,7 @@ import re
 import shutil
 import sys
 import time
+from datetime import date, datetime
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -456,7 +457,19 @@ class Book:
                     if not fallback:
                         fallback = text
                     continue
-                if is_unit_stamp(text):
+                # Two-letter department/category names (HR, QC, BK) are real
+                # labels in a column independently established by longer names.
+                # Keep the general short-token filter for units, isolated
+                # abbreviations and numeric/marker columns.
+                short_name = (
+                    re.fullmatch(r"[A-Z]{2}", text) is not None
+                    and text.lower() not in UNIT_TOKENS
+                    and re.fullmatch(r"[KMGT]W", text) is None
+                    and c in self.label_columns(sheet)
+                    and c not in self.stamp_columns(sheet)
+                    and candidate not in self.formula
+                )
+                if is_unit_stamp(text) and not short_name:
                     continue
                 if re.fullmatch(r"scenario\s+\d+", text, re.I):
                     continue
@@ -906,7 +919,7 @@ def _copy_lock_split(gold: Book, cells: list[str]):
     return pinned, moving
 
 
-def copy_lock_note(gold: Book, cells: list[str]) -> str:
+def _cell_copy_lock_note(gold: Book, cells: list[str]) -> str:
     """A clause naming the references the copy pattern pins, when it pins any.
 
     0658's three blocked records each kept some references fixed
@@ -945,6 +958,56 @@ def copy_lock_note(gold: Book, cells: list[str]) -> str:
         ". As this formula is copied across the band, %s stay%s fixed "
         "while every other reference shifts with its position"
         % (subject, "" if plural else "s")
+    )
+
+
+def _copied_named_operands(gold: Book, cells: list[str]) -> list[str]:
+    """Prove unchanged symbolic names across the complete copied formula band.
+
+    Keeping a name does not imply that its definition is absolute: relative
+    names can resolve differently at different cells. State the name's copy
+    behavior only, without claiming a fixed value or resolved address.
+    """
+    from openpyxl.formula import Tokenizer
+    if len(cells) < 2:
+        return []
+    expected = None
+    for cell in cells:
+        formula = gold.formula.get(cell)
+        if not formula or not copy_equivalent(gold, cells[0], cell):
+            return []
+        names = []
+        for token in Tokenizer(formula).items:
+            if token.type != "OPERAND" or token.subtype != "RANGE":
+                continue
+            raw = token.value
+            if REF_RE.fullmatch(raw):
+                continue
+            name = raw.rsplit("!", 1)[-1]
+            if not re.fullmatch(r"[A-Za-z_\\][A-Za-z0-9_.\\]*", name):
+                return []  # No claim about structured or unresolved forms.
+            names.append(raw)
+        if expected is None:
+            expected = names
+        elif names != expected:
+            return []
+    return list(dict.fromkeys(expected or []))
+
+
+def copy_lock_note(gold: Book, cells: list[str]) -> str:
+    note = _cell_copy_lock_note(gold, cells)
+    names = _copied_named_operands(gold, cells)
+    if not names:
+        return note
+    # The cell-reference parser intentionally excludes named operands. Its
+    # universal wording must not accidentally claim those names also shift.
+    note = note.replace("every other reference", "every other cell reference")
+    note = note.replace("every reference", "every cell reference")
+    listed = ", ".join(q(name) for name in names)
+    return note + (
+        ". The named reference%s %s retain%s the same name%s throughout the band"
+        % ("s" if len(names) > 1 else "", listed,
+           "" if len(names) > 1 else "s", "s" if len(names) > 1 else "")
     )
 
 
@@ -1539,7 +1602,7 @@ METHOD_ENTRY_IDS = set(METHOD_ROLE_PATTERNS)
 CONVENTION_ENTRY_IDS = {
     "discount_period", "inert_line", "terminal_value", "row_populated",
     "npv_timing", "aggregate_scope", "projection_rule", "distribution_policy",
-    "liquidation_preference", "stake_scaling", "source_selection",
+    "liquidation_preference", "stake_scaling", "source_selection", "column_literal_increment", "scenario_literal_increment",
 }
 DISTRIBUTION_LABELS = ("dividend", "distribution", "shareholder payment")
 # Wider than the entry's name, because the observed rows are labelled by what
@@ -1570,6 +1633,78 @@ def method_roles(label: str) -> list[str]:
     return hits
 
 
+def source_payroll_role(gold: Book, band: dict) -> list[str] | None:
+    """Recognize monthly salary branches from their actual labelled operands.
+
+    Job titles containing "sales" do not turn a salary calculation into revenue.
+    This closed shape changes classification only; the normal renderer, copied
+    family proof and graded-closure suppression still derive every claim.
+    """
+    cells = band.get("stated_cell_keys") or band.get("cell_keys") or []
+    if not cells:
+        return None
+    evidence = []
+    def shape(n, kind, name, count):
+        return n is not None and n.kind == kind and n.name.upper() == name and len(n.args) == count
+    def number(n, value):
+        return n is not None and n.kind == "const" and n.name == "number" and n.shape == value
+    for cell in cells:
+        sheet, coord = cell.rsplit("!", 1)
+        column, row = split_coord(coord)
+        ast = _parse_formula_ast(gold.formula.get(cell, ""))
+        if shape(ast, "prefix", "+", 1):
+            ast = ast.args[0]
+        if not shape(ast, "func", "IF", 3) or not number(ast.args[2], 0):
+            return None
+        condition, pay, _ = ast.args
+        if not shape(pay, "infix", "/", 2) or not number(pay.args[1], 1000):
+            return None
+        pay = pay.args[0]
+        if not shape(pay, "infix", "/", 2) or not number(pay.args[1], 12):
+            return None
+        salary = pay.args[0]
+        if salary.kind != "ref" or not re.fullmatch(r"\$[A-Z]{1,3}" + str(row), salary.name):
+            return None
+        if shape(condition, "func", "OR", 2):
+            condition, previous = condition.args
+            if not shape(previous, "infix", ">", 2) or not number(previous.args[1], 0):
+                return None
+            prior = previous.args[0]
+            if prior.kind != "ref" or not re.fullmatch(r"[A-Z]{1,3}" + str(row), prior.name):
+                return None
+            if col_to_num(split_coord(prior.name)[0]) >= col_to_num(column):
+                return None
+        if not shape(condition, "infix", ">=", 2):
+            return None
+        period, hire = condition.args
+        if (period.kind != "ref" or not re.fullmatch(column + r"\$[1-9][0-9]*", period.name)
+                or hire.kind != "ref" or not re.fullmatch(r"\$[A-Z]{1,3}" + str(row), hire.name)):
+            return None
+        salary_col = split_coord(salary.name)[0]
+        hire_col = split_coord(hire.name)[0]
+        if col_to_num(salary_col) >= col_to_num(column) or col_to_num(hire_col) >= col_to_num(salary_col):
+            return None
+        def heading(col):
+            for r in range(row - 1, max(0, row - 65), -1):
+                value = gold.value.get(key(sheet, col + str(r)))
+                if isinstance(value, str) and value.strip():
+                    return r, value.strip()
+            return None, ""
+        salary_row, salary_label = heading(salary_col)
+        hire_row, hire_label = heading(hire_col)
+        if (salary_row != hire_row or salary_row is None
+                or split_coord(period.name)[1] >= salary_row
+                or not re.fullmatch(r"(?:base|annual) salary", salary_label, re.I)
+                or not re.fullmatch(r"(?:hire|start) month", hire_label, re.I)):
+            return None
+        employee = gold.value.get(key(sheet, num_to_col(col_to_num(hire_col)-1)+str(hire_row)))
+        if not isinstance(employee, str) or not re.fullmatch(r"employees?", employee.strip(), re.I):
+            return None
+        evidence.extend([f"{sheet}!{salary_col}{salary_row}: {salary_label}",
+                         f"{sheet}!{hire_col}{hire_row}: {hire_label}"])
+    return list(dict.fromkeys(evidence))
+
+
 def method_roles_for_band(gold: Book, band: dict) -> tuple[list[str], list[str]]:
     """Role from the row itself, falling back to two neighboring rows.
 
@@ -1578,6 +1713,9 @@ def method_roles_for_band(gold: Book, band: dict) -> tuple[list[str], list[str]]
     gives no role, so it cannot override a clear label.
     """
     own = band.get("label") or ""
+    payroll = source_payroll_role(gold, band)
+    if payroll is not None:
+        return ["method_operating_expense"], [own, *payroll]
     direct = method_roles(own)
     # Drug reimbursement is a healthcare revenue stream when explicitly
     # nested under a Revenue heading. The generic reimbursement debt alias
@@ -2181,7 +2319,9 @@ def catalog_signature(entry_id: str, profile: dict) -> str | None:
         return None
 
     if entry_id == "method_discounting":
-        if "NPV" in funcs or "XNPV" in funcs:
+        if "XNPV" in funcs:
+            return None  # Its exact dated method is rendered by the custom AST path.
+        if "NPV" in funcs:
             return "npv_plus_t0" if re.search(r"\)\s*[+\-]", formula) else "periodic_discount"
         if profile_has_all(profile, (r"growth",), (r"discount", r"wacc")) and "/" in ops:
             return "perpetuity_growth"
@@ -2214,6 +2354,17 @@ def ast_is_ref_like(node) -> bool:
         if node.name == "*":
             pairs.append((right, left))
         for ref_node, const_node in pairs:
+            # Preserve the existing thousand/million unit-scale classification
+            # when the workbook spells that exact constant as a power of ten.
+            if (ast_is_ref_like(ref_node) and const_node.kind == "infix"
+                    and const_node.name == "^" and len(const_node.args) == 2
+                    and all(x.kind == "const" and x.name == "number" for x in const_node.args)):
+                try:
+                    base, exponent = (float(x.shape) for x in const_node.args)
+                    if base == 10 and exponent in (3, 4, 6):
+                        return True
+                except (TypeError, ValueError):
+                    pass
             if not (
                 ast_is_ref_like(ref_node)
                 and const_node.kind == "const"
@@ -2226,6 +2377,28 @@ def ast_is_ref_like(node) -> bool:
             except (TypeError, ValueError):
                 continue
     return False
+
+
+def _prior_row_mean(profile: dict) -> bool:
+    """An explicit trailing average is a calculation even on a ratio-labelled row."""
+    ast = profile.get("ast")
+    cells = profile.get("cells") or []
+    if (ast is None or ast.kind != "func" or ast.name != "AVERAGE" or len(ast.args) != 1
+            or ast.args[0].kind != "ref" or ":" not in ast.args[0].name or not cells):
+        return False
+    sheet, coord = cells[0].rsplit("!", 1)
+    position = split_coord(coord)
+    refs = profile.get("references") or []
+    if not position or len(refs) < 2 or len(set(refs)) != len(refs):
+        return False
+    columns = []
+    for ref in refs:
+        rsheet, rcoord = ref.rsplit("!", 1)
+        point = split_coord(rcoord)
+        if rsheet != sheet or not point or point[1] != position[1]:
+            return False
+        columns.append(col_to_num(point[0]))
+    return sorted(columns) == list(range(min(columns), col_to_num(position[0])))
 
 
 def structural_reason(profile: dict) -> str | None:
@@ -2242,11 +2415,12 @@ def structural_reason(profile: dict) -> str | None:
     if profile.get("text_literals") and funcs & {"IF", "IFS", "OR", "AND", "ROUND"}:
         return "diagnostic_or_warning_logic"
     if funcs <= {"SUM"} and ops <= {"+", "-"}:
-        return "component_aggregation"
+        # Material embedded parameters must survive removal of the formula cell.
+        return None if nonboring_numbers(profile) else "component_aggregation"
     if not funcs and ops and ops <= {"+", "-"}:
         return "composition_or_rollforward"
     label = (profile.get("label") or "").lower()
-    if not (funcs & {"IF", "IFS", "IFERROR", "CHOOSE", "SWITCH", "LOOKUP", "XLOOKUP"}) and any(
+    if not _prior_row_mean(profile) and not (funcs & {"IF", "IFS", "IFERROR", "CHOOSE", "SWITCH", "LOOKUP", "XLOOKUP"}) and any(
         token in label for token in ("/revenue", "% of ", " margin", " ratio")
     ):
         return "ratio_or_assumption_row"
@@ -2378,7 +2552,25 @@ def reference_lock_qualifier(raw: str) -> tuple[str, str]:
     return "", (" with " + " and ".join(details) + " fixed when copied") if details else ""
 
 
+def date_series_reference(gold: Book, cell: str) -> bool:
+    """A date among three adjacent dates cannot inherit an adjacent heading."""
+    sheet, coord = cell.rsplit('!', 1)
+    parsed = split_coord(coord)
+    if not parsed or not isinstance(gold.value.get(cell), (date, datetime)):
+        return False
+    column, row = col_to_num(parsed[0]), parsed[1]
+    for start in range(max(1, column - 2), column + 1):
+        if all(isinstance(gold.value.get(key(sheet, f'{num_to_col(c)}{row}')),
+                          (date, datetime)) for c in range(start, start + 3)):
+            return True
+    return False
+
+
 def describe_ref(gold: Book, raw: str, sheet: str, own_label: str) -> str:
+    # A deleted-reference operand can retain its worksheet qualifier. It is
+    # still an Excel reference error, never an unresolved workbook name.
+    if re.fullmatch(r"(?:(?:'(?:[^']|'')+'|[^\s'!+*/^&=<>(),:;{}\[\]-]+)!)?#REF!", raw, re.I):
+        return f"the broken reference {q(raw)} (which yields a reference error when evaluated)"
     refs = refs_in("=" + raw, sheet)
     lock_prefix, lock_suffix = reference_lock_qualifier(raw)
     if len(refs) == 1:
@@ -2404,6 +2596,9 @@ def describe_ref(gold: Book, raw: str, sheet: str, own_label: str) -> str:
                 f"{lock_prefix}range {first_sheet}!{first_coord}:{last_coord}"
                 f"{lock_suffix}"
             )
+        if labels and all(ref_labels) and all(date_series_reference(gold, ref) for ref in refs):
+            return location + (' containing a date value' if len(refs) == 1
+                               else ' containing date values')
         if labels and all(ref_labels):
             named = [q(label) for label in labels]
             label_text = named[0] if len(named) == 1 else ", ".join(named[:-1]) + " and " + named[-1]
@@ -2470,6 +2665,8 @@ def describe_ast(node, gold: Book, sheet: str, own_label: str) -> str:
                 f"option {index}: ({value})" for index, value in enumerate(args[1:], 1)
             )
             return f"use ({args[0]}) as the option number, then choose {options}"
+        if name == "ROUND" and len(args) == 2:
+            return f"round ({args[0]}) to ({args[1]}) decimal places"
         if name == "MROUND" and len(args) >= 2:
             return f"round ({args[0]}) to the nearest multiple of ({args[1]})"
         if name == "SUMPRODUCT":
@@ -3069,12 +3266,16 @@ def detect_distribution_policy(gold: Book, scope: set[str],
             and ast.name == "*"
             and len(ast.args) == 2
         ):
-            # Exact payout product: two bare references, one on a payout row.
+            # The fixed sentence describes a share of earnings. A dividend
+            # per share is an amount, and multiplying it by a share count
+            # must retain those two operands instead of inventing a ratio.
             factor_cells = [_single_ref_cell(arg, sheet) for arg in ast.args]
             if all(factor_cells) and any(
-                ("payout" in gold.row_label(fc).lower()
-                 or "dividend per" in gold.row_label(fc).lower())
-                for fc in factor_cells
+                "payout" in gold.row_label(factor_cells[index]).lower()
+                and re.search(r"\b(?:net (?:income|profit|earnings)|earnings|profit after tax)\b",
+                              gold.row_label(factor_cells[1-index]).lower())
+                and not re.search(r"\b(?:per share|eps)\b", gold.row_label(factor_cells[1-index]).lower())
+                for index in (0, 1)
             ):
                 value = "payout_ratio"
         if value is None and ast is not None and (
@@ -3213,13 +3414,47 @@ def solves_for_divisor(formula: str) -> bool:
     return bool(re.search(r"\b%s\b" % re.escape(ref), head))
 
 
+def npv_cell_timing_fields(gold: Book, cell: str) -> dict | None:
+    """Name a single periodic NPV series by its source cell when no label exists."""
+    if gold.row_label(cell) or "!" not in cell or not split_coord(cell.rsplit("!", 1)[1]):
+        return None
+    ast = _parse_formula_ast(gold.formula.get(cell, ""))
+    if ast is None:
+        return None
+    functions = [node for node in walk_ast(ast) if node.kind == "func"]
+    calls = [node for node in functions if node.name.upper() == "NPV"]
+    if len(calls) != 1 or len(calls[0].args) < 2 or any(node.name.upper() == "XNPV" for node in functions):
+        return None
+    return {"target_cell": "`" + pretty(cell) + "`"}
+
+
 def detect_npv_timing(gold: Book, scope: set[str]) -> list[dict]:
     out = []
     for k in sorted(scope):
         formula = gold.formula.get(k)
-        if not formula or "NPV(" not in formula.upper():
+        if not formula:
             continue
-        tail = formula.upper().split("NPV(", 1)[1]
+        ast = _parse_formula_ast(formula)
+        if ast is None:
+            continue
+        functions = {node.name.upper() for node in walk_ast(ast) if node.kind == "func"}
+        if getattr(ast, "kind", None) == "func" and ast.name.upper() == "XNPV" and len(ast.args) == 3:
+            out.append(record(
+                "npv_timing", "dated_first_date_origin", [k], formula,
+                ["excel_default_one_period_out", "t0_added_separately", "dated_first_date_origin"],
+                "XNPV uses the first supplied cash-flow date as its discounting origin.",
+                fields={"label": q(gold.row_label(k))},
+            ))
+            continue
+        # Function identity is parsed: XNPV, quoted text, and sheet names must
+        # never inherit Excel NPV's one-period-out convention. Mixed dated and
+        # periodic expressions retain the full custom-method disclosure.
+        if "NPV" not in functions or "XNPV" in functions:
+            continue
+        match = re.search(r"(?<![A-Z0-9_.])NPV\s*\(", STRING_RE.sub("", formula.upper()))
+        if match is None:
+            continue
+        tail = STRING_RE.sub("", formula.upper())[match.end():]
         extra = bool(re.search(r"\)\s*[+\-]\s*[A-Z$]", tail))
         out.append(record(
             "npv_timing",
@@ -3228,9 +3463,27 @@ def detect_npv_timing(gold: Book, scope: set[str]) -> list[dict]:
             formula,
             ["excel_default_one_period_out", "t0_added_separately"],
             "Excel NPV discounts its first argument by one full period.",
-            fields={"label": q(gold.row_label(k))},
+            fields=(npv_cell_timing_fields(gold, k) if not extra else None)
+            or {"label": q(gold.row_label(k))},
         ))
     return out
+
+
+def verified_npv_cell_timing(rec: dict, gold: Book) -> bool:
+    cells = rec.get("cell_keys") or []
+    if len(cells) != 1 or rec.get("cells") != [pretty(c) for c in cells] or set(_stated_keys(rec)) != set(cells):
+        return False
+    candidates = detect_npv_timing(gold, set(cells))
+    if len(candidates) != 1:
+        return False
+    expected = candidates[0]
+    return (rec.get("entry") == rec.get("family") == "npv_timing"
+            and rec.get("source") == "convention_detector"
+            and rec.get("value") == expected["value"] == "excel_default_one_period_out"
+            and rec.get("band") == expected["band"]
+            and rec.get("evidence") == expected["evidence"] == gold.formula.get(cells[0])
+            and set(rec.get("fields") or {}) == {"target_cell"}
+            and rec["fields"] == expected["fields"])
 
 
 def q(text: str) -> str:
@@ -3292,6 +3545,178 @@ def is_step_increment(body: str, prev: str) -> bool:
     return bool(re.fullmatch(
         r"%s\s*[+\-]\s*%s" % (prev_re, other), text, re.I
     ))
+
+
+def column_increment_record(gold: Book, delivered: Book, cells: list[str]):
+    """Exact copied-down literal rule; a heading is context, not a row label."""
+    if len(cells) < 2 or len(set(cells)) != len(cells):
+        return None
+    sheet, coord = cells[0].rsplit("!", 1)
+    col, start = split_coord(coord)
+    if cells != [key(sheet, f"{col}{r}") for r in range(start, start + len(cells))]:
+        return None
+    if any(gold.row_label(c) or delivered.has(c) for c in cells):
+        return None
+    if full_copied_scope_vertical(gold, [cells[0]], set()) != cells:
+        return None
+    heading_cell = None
+    # A bounded search only identifies literal text in this exact column.
+    # No financial interpretation or nearest-row substitution is made.
+    for row in range(start - 1, max(0, start - 33), -1):
+        candidate = key(sheet, f"{col}{row}")
+        value = gold.value.get(candidate)
+        if candidate not in gold.formula and isinstance(value, str) and value.strip():
+            if value.startswith("=") or delivered.value.get(candidate) != value:
+                return None
+            heading_cell = candidate
+            break
+    if heading_cell is None:
+        return None
+    signature = None
+    for offset, cell in enumerate(cells):
+        previous = f"{col}{start + offset - 1}"
+        match = re.fullmatch(r"=\s*\+?\$?" + previous
+                            + r"\s*([+-])\s*(\d+(?:\.\d+)?)\s*", gold.formula.get(cell, ""))
+        if not match or not math.isfinite(float(match.group(2))) or float(match.group(2)) == 0:
+            return None
+        current = match.groups()
+        if signature is not None and signature != current:
+            return None
+        signature = current
+    band = make_vertical_band(gold, sheet, col_to_num(col), cells)
+    profile = formula_profile(gold, band)
+    if not profile.get("complete"):
+        return None
+    fields = custom_sentence_fields(profile, gold)
+    if not fields.pop("_coverage_complete"):
+        return None
+    fields.pop("label")
+    fields.update(heading=q(gold.value[heading_cell]), heading_cell=pretty(heading_cell))
+    result = record("column_literal_increment", "fixed_step", cells,
+                    gold.formula[cells[0]], ["fixed_step"],
+                    "Source-defined literal increment under an unchanged column heading.", fields=fields)
+    result["heading_cell"] = heading_cell
+    result["coverage_complete"] = True
+    return result
+
+
+def detect_column_literal_increment(gold: Book, delivered: Book, selected: set[str]):
+    out, seen = [], set()
+    for cell in sorted(selected):
+        if cell in seen or cell not in gold.formula:
+            continue
+        cells = full_copied_scope_vertical(gold, [cell], set())
+        seen.update(cells)
+        if not set(cells) <= selected:
+            continue
+        rec = column_increment_record(gold, delivered, cells)
+        if rec is not None:
+            out.append(rec)
+    return out
+
+
+def ship_column_literal_increment(rec: dict, ctx: dict) -> bool:
+    cells = rec.get("cell_keys") or []
+    expected = column_increment_record(ctx["gold"], ctx["delivered"], cells)
+    if expected is None or any(rec.get(k) != expected[k] for k in expected if k not in ("disposition", "leak_flag")):
+        rec["declined_reason"] = "column increment source, heading or complete family differs"
+        return False
+    reach = set(cells)
+    for cell in cells:
+        reach.update(refs_in(ctx["gold"].formula[cell], cell.rsplit("!", 1)[0]))
+    if reach & ctx["targets"]:
+        rec["declined_reason"] = "column increment reaches original graded closure"
+        return False
+    return True
+
+
+def scenario_increment_record(gold: Book, delivered: Book, cells: list[str]):
+    """A whole copied-down arithmetic family within an explicit scenario block."""
+    if len(cells) < 2 or len(set(cells)) != len(cells):
+        return None
+    sheet, coord = cells[0].rsplit("!", 1)
+    parsed = split_coord(coord)
+    if not parsed:
+        return None
+    column, start = col_to_num(parsed[0]), parsed[1]
+    if cells != [key(sheet, f"{parsed[0]}{r}") for r in range(start, start + len(cells))]:
+        return None
+    if any(delivered.has(c) for c in cells) or full_copied_scope_vertical(gold, [cells[0]], set()) != cells:
+        return None
+    signature = None
+    for offset, cell in enumerate(cells):
+        previous = f"{num_to_col(column-1)}{start+offset}"
+        match = re.fullmatch(r"=\s*\+?" + previous + r"\s*([+-])\s*(\d+(?:\.\d+)?)\s*", gold.formula.get(cell, ""))
+        if not match or not math.isfinite(float(match.group(2))) or float(match.group(2)) == 0:
+            return None
+        if signature is not None and signature != match.groups():
+            return None
+        signature = match.groups()
+    pattern = r"(?:mgmt|management|base|downside|upside|best|worst) case"
+    contexts = []
+    for label_cell in gold.stored_row_cells(sheet, start, hi=column-1):
+        label_col = col_to_num(split_coord(label_cell.rsplit("!",1)[1])[0])
+        def marker(row):
+            k=key(sheet,f"{num_to_col(label_col)}{row}");v=gold.value.get(k)
+            return v.strip() if k not in gold.formula and isinstance(v,str) and re.fullmatch(pattern,v.strip(),re.I) else None
+        if marker(start) is None:
+            continue
+        lo=hi=start
+        while lo>max(1,start-8) and marker(lo-1):lo-=1
+        while hi<start+8 and marker(hi+1):hi+=1
+        labels=[marker(r) for r in range(lo,hi+1)]
+        if not 2<=len(labels)<=8 or len(set(x.lower() for x in labels))!=len(labels) or start+len(cells)-1>hi:
+            continue
+        heading_cell=key(sheet,f"{num_to_col(label_col)}{lo-1}");heading=gold.value.get(heading_cell)
+        if (heading_cell in gold.formula or not isinstance(heading,str) or not heading.strip()
+                or is_unit_stamp(heading) or re.fullmatch(pattern,heading.strip(),re.I)
+                or gold.stored_row_cells(sheet,lo-1)!=[heading_cell]):
+            continue
+        label_cells=[key(sheet,f"{num_to_col(label_col)}{r}")for r in range(lo,hi+1)]
+        if any(k in delivered.formula or delivered.value.get(k)!=gold.value.get(k) for k in [heading_cell,*label_cells]):
+            continue
+        # Another row name between this label and the formula makes the block ambiguous.
+        if any(any(k in gold.value and isinstance(gold.value[k],str)
+                   for k in gold.stored_row_cells(sheet,r,lo=label_col+1,hi=column-1))for r in range(lo,hi+1)):
+            continue
+        contexts.append((heading_cell,label_cells))
+    if len(contexts)!=1:
+        return None
+    heading_cell,label_cells=contexts[0]
+    band=make_vertical_band(gold,sheet,column,cells);profile=formula_profile(gold,band)
+    if not profile.get("complete"):
+        return None
+    fields=custom_sentence_fields(profile,gold)
+    if not fields.pop("_coverage_complete"):
+        return None
+    fields.pop("label")
+    fields.update(heading=q(gold.value[heading_cell]),heading_cell=pretty(heading_cell),
+                  scenario_rows=", ".join(f"{pretty(k)} ({q(gold.value[k])})"for k in label_cells))
+    result=record("scenario_literal_increment","fixed_step",cells,gold.formula[cells[0]],["fixed_step"],
+                  "Complete source arithmetic under explicit unchanged scenario labels.",fields=fields)
+    result.update(heading_cell=heading_cell,scenario_label_cells=label_cells,coverage_complete=True)
+    return result
+
+
+def detect_scenario_literal_increment(gold: Book, delivered: Book, selected: set[str]):
+    records=[];seen=set()
+    for cell in sorted(selected):
+        if cell in seen or cell not in gold.formula:continue
+        cells=full_copied_scope_vertical(gold,[cell],set());seen.update(cells)
+        if not set(cells)<=selected:continue
+        rec=scenario_increment_record(gold,delivered,cells)
+        if rec is not None:records.append(rec)
+    return records
+
+
+def ship_scenario_literal_increment(rec: dict, ctx: dict) -> bool:
+    cells=rec.get("cell_keys")or[]
+    expected=scenario_increment_record(ctx['gold'],ctx['delivered'],cells)
+    if expected is None or any(rec.get(k)!=expected[k]for k in expected if k not in ('disposition','leak_flag')):
+        return False
+    reach=set(cells)|{expected['heading_cell']}|set(expected['scenario_label_cells'])
+    for cell in cells:reach.update(refs_in(ctx['gold'].formula[cell],cell.rsplit('!',1)[0]))
+    return not bool(reach&ctx['targets'])
 
 
 def detect_projection_rule(gold: Book, delivered: Book, selected: set[str],
@@ -4161,6 +4586,8 @@ def _origin(rec: dict):
 
 
 SHIP_WHEN = {
+    "column_literal_increment": ship_column_literal_increment,
+    "scenario_literal_increment": ship_scenario_literal_increment,
     "projection_rule": ship_projection_rule,
     "source_selection": ship_source_selection,
     "npv_timing": ship_not_a_target,
@@ -4444,6 +4871,20 @@ def records_provenance(selection: dict) -> dict:
     }
 
 
+def prefer_scenario_arithmetic(gold, delivered, scope, closure, method_records, custom_claimed):
+    scenario_records = detect_scenario_literal_increment(gold, delivered, scope)
+    scenario_records = [r for r in scenario_records if ship_scenario_literal_increment(
+        r, {"gold": gold, "delivered": delivered, "targets": closure})]
+    scenario_claimed = {c for r in scenario_records for c in r["cell_keys"]}
+    # Preserve arbitration; replace only records wholly covered by exact source arithmetic.
+    if any(set(r.get("cell_keys", [])) & scenario_claimed and
+           not set(r.get("cell_keys", [])) <= scenario_claimed for r in method_records):
+        scenario_records = []; scenario_claimed = set()
+    method_records = [r for r in method_records if not set(r.get("cell_keys", [])) & scenario_claimed]
+    custom_claimed = custom_claimed - scenario_claimed
+    return scenario_records, scenario_claimed, method_records, custom_claimed
+
+
 def detect_records(args) -> dict:
     task_dir = Path(args.task_dir).resolve()
     selection = read_stage(task_dir, "bands", Path(args.runs_root))
@@ -4470,8 +4911,10 @@ def detect_records(args) -> dict:
         resolutions_path=resolutions_path,
     )
     custom_calibration = calibrate_legacy_custom(task_dir, method_assessments, scope)
-    convention_scope = scope - custom_claimed
-    convention_records = []
+    scenario_records, scenario_claimed, method_records, custom_claimed = prefer_scenario_arithmetic(
+        gold, delivered, scope, closure, method_records, custom_claimed)
+    convention_scope = scope - custom_claimed - scenario_claimed
+    convention_records = detect_column_literal_increment(gold, delivered, convention_scope)
     for fn in (
         detect_discount_period,
         detect_inert_line,
@@ -4498,7 +4941,7 @@ def detect_records(args) -> dict:
         rec for rec in convention_records
         if not (set(rec.get("cell_keys", [])) & custom_claimed)
     ]
-    records = method_records + convention_records
+    records = method_records + scenario_records + convention_records
 
     unique = []
     seen = set()
@@ -4744,6 +5187,11 @@ def render_sentence(rec: dict) -> str:
     if not template:
         return ""
     fields = dict(rec.get("fields") or {})
+    if rec.get("entry") == "npv_timing" and rec.get("value") == "excel_default_one_period_out":
+        if set(fields) == {"target_cell"}:
+            fields["subject"] = "The NPV series in cell " + str(fields["target_cell"])
+        elif "label" in fields:
+            fields["subject"] = "The present value on the row labelled " + str(fields["label"])
     if "{calculation_kind}" in template:
         fields["calculation_kind"] = {
             "single": "single-cell calculation",
@@ -5042,12 +5490,66 @@ def verified_source_label_numeric_offsets(section: str, task_dir: Path, records:
     return offsets
 
 
+def verified_method_numeric_offsets(section: str, task_dir: Path, records: list[dict],
+                                    gold: Book | None, closure: set[str] | None = None) -> dict[int, dict]:
+    """Bind constants and numeric metadata to a fully regenerated method sentence.
+
+    Repeated labels and reference-occurrence ordinals are not formula constants.
+    Counting by numeric value can spend a constant's budget on those labels.
+    Reconstruct the complete source profile and rendered fields instead, and
+    license only their exact sentence spans on the matching record's bullet.
+    """
+    if gold is None:
+        return {}
+    targets, _ = load_key(task_dir)
+    target_cells = {parse_ref(ref, "") for ref in targets if "!" in ref}
+    offsets = {}
+    for rec in records:
+        old = rec.get("method_profile") or {}
+        if (rec.get("source") != "custom_method_detector" or rec.get("entry") not in METHOD_ENTRY_IDS
+                or rec.get("value") != "out_of_catalogue" or rec.get("disposition") != "disclosed"
+                or rec.get("leak_flag") or not rec.get("coverage_complete") or not old.get("complete")
+                or not rec.get("cell_keys") or target_cells & record_reach(rec)
+                or (closure and set(closure) & record_reach(rec))):
+            continue
+        canonical_band = compact_cells([pretty(c) for c in rec["cell_keys"]])
+        if (old.get("band") not in (canonical_band, canonical_band[1:-1])
+                or compact_cells(rec.get("cells") or []) != rec.get("band")):
+            continue
+        profile = formula_profile(gold, dict(band=old["band"], cell_keys=rec["cell_keys"],
+                                             label=old.get("label", ""), pattern=old.get("pattern", "")))
+        if not profile.get("complete") or {k: v for k, v in profile.items() if k != "ast"} != old:
+            continue
+        fields = custom_sentence_fields(profile, gold, lock_cells=_stated_keys(rec))
+        if not fields.pop("_coverage_complete", False) or fields != rec.get("fields"):
+            continue
+        sentence = render_sentence(rec)
+        if not sentence:
+            continue
+        header = "- " + compact_cells(rec.get("cells") or []) + ": "
+        for line in re.finditer("^" + re.escape(header) + r"[^\n]*", section, flags=re.MULTILINE):
+            body = line.group()[len(header):]
+            for variant in dict.fromkeys((sentence, sentence[0].lower() + sentence[1:])):
+                position = body.find(variant)
+                if position < 0:
+                    continue
+                for number in NUMBER_RE.finditer(variant):
+                    offset = line.start() + len(header) + position + number.start()
+                    offsets[offset] = dict(kind="verified_method_sentence", literal=number.group(),
+                                           band=rec["band"], offset=offset)
+                break
+    return offsets
+
+
 def metadata_literal_warnings(section: str, task_dir: Path, records: list[dict],
                               gold: Book | None) -> list[dict]:
     targets = numeric_targets(task_dir)
     metadata = verified_header_numeric_offsets(section, records, gold)
     metadata.update(verified_source_label_numeric_offsets(section, task_dir, records, gold))
-    return [dict(item, warning="numeric target coincidence occurs only in verified workbook metadata")
+    metadata.update(verified_method_numeric_offsets(section, task_dir, records, gold))
+    return [dict(item, warning=("numeric target coincidence is part of an exactly rederived source method"
+                               if item["kind"] == "verified_method_sentence" else
+                               "numeric target coincidence occurs only in verified workbook metadata"))
             for item in sorted(metadata.values(), key=lambda item: item["offset"])
             if any(same_number(float(item["literal"].replace(",", "")), target) for target in targets)]
 
@@ -5066,6 +5568,7 @@ def audit_text(section: str, task_dir: Path, records: list[dict] | None = None,
     # counter that an unrelated sentence can spend before the real claim.
     permitted_offsets = set(verified_header_numeric_offsets(section, records or [], gold))
     permitted_offsets.update(verified_source_label_numeric_offsets(section, task_dir, records or [], gold, closure))
+    permitted_offsets.update(verified_method_numeric_offsets(section, task_dir, records or [], gold, closure))
     used_sentences = set()
     for rec in records or []:
         if closure and record_reach(rec) & set(closure):
@@ -5200,7 +5703,7 @@ def cmd_write(args):
 # which is never staged for the agent, and it never copies golden cached
 # values anywhere.
 
-FAITHCHECK_SCOPE_ENTRIES = METHOD_ENTRY_IDS | {"projection_rule", "distribution_policy"}
+FAITHCHECK_SCOPE_ENTRIES = METHOD_ENTRY_IDS | {"projection_rule", "distribution_policy", "column_literal_increment", "scenario_literal_increment"}
 
 
 def _fault(faults: list, rec, kind: str, claim: str, expected: str = "", found: str = ""):
@@ -5269,6 +5772,180 @@ def _heterogeneous_scope_partitioned(
         covered.update(keys)
     return covered == Counter({cell: 1 for cell in span})
 
+
+
+def _source_method_scope_partitioned(gold, span, disclosed, entry, closure):
+    """Prove a complete labelled family across distinct custom-method roles.
+
+    A copied conversion formula may cross debt, tax and working-capital rows.
+    Each sentence must still reproduce its own source formula and label; role
+    metadata cannot erase a missing, duplicated, graded or contradictory cell.
+    """
+    expected = set(span)
+    if (entry not in METHOD_ENTRY_IDS or len(expected) != len(span) or len(span) < 2
+            or expected & set(closure) or len({gold.row_label(c) for c in span}) <= 1
+            or any(not copy_compatible(gold, a, b) for a, b in zip(span, span[1:]))):
+        return False
+    covered = Counter()
+    entries = set()
+    for candidate in disclosed:
+        keys = _stated_keys(candidate)
+        if not expected.intersection(keys):
+            continue
+        old = candidate.get("method_profile") or {}
+        if (candidate.get("entry") not in METHOD_ENTRY_IDS
+                or candidate.get("source") != "custom_method_detector"
+                or candidate.get("value") != "out_of_catalogue"
+                or candidate.get("disposition") != "disclosed"
+                or candidate.get("leak_flag") or candidate.get("coverage_complete") is not True
+                or old.get("complete") is not True or len(set(keys)) != len(keys)
+                or set(keys) - expected or set(candidate.get("cell_keys") or []) != set(keys)):
+            return False
+        profile = formula_profile(gold, dict(band=old.get("band"), cell_keys=keys,
+            label=old.get("label", ""), pattern=old.get("pattern", "")))
+        if not profile.get("complete") or {k: v for k, v in profile.items() if k != "ast"} != old:
+            return False
+        fields = custom_sentence_fields(profile, gold, lock_cells=keys)
+        if not fields.pop("_coverage_complete", False) or fields != candidate.get("fields"):
+            return False
+        label = _unquote_label(fields.get("label"))
+        if not label or any(gold.row_label(c) != label for c in keys):
+            return False
+        entries.add(candidate["entry"])
+        covered.update(keys)
+    return len(entries) > 1 and covered == Counter({cell: 1 for cell in span})
+
+
+def _orthogonal_scope_partitioned(gold, span, disclosed, entry, closure):
+    """Verify intersecting complete families without merging their row labels.
+
+    A vertical copy family can intersect a separately disclosed horizontal
+    family. Only exact, complete perpendicular bands can contribute their one
+    intersection cell; every claim keeps its independently resolved source label.
+    """
+    expected = set(span)
+    if len(expected) != len(span) or len(expected) < 2:
+        return False
+    if expected & set(closure) or len({gold.row_label(c) for c in span}) <= 1:
+        return False
+    coords = [(*c.rsplit("!", 1)[:1], split_coord(c.rsplit("!", 1)[1])) for c in span]
+    if any(x[1] is None for x in coords) or len({x[0] for x in coords}) != 1:
+        return False
+    vertical = len({x[1][0] for x in coords}) == 1
+    horizontal = len({x[1][1] for x in coords}) == 1
+    if vertical == horizontal:
+        return False
+    covered = Counter()
+    orthogonal = False
+    for candidate in disclosed:
+        if candidate.get("entry") != entry:
+            continue
+        keys = _stated_keys(candidate)
+        intersection = expected.intersection(keys)
+        if not intersection:
+            continue
+        if not keys or len(set(keys)) != len(keys) or set(candidate.get("cell_keys") or []) != set(keys):
+            return False
+        if set(keys) & set(closure):
+            return False
+        label = _unquote_label((candidate.get("fields") or {}).get("label"))
+        if not label or any(gold.row_label(c) != label for c in keys):
+            return False
+        if set(keys) - expected:
+            if (candidate.get("source") != "custom_method_detector"
+                    or candidate.get("coverage_complete") is not True
+                    or candidate.get("method_profile", {}).get("complete") is not True
+                    or len(intersection) != 1):
+                return False
+            positions = [split_coord(c.rsplit("!", 1)[1]) for c in keys]
+            if any(p is None for p in positions) or {c.rsplit("!", 1)[0] for c in keys} != {coords[0][0]}:
+                return False
+            if vertical:
+                if len({p[1] for p in positions}) != 1:
+                    return False
+                full = full_copied_scope(gold, keys, closure)
+            else:
+                if len({p[0] for p in positions}) != 1:
+                    return False
+                full = full_copied_scope_vertical(gold, keys, closure)
+            if set(full) != set(keys) or any(not copy_compatible(gold, a, b) for a, b in zip(keys, keys[1:])):
+                return False
+            orthogonal = True
+        covered.update(intersection)
+    return orthogonal and covered == Counter({cell: 1 for cell in span})
+
+
+def _mixed_method_scope_warning(gold, delivered, span, disclosed, entry, closure,
+                                selection, assessments):
+    """Prove mixed standard/structural/custom categories in one copy family.
+
+    Standard and structural members keep their original classifications. They
+    cannot supply missing custom clauses. This exception affects scope wording
+    only; source references, numerical checks and reviews remain mandatory.
+    """
+    expected = set(span)
+    if (entry not in METHOD_ENTRY_IDS or not 2 <= len(span) <= 32
+            or len(expected) != len(span) or expected & set(closure)
+            or len({gold.row_label(c) for c in span}) <= 1
+            or selection is None or not expected <= {c for b in selection.get("bands", [])
+                for c in (b.get("stated_cell_keys") or b.get("cell_keys") or [])}
+            or any(delivered.has(c) for c in span)
+            or any(not copy_compatible(gold, a, b) for a, b in zip(span, span[1:]))):
+        return None
+    maximal = (full_copied_scope(gold, [span[0]], closure),
+               full_copied_scope_vertical(gold, [span[0]], closure))
+    if span not in maximal:
+        return None
+    covered = {}
+    for candidate in disclosed:
+        keys = _stated_keys(candidate)
+        if not expected.intersection(keys):
+            continue
+        if (candidate.get('entry') != entry or len(keys) != 1
+                or candidate.get('cell_keys') != keys or keys[0] in covered
+                or candidate.get('source') != 'custom_method_detector'
+                or candidate.get('value') != 'out_of_catalogue'
+                or candidate.get('coverage_complete') is not True
+                or candidate.get('leak_flag') is not False):
+            return None
+        covered[keys[0]] = candidate
+    if not covered or set(covered) == expected:
+        return None
+    prior = list(indexed_assessments.weighted(assessments))
+    evidence = []
+    for cell in span:
+        rows = [r for r, count in prior if count > 0 and cell in r.get('cell_keys', [])]
+        unique = {json.dumps(r, sort_keys=True) for r in rows}
+        if len(unique) != 1:
+            return None
+        old = rows[0]
+        if (old.get('cell_keys') != [cell] or old.get('cells') != [pretty(cell)]
+                or old.get('roles') != [entry] or old.get('entry') != entry
+                or old.get('label') != gold.row_label(cell)):
+            return None
+        sheet, coord = cell.rsplit('!', 1)
+        col, row = split_coord(coord)
+        band = make_band(gold, sheet, row, [(col_to_num(col), cell)])
+        base = {k: old[k] for k in ('band', 'cells', 'cell_keys', 'label', 'roles', 'role_context')}
+        rec, current = try_custom_role(gold, band, gold.row_label(cell), base, entry)
+        profile = formula_profile(gold, band)
+        if (current != old or not profile.get('complete')
+                or set(profile.get('references', [])) & set(closure)):
+            return None
+        if cell in covered:
+            if rec is None or current.get('status') != 'out_of_catalogue':
+                return None
+            actual = covered[cell]
+            if any(actual.get(k) != rec.get(k) for k in
+                   ('fields', 'method_profile', 'custom_reason', 'evidence', 'cells', 'cell_keys')):
+                return None
+        elif rec is not None or current.get('status') not in {'standard', 'structural'}:
+            return None
+        evidence.append(dict(cell=cell, formula=profile['formula'], label=profile['label'],
+                             classification=current, disclosed=cell in covered))
+    return dict(code='mixed_method_category_scope', family=span, entry=entry,
+                reason='Distinct source labels retain their proved standard, structural and custom classifications.',
+                cells=evidence, numerical_checks_waived=False, missing_custom_clauses=False)
 
 
 def _claimed_rows(rec: dict) -> set[tuple]:
@@ -5350,6 +6027,12 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
 
     faults: list[dict] = []
 
+    scope_warnings = []
+    try:
+        source_selection = read_stage(task_dir, "bands", runs_root)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        source_selection = None
+
     truncated: set[str] = set()
     referenced_rows: set[tuple] = set()
     if any(rec.get("entry") == "row_populated" for rec in disclosed):
@@ -5369,6 +6052,20 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
         cells = list(rec.get("cell_keys") or [])
         stated = _stated_keys(rec)
         anchor_cells = stated or cells
+
+        if entry == "npv_timing" and "target_cell" in fields and not verified_npv_cell_timing(rec, gold):
+            _fault(faults, rec, "npv_cell_timing", "cell locator must identify the exact single periodic NPV source call",
+                   expected="unlabelled source cell with one periodic NPV series", found=fields)
+
+        if entry == "column_literal_increment" and not ship_column_literal_increment(
+                dict(rec), {"gold": gold, "delivered": delivered, "targets": closure}):
+            _fault(faults, rec, "column_increment", "column heading, full source mechanics or graded closure differs",
+                   expected="exact source-derived nongraded column increment", found="invalid record")
+
+        if entry == "scenario_literal_increment" and not ship_scenario_literal_increment(
+                dict(rec), {"gold": gold, "delivered": delivered, "targets": closure}):
+            _fault(faults, rec, "scenario_increment", "scenario block, complete source mechanics or graded closure differs",
+                   expected="exact source-derived nongraded scenario increment", found="invalid record")
 
         # ------------------------------------------------ (a) target label
         claimed_label = _unquote_label(fields.get("label"))
@@ -5474,6 +6171,18 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
             partitioned = _heterogeneous_scope_partitioned(
                 gold, span, disclosed, entry
             ) if len(span) > 1 else False
+            if not partitioned and len(span) > 1:
+                partitioned = _source_method_scope_partitioned(gold, span, disclosed, entry, closure)
+            if not partitioned and len(span) > 1:
+                partitioned = _orthogonal_scope_partitioned(gold, span, disclosed, entry, closure)
+            if not partitioned and len(span) > 1:
+                warning = _mixed_method_scope_warning(
+                    gold, delivered, span, disclosed, entry, closure,
+                    source_selection, payload.get("method_assessments", []))
+                if warning is not None:
+                    partitioned = True
+                    if warning not in scope_warnings:
+                        scope_warnings.append(warning)
             if "single-cell calculation" in sentence and len(span) > 1 and not partitioned:
                 _fault(
                     faults, rec, "scope",
@@ -5601,6 +6310,7 @@ def faithcheck_task(task_dir: Path, runs_root: Path = DEFAULT_RUNS_ROOT,
         "graded_closure_cells": len(closure),
         "faults": faults,
         "passed": not faults,
+        **({"warnings": scope_warnings} if scope_warnings else {}),
     }
 
 

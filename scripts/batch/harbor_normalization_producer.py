@@ -251,7 +251,8 @@ def prepare(s):
     normalization_body(body,source=b['source_file'],baseline=b['baseline_inputs'],draft=draft_record,rows=rows,bindings=b)
     oversized=K.encoded_size(body)>MAX_CONTEXT_BYTES
     evidence=store_evidence(run/'review-evidence.json',body);analysis=store_evidence(run/'analysis.json',rows)
-    require(not oversized and len(raw(evidence)) <= MAX_CONTEXT_BYTES,'complete normalization context exceeds bounded request size; no candidates may be dropped')
+    if oversized or len(raw(evidence)) > MAX_CONTEXT_BYTES:
+        raise K.RequestTooLarge('complete normalization context exceeds bounded request size; no candidates may be dropped')
     clean=[r for r in rows if r['clean']]
     request=None
     if clean:

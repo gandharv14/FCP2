@@ -16,6 +16,7 @@ import time
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
+from urllib.parse import urlsplit
 
 
 RELEASE_SCHEMA_VERSION = "workbook-release/v2"
@@ -57,6 +58,26 @@ EXTERNAL_RELATIONSHIP_TYPES = frozenset({
     "oleobject",
     "package",
 })
+PASSIVE_WEB_HYPERLINK_POLICY = "passive-web-hyperlinks/v1"
+HYPERLINK_RELATIONSHIP_TYPES = frozenset({
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/hyperlink",
+})
+
+
+def _passive_web_hyperlink(relation) -> bool:
+    """A web reference does not load workbook data or execute embedded content."""
+    if relation.get("Type") not in HYPERLINK_RELATIONSHIP_TYPES:
+        return False
+    target = relation.get("Target", "")
+    if any(ord(char) < 33 or ord(char) == 127 for char in target):
+        return False
+    try:
+        url = urlsplit(target)
+        return (url.scheme in {"http", "https"} and bool(url.hostname)
+                and url.username is None and url.password is None)
+    except ValueError:
+        return False
 
 
 class ReleasePublicationError(ValueError):
@@ -262,7 +283,8 @@ def _reject_external_package_artifacts(task_dir: Path) -> None:
                         target_mode = relation.attrib.get("TargetMode", "")
                         if (
                             type_name.casefold() in EXTERNAL_RELATIONSHIP_TYPES
-                            or target_mode.strip().casefold() == "external"
+                            or (target_mode.strip().casefold() == "external"
+                                and not _passive_web_hyperlink(relation.attrib))
                         ):
                             blocked_relationships.append(
                                 f"{relationship_part}:"

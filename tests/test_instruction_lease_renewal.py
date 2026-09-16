@@ -42,6 +42,43 @@ def test_renewal_preserves_checkpoint_and_executes_only_next_step(boundary):
     assert R.checkpoint_predecessor(renewed,complete)==cp
     with pytest.raises(ValueError):authorize(boundary)
 
+
+def test_pending_model_after_actual_renewal_keeps_renewed_predecessor(boundary,monkeypatch):
+    worker,s,old,cp,snap,path=boundary
+    complete=authorize(boundary);lease=Lease(**read(complete)['lease']);worker=replace(worker,lease_renewal=complete)
+    original=Path(cp['path']).read_bytes();tracker=path.read_bytes();calls=[]
+    request=worker.run/'immutable-review-request.json'
+    def operation(worker,selection,current,phase,directory,**options):
+        calls.append((phase,options['models'],current))
+        if not request.exists():request.write_bytes(b'original prepared request\n')
+        assert request.read_bytes()==b'original prepared request\n'
+        return selection,current,None if options['models'] else 'MODEL_REQUIRED'
+    monkeypatch.setattr(w,'_operation',operation)
+    first=w.step(worker,s,lease,checkpoint=complete,models=False)
+    second=w.step(worker,first.selection,first.lease,checkpoint=first.evidence,models=False)
+    done=w.step(worker,second.selection,second.lease,checkpoint=second.evidence,models=True)
+    assert first.status==second.status=='MODEL_REQUIRED' and done.status=='STEP_COMPLETE'
+    assert calls==[('disclosure-review',False,lease),('disclosure-review',False,lease),('disclosure-review',True,lease)]
+    assert Path(cp['path']).read_bytes()==original and path.read_bytes()==tracker
+    assert read(first.evidence)['intent']==read(second.evidence)['intent']==read(done.evidence)['intent']
+
+
+@pytest.mark.parametrize('fault',['old-lease','foreign-predecessor','pending-selection','pending-lease'])
+def test_pending_renewal_cannot_change_custody_or_predecessor(boundary,monkeypatch,fault):
+    worker,s,old,cp,snap,path=boundary
+    complete=authorize(boundary);lease=Lease(**read(complete)['lease']);worker=replace(worker,lease_renewal=complete)
+    monkeypatch.setattr(w,'_operation',lambda worker,s,l,*args,**kw:(s,l,'MODEL_REQUIRED'))
+    pending=w.step(worker,s,lease,checkpoint=complete,models=False);v=read(pending.evidence)
+    if fault=='foreign-predecessor':
+        intent=read(v['intent']);intent['previous']=cp
+        Path(v['intent']['path']).write_bytes(L.canonical(intent));v['intent']=record(v['intent']['path'])
+    elif fault=='pending-selection':v['selection']['unbound']=True
+    elif fault=='pending-lease':v['lease']=asdict(old)
+    if fault!='old-lease':Path(pending.evidence['path']).write_bytes(L.canonical(v))
+    def forbidden(*args,**kw):raise AssertionError('invalid pending custody reached an operation')
+    monkeypatch.setattr(w,'_operation',forbidden)
+    with pytest.raises(ValueError):w.step(worker,s,old if fault=='old-lease' else lease,checkpoint=record(pending.evidence['path']),models=True)
+
 @pytest.mark.parametrize('fault',['owner','token','selection','pending','uncertain','checkpoint','expired'])
 def test_invalid_boundary_cannot_renew(boundary,fault):
     worker,s,l,cp,snap,path=boundary;before=path.read_bytes()
@@ -164,3 +201,46 @@ def test_historical_snapshot_must_be_actual_completed_intent_code(tmp_path):
     def snapshot(root):return w.keep(tmp_path/(root.name+'.json'),{'root':str(root),'files':[{'relative':'worker.py','sha256':record(root/'worker.py')['sha256']}]})
     R.historical_code(snapshot(old),complete)
     with pytest.raises(ValueError,match='completed intent root'):R.historical_code(snapshot(new),complete)
+
+
+def test_known_disclosure_command_repair_keeps_its_permit_across_real_renewal(boundary,monkeypatch):
+    from scripts.batch import harbor_disclosure_command_repair as K
+    worker,s,old,cp,snap,path=boundary
+    permit=w.keep(worker.run/'command-repair/permit.json',dict(schema_version=K.SCHEMA,phase='disclosure-build'))
+    selected=replace(worker,code_repair=permit);original_step=w.step_directory;seen=[]
+    # Preserve the existing actual completed checkpoint in this fixture; the
+    # owning adapter independently binds its relocated completed command step.
+    monkeypatch.setattr(w,'step_directory',lambda worker,phase:original_step(replace(worker,code_repair=None),phase))
+    monkeypatch.setattr(K,'validate',lambda candidate,before:seen.append((candidate.code_repair,before['revision'])))
+    before=path.read_bytes();complete=R.authorize(selected,s,old,cp,snap,duration_ns=200,clock=lambda:30)
+    current=read(record(path));renewed=replace(selected,lease_renewal=complete);value=R.validate(renewed,current)
+    assert seen==[(permit,old.revision)]and current['revision']==old.revision+1
+    assert value['prior_continuations']['code_repair']==permit and value['checkpoint']==cp
+    assert read(complete)['lease']['owner']==old.owner and read(complete)['lease']['token']==old.token
+    assert value['semantic_budget_reset']is False
+
+
+def test_unrecognized_code_repair_cannot_reach_renewal_cas(boundary,monkeypatch):
+    worker,s,old,cp,snap,path=boundary
+    permit=w.keep(worker.run/'foreign-repair.json',dict(schema_version='unrecognized',phase='other'))
+    selected=replace(worker,code_repair=permit);raw=path.read_bytes()
+    with pytest.raises(ValueError,match='unsupported code repair renewal'):R.authorize(selected,s,old,cp,snap,duration_ns=200,clock=lambda:30)
+    assert path.read_bytes()==raw and not(worker.run/'lease-renewals').exists()
+
+@pytest.mark.parametrize('fault',[None,'foreign','changed','missing','wrong-snapshot'])
+def test_completed_command_repair_requires_exact_two_code_inventories(tmp_path,monkeypatch,fault):
+    from scripts.batch import harbor_disclosure_command_repair as K
+    roots=[tmp_path/'old',tmp_path/'selected'];rows=[];code={}
+    for root in roots:
+        root.mkdir();f=root/'module.py';f.write_text(root.name+'\n');code[str(f)]=record(f)['sha256'];rows.append(w.keep(tmp_path/(root.name+'.json'),dict(root=str(root),files=[dict(relative='module.py',sha256=record(f)['sha256'])])))
+    profile=w.keep(tmp_path/'profile.json',dict(workbook='0280',old_snapshot=rows[0],snapshot=rows[1]));permit=w.keep(tmp_path/'permit.json',dict(profile=profile,current_code=code))
+    (tmp_path/'0280.json').write_text('{}');worker=SimpleNamespace(code_repair=permit,context=SimpleNamespace(tracker_root=tmp_path))
+    monkeypatch.setattr(K,'selected',lambda worker:True);monkeypatch.setattr(K,'validate',lambda worker,before:read(permit))
+    supplied=dict(code)
+    if fault=='foreign':supplied[str(tmp_path/'foreign.py')]='a'*64
+    if fault=='missing':supplied.pop(next(iter(supplied)))
+    if fault=='changed':(roots[0]/'module.py').write_text('changed')
+    intent=w.keep(tmp_path/'intent.json',dict(code=supplied));checkpoint=w.keep(tmp_path/'complete.json',dict(intent=intent));snapshot=rows[0]if fault=='wrong-snapshot'else rows[1]
+    if fault is None:R.command_repair_history(worker,snapshot,checkpoint)
+    else:
+        with pytest.raises(ValueError):R.command_repair_history(worker,snapshot,checkpoint)

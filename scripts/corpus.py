@@ -89,7 +89,8 @@ def code_files():
     records = {name: digest(ROOT / name) for name in sorted(set(files))
                if (Path(name).suffix in {".py", ".sh", ".md", ".yaml", ".yml", ".toml", ".txt", ".json"}
                    or name == ".python-version")
-               and not name.startswith("release_out/") and (ROOT / name).is_file()}
+               and not name.startswith(("release_out/", "reports/", "diagnostics/"))
+               and (ROOT / name).is_file()}
     return _validate_code_records(ROOT, records)
 
 

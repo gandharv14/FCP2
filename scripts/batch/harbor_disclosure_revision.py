@@ -69,6 +69,39 @@ def rejected(review,manifest,manifest_sha):
     return blocked
 
 
+def date_reference_steps(old,new,disclosure):
+    """Permit only source-derived date-reference descriptions in method steps."""
+    from scripts.batch import harbor_instruction_producer as producer
+    renderer=producer.skill_module(Path(__file__).resolve().parents[2],'task-disclosure','disclose')
+    source=Path(disclosure['golden'])
+    require(record(source)['sha256']==disclosure['golden_sha256'],'reference-label source changed')
+    gold=renderer.Book(source)
+    profile=old.get('method_profile') or {}
+    require(old.get('source')=='custom_method_detector' and profile.get('complete')
+            and old.get('coverage_complete') and old.get('disposition')=='disclosed'
+            and old.get('leak_flag')is False,'complete disclosed source method required')
+    actual=renderer.formula_profile(gold,dict(band=profile['band'],cell_keys=old['cell_keys'],
+        label=profile['label'],pattern=profile['pattern']))
+    require({k:v for k,v in actual.items()if k!='ast'}==profile,'retained formula profile differs from source')
+    fields=renderer.custom_sentence_fields(actual,gold,lock_cells=renderer._stated_keys(old))
+    require(fields.pop('_coverage_complete',False) and fields==new['fields'],
+            'corrected method steps were not rederived from source')
+    expected=old['fields']['steps'];changed=False
+    sheet=profile['representative_cell'].rsplit('!',1)[0]
+    for raw in dict.fromkeys(profile['raw_references']):
+        refs=renderer.refs_in('='+raw,sheet)
+        if len(refs)!=1 or not renderer.date_series_reference(gold,refs[0]):continue
+        corrected=renderer.describe_ref(gold,raw,sheet,profile['label'])
+        suffix=' containing a date value'
+        require(corrected.endswith(suffix),'single source date description required')
+        label=gold.row_label(refs[0])
+        if not label:continue
+        previous=corrected[:-len(suffix)]+' on the row labelled '+renderer.q(label)
+        if previous in expected:expected=expected.replace(previous,corrected);changed=True
+    require(changed and expected==new['fields']['steps'],
+            'reference repair changed more than adjacent date-series labels')
+
+
 def label_changes(old,new,old_manifest,new_manifest,blocked):
     """No scope, operator, source, row count or passing sentence may change."""
     require(set(old)==set(new),'disclosure schema changed')
@@ -78,6 +111,9 @@ def label_changes(old,new,old_manifest,new_manifest,blocked):
     for index,(a,b) in enumerate(zip(old['records'],new['records'])):
         require(set(a)==set(b),'record schema changed')
         if a==b:continue
+        if ({k for k in a if a[k]!=b[k]}=={'fields'} and set(a['fields'])==set(b['fields'])
+                and {k for k in a['fields']if a['fields'][k]!=b['fields'][k]}=={'steps'}):
+            date_reference_steps(a,b,old);changed.append(index);continue
         require({k for k in a if a[k]!=b[k]}<=allowed and set(a['fields'])==set(b['fields'])
                 and {k for k in a['fields'] if a['fields'][k]!=b['fields'][k]}=={'label'},'correction changed more than target label')
         oldlabel=a['fields']['label'].strip('"');newlabel=b['fields']['label'].strip('"')
@@ -211,6 +247,9 @@ def _complete(worker,selection,lease,old_snapshot,directory,context,*,recovery=N
 def validate(worker,before):
     from scripts.batch import harbor_instruction_worker as W
     binding=worker.disclosure_revision;p=read(binding)
+    if p.get('source_revision') is not None:
+        from scripts.batch.harbor_disclosure_source_revision import validate
+        return validate(worker,before)
     if p.get('schema_version')=='harbor-disclosure-manifest-revision/v1':
         from scripts.batch.harbor_disclosure_manifest_revision import validate
         return validate(worker,before)
@@ -271,6 +310,9 @@ def permit_history(p):
 
 def validate_task(task):
     p=read(task.disclosure_revision)
+    if p.get('source_revision') is not None:
+        from scripts.batch.harbor_disclosure_source_revision import validate_task
+        return validate_task(task)
     if p.get('schema_version')=='harbor-disclosure-manifest-revision/v1':
         from scripts.batch.harbor_disclosure_manifest_revision import validate_task
         return validate_task(task)
@@ -292,6 +334,9 @@ def validate_review_history(binding,call,manifest,instruction,disclosure):
     if binding is None:
         require(budget!=BUDGET,'corrective review requires retained revision authority');return {}
     p=read(binding)
+    if p.get('source_revision') is not None:
+        from scripts.batch.harbor_disclosure_source_revision import validate_review_history
+        return validate_review_history(binding,call,manifest,instruction,disclosure)
     if p.get('schema_version')=='harbor-disclosure-manifest-revision/v1':
         from scripts.batch.harbor_disclosure_manifest_revision import validate_review_history
         return validate_review_history(binding,call,manifest,instruction,disclosure)

@@ -102,7 +102,7 @@ def _validate_tracker(d):
                 text(v.get('path'),'/artifact_hashes/'+p+'/path',False)
                 digest(v.get('sha256'),'/artifact_hashes/'+p+'/sha256',False)
             else:digest(v,'/artifact_hashes/'+p,False)
-    c=obj(d.get('current_confidence'),'/current_confidence',{'level','reason_codes','contributors','computed_at_revision'},{'level','reason_codes','contributors','computed_at_revision'})
+    c=obj(d.get('current_confidence'),'/current_confidence',{'level','reason_codes','contributors','computed_at_revision','verified_profile_skips'},{'level','reason_codes','contributors','computed_at_revision'})
     need(c.get('level') in {None,'low','medium','high'},'/current_confidence/level','invalid confidence')
     reasons=arr(c.get('reason_codes'),'/current_confidence/reason_codes');need(all(isinstance(x,str) and x for x in reasons),'/current_confidence/reason_codes','expected nonempty reason strings');contributors=arr(c.get('contributors'),'/current_confidence/contributors')
     need(all(x in LANES for x in contributors) and len(set(x for x in contributors if isinstance(x,str)))==len(contributors),'/current_confidence/contributors','invalid contributors')
@@ -145,8 +145,15 @@ def _validate_tracker(d):
         for k in ('summary','why_not_promoted','next_action'):text(f.get(k),'/promotion_failure/'+k,False)
         if integer(f.get('first_seen')) and integer(f.get('last_seen')):need(f['first_seen']<=f['last_seen'],'/promotion_failure','reversed observation times')
     if d.get('execution_state')=='STOPPED':need(isinstance(failure,dict) and failure.get('fixability') in {'terminal','exhausted'} and d.get('terminal_verdict')=='STOPPED' and d.get('final_status')=='STOPPED','/execution_state','STOPPED requires matching terminal failure and verdict')
+    verified_skip=False
+    if 'verified_profile_skips' in c:
+        try:
+            from scripts.batch.harbor_profile_skips import validate_marker
+            verified_skip=c.get('level')=='medium' and validate_marker(d,c['verified_profile_skips'])is True
+        except (ValueError,TypeError,KeyError,OSError):verified_skip=False
+        need(verified_skip,'/current_confidence/verified_profile_skips','invalid source-bound public capture skip')
     if d.get('execution_state') in {'publication_queued','PROMOTED'}:
-        need(failure is None and c.get('level')=='high' and len(levels)==len(LANES) and all(isinstance(lanes.get(x),dict) and lanes[x].get('state')=='passed' for x in LANES),'/execution_state','qualification requires all lanes passed/high and no failure')
+        need(failure is None and (c.get('level')=='high' or verified_skip) and len(levels)==len(LANES) and all(isinstance(lanes.get(x),dict) and lanes[x].get('state')=='passed' for x in LANES),'/execution_state','qualification requires all lanes passed/high and no failure')
     if d.get('execution_state')=='PROMOTED':need(d.get('terminal_verdict')==d.get('final_status')=='PROMOTED' and all(d.get('promotion_ids',{}).get(k) for k in ('task_generation_id','release_id')),'/execution_state','promotion identity or verdict missing')
     if issues:raise InvalidTracker(issues)
     return d

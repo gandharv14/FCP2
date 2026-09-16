@@ -33,6 +33,41 @@ def test_source_ast_blank_closure_labels_and_complete_union(tmp_path,monkeypatch
     assert ['Model!C1','Model!A2'] in decoded['dependency_edges']
     assert E.validate_plan(plan,body,*paths,root=ROOT)==plan
 
+
+def test_redacted_delivered_formula_keeps_its_own_dependency_evidence(tmp_path,monkeypatch):
+    body,paths=body_fixture(tmp_path,monkeypatch,1,formula='=SUM(D1:D3)')
+    for name,path in zip(('golden','delivered'),paths):
+        w=openpyxl.load_workbook(path);ws=w.active
+        ws['D1']=10 if name=='golden'else 12
+        ws['D3']=30 if name=='golden'else None
+        if name=='delivered':ws['C1']=None
+        w.save(path);w.close();body['workbooks'][name]=S.workbook_evidence(record(path));body['manifest']['input_hashes'][name]=record(path)['sha256']
+    p=E.plan(body,*paths,root=ROOT);pair={k:E.decode_workbook(v)for k,v in p['batches'][0]['workbooks'].items()}
+    assert pair['golden']['selected_refs']==pair['delivered']['selected_refs']
+    assert pair['golden']['present']['Model!D1']['value']==10
+    assert pair['delivered']['present']['Model!D1']['value']==12
+    assert {'Model!C1','Model!D2','Model!D3'}<=set(pair['delivered']['blank_refs'])
+    assert pair['golden']['present']['Model!D3']['value']==30
+    assert not any(edge[0]=='Model!C1'for edge in pair['delivered']['dependency_edges'])
+    assert 'Model!Z999'not in pair['delivered']['selected_refs']and pair['delivered']['unknown_elsewhere']
+    assert E.validate_plan(p,body,*paths,root=ROOT)==p
+    with pytest.raises(E.ScopeDiagnosisRequired):E.plan(body,*paths,root=ROOT,max_bytes=100)
+
+
+def test_paired_closure_reaches_dependencies_alternating_between_sources(tmp_path,monkeypatch):
+    body,paths=body_fixture(tmp_path,monkeypatch,1,formula='=D1')
+    for name,path in zip(('golden','delivered'),paths):
+        w=openpyxl.load_workbook(path);ws=w.active
+        if name=='golden':ws['D1']=5;ws['E1']='=F1';ws['F1']=17
+        else:ws['C1']=None;ws['D1']='=E1';ws['E1']=9
+        w.save(path);w.close();body['workbooks'][name]=S.workbook_evidence(record(path));body['manifest']['input_hashes'][name]=record(path)['sha256']
+    p=E.plan(body,*paths,root=ROOT);pair={k:E.decode_workbook(v)for k,v in p['batches'][0]['workbooks'].items()}
+    assert pair['golden']['selected_refs']==pair['delivered']['selected_refs']
+    assert pair['golden']['present']['Model!F1']['value']==17
+    assert 'Model!F1'in pair['delivered']['blank_refs']
+    assert ['Model!D1','Model!E1']in pair['delivered']['dependency_edges']
+    assert ['Model!E1','Model!F1']in pair['golden']['dependency_edges']
+
 @pytest.mark.parametrize('mutation',['blank','present','edge','sentence','coverage','extra'])
 def test_projection_tampering_rejected(tmp_path,monkeypatch,mutation):
     body,paths=body_fixture(tmp_path,monkeypatch);p=E.plan(body,*paths,root=ROOT,max_sentences=2)
@@ -72,13 +107,19 @@ def test_cyclic_dependencies_terminate_and_are_retained(tmp_path,monkeypatch):
     assert ['Model!C1','Model!D1'] in edges and ['Model!D1','Model!C1'] in edges
 
 
-def test_named_reference_conservatively_retains_complete_snapshot(tmp_path,monkeypatch):
+def test_static_named_reference_retains_exact_definition_and_complete_area(tmp_path,monkeypatch):
     from openpyxl.workbook.defined_name import DefinedName
     body,paths=body_fixture(tmp_path,monkeypatch,1,'=NamedInputs')
     for name,p in zip(('golden','delivered'),paths):
         w=openpyxl.load_workbook(p);w.defined_names.add(DefinedName('NamedInputs',attr_text='Model!$A$1:$A$3'));w.save(p);w.close();body['workbooks'][name]=S.workbook_evidence(record(p));body['manifest']['input_hashes'][name]=record(p)['sha256']
     plan=E.plan(body,*paths,root=ROOT)
-    assert plan['batches'][0]['workbooks']['golden']['closure']=='full_snapshot_fallback'
+    shard=plan['batches'][0]['workbooks']['golden']
+    assert shard['closure']=='exact_ast_closure'
+    assert 'Model!A2' in E.decode_workbook(shard)['blank_refs']
+    assert shard['snapshot_metadata']['resolved_defined_names'][0]['definition']=='Model!$A$1:$A$3'
+    assert E.validate_plan(plan,body,*paths,root=ROOT)==plan
+    shard['snapshot_metadata']['resolved_defined_names'][0]['definition']='Model!$A$99'
+    with pytest.raises(ValueError,match='differs'):E.validate_plan(plan,body,*paths,root=ROOT)
 
 
 def test_cached_presence_and_unknown_addresses_are_not_conflated(tmp_path,monkeypatch):

@@ -221,6 +221,22 @@ def test_equivalent_primitive_spellings_redact_without_digit_exemption(text,valu
     assert '[redacted]' in redacted
 
 
+@pytest.mark.parametrize('text,forbidden',[
+    ('Total 1,327.163 and 1,328.488.',{'1'}),
+    ('Signed value -1.',{'1'}),
+    ('Grouped value 7,123,456.',{'123'}),
+])
+def test_numeric_fragment_gate_redacts_whole_token(text,forbidden):
+    redacted=P.redact(text,forbidden)
+    assert '[redacted]' in redacted
+    assert P.validator().leaked_value(redacted,forbidden) is None
+    assert not any(char.isdigit()for char in redacted)
+
+
+def test_numeric_fragment_redaction_preserves_unrelated_numbers_and_text():
+    assert P.redact('Series metadata: 19 and 23,700.363; total 1,327.163.',{'1'}) == 'Series metadata: 19 and 23,700.363; total [redacted].'
+
+
 @pytest.mark.parametrize('ip',['224.0.0.1','ff02::1','255.255.255.255'])
 def test_multicast_broadcast_not_valid_http_targets(ip):
     assert not P.public_address(ip)

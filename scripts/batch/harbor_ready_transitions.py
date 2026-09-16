@@ -45,7 +45,27 @@ def _semantic_attempts(before,selection,proof):
     return attempts
 
 
+def _verified_profile_skip(result):
+    return (isinstance(result,dict) and result.get('confidence')=='medium'
+            and all(type(result.get(k))is int for k in ('public_sources','accepted_profiles','skipped_profiles'))
+            and result['public_sources']>0 and result['accepted_profiles']>=0 and result['skipped_profiles']>0
+            and result['accepted_profiles']+result['skipped_profiles']==result['public_sources']
+            and isinstance(result.get('skip_reasons'),list) and len(result['skip_reasons'])==result['skipped_profiles']
+            and all(reason in {'http_401','http_403'}for reason in result['skip_reasons']))
+
+
+def _profile_medium(proof):
+    check=proof.get('checks',{}).get('accepted_public_profiles',{})
+    return check.get('checked')is True and _verified_profile_skip(check.get('result'))
+
+
 def _proof(before, selection, *, runtime_producer=None):
+    from scripts.batch.harbor_completed_lanes import pair_validation_scope
+    with pair_validation_scope():
+        return _proof_current(before, selection, runtime_producer=runtime_producer)
+
+
+def _proof_current(before, selection, *, runtime_producer=None):
     from scripts.batch.harbor_complete_readiness import complete_readiness
     s = selection.content
     require(s.workbook == before['workbook_id'], 'foreign readiness workbook')
@@ -68,7 +88,11 @@ def _proof(before, selection, *, runtime_producer=None):
         else:
             result=check_completed_gate(view,CompletionEvidence(kind,selection),notes.RootContext(Path('.'),s.trusted_public_key),
                                         **({'runtime_producer':runtime_producer} if runtime_producer is not None else {}))
-        require(result['passed'] and result.get('confidence','high')=='high','canonical owning revalidation failed: '+kind)
+        profile_skip=False
+        if kind=='source_profile' and result.get('confidence')=='medium':
+            from scripts.batch.harbor_profile_readiness import validate_profiles
+            profile_skip=_verified_profile_skip(validate_profiles(selection.public_profiles,root=ROOT))
+        require(result['passed'] and (result.get('confidence','high')=='high' or profile_skip),'canonical owning revalidation failed: '+kind)
         view['bindings'].update(result['bindings'])
         view['lane_state'][lane].update(state='running' if kind=='normalization_phase1' else 'passed',phase=result.get('phase'))
         invocation_evidence.extend(result['evidence']);invocations.append(kind)
@@ -81,7 +105,7 @@ def _proof(before, selection, *, runtime_producer=None):
     require(all(v.get('checked') is True for v in proof['checks'].values()), 'unchecked readiness gate')
     lifecycle.check_records(proof['evidence'])
     attempts=_semantic_attempts(before,selection,proof)
-    require(proof['checks']['accepted_public_profiles']['result']['confidence'] == 'high', 'profile confidence is not high')
+    require(proof['checks']['accepted_public_profiles']['result']['confidence']=='high' or _profile_medium(proof),'profile gap lacks verified generic fallback')
     proof['semantic_attempts']=attempts
     return proof
 
@@ -125,7 +149,7 @@ def _after(before, action, selection, proof, now, notespath, published=None, pri
         _old_notes(before)
     else:
         notes.validate_notes_pair(before, prior_notes)
-    old_failure = before['promotion_failure']
+    old_failure = before['promotion_failure'];profile_medium=_profile_medium(proof)
     if action in {'clear', 'resume'}:
         require(old_failure is not None, 'there is no failure to clear')
         # The complete fixed checker must cover a gate that actually owned the
@@ -133,7 +157,7 @@ def _after(before, action, selection, proof, now, notespath, published=None, pri
         require(old_failure['lane'] in schema.LANES, 'owning failure lane is missing')
         require(proof.get('canonical_invocations') == [kind for kind,_ in __import__('scripts.batch.harbor_completed_lanes',fromlist=['STEPS']).STEPS], 'complete canonical revalidation order is missing')
     else:
-        require(old_failure is None and all(row.get('state') == 'passed' and row.get('current_confidence') == 'high' for row in before['lane_state'].values()), 'all canonical lanes must already pass')
+        require(old_failure is None and all(row.get('state')=='passed' and row.get('current_confidence')==('medium' if profile_medium and lane=='harbor-source-profiler' else 'high') for lane,row in before['lane_state'].items()), 'all canonical lanes must already pass')
     if action == 'resume':
         require(before['execution_state'] == 'STOPPED' and all(v is None for v in before['leases'].values()), 'resume requires STOPPED with independently released leases')
     elif action == 'promoted':
@@ -148,12 +172,15 @@ def _after(before, action, selection, proof, now, notespath, published=None, pri
     if action in {'clear', 'resume'}:
         after['failure_history'].append(dict(event='clear', revision=after['revision'], failure=copy.deepcopy(old_failure), result='complete_current_readiness', evidence_paths=evidence))
         after['promotion_failure'] = None
-        for row in after['lane_state'].values():
-            row.update(state='passed', current_confidence='high', evidence_paths=evidence)
+        for lane,row in after['lane_state'].items():
+            row.update(state='passed',current_confidence='medium' if profile_medium and lane=='harbor-source-profiler' else 'high',evidence_paths=evidence)
         after['lane_state']['harbor-normalization-engineer']['phase']='phase2_complete'
         for row in after['lane_state'].values():
-            row['confidence_history'].append(dict(level='high', reason='complete_current_readiness', revision=after['revision']))
-    after['current_confidence'] = dict(level='high', reason_codes=['complete_current_readiness'], contributors=list(schema.LANES), computed_at_revision=after['revision'])
+            row['confidence_history'].append(dict(level=row['current_confidence'],reason='verified_public_access_skip' if row['current_confidence']=='medium' else 'complete_current_readiness',revision=after['revision']))
+    after['current_confidence'] = dict(level='medium' if profile_medium else 'high', reason_codes=['complete_current_readiness','verified_public_access_skip'] if profile_medium else ['complete_current_readiness'], contributors=list(schema.LANES), computed_at_revision=after['revision'])
+    if profile_medium:
+        from scripts.batch.harbor_profile_skips import marker
+        after['current_confidence']['verified_profile_skips']=marker(after,selection.public_profiles)
     after['confidence_history'].append(copy.deepcopy(after['current_confidence']))
     after.update(current_gate=None, last_gate=action, execution_state='running' if action in {'clear', 'resume'} else 'publication_queued', terminal_verdict=None if action in {'clear', 'resume'} else 'PUBLICATION_READY', final_status=None, stop_reason=None, staged_path=str(selection.content.stage))
     after['bindings']['staged_bundle'] = dict(path=str(selection.content.stage), sha256=proof['stage_sha256'])

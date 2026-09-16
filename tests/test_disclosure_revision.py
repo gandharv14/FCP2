@@ -75,7 +75,7 @@ def test_evaluator_delta_is_not_a_disclosure_revision(tmp_path):
 def test_new_review_scope_carries_original_history_and_never_reuses_uuid(tmp_path,monkeypatch):
     tracker=put(tmp_path/'tracker.json',{'tracker':'real retained identity'})
     receipt=put(tmp_path/'permit.json',{'revision':2,'limit':2,'original_attempt_id':'old','physical_count':1})
-    t=SimpleNamespace(run=tmp_path/'producer',tracker=tracker,policy=SimpleNamespace(model='m',reasoning_effort='high'),stage_tree={},disclosure_revision=receipt)
+    t=SimpleNamespace(run=tmp_path/'producer',tracker=tracker,policy=SimpleNamespace(model='m',reasoning_effort='high'),stage_tree={},disclosure_revision=receipt,dialogue_pre_review_repair=None)
     identity=dict(workbook='0056',original={'sha256':'a'*64})
     monkeypatch.setattr(P,'lane_context',lambda *a:({},identity));monkeypatch.setattr(P,'code_evidence',lambda t:[]);monkeypatch.setattr(R,'validate_task',lambda t:read_receipt(t))
     req=P._request(t,'disclosure-review',P.DISCLOSURE,1,1,{},'Review every sentence',[])
@@ -222,7 +222,7 @@ def test_full_request_validation_handles_binary_workbook_budget_before_receipt(t
     payload=put(tmp_path/'request.json',{})
     context=put(tmp_path/'context.json',dict(kind='disclosure-review',stage_tree={},workbook='0056',original=original,
         disclosure_revision=revision,evidence=[revision],budget_evidence=[record(binary),record(receipt_snapshot)],request=payload,ordinal=1,limit=1,response_mode='json_object',code=[]))
-    t=SimpleNamespace(disclosure_revision=revision,run=tmp_path/'producer',stage_tree={},code_repair=None)
+    t=SimpleNamespace(disclosure_revision=revision,run=tmp_path/'producer',stage_tree={},code_repair=None,dialogue_pre_review_repair=None)
     prepared=E.PreparedCall(payload,Policy('project'),E.SemanticScope('0056','a'*64,P.DISCLOSURE,R.BUDGET),1,1,'00000000-0000-4000-8000-000000000001',(record(binary),record(receipt_snapshot)))
     request=P.Request(prepared,context)
     monkeypatch.setattr(P,'task_context',lambda t:({},dict(workbook='0056',original=original)))

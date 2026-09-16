@@ -98,7 +98,23 @@ def _disclosure_history(worker,before):
     return records
 
 
-def _failure(worker, selected, lease, blocked):
+def _takeover_history(worker, blocked, before, lease, takeover):
+    """Prove one explicitly selected completed custody chain without renewal."""
+    from scripts.batch import harbor_lease_takeover as T
+    w = _worker(); failed = read(blocked)
+    original_worker = replace(worker, retry=None)
+    phase = failed['step']
+    require(phase in ('nat-writer', 'nat-review') and
+            blocked == record(w.step_directory(original_worker, phase)/'blocked.json'),
+            'takeover detached from original blocked NAT')
+    request = w.request_saved(w.step_directory(original_worker, phase)/'request.json')
+    original = read(request.context)['budget_evidence'][0]
+    T.continuation_chain(original, failed['lease'], before, lease,
+        takeover=takeover, tracker_path=worker.context.tracker_root/(before['workbook_id']+'.json'))
+    return T.completion_records(takeover)
+
+
+def _failure(worker, selected, lease, blocked, takeover=None):
     w = _worker()
     require(worker.retry is None, 'a retry cannot authorize another retry')
     facade, before, tracker = w.active(worker, selected, lease)
@@ -111,7 +127,10 @@ def _failure(worker, selected, lease, blocked):
     request = w.request_saved(w.step_directory(worker,'nat-writer')/'request.json')
     request_context = read(request.context)
     blocked_request=w.request_saved(w.step_directory(worker,phase)/'request.json')
-    _renewal_chain(read(blocked_request.context)['budget_evidence'][0], failed['lease'], before, lease)
+    if takeover is None:
+        _renewal_chain(read(blocked_request.context)['budget_evidence'][0], failed['lease'], before, lease)
+    else:
+        _takeover_history(worker, blocked, before, lease, takeover)
     require(not any(h.get('schema_version') == SCHEMA for h in before['handoffs']), 'round2 already authorized')
     require(not (w.step_directory(worker,phase)/'exception.json').exists(), 'unknown interrupted writer is not a semantic retry')
     for later_phase in w.STEPS[w.STEPS.index(phase)+1:]:
@@ -237,7 +256,7 @@ def _project(before, permit_binding):
     return after
 
 
-def authorize(worker, selected, lease, *, blocked, _fault=lambda _: None):
+def authorize(worker, selected, lease, *, blocked, takeover=None, _fault=lambda _: None):
     """Root prepares an immutable retry permit and CAS records one spent round.
 
     An interrupted transaction is not rerun. Use recover() with the exact permit.
@@ -247,7 +266,8 @@ def authorize(worker, selected, lease, *, blocked, _fault=lambda _: None):
     worker.run.mkdir(parents=True, exist_ok=True)
     with (worker.run / 'worker.lock').open('a+b') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        before, tracker, state, nat, prefix, initial = _failure(worker, selected, lease, blocked)
+        before, tracker, state, nat, prefix, initial = _failure(worker, selected, lease, blocked,
+            **({'takeover': takeover} if takeover is not None else {}))
         directory = worker.run / 'nat-retry-02'
         require(not directory.exists(), 'retry transaction already prepared; explicit reconciliation required')
         directory.mkdir()
@@ -255,6 +275,8 @@ def authorize(worker, selected, lease, *, blocked, _fault=lambda _: None):
         producer.put(directory / 'intent.json', dict(blocked=blocked, tracker=tracker, code=current_code))
         proof = _fresh_prefix(before, selected, worker.context)
         records = proof + [tracker, blocked, initial, *prefix] + _disclosure_history(worker,before)
+        if takeover is not None:
+            records += _takeover_history(worker, blocked, before, lease, takeover)
         if worker.lease_renewal is not None:
             from scripts.batch.harbor_instruction_lease_renewal import history
             records += history(worker,before)
@@ -274,11 +296,13 @@ def authorize(worker, selected, lease, *, blocked, _fault=lambda _: None):
             initial=initial, prefix=prefix, before=before_copy, selection=codec.encode(selected), lease=asdict(lease),
             code=current_code, rejection_phase=read(blocked)['step'], original_attempt=state['attempts'][0], prior_state=state, copies=copies,
             spent=1, remaining=1, limit=2, semantic_budget_reset=False,
+            **({'lease_takeover': takeover} if takeover is not None else {}),
             **({'prior_continuations':_prior_continuations(worker)} if _prior_continuations(worker) else {})))
         _fault('prepared')
         def mutate(after):
             require(w.code(worker) == current_code, 'code changed before retry CAS')
-            fresh = _failure(worker, selected, lease, blocked)
+            fresh = _failure(worker, selected, lease, blocked,
+                **({'takeover': takeover} if takeover is not None else {}))
             require(fresh[0] == before and fresh[2] == state, 'retry evidence changed before CAS')
             lifecycle.check_records([c['original'] for c in copies])
             projected = _project(before, permit)
@@ -321,11 +345,31 @@ def recover(worker, permit, lease):
 
 def validate(worker, before):
     """Read-only consumer of root-selected CAS evidence, never a PASS callback."""
+    return _validate(worker,before,_worker().code(worker))
+
+
+def validate_historical_integrity(worker,before,snapshot):
+    from scripts.batch.harbor_instruction_lease_renewal import _historical_inventory
+    expected=_historical_inventory(worker,snapshot)
+    current=Path(__file__).resolve().parents[2]
+    relative=Path('.cursor/skills/naturalize-finance-task-instruction')
+    def skill_inventory(root):
+        paths=(root/relative).rglob('*');result={}
+        for p in paths:
+            require(not p.is_symlink(),'historical NAT skill contains a symlink')
+            if p.is_file()and '__pycache__'not in p.parts:result[str(p.relative_to(root/relative))]=record(p)['sha256']
+        return result
+    old_skill=skill_inventory(worker.root)
+    require(old_skill and old_skill==skill_inventory(current),'historical NAT validator bytes changed')
+    return _validate(worker,before,expected,skill_root=current)
+
+
+def _validate(worker,before,expected_code,*,skill_root=None):
     w = _worker(); completion = read(worker.retry)
     require(completion['schema_version'] == SCHEMA, 'unknown retry completion')
     value = read(completion['permit'])
     require(value['schema_version'] == SCHEMA and value['worker_run'] == str(worker.run), 'foreign retry permit')
-    require(value['code'] == w.code(worker), 'retry code changed; fresh root revalidation required')
+    require(value['code'] == expected_code, 'retry code changed; fresh root revalidation required')
     require(value.get('prior_continuations',{})==_prior_continuations(worker),'NAT retry detached disclosure history')
     _disclosure_history(worker,before)
     if worker.lease_renewal is not None:
@@ -335,6 +379,10 @@ def validate(worker, before):
         lifecycle.checked_record(binding)
     require(dict(schema_version=SCHEMA, permit=completion['permit']) in before['handoffs'], 'retry lacks tracker CAS authority')
     after = read(completion['after']); old = read(value['before'])
+    if 'lease_takeover' in value:
+        records = _takeover_history(worker, value['blocked'], old, Lease(**value['lease']), value['lease_takeover'])
+        require(all(row in [item['original'] for item in value['copies']] for row in records),
+                'NAT permit lost completed takeover evidence')
     expected = _project(old, completion['permit'])
     expected['revision'] += 1; expected['updated_at'] = after['updated_at']
     expected['leases']['task_agent']['heartbeat_at'] = after['updated_at']
@@ -344,7 +392,7 @@ def validate(worker, before):
         lifecycle.checked_record(row['retained'])
         require(row['original']['sha256'] == row['retained']['sha256'], 'archived evidence changed')
     n = worker.run / 'producer/naturalization'
-    r = producer.skill_module(worker.root, 'naturalize-finance-task-instruction', 'naturalize_recovery')
+    r = producer.skill_module(skill_root or worker.root, 'naturalize-finance-task-instruction', 'naturalize_recovery')
     state = r._read_state(n); r._verified_snapshot(n, state); r._verified_budget(n, state); r._verify_attempt_evidence(n, state)
     require(state['attempts'] and state['attempts'][0] == value['original_attempt'] and 1 <= r._attempts_used(state) <= 2, 'original writer attempt or cumulative budget changed')
     require(state['source_sha256'] == value['prior_state']['source_sha256'] and state['attempt_limit'] == 2 and not state.get('budget_inheritance'), 'NAT source or budget scope changed')

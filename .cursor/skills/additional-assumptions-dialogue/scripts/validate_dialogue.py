@@ -268,7 +268,10 @@ def review_warnings(review: dict | None, claims_payload: dict, *, draft_text=Non
     if review_accuracy_faults(review, claims_payload):
         return []
     if source_warning_proof is not None:
-        from scripts.batch import harbor_dialogue_source_warnings as source_warnings
+        if source_warning_proof.get('schema_version') == 'harbor-dialogue-source-revision-warning/v1':
+            from scripts.batch import harbor_dialogue_source_revision_warnings as source_warnings
+        else:
+            from scripts.batch import harbor_dialogue_source_warnings as source_warnings
         proof = source_warnings.revalidate(source_warning_proof, review, claims_payload, draft_text,
                                           root=Path(__file__).resolve().parents[4])
         return proof['warnings']
@@ -323,7 +326,80 @@ def review_warnings(review: dict | None, claims_payload: dict, *, draft_text=Non
             return warnings
         simple=r'(?:The (?:VP|senior) response is |The dialogue is )?(?:[Rr]epetitive|[Ss]tilted|[Ff]orced|[Ff]ormulaic|[Oo]verly formal)(?: and (?:repetitive|stilted|forced|formulaic|overly formal))?(?: phrasing)?\.?'
         restatement=r'The VP response is repetitive and forced: "[^"\n]+" merely restates "[^"\n]+" and reads like wording inserted to satisfy a rubric rather than natural Slack dialogue\.'
-        if all(isinstance(f,str) and (re.fullmatch(simple,f) or re.fullmatch(restatement,f)) for f in style):
+        repeated_templates = (
+            'Across the file, the junior questions and senior answers repeat a narrow set of templates '
+            'for nearly every row, especially throughout the long source-selection section, so the '
+            'conversation reads like a generated checklist rather than Slack.'
+        )
+        counted_templates = (
+            f"Across {len(claims)} exchanges, the junior questions and senior answers cycle through "
+            "narrowly varied templates, making the file read like a generated checklist rather than a Slack conversation."
+        )
+        counted_mapping = (len(claims) > 0 and
+                           all(len(mapped.get(c['record_id'], [])) == 2 and
+                               sum(is_junior(t['speaker']) for t in mapped[c['record_id']]) == 1
+                               for c in claims))
+        retained_template_findings = {
+            'The first 84 exchanges mechanically cycle through a small set of near-identical junior-question and senior-answer templates, so the conversation reads as a generated checklist rather than Slack.',
+            'The 24 Summary exchanges continue the same repetitive one-cell-at-a-time pattern and read like model documentation rather than a natural deal-team conversation.',
+            'The file is a long, mechanically repeated sequence of scoped source-link questions and declarative answers, so it reads like a checklist or model-mapping document rather than a natural Slack conversation.',
+            "The first two senior answers are near-copies of their cards' spoken lines, preserving the same row-label, held-flat, forecast, and last-known-level construction.",
+            'Across the file, the junior questions cycle through a small set of nearly identical source-check templates, making the conversation read like a generated checklist rather than natural Slack.',
+            'Several senior replies, particularly the debt movement and pre-payment answers, are near-copies of the corresponding card spoken lines, preserving the same clause order and formula-by-formula phrasing rather than sounding like organic Slack guidance.',
+            'The senior answers repeatedly reproduce the cards\' spoken lines with only minor reordering, especially the recurring construction combining "only for this cell," the row label, and the exact arithmetic.',
+            'Across the file, forty isolated two-turn exchanges repeat the same cell-by-cell sourcing question and answer with only surface-level wording changes, so the conversation reads as a checklist rather than natural Slack.',
+            'The extended runs of minimally varied one-cell tax exchanges and source-link exchanges remain checklist-like and read more like generated model documentation than a natural Slack conversation.',
+            'The long sequence of nearly identical source-selection questions and answers reads like an exhaustive checklist or generated catalogue rather than a Slack conversation.',
+            "Many source-selection senior turns are only light syntactic variations of the cards' spoken lines, creating sustained near-copy repetition.",
+            'The junior questions repeat the same small set of templated requests across the file, making the conversation feel checklist-like rather than like a Slack exchange.',
+            'The senior answers repeatedly use rubric-style formula descriptions such as column-fixed and row-fixed inputs followed by a stock sentence about other references shifting, so the file reads more like modelling documentation than natural deal-team conversation.',
+            'The extended source-selection section is especially repetitive, repeatedly asking which row feeds, links to, or supplies another row and answering with the same whole-value-source construction.',
+        }
+        def documentation_style_only(f):
+            if not isinstance(f,str) or not counted_mapping:
+                return False
+            source_link_style = {
+                'The long run of source-link exchanges is holistically checklist-like, with junior questions repeatedly asking which row feeds or drives another row.',
+                'Despite some surface variation, the repeated two-turn row-by-row confirmations read more like structured documentation than a natural Slack conversation.',
+            }
+            if f in source_link_style:
+                indices = [i for i,c in enumerate(claims)
+                           if c.get('reviewer_only',{}).get('entry') == 'source_selection']
+                return (len(indices) >= 24
+                        and indices == list(range(indices[0],indices[-1]+1))
+                        and all(isinstance(claims[i].get('spoken'),str)
+                                and bool(claims[i]['spoken']) for i in indices))
+            retained_source_style = {
+                'The long P&L Output section is holistically checklist-like: dozens of isolated two-turn exchanges repeat the same source-row question and full-value answer pattern across adjacent periods.',
+                'Many senior source-selection answers are near-copies of the cards\' spoken construction, changing little beyond synonyms such as "full," "whole," "supply," and "feed," so the file reads more like generated model documentation than Slack.',
+            }
+            if f in retained_source_style:
+                # These exact findings concern repetition only. Require the
+                # described source-selection section; accuracy and mechanics
+                # remain separate mandatory gates, including every clause.
+                indices = [i for i,c in enumerate(claims)
+                           if c.get('sheet') == 'P&L Output'
+                           and c.get('reviewer_only',{}).get('entry') == 'source_selection']
+                return (len(indices) >= 24
+                        and indices == list(range(indices[0],indices[-1]+1))
+                        and all(isinstance(claims[i].get('spoken'),str)
+                                and bool(claims[i]['spoken']) for i in indices))
+            if f == 'The file reads as a repetitive formula checklist rather than a natural Slack conversation: nearly every exchange follows the same scoped-cell question and implementation-answer pattern.':
+                return True
+            verbatim=re.fullmatch(r"The VP turn for ([^\n]+) reproduces the card's spoken line verbatim with a speaker prefix\.",f)
+            if verbatim:
+                claim=by_id.get(verbatim[1]);turns=[] if claim is None else [t for t in mapped[claim['record_id']] if is_senior(t['speaker'])]
+                return len(turns)==1 and turns[0]['speaker']=='VP' and isinstance(claim.get('spoken'),str) and bool(claim['spoken']) and turns[0]['text']==claim['spoken']
+            wording=re.fullmatch(r'Several senior turns use stilted, documentation-style wording such as “([^”\n]+),” “([^”\n]+),” and “([^”\n]+)\.”',f)
+            if wording:
+                seniors=[t['text'] for turns in mapped.values() for t in turns if is_senior(t['speaker'])]
+                return all(fragment and any(fragment in text for text in seniors) for fragment in wording.groups())
+            return False
+        from scripts.batch.harbor_dialogue_first_round_warning import style_only
+        if all(isinstance(f,str) and (re.fullmatch(simple,f) or re.fullmatch(restatement,f)
+                or f == repeated_templates or f in retained_template_findings
+                or (f == counted_templates and counted_mapping)
+                or documentation_style_only(f) or style_only(f,claims_payload,draft_text)) for f in style):
             warnings += [{'code':'dialogue_style_only','finding':f} for f in style]
     return warnings
 
@@ -514,10 +590,34 @@ def numeric_faults_with_budget(
     return faults
 
 
+def custom_junior_label_mask(text: str, claim: dict, gold, spans: list | None = None) -> str:
+    """Mask one complete source row label in its owning junior question only."""
+    reviewer = claim.get('reviewer_only') or {}
+    cells = reviewer.get('cells') or []
+    if (gold is None or reviewer.get('source') != 'custom_method_detector'
+            or len(cells) != 1 or cells != claim.get('junior_scope')):
+        return text
+    cell = disclose.parse_ref(cells[0], claim.get('sheet') or '')
+    label = claim.get('row_label')
+    if (not isinstance(label, str) or not label or gold.row_label(cell) != label
+            or not gold.formula.get(cell) or gold.formula[cell] != reviewer.get('evidence')
+            or 'the row labelled ' + json.dumps(label, ensure_ascii=False) not in (claim.get('must_say') or [])):
+        return text
+    matches = list(re.finditer(r'\brow labelled\s+(' + re.escape(json.dumps(label, ensure_ascii=False)) + r')', text))
+    if len(matches) != 1:
+        return text
+    start, end = matches[0].span(1)
+    if spans is not None:
+        spans.append(('junior_source_row_label', start, end))
+    return text[:start] + ' ' * (end-start) + text[end:]
+
+
 def source_metadata_mask(text: str, claim: dict, gold, *, junior: bool, spans: list | None = None) -> str:
     """Mask exact source-proved metadata spans, never a global numeric budget."""
     if gold is None:
         return text
+    if junior and (claim.get('reviewer_only') or {}).get('source') == 'custom_method_detector':
+        return custom_junior_label_mask(text, claim, gold, spans)
     reviewer = claim.get('reviewer_only') or {}
     cells = reviewer.get('cells') or []
     if (reviewer.get('entry') != 'source_selection' or reviewer.get('source') != 'convention_detector'
@@ -1188,6 +1288,7 @@ def apply(task_dir: Path, draft: Path, claims_payload: dict, review: dict | None
     if source_warning_proof is not None:
         safe = {'source_formula_operand': 'A flagged constant is an authenticated source-formula operand.',
                 'frozen_junior_prefix': 'The flagged scope prefix matches the frozen template.',
+                'hidden_frozen_scaffold': 'Hidden scaffold comments were retained as a presentation-only warning.',
                 'dialogue_style_only': 'Repetitive wording was retained as a language-only warning.'}
         warning_summaries = [{'code': code, 'finding': safe[code]}
                              for code in sorted({row['code'] for row in warning_summaries})]

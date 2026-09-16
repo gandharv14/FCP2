@@ -116,3 +116,26 @@ def test_lookup_grouped_journal_stops_at_same_first_bad_search_value():
  assert e._lookup_reference_plan(SimpleNamespace(op='HLOOKUP',range_truncated=False)) is None
  assert dict(e.read_attempts)=={'S!A1':{'T!A1'},'S!B1':{'T!A1'}}
  assert not e.read_attempts.direct and len(e.read_attempts.groups)==1
+
+
+def test_ordered_rows_tied_keys_deduplicate_across_chunks():
+ from xl_seg.active_graph import OrderedRows
+ p=Pool();row=p.union((p.chunk(['a','b']),p.chunk(['b','c'])))
+ ordered=OrderedRows(Rows({'x':row}),key=lambda _:0)
+ values=list(ordered['x'])
+ assert len(values)==3 and set(values)=={'a','b','c'}
+ assert list(ordered['x'])==values
+
+def test_attempted_read_budget_is_independent_and_precedes_output(monkeypatch):
+ import xl_segment as s
+ monkeypatch.setattr(s,'MAX_MATERIALIZED_PROOF_EDGES',2)
+ cone={'t1','t2'}
+ assert s._check_proof_edge_budget({},cone)==0
+ assert s._proof_attempted_reads({'b':{'t2',None},'a':{'t1','outside'}},cone)=={'a':['t1'],'b':['t2']}
+ class NoOutput(dict):
+  def items(self):pytest.fail('output materialization must not start')
+ with pytest.raises(s.ProofResourceExhaustion) as exc:
+  s._proof_attempted_reads(NoOutput({'a':{'t1','t2'},'b':{'t1'}}),cone)
+ assert exc.value.report['resource']=='materialized_attempted_read_edges'
+ assert exc.value.report['observed_edge_count_lower_bound']==3
+ assert exc.value.report['proof_truncated'] is False

@@ -25,8 +25,23 @@ def keep(path,value):return W.keep(path,value)
 MUTABLE={'normalized_final':'normalized.json','normalization_report':'normalization_report.json','normalization_exclusions':'exclusions.json'}
 
 
+def merge_witnesses(witnesses):
+    """Verify every copy before combining equivalent historical bindings."""
+    combined={}
+    for witness in witnesses:
+        require(set(witness)=={'key','original','copy'} and witness['key'] in MUTABLE,'invalid managed witness schema')
+        original,copy=witness['original'],witness['copy']
+        require(set(original)==set(copy)=={'path','sha256'} and original['sha256']==copy['sha256'],'managed witness content identity changed')
+        E.checked_bytes(copy)
+        key=(original['path'],original['sha256'])
+        if key in combined:
+            require(combined[key]['key']==witness['key'],'managed witness role conflicts')
+        else:combined[key]=witness
+    return tuple(combined.values())
+
+
 def checked(binding,witnesses=()):
-    match=[w for w in witnesses if w['original']==binding]
+    match=merge_witnesses(w for w in witnesses if w['original']==binding)
     if match:
         require(len(match)==1 and match[0]['copy']['sha256']==binding['sha256'],'ambiguous mutable witness')
         E.checked_bytes(match[0]['copy'])
@@ -95,7 +110,7 @@ def _history_checkpoint(s,descriptor,kind,witnesses,seen):
         require(Path(w['original']['path'])==selected.content.normalization_run/MUTABLE[w['key']]
                 and Path(w['copy']['path'])==root/'generated-before'/MUTABLE[w['key']],'foreign historical output witness')
         checked(w['original'],local)
-    combined=tuple({(w['original']['path'],w['original']['sha256']):w for w in (*witnesses,*local)}.values())
+    combined=merge_witnesses((*witnesses,*local))
     for item in [v['prior'],v['checkpoint'],*v['original_checkpoints'],*v['evidence']]:checked(item,combined)
     earlier,prior_kind,checkpoint=predecessor(s,v['prior'],combined,current=selected,_seen=seen)
     partition=unchanged(earlier,selected)
@@ -161,22 +176,45 @@ def unchanged(old,new):
     """Only owning proof locators, or explicitly delegated partition output, vary."""
     a,b=old.content,new.content;ob,nb=a.bindings,b.bindings
     partition=nb.get('normalization_partitioned_review') is not None and a.normalization_prepared is None
-    allowed=AUDIT|NPROOF|(NOUTPUT if partition else set())
+    single=(not partition and a.normalization_prepared is None and a.normalization_call is None
+            and b.normalization_prepared is not None and b.normalization_call is not None)
+    allowed=AUDIT|NPROOF|(NOUTPUT if partition or single else set())
+    if single:allowed=allowed|{'normalization_prepared_request'}
     require({k:v for k,v in ob.items() if k not in allowed}=={k:v for k,v in nb.items() if k not in allowed},'non-proof financial binding changed')
     candidate=replace(b,bindings=ob)
     if partition:
         require(b.normalization_call is None,'partition output cannot invent a single Call')
         from scripts.batch import harbor_normalization_partitioned as P
         manifest=read(b.normalization_prepared)
-        require(manifest['previous']['prior_plan']==record(a.normalization_run/'production-selection.json'),'partition predecessor differs')
+        original_plan=record(a.normalization_run/'production-selection.json')
+        if manifest['previous'] is None:
+            require(manifest['selection']==original_plan and manifest['prior_attempt_submitted'] is False
+                    and manifest['semantic_budget_reset'] is False and b.normalization_run==a.normalization_run,
+                    'initial partition predecessor differs')
+        else:
+            require(manifest['previous']['prior_plan']==original_plan,'partition predecessor differs')
         from scripts.batch.harbor_normalization_validator_bridge import validate_content
         validate_content(b)
+        candidate=replace(candidate,normalization_run=a.normalization_run,normalization_prepared=a.normalization_prepared,normalization_call=a.normalization_call)
+    if single:
+        manifest=read(b.normalization_prepared)
+        require(manifest['schema_version']=='prepared-normalization-review/v1'
+                and manifest['selection']==record(a.normalization_run/'production-selection.json')
+                and manifest['semantic_budget_reset'] is False and b.normalization_run==a.normalization_run
+                and nb.get('normalization_partitioned_review') is None
+                and nb['normalization_prepared_manifest']==b.normalization_prepared
+                and nb['normalization_prepared_request']==manifest['request']
+                and manifest['request']['sha256']==b.normalization_call.request['sha256']
+                and E.checked_bytes(manifest['request'])==E.checked_bytes(b.normalization_call.request),
+                'single normalization predecessor or request differs')
+        W.lanes.normalization_attempt(b)
+        W.lanes.normalization_projection(b,phase1=True)
         candidate=replace(candidate,normalization_run=a.normalization_run,normalization_prepared=a.normalization_prepared,normalization_call=a.normalization_call)
     require(replace(new,content=candidate)==old,'task, model Call or non-proof selection changed')
     for key in ('audit_equivalence','audit_validator_upgrade'):
         if ob.get(key) is not None and nb.get(key)!=ob[key]:
             require(read(nb[key]).get('previous')==ob[key],'audit proof does not retain exact predecessor')
-    return partition
+    return partition or single
 
 
 def checks(s,before,selection,last):
@@ -202,9 +240,14 @@ def prepare(s,lease,prior,current,last,root):
     partition=unchanged(old,current)
     require(last==('normalization_phase1' if partition else kind),'prefix cannot skip unfinished stages')
     if partition:
-        from scripts.batch import harbor_normalization_partitioned as P
-        selected=P.selection(current.content.normalization_prepared)
-        require(selected.budget==s.normalization_budget,'worker original budget differs from partition delegation')
+        if current.content.normalization_call is None:
+            from scripts.batch import harbor_normalization_partitioned as P
+            selected=P.selection(current.content.normalization_prepared)
+            require(selected.budget==s.normalization_budget,'worker original budget differs from partition delegation')
+        else:
+            manifest=read(current.content.normalization_prepared)
+            require(manifest['budget']==W.bootstrap.serial(asdict(s.normalization_budget)),
+                    'worker original budget differs from single review delegation')
     else:require(KINDS.index(kind)>=1,'normalization proof required before retained checkpoint refresh')
     # Future checkpoints cannot be silently abandoned or reused under old proof.
     require(not any((s.run/(k+'.json')).exists() for k in KINDS[KINDS.index(last)+1:]),'later checkpoint requires full-prefix selection')
@@ -340,6 +383,8 @@ def advance(s,lease,binding,directory,*,dispatch=False,credential=None,captures=
     phase2=continuation/'normalization_phase2.json'
     if phase2.exists():
         selection=decode(read(record(phase2))['selection']);start='normalization_phase2'
+        if before['lane_state']['harbor-normalization-engineer'].get('phase')!='phase2_complete':
+            return W._gate(s,lease,'normalization_phase2',selection)
     for kind in KINDS[KINDS.index(start)+1:]:
         checkpoint=continuation/(kind+'.json')
         if checkpoint.exists():

@@ -2735,7 +2735,7 @@ Batch results are written to
 and stopped workbooks. Harbor rollout is a separate operation and is never
 started by this skill.
 
-Variable/source audits require `lbx_api_key` in `.env`. Audit generation is
+Variable/source audits require `lbx_labelbox_api_key` in `.env`. Audit generation is
 pinned to `openai/gpt-5.6-sol`; public-source profiling, disclosure arbitration,
 naturalization, independent review, and dialogue generation use pinned
 `gpt-5.6-sol-high` agents.
@@ -2851,7 +2851,7 @@ batch; one corrective retry is allowed.
 ```bash
 # 0. Generate the review artifacts from the inputs-only workbook.
 #    The deterministic inventory is sent to GPT 5.6 Sol through Labelbox's
-#    LiteLLM proxy; lbx_api_key is read from .env and never written to disk.
+#    LiteLLM proxy; lbx_labelbox_api_key is read from .env and never written to disk.
 python3.12 xl_variable_source_audit.py 0233 \
     --inputs-root inputs_out --seg-root seg_out --audit-root runs
 #

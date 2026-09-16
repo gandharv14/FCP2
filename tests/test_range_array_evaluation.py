@@ -72,9 +72,48 @@ def test_range_binary_broadcast_comparison_and_error_propagation():
     assert isinstance(propagated[1], ExcelError)
     assert isinstance(propagated[2], Unresolved)
 
-    mismatch = _binary("+", values, RangeValues([1, 2], rows=1, cols=2))
+    expanded = _binary("+", values, RangeValues([1, 2], rows=1, cols=2))
+    assert (expanded.rows, expanded.cols, list(expanded)) == (2, 2, [2, 4, 4, 6])
+    mismatch = _binary("+", values, RangeValues([1, 2, 3], rows=1, cols=3))
     assert isinstance(mismatch, ExcelError)
     assert mismatch.code == "#VALUE!"
+
+
+def test_outer_product_preserves_orientation_errors_and_resource_bound():
+    column = RangeValues([2, 3], 2, 1)
+    row = RangeValues([5, 7, 11], 1, 3)
+    result = _binary("*", column, row)
+    assert (result.rows, result.cols, list(result)) == (2, 3, [10, 14, 22, 15, 21, 33])
+    assert list(_binary("-", row, column)) == [3, 5, 9, 2, 4, 8]
+    bad = _binary("*", column, RangeValues([1, ExcelError('#N/A')], 1, 2))
+    assert bad[0] == 2 and bad[2] == 3
+    assert bad[1].code == bad[3].code == '#N/A'
+    assert isinstance(_binary('*', RangeValues([1] * 1001, 1001, 1),
+                              RangeValues([1] * 1000, 1, 1000)), Unresolved)
+    assert _binary('*', RangeValues([1], 2, 2), row).code == '#VALUE!'
+    # Comma-separated SUMPRODUCT arguments do not inherit arithmetic expansion.
+    assert Evaluator(None, None)._fn_sumproduct([column, row]).code == '#VALUE!'
+    assert Evaluator(None, None)._fn_sumproduct([
+        column, RangeValues([5, 7], 1, 2)]).code == '#VALUE!'
+
+
+def test_sumproduct_row_column_masks_reconstruct_from_inputs(tmp_path):
+    # Same outer-product shape as retained 0086 Annual CF C10/C18. Microsoft:
+    # https://learn.microsoft.com/en-us/office/vba/excel/concepts/excel-performance/excel-tips-for-optimizing-performance-obstructions#optimize-array-formulas-and-sumproduct
+    path = tmp_path / 'outer.xlsx'
+    book = openpyxl.Workbook(); ws = book.active; ws.title = 'Mask'
+    ws.append(['A', 1, 2, 1]); ws.append(['B', 10, 20, 30]); ws.append(['A', 40, 50, 60])
+    ws['E1'] = ArrayFormula(ref='E1', text='=SUMPRODUCT((A2:A3="A")*(B1:D1=1),B2:D3)')
+    ws['E2'] = ArrayFormula(ref='E2', text='=SUMPRODUCT((B1:D1=2)*(A2:A3="B"),B2:D3)')
+    book.save(path)
+    _, graph, result = _evaluate_workbook(path)
+    try:
+        assert result.values['Mask!E1'] == 100
+        assert result.values['Mask!E2'] == 20
+        assert result.coverage['errors'] == 0
+        assert not result.oracle_reads
+    finally:
+        graph.close()
 
 
 def test_index_one_dimensional_and_reference_shapes():

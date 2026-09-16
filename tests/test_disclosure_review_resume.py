@@ -92,7 +92,7 @@ def test_authorize_preserves_failed_history_and_refuses_second_namespace_after_d
     blocked=W.step(worker,s,lease,phase='disclosure-review',checkpoint=build.evidence)
     before={f.name:f.read_bytes() for f in oldstep.iterdir()}
     snapshot=W.keep(tmp_path/'old-code.json',{'root':str(worker.root),'files':[]})
-    monkeypatch.setattr(R,'changes',lambda *a:['reviewed fixture boundary'])
+    monkeypatch.setattr(R,'changes',lambda *a,**k:['reviewed fixture boundary'])
     monkeypatch.setattr(history,'prefix',lambda *a,**k:[])
     monkeypatch.setattr(takeover,'continuation_chain',lambda *a,**k:[])
     monkeypatch.setattr(producer,'validate_request',lambda *a:None)

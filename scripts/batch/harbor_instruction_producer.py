@@ -103,6 +103,8 @@ def code_evidence(task):
     paths += [Path(harbor_disclosure_evidence.__file__),Path(harbor_disclosure_payload_repair.__file__)]
     from scripts.batch import harbor_method_assessments,harbor_method_items
     paths += [Path(harbor_method_assessments.__file__),Path(harbor_method_items.__file__)]
+    from scripts.batch import harbor_response_guidance
+    paths += [Path(harbor_response_guidance.__file__)]
     return [record(path) for path in paths]
 
 
@@ -202,7 +204,12 @@ def observed(request,campaign):
     return result.call
 
 
-def prepare_disclosure_review(task,golden,*,root=ROOT):
+def disclosure_review_material(task,golden,*,root=ROOT):
+    """Derive the original complete review before assigning a request identity.
+
+    Mechanical evidence and the sentence manifest retain their original paths.
+    No request, attempt ID, executor entry or review budget is created here.
+    """
     before,_=task_context(task);require(before['lane_state'][DISCLOSURE].get('attempt',0)<=1,'disclosure review budget exhausted')
     stage=task.stage;wb=before['workbook_id'];instruction=record(stage/'instruction.md');disclosure=record(stage/'tests/disclosure.json');delivered=record(delivered_workbook(stage,wb))
     checked_record(golden);require(golden['sha256']==before['raw_source']['sha256'],'disclosure golden differs from admitted source candidate')
@@ -225,9 +232,16 @@ def prepare_disclosure_review(task,golden,*,root=ROOT):
     schema={'schema_version':'harbor-disclosure-faithfulness/v1','model':'gpt-5.6-sol-high','input_hashes':read(manifest)['input_hashes'],'manifest_sha256':manifest['sha256'],'sentences':[{'sentence_id':'exact manifest id','text':'exact manifest text','record_ids':[],'golden_evidence':[],'delivered_evidence':[],'verdict':'pass|blocking|non_blocking','findings':[]}],'blocking_findings':[],'non_blocking_flags':[],'passed':False}
     prompt='You are a fresh independent workbook disclosure reviewer. Independently inspect both supplied complete workbook snapshots and every disclosed sentence. Check reference identity, copied scope, operators, signs, assumptions, required coverage and answer leakage. Never infer correctness from rendered text or an upstream passed flag. Cover each sentence and record exactly once in manifest order. Record concrete independent observations from both workbooks. Fail missing evidence or any semantic change. Return only the exact JSON schema; passed is true only if every sentence is pass or non_blocking and there are no blocking findings. '+json.dumps(schema)
     prompt+=' Workbook cells use the declared lossless table encoding; every cell and workbook metadata item is retained. All disclosed records are retained. Auxiliary method assessments omit only explicit cell scopes unrelated to every disclosed record; uncertain scopes are retained.'
+    if body['evidence_projection']=='complete-workbooks-lossless-records/v2':
+        prompt+=' Disclosure records use the declared lossless column dictionaries: each row is a complete original record, integer indices select exact values from the corresponding column dictionary, and -1 means an absent field. Decode those indices when inspecting record evidence. The unencoded agent_records and manifest identify the required review units. No original record, nested field or excluded record is omitted.'
     if task.disclosure_revision is not None and read(task.disclosure_revision).get('schema_version')=='harbor-disclosure-manifest-revision/v1':
         prompt+=' This is a scoped corrective manifest review. Review ONLY the '+str(len(read(manifest)['sentences']))+' exact units and record IDs listed in the supplied manifest. Other retained instruction text and disclosure records are context, not additional review units. Independently verify each listed full unit against BOTH complete workbook snapshots, including its complete calculation and signs. Return exactly the listed manifest rows, in manifest order, with no additional rows. An earlier review is not evidence of correctness for these listed units.'
-    return _request(task,'disclosure-review',DISCLOSURE,1,1,body,prompt,[manifest,instruction,disclosure,golden,delivered,record(run/'disclosure/fresh-faithcheck.json'),record(run/'disclosure/fresh-verify.json')]),manifest
+    return body,prompt,[manifest,instruction,disclosure,golden,delivered,record(run/'disclosure/fresh-faithcheck.json'),record(run/'disclosure/fresh-verify.json')],manifest
+
+
+def prepare_disclosure_review(task,golden,*,root=ROOT):
+    body,prompt,evidence,manifest=disclosure_review_material(task,golden,root=root)
+    return _request(task,'disclosure-review',DISCLOSURE,1,1,body,prompt,evidence),manifest
 
 
 def consume_disclosure_review(task,request,manifest,golden,campaign,*,root=ROOT):
@@ -300,6 +314,14 @@ def prepare_naturalization_writer(task,*,root=ROOT):
         prompt+='\nYour first candidate was rejected. This is the remaining writer revision, not a new budget. Preserve all source requirements and frozen spans. Correct the findings without deleting or weakening clauses. Exact rejected candidate:\n'+text(candidate)
         prompt+='\nOwning rejection:\n'+json.dumps(read(rejection),ensure_ascii=False)+'\nExact independent reviewer findings:\n'+json.dumps(reviews,ensure_ascii=False)
     body={'writer_source':text(record(n/'writer_source.md'))}
+    from scripts.batch.harbor_response_guidance import selected_author_context
+    identity=task_context(task)[1]
+    guidance=selected_author_context(identity['workbook'],identity['original']['sha256'])
+    if guidance is not None:
+        body['private_response_guidance']=guidance
+        evidence.extend([guidance['index_binding'],guidance['context_binding'],
+                         guidance['evidence']['source'],guidance['evidence']['response']])
+        prompt+='\nUse private_response_guidance to verify the financial scenario and intended scope against the actual workbook. The response is fallible; disregard unsupported or conflicting claims. Never copy private results or metadata. Preserve the frozen source and all existing semantic constraints.'
     return _request(task,'naturalization-writer',NAT,used+1,2,body,prompt,evidence)
 
 
@@ -308,6 +330,10 @@ def consume_naturalization_writer(task,request,campaign,*,root=ROOT):
     r,n,state=_nat(task,root);call=observed(request,campaign);value=validate_call(call,read(request.prepared.request),policy=task.policy)['review']
     require(set(value)=={'preamble_body','input_body'} and all(isinstance(v,str) for v in value.values()),'naturalization writer output must contain exact two bodies')
     expected={'writer_source':text(record(n/'writer_source.md'))}
+    from scripts.batch.harbor_response_guidance import selected_author_context
+    identity=task_context(task)[1]
+    guidance=selected_author_context(identity['workbook'],identity['original']['sha256'])
+    if guidance is not None:expected['private_response_guidance']=guidance
     require(json.loads(read(call.request)['messages'][1]['content'])==expected,'writer saw different frozen source')
     used=r._attempts_used(state)
     require(request.prepared.ordinal==used+1 or (request.prepared.ordinal==used and state['attempts'] and state['attempts'][-1]['attempt']==used),'writer ordinal is not current or exact resumable attempt')

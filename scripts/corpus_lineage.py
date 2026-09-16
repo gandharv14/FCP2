@@ -32,7 +32,20 @@ def validate_normalization(original, candidate, record):
     if record.get('policy_version') == 'quarantined-table-source-inventory/v1':
         from xl_table_quarantine_inventory import validate_adoption
         return validate_adoption(original, candidate, record)
-    if record.get('policy_version') == 'presentation-data-tables/v2':
+    if record.get('policy_version') in {'source-cache-equivalence/v1', 'source-cache-equivalence-certified-cycles/v2', 'source-cache-equivalence-large-acyclic/v3', 'source-cache-equivalence-selected-scope/v4'}:
+        _require(manifest.get('policy_version')==record['policy_version'],'cache lineage policy version differs')
+        from xl_source_cache_equivalence import verify
+        import os
+        history=os.environ.get('HARBOR_SOURCE_CACHE_HISTORY')
+        if history:
+            from scripts.batch.harbor_source_cache_history import verify as verify_history
+            verify_history(verify,original,recorded_candidate,manifest,
+                profile=json.loads(history),root=Path(__file__).resolve().parents[1])
+        else:verify(original,recorded_candidate,manifest)
+    elif record.get('policy_version') == 'source-vba-only-projection/v1':
+        from xl_macro_source_projection import verify
+        verify(original, recorded_candidate, manifest)
+    elif record.get('policy_version') in {'presentation-data-tables/v2', 'presentation-data-tables-remediation/v1'}:
         from xl_presentation_tables import verify_materialization
         verify_materialization(original, recorded_candidate, record['curation'], manifest)
     elif record.get('plan'):

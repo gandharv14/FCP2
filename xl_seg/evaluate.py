@@ -71,8 +71,8 @@ CONVERGENCE = 1e-12
 SOURCE_WALK_PURE_OPS = frozenset({
     "+", "-", "*", "/", "^", "&", "=", "<>", ">", "<", ">=", "<=",
     "u-", "u+", "%", "isect", " ",
-    "ABS", "AND", "AVERAGE", "AVERAGEIF", "AVERAGEIFS", "CONCAT",
-    "CONCATENATE", "COUNT", "COUNTA", "COUNTBLANK", "COUNTIF", "COUNTIFS",
+    "ABS", "AND", "AVERAGE", "AVERAGEIFS", "CONCAT",
+    "CONCATENATE", "COUNT", "COUNTBLANK", "COUNTIF", "COUNTIFS",
     "CUMIPMT", "CUMPRINC", "DATE", "DATEDIF", "DAY", "DAYS", "DAYS360",
     "EDATE", "EOMONTH", "EXP", "FIXED", "FV", "GCD", "INT", "IPMT",
     "IRR", "ISBLANK", "ISERR", "ISERROR", "ISNA", "ISNUMBER", "LARGE",
@@ -685,6 +685,24 @@ def snap(result: float, *operands: float) -> float:
     return 0.0 if scale and abs(result) < scale * 1e-13 else result
 
 
+def _ordered_formula_comparison(op, left, right):
+    """Order numeric and text values by type; never coerce text to zero.
+
+    This narrow branch leaves existing boolean, blank and same-type policies
+    intact. Criteria and lookup equality have separate existing semantics.
+    """
+    numeric_left = isinstance(left, (int, float)) and not isinstance(left, bool)
+    numeric_right = isinstance(right, (int, float)) and not isinstance(right, bool)
+    if numeric_left and isinstance(right, str):
+        a, b = 0, 1
+    elif isinstance(left, str) and numeric_right:
+        a, b = 1, 0
+    else:
+        a, b = num(left), num(right)
+    return {">": lambda: a > b, "<": lambda: a < b,
+            ">=": lambda: a >= b, "<=": lambda: a <= b}[op]()
+
+
 BINARY = {
     "+": lambda a, b: snap(num(a) + num(b), num(a), num(b)),
     "-": lambda a, b: snap(num(a) - num(b), num(a), num(b)),
@@ -694,10 +712,10 @@ BINARY = {
     "&": lambda a, b: f"{_text(a)}{_text(b)}",
     "=": lambda a, b: _equal(a, b),
     "<>": lambda a, b: not _equal(a, b),
-    ">": lambda a, b: num(a) > num(b),
-    "<": lambda a, b: num(a) < num(b),
-    ">=": lambda a, b: num(a) >= num(b),
-    "<=": lambda a, b: num(a) <= num(b),
+    ">": lambda a, b: _ordered_formula_comparison(">", a, b),
+    "<": lambda a, b: _ordered_formula_comparison("<", a, b),
+    ">=": lambda a, b: _ordered_formula_comparison(">=", a, b),
+    "<=": lambda a, b: _ordered_formula_comparison("<=", a, b),
 }
 
 
@@ -757,22 +775,34 @@ def _binary_value(op, left, right):
 
 
 def _binary(op, left, right):
-    """Excel array arithmetic: scalar broadcast or exact-shape elementwise."""
+    """Excel array arithmetic, including singleton row/column expansion."""
     left_range = isinstance(left, RangeValues)
     right_range = isinstance(right, RangeValues)
     if not left_range and not right_range:
         return _binary_value(op, left, right)
     if left_range and right_range:
+        # Array arithmetic expands a one-row or one-column operand. This is
+        # distinct from SUMPRODUCT's separate arguments, which must still have
+        # equal dimensions. Never materialize an unbounded outer product.
+        if len(left) != left.rows * left.cols or len(right) != right.rows * right.cols:
+            return ExcelError("#VALUE!")
         if (
-            (left.rows, left.cols) != (right.rows, right.cols)
-            or len(left) != len(right)
+            left.rows != right.rows and min(left.rows, right.rows) != 1
+            or left.cols != right.cols and min(left.cols, right.cols) != 1
         ):
             return ExcelError("#VALUE!")
+        rows, cols = max(left.rows, right.rows), max(left.cols, right.cols)
+        if rows * cols > max(len(left), len(right)) and rows * cols > 1_000_000:
+            return Unresolved("array-broadcast-cell-limit")
         values = [
-            _binary_value(op, left_value, right_value)
-            for left_value, right_value in zip(left, right)
+            _binary_value(
+                op,
+                left[(row if left.rows > 1 else 0) * left.cols + (col if left.cols > 1 else 0)],
+                right[(row if right.rows > 1 else 0) * right.cols + (col if right.cols > 1 else 0)],
+            )
+            for row in range(rows) for col in range(cols)
         ]
-        return RangeValues(values, left.rows, left.cols)
+        return RangeValues(values, rows, cols)
     source = left if left_range else right
     scalar = right if left_range else left
     values = [
@@ -880,6 +910,7 @@ class CalculationMetadata:
     calc_mode_origin: str = "unknown"
     full_calc_on_load_origin: str = "unknown"
     force_full_calc_origin: str = "unknown"
+    primitive_date_policy: dict | None = None
 
     @property
     def calcMode(self):
@@ -917,6 +948,13 @@ class Evaluator:
         self.oracle = oracle
         self.strict_proof = strict_proof
         self.calculation = calculation if calculation is not None else oracle
+        self._primitive_date_text = {}
+        self._formula_date_text = {}
+        date_policy = getattr(self.calculation, "primitive_date_policy", None)
+        if date_policy is not None:
+            from xl_date_text_policy import load, graph_literals
+            self._primitive_date_text = load(date_policy, self.calculation.source)
+            self._formula_date_text = graph_literals(self._primitive_date_text, graph)
         self.proof_outputs = set(proof_outputs) if proof_outputs is not None else None
         self.run_probes = run_probes
         self.proof_scope = set(proof_scope) if proof_scope is not None else None
@@ -1451,6 +1489,11 @@ class Evaluator:
                 value = node.value if node.value != "" else node.expr
                 return ExcelError(value) if value in NATIVE_ERRORS else Unresolved("unknown-error-literal")
             if node.op == "text":
+                if node.id in self._formula_date_text:
+                    selected = self._formula_date_text[node.id]
+                    if node.value != str(selected):
+                        raise ValueError("selected date literal differs from source AST")
+                    return selected
                 return node.value
             if node.op == "logical":
                 raw = str(node.value).upper()
@@ -1494,6 +1537,17 @@ class Evaluator:
 
     def _apply(self, node):
         op = node.op
+        if op == "AVERAGEIF":
+            from .literal_criteria import projection
+            proof = projection(self, node)
+            if proof is not None:
+                values = [self._read(ref) for ref in proof['selected_targets']]
+                bad = self._bad_in(values)
+                if bad is not None:
+                    return bad
+                numbers = [num(value) for value in values
+                           if isinstance(value, (int, float)) and not isinstance(value, bool)]
+                return sum(numbers) / len(numbers) if numbers else ExcelError("#DIV/0!")
         if op == ":":
             return self._reference_range(node)
         if op == "OFFSET":
@@ -1932,7 +1986,17 @@ class Evaluator:
         arrays = [list(flatten([arg])) for arg in args]
         if not arrays:
             return 0.0
-        width = min(len(array) for array in arrays)
+        shapes = [(arg.rows, arg.cols) if isinstance(arg, RangeValues)
+                  else (1, len(array)) for arg, array in zip(args, arrays)]
+        if len(set(shapes)) != 1 or any(
+            rows * cols != len(array)
+            for (rows, cols), array in zip(shapes, arrays)
+        ):
+            return ExcelError("#VALUE!")
+        bad = self._bad_in(arrays)
+        if bad is not None:
+            return bad
+        width = len(arrays[0])
         vals = [
             math.prod(num(array[index]) for array in arrays)
             for index in range(width)
@@ -1988,6 +2052,14 @@ class Evaluator:
         decimals = len(pattern.split(".", 1)[1].split("%", 1)[0]) if "." in pattern else 0
         grouping = "," in pattern.split(".", 1)[0]
         rendered = f"{scaled:,.{decimals}f}" if grouping else f"{scaled:.{decimals}f}"
+        if re.fullmatch(r"\$(?:0|0,0|#,##0)(?:\.0+)?", pattern):
+            # A literal dollar prefix is part of the rendered TEXT value.
+            # Negative currency sections need their own signed-format rules.
+            if scaled < 0:
+                return Unresolved("unsupported-negative-currency-text-format")
+            if decimals > 15 or not math.isfinite(scaled) or not (scaled * 10**decimals).is_integer():
+                return Unresolved("unsupported-currency-text-rounding")
+            return "$" + rendered
         return rendered + ("%" if percent else "")
 
     def _fn_right(self, args):
@@ -2284,8 +2356,14 @@ class Evaluator:
         return float(sign * count)
 
     def _fn_yearfrac(self, args):
-        start_serial = num(args[0])
-        end_serial = num(args[1]) if len(args) > 1 else 0.0
+        if not 2 <= len(args) <= 3:
+            return Unresolved("yearfrac-arity")
+        start_serial = _date_number(args[0])
+        end_serial = _date_number(args[1])
+        if is_bad(start_serial):
+            return start_serial
+        if is_bad(end_serial):
+            return end_serial
         basis = int(num(args[2])) if len(args) > 2 and args[2] is not None else 0
         if start_serial > end_serial:
             start_serial, end_serial = end_serial, start_serial
@@ -2412,6 +2490,22 @@ class Evaluator:
     def _fn_ln(self, args):
         value = num(args[0])
         return math.log(value) if value > 0 else ExcelError("#NUM!")
+
+    def _fn_log(self, args):
+        if len(args) not in (1, 2):
+            return Unresolved("log-arity")
+        values = [self._elementary_number(value) for value in args]
+        bad = next((value for value in values if is_bad(value)), None)
+        if bad is not None:
+            return bad
+        number = values[0]
+        base = values[1] if len(values) == 2 else 10.0
+        if number <= 0 or base <= 0:
+            return ExcelError("#NUM!")
+        if base == 1:
+            return ExcelError("#DIV/0!")
+        result = math.log(number) / math.log(base)
+        return result if math.isfinite(result) else ExcelError("#NUM!")
 
     def _fn_concatenate(self, args):
         return "".join(_text(value) for value in flatten(args))
@@ -2612,6 +2706,34 @@ class Evaluator:
         return vals[low]
 
     _fn_quartile_inc = _fn_quartile
+
+    def _fn_percentile(self, args):
+        # Excel's legacy PERCENTILE and PERCENTILE.INC use the inclusive
+        # rank k*(n-1), interpolating between adjacent sorted observations.
+        if len(args) != 2:
+            return Unresolved("arity")
+        vals = sorted(numbers([args[0]]))
+        if not vals or not all(math.isfinite(v) for v in vals):
+            return ExcelError("#NUM!")
+        k_arg = args[1]
+        if isinstance(k_arg, RangeValues):
+            if not k_arg.rows == k_arg.cols == len(k_arg) == 1:
+                return ExcelError("#VALUE!")
+            k_arg = k_arg[0]
+        try:
+            k = float(0 if k_arg is None else k_arg)
+        except (TypeError, ValueError, OverflowError):
+            return ExcelError("#VALUE!")
+        if not math.isfinite(k) or not 0 <= k <= 1:
+            return ExcelError("#NUM!")
+        position = k * (len(vals) - 1)
+        low = int(math.floor(position))
+        fraction = position - low
+        if low + 1 < len(vals):
+            return (1 - fraction) * vals[low] + fraction * vals[low + 1]
+        return vals[low]
+
+    _fn_percentile_inc = _fn_percentile
 
     def _fn_gcd(self, args):
         vals = [int(num(v)) for v in flatten(args)
@@ -2873,6 +2995,10 @@ class Evaluator:
 
     def _counta(self, node):
         """Count nonblank values, recovering a range omitted by older AST graphs."""
+        from .formula_presence import projection
+        proof = projection(self, node)
+        if proof is not None:
+            return float(proof['count'])
         args = self._args(node)
         values = list(flatten(args))
         if not values or all(value is None for value in values):
@@ -3392,6 +3518,17 @@ class Evaluator:
             return self._source_pool.sources(self._source_pool.span((node.sheet, node.coordinate or ""), lambda: range_members(node.sheet, node.coordinate or "")))
         if node.kind != "op":
             return set()
+
+        if node.op == 'COUNTA':
+            from .formula_presence import projection
+            if projection(self, node) is not None:
+                return set()
+
+        if node.op == "AVERAGEIF":
+            from .literal_criteria import projection
+            proof = projection(self, node)
+            if proof is not None:
+                return set(proof['criteria']) | set(proof['selected_targets'])
 
         if node.op == "COLUMN" and not is_bad(self._column(node)):
             # A proved coordinate result never consumes the anchor's value.
@@ -3947,7 +4084,10 @@ class Evaluator:
             }
         branch_guards = []
         constant_error_branches = []
+        constant_text_condition_proofs = []
         equation_condition_proofs = []
+        equation_denominator_proofs = []
+        equation_denominator_guards = []
         equation_inline_mode = False
         unsupported_nodes = []
 
@@ -4027,7 +4167,7 @@ class Evaluator:
             finally:
                 equation_inline_mode = original_mode
 
-        def derive_spec(spec, seen, *, sum_blank_as_zero=False):
+        def derive_spec(spec, seen, *, sum_blank_as_zero=False, average_skip_blank=False):
             kind, payload = spec
             if kind == "none":
                 return []
@@ -4045,6 +4185,18 @@ class Evaluator:
                     sources = (payload,)
             else:
                 return None
+            if average_skip_blank:
+                # A blank reference contributes neither value nor count to
+                # AVERAGE. Never discard a cyclic member or a scalar AST
+                # expression merely because its endpoint is empty.
+                sources = [source for source in sources if not (
+                    source not in position
+                    and (source not in self.graph.nodes or (
+                        self.graph.nodes[source].is_cell
+                        and source in self.values
+                        and self.values[source] in (None, "")
+                    ))
+                )]
             values = [
                 (
                     constant(0.0)
@@ -4083,6 +4235,38 @@ class Evaluator:
                 comparison_specs = self._arg_specs(node)
                 if len(comparison_specs) != 2:
                     return None
+                # A declared primitive label and a text literal cannot vary
+                # with this cycle. Preserve Excel's typed comparison rather
+                # than forcing text into the numeric affine representation.
+                fixed = []
+                for kind, leaf_id in comparison_specs:
+                    leaf = self.graph.nodes.get(leaf_id) if kind == "scalar" else None
+                    if leaf is None or leaf_id in position or leaf_id in seen:
+                        break
+                    if leaf.kind == "const" and leaf.op == "text":
+                        value = leaf.value
+                    elif leaf.kind in {"input", "label"} and leaf_id in self.values:
+                        value = self.values[leaf_id]
+                        original = primitive_value(leaf)
+                        if type(value) is not type(original) or value != original:
+                            break
+                    else:
+                        break
+                    if type(value) not in (str, bool, int, float) or (
+                        isinstance(value, (int, float)) and not math.isfinite(value)
+                    ):
+                        break
+                    fixed.append(value)
+                if len(fixed) == 2 and any(type(value) is str for value in fixed):
+                    condition = _binary(node.op, *fixed)
+                    actual = self._eval_node(node.id)
+                    if is_bad(condition) or is_bad(actual) or type(actual) is not bool or actual != condition:
+                        return None
+                    constant_text_condition_proofs.append({
+                        "node": node.id, "sources": [item[1] for item in comparison_specs],
+                        "left": fixed[0], "right": fixed[1], "selected": condition,
+                    })
+                    return condition
                 sides = [
                     derive_spec(item, seen | {node.id})
                     for item in comparison_specs
@@ -4257,6 +4441,7 @@ class Evaluator:
                     # references as zero, so their absence is affine rather
                     # than an unsupported dependency.
                     sum_blank_as_zero=node.op == "SUM",
+                    average_skip_blank=node.op == "AVERAGE",
                 )
                 for spec in specs
             ]
@@ -4266,6 +4451,8 @@ class Evaluator:
             if node.op in ("u+", "u-") and len(args) == 1:
                 return scale(args[0], -1.0 if node.op == "u-" else 1.0)
             if node.op in ("SUM", "AVERAGE"):
+                if node.op == "AVERAGE" and not args:
+                    return reject(node_id, "average_without_numeric_arguments")
                 total = constant(0.0)
                 for arg in args:
                     total = combine(total, arg)
@@ -4283,6 +4470,24 @@ class Evaluator:
                         total = scale(arg, total[1])
                     else:
                         total = scale(total, arg[1])
+                return total
+            if node.op == "SUMPRODUCT":
+                # Keep each argument's range positions. Each product term is
+                # affine only when at most one factor depends on the cycle.
+                # The ordinary evaluator also proves matching array shapes;
+                # equal flattened lengths alone would not establish that.
+                actual = self._eval_node(node_id)
+                if not grouped_args or len({len(group) for group in grouped_args}) != 1 or is_bad(actual):
+                    return reject(node_id, "sumproduct_array_dimensions_or_error")
+                total = constant(0.0)
+                for factors in zip(*grouped_args):
+                    product = constant(1.0)
+                    for factor in factors:
+                        if not is_constant(product) and not is_constant(factor):
+                            return reject(node_id, "bilinear_sumproduct")
+                        product = (scale(factor, product[1]) if is_constant(product)
+                                   else scale(product, factor[1]))
+                    total = combine(total, product)
                 return total
             if node.op in ("MIN", "MAX") and args:
                 endpoint = [
@@ -4359,6 +4564,33 @@ class Evaluator:
                 and abs(right[1]) > CONVERGENCE
             ):
                 return scale(left, 1.0 / right[1])
+            if node.op == "/" and not equation_inline_mode:
+                # A denominator may be constant on the member equations even
+                # though its unreduced expression names SCC variables. Use the
+                # same finite, exact-coefficient substitution as selectors;
+                # never select a constant from a converged endpoint alone.
+                start_guards = len(branch_guards)
+                start_errors = len(unsupported_nodes)
+                expanded = equation_constant(right, seen | {node_id})
+                native = (self._eval_node(specs[1][1])
+                          if specs[1][0] == "scalar" else None)
+                if (expanded is not None and expanded[1]
+                        and math.isfinite(expanded[0][1])
+                        and abs(expanded[0][1]) > CONVERGENCE
+                        and isinstance(native, (int, float))
+                        and not isinstance(native, bool)
+                        and math.isfinite(float(native))
+                        and float(native) == expanded[0][1]):
+                    denominator = expanded[0][1]
+                    equation_denominator_proofs.append({
+                        "node": node_id, "members": expanded[1],
+                        "denominator": denominator,
+                        "native_denominator": float(native),
+                    })
+                    equation_denominator_guards.append((right, abs(denominator)))
+                    return scale(left, 1.0 / denominator)
+                del branch_guards[start_guards:]
+                del unsupported_nodes[start_errors:]
             return reject(node_id, "unsupported_operation")
 
         matrix = []
@@ -4431,7 +4663,7 @@ class Evaluator:
         # Banach's theorem gives a unique fixed point and the useful endpoint
         # error bound ||x-x*||∞ <= residual / (1-||A||∞).
         residual = self._equation_residual(members)[0]
-        if equation_condition_proofs and residual is not None:
+        if (equation_condition_proofs or equation_denominator_proofs) and residual is not None:
             # A constrained selector need not describe the map off its member
             # equations. Bound distance using the selected affine system too,
             # rather than borrowing only the original nonlinear-map residual.
@@ -4450,6 +4682,10 @@ class Evaluator:
                 "certified": False,
                 "reason": "missing_affine_endpoint_residual",
             }
+        for denominator, gap in equation_denominator_guards:
+            if gap <= sum(denominator[2]) * endpoint_error_bound:
+                return {"certified": False,
+                        "reason": "unstable_equation_denominator"}
         for selected, other, gap in branch_guards:
             guard_sensitivity = sum(
                 abs(selected[0][index] - other[0][index])
@@ -4472,7 +4708,10 @@ class Evaluator:
             return {
                 "certified": True,
                 **({"constant_error_branches": constant_error_branches} if constant_error_branches else {}),
+                **({"constant_text_condition_proofs": constant_text_condition_proofs} if constant_text_condition_proofs else {}),
                 **({"equation_condition_proofs": equation_condition_proofs} if equation_condition_proofs else {}),
+                **({"equation_denominator_proofs": equation_denominator_proofs,
+                    "contraction_scope": "equation_reduced_system"} if equation_denominator_proofs else {}),
                 "kind": "scalar_affine",
                 "coefficient": coefficient,
                 "constant": constants[0],
@@ -4485,7 +4724,10 @@ class Evaluator:
         return {
             "certified": True,
                 **({"constant_error_branches": constant_error_branches} if constant_error_branches else {}),
+                **({"constant_text_condition_proofs": constant_text_condition_proofs} if constant_text_condition_proofs else {}),
                 **({"equation_condition_proofs": equation_condition_proofs} if equation_condition_proofs else {}),
+                **({"equation_denominator_proofs": equation_denominator_proofs,
+                    "contraction_scope": "equation_reduced_system"} if equation_denominator_proofs else {}),
             "kind": "affine_system",
             "dimension": dimension,
             "contractive": True,
@@ -4526,7 +4768,7 @@ class Evaluator:
                     # evaluate its AST (or fail) instead of seeding that answer.
                     seed_categories["formula_cache_rejected"].add(cid)
                 if requested and info.node.kind in ("input", "label"):
-                    self.values[cid] = primitive_value(info.node)
+                    self.values[cid] = self._primitive_value(info.node)
                     seed_categories["requested_frontier"].add(cid)
                     seed_categories[
                         "primitive_input" if info.node.kind == "input"
@@ -4538,7 +4780,7 @@ class Evaluator:
                     seed_categories["implicit_seed_rejected"].add(cid)
                 continue
             if requested or info.node.kind in ("input", "label") or info.is_literal:
-                self.values[cid] = primitive_value(info.node)
+                self.values[cid] = self._primitive_value(info.node)
                 if requested:
                     seed_categories["requested_frontier"].add(cid)
                 if info.node.kind == "input":
@@ -5138,6 +5380,11 @@ class Evaluator:
                 for diagnostic in cycle_diagnostics
             ),
         }
+        if getattr(self.calculation, "primitive_date_policy", None) is not None:
+            coverage["primitive_date_policy"] = self.calculation.primitive_date_policy
+            coverage["primitive_date_cells"] = sorted(self._primitive_date_text)
+            if self._formula_date_text:
+                coverage["formula_date_literals"] = sorted(self._formula_date_text)
         # The final pass's active graph carries the dependencies actually read,
         # including runtime-resolved dynamic references (OFFSET targets) that
         # the static edge list cannot see. Verification walks the output cone
@@ -5192,6 +5439,15 @@ class Evaluator:
             strict_proof=self.strict_proof,
             benchmark=benchmark,
         )
+
+    def _primitive_value(self, node):
+        value = primitive_value(node)
+        if node.id not in self._primitive_date_text:
+            return value
+        selected = self._primitive_date_text[node.id]
+        if node.kind not in ("input", "label") or node.value_type != "str" or type(value) is not str or value != str(selected):
+            raise ValueError("selected primitive date differs from source AST")
+        return selected
 
     @staticmethod
     def _value_change(before, after):
@@ -5380,11 +5636,18 @@ def workbook_calculation_metadata(path) -> CalculationMetadata:
         )
     count_raw = calc.attrib.get("iterateCount")
     delta_raw = calc.attrib.get("iterateDelta")
+    iterate_raw = calc.attrib.get("iterate")
+    parsed_iterate = _xml_bool(iterate_raw)
+    iteration_disabled = iterate_raw is None or parsed_iterate is False
     try:
         count = int(count_raw) if count_raw else None
         count_valid = (
             count_raw is None
             or 0 < count <= MAX_WORKBOOK_ITERATIONS
+            # iterateCount is an OOXML unsigned integer. Excel also saves zero
+            # when iteration is disabled; retain that explicit dormant setting.
+            # Zero never authorizes an enabled or unknown iterative calculation.
+            or count == 0 and iteration_disabled
         )
         if not count_valid:
             count = None
@@ -5404,8 +5667,6 @@ def workbook_calculation_metadata(path) -> CalculationMetadata:
         delta = None
         delta_valid = False
     raw = {str(key): str(value) for key, value in sorted(calc.attrib.items())}
-    iterate_raw = calc.attrib.get("iterate")
-    parsed_iterate = _xml_bool(iterate_raw)
     calc_mode_raw = calc.attrib.get("calcMode")
     parsed_calc_mode = (
         calc_mode_raw

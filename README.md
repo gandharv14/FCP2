@@ -5,6 +5,248 @@ reconstruction, faithful instructions, research environments, and exact grading.
 The walkthrough below explains the segmentation stages and the required Harbor
 quality gates.
 
+## System architecture
+
+The pipeline turns a workbook into a **verified reconstruction problem**, then
+packages it as a **Harbor reinforcement-learning task**. External-input research
+is an optional branch.
+
+- [End-to-end architecture](#end-to-end-architecture)
+- [Reconstruction engine](#reconstruction-engine)
+- [Delivered task, trust boundaries, and RL reward](#delivered-task-trust-boundaries-and-rl-reward)
+
+### End-to-end architecture
+
+```mermaid
+flowchart TB
+    RAW["Raw financial workbook<br/>XLSX / XLSM / legacy XLS or XLSB"]
+
+    subgraph SOURCE["A · Source intake and qualification"]
+        INV["Freeze inventory<br/>Workbook ID + original SHA-256<br/>Retain every original in corpus denominator"]
+        HEALTH{"Source-health screening<br/>Format, caches, links,<br/>volatile formulas, data tables"}
+        RECOVER["Supported source preparation<br/>Approved remediation or legacy conversion<br/>Trusted Excel recalculation where required"]
+        EQUIV{"Validate prepared candidate<br/>Financial equivalence, lineage,<br/>approvals and signed receipts"}
+        AST["Parse workbook into formula graph<br/>xl_ast_graph.py<br/>nodes.csv + edges.csv"]
+        SRC[("Immutable source generation<br/>Workbook + AST + health evidence<br/>Source manifest and code fingerprints")]
+
+        INV --> HEALTH
+        HEALTH -->|"Accepted source"| AST
+        HEALTH -->|"Preparation required"| RECOVER
+        RECOVER --> EQUIV
+        EQUIV -->|"Validated"| AST
+        AST --> SRC
+    end
+
+    subgraph PROOF["B · Identify and prove the task"]
+        SEG["Segment dependency graph<br/>Identify inputs, intermediate calculations,<br/>curated outputs and scaffolding"]
+        RECON{"Strict reconstruction + preflight<br/>Recompute outputs from supplied inputs<br/>Check numeric agreement and proof closure"}
+        GEN[("Immutable segmentation generation<br/>Curated targets, segmentation,<br/>lineage and reconstruction proof")]
+        BASE["Build baseline inputs-only workbook<br/>Remove calculated answers and answer copies<br/>Preserve supplied inputs, layout and styles"]
+
+        SEG --> RECON
+        RECON -->|"PASS"| GEN
+        GEN --> BASE
+    end
+
+    subgraph RESEARCH["C · Design the input-retrieval challenge"]
+        AUDIT["Variable/source audit<br/>Deterministic cell inventory<br/>Model-assisted source classification"]
+        NORM["Normalize and independently review<br/>Atomic variables + exact cell references<br/>Every audit row included or explicitly excluded"]
+        MODE{"Validated task mode"}
+        PLAIN["Plain task<br/>Baseline inputs remain in workbook"]
+        PROFILE["Profile public sources<br/>Review terminology and source presentation"]
+        SPEC{"Validate final MCP specification<br/>Research eligibility, exact workbook values,<br/>maskability and duplicate-leak checks"}
+        MCP["Deterministic offline MCP generation<br/>Supported records + dimension distractors<br/>+ stale, superseded releases"]
+        DOUBLE{"Double-build equality<br/>Artifact validation + real MCP smoke"}
+        MASK["Build separate research inputs workbook<br/>Blank served variables and duplicate representations<br/>Keep unredacted baseline for audits"]
+
+        AUDIT --> NORM --> MODE
+        MODE -->|"No eligible research variables"| PLAIN
+        MODE -->|"Eligible research variables"| PROFILE
+        PROFILE --> SPEC
+        SPEC -->|"PASS"| MCP --> DOUBLE
+        DOUBLE -->|"PASS"| MASK
+    end
+
+    subgraph AUTHOR["D · Author and qualify the staged task"]
+        PACK["Stage Harbor bundle<br/>xl_output_task.py<br/>Instructions, environment and private tests"]
+        DISC["Workbook disclosure and method guidance<br/>Source-grounded rules and exceptions<br/>Structural and semantic validation"]
+        NAT["Naturalize instruction prose<br/>Preserve frozen targets, tables and rules<br/>Independent semantic review"]
+        VERIFY{"Independent verification<br/>Fresh disclosure review<br/>Live MCP retrieval oracle when applicable<br/>Exact-answer grader smoke = 1.0"}
+        DIALOGUE["Author colleague Q&A<br/>Validate claim coverage and faithfulness<br/>Apply transactionally; smoke final main image"]
+        READY{"All applicable gates current?<br/>Evidence matches exact staged bytes"}
+
+        PACK --> DISC --> NAT --> VERIFY
+        VERIFY -->|"PASS"| DIALOGUE --> READY
+    end
+
+    PUB["Serial strict publication<br/>Freeze task generation<br/>Atomic release update with prior-state check"]
+    OUT[("Published RL task<br/>tasks_outputs / ID-outputs")]
+    HOLD["Stop affected workbook<br/>Retain diagnostics and failure history"]
+    RETRY["If eligible: bounded repair<br/>Restart at earliest invalidated gate<br/>Revalidate dependent downstream evidence"]
+
+    RAW --> INV
+    SRC --> SEG
+    BASE --> AUDIT
+    PLAIN --> PACK
+    MASK --> PACK
+    READY -->|"Qualified"| PUB --> OUT
+
+    HEALTH -->|"Unsupported / insufficient evidence"| HOLD
+    EQUIV -->|"FAIL"| HOLD
+    RECON -->|"FAIL"| HOLD
+    SPEC -->|"FAIL"| HOLD
+    DOUBLE -->|"FAIL"| HOLD
+    VERIFY -->|"FAIL"| HOLD
+    READY -->|"FAIL"| HOLD
+    HOLD -.-> RETRY
+```
+
+**Control plane:** the Harbor orchestrator coordinates workbook workers,
+specialist lanes, leases, resource limits, immutable checkpoints, bounded
+retries, and publication. Repairs invalidate dependent downstream evidence;
+a failure stops the affected workbook. Failure edges are representative: every
+applicable gate must pass before publication.
+
+### Reconstruction engine
+
+The key invariant is that **selected outputs must be derived from supplied
+inputs without using formula caches as answers**. AST means abstract syntax
+tree: the parsed operators and references that make up each formula.
+
+```mermaid
+flowchart TB
+    GRAPH[("Source AST graph<br/>Cells, formula operators, references<br/>Typed dependency edges")]
+
+    subgraph STRUCTURE["Structural analysis"]
+        S12["1–2 · Project and type<br/>Collapse formula AST into cell dependencies<br/>Identify numbers, text, dates and formulas"]
+        S3["3 · Build bands<br/>Group repeated formula patterns<br/>across periods into financial line items"]
+        S35["3½ · Promote embedded assumptions<br/>Represent meaningful formula literals<br/>as explicit supplied inputs"]
+        S456["4–6 · Simplify topology<br/>Bypass display-only mirrors<br/>Contract circular components; identify islands"]
+        S7["7 · Score candidate outputs<br/>Financial labels, topology and other signals"]
+        CUR[("curation.toml<br/>Selected output bands and names<br/>Preserve explicit curated cell identity")]
+        S8["8 · Trace selected-output dependencies<br/>Build the complete input frontier<br/>Partition the dependency cone"]
+
+        S12 --> S3 --> S35 --> S456 --> S7 --> CUR --> S8
+    end
+
+    subgraph BUCKETS["Segmentation contract"]
+        INPUT["INPUT<br/>Supplied primitive values<br/>and promoted assumptions"]
+        MID["MIDDLE<br/>Calculations needed<br/>to derive selected outputs"]
+        OUTPUT["OUTPUT<br/>Exact curated target cells"]
+        SCAF["SCAFFOLDING<br/>Unused inputs, dead branches,<br/>detached content and presentation"]
+    end
+
+    subgraph CHECK["9 · Independent reconstruction"]
+        EVAL["Evaluate formulas from supplied inputs<br/>Resolve supported runtime dependencies<br/>Stabilize the active dependency graph"]
+        CYCLE["Validate circular calculations<br/>Workbook iteration semantics<br/>and cycle certificates"]
+        FRESH["Run a fresh strict proof<br/>Check complete dependency closure<br/>Reject unresolved or cache-seeded derivations"]
+        COMPARE{"Compare reconstructed targets<br/>with qualified workbook reference values<br/>within configured tolerances"}
+
+        EVAL --> CYCLE --> FRESH --> COMPARE
+    end
+
+    subgraph EMIT["10–11 · Evidence and publication"]
+        LINEAGE["Generate output lineage<br/>Readable derivations + exact cell dependencies"]
+        ART[("segments.json · bands.csv<br/>output_candidates.csv · lineage.json<br/>lineage/*.md · verification evidence")]
+        PIN["Publish segmentation generation<br/>Bind source, curation, parser and verifier hashes"]
+
+        LINEAGE --> ART --> PIN
+    end
+
+    REF[("Qualified workbook<br/>Private reference values")]
+    FAIL["Reject proof<br/>Retain divergence and dependency diagnostics"]
+
+    GRAPH --> S12
+    S8 --> INPUT
+    S8 --> MID
+    S8 --> OUTPUT
+    S8 --> SCAF
+    INPUT -->|"Only allowed seeds"| EVAL
+    MID -->|"Formula semantics"| EVAL
+    OUTPUT -->|"Targets to prove"| FRESH
+    REF -->|"Comparison only"| COMPARE
+    COMPARE -->|"PASS"| LINEAGE
+    COMPARE -->|"FAIL"| FAIL
+```
+
+Large graphs can use disposable SQLite indexes and compact proof structures.
+The immutable graph evidence remains the basis for validation.
+
+### Delivered task, trust boundaries, and RL reward
+
+MCP (Model Context Protocol) exposes the optional research service through a
+generic tool interface. The solver sees supplied inputs and research records;
+the verifier receives the hidden answer key only at grading time.
+
+```mermaid
+flowchart TB
+    RELEASE[("Qualified Harbor task release")]
+
+    subgraph SOLVER["Solver-visible task"]
+        INSTR["instruction.md<br/>Business context, supplied inputs,<br/>disclosures and exact output contract"]
+        MAIN["Main container<br/>Inputs-only workbook<br/>Colleague Q&A and working tools"]
+        AGENT["Solver agent<br/>Inspect inputs, research missing values,<br/>reconstruct financial calculations"]
+        ANSWERS["/app/answers.json<br/>Target cell reference → predicted value"]
+
+        INSTR --> AGENT
+        MAIN --> AGENT
+        AGENT --> ANSWERS
+    end
+
+    subgraph OPTIONAL["Optional MCP sidecar · offline synthetic research"]
+        SERVER["FastMCP HTTP server<br/>http://mcp-server:8000/mcp"]
+        TOOLS["Generic research tools<br/>list_sources · list_datasets<br/>search_documents · fetch_document<br/>query_records"]
+        DATA[("runtime/<br/>Sources, documents, datasets, records<br/>Exact workbook inputs + distractors<br/>Provenance and supersession chains")]
+
+        SERVER --> TOOLS --> DATA
+    end
+
+    subgraph PRIVATE["Verifier-only assets · unavailable during solving"]
+        KEY[("tests/answer_key.json<br/>Curated target values<br/>Output groups + numeric tolerances")]
+        SUPPORT[("Private test evidence<br/>Generation bindings and proof<br/>Masked-input audit map for MCP tasks")]
+        GRADER["tests/test.sh → run_grader.py<br/>Canonical finance_grader<br/>Continuous reward with partial credit"]
+        REWARD["/logs/verifier/<br/>reward.json · reward.txt<br/>reward-details.json · score_details.json"]
+
+        KEY --> GRADER
+        GRADER --> REWARD
+    end
+
+    subgraph CUSTODY["Private build and verification custody"]
+        BUILD[("Original workbook, AST and lineage<br/>Normalization specs and reviews<br/>MCP eval/tasks.jsonl<br/>Trusted receipts and publication history")]
+        ARCHIVE["Optional retained verification package<br/>Hash-addressed evidence + isolated replay<br/>Verified cleanup of selected scratch"]
+        BUILD --> ARCHIVE
+    end
+
+    RELEASE --> INSTR
+    RELEASE --> MAIN
+    RELEASE --> SERVER
+    RELEASE --> KEY
+    RELEASE --> SUPPORT
+    AGENT <-->|"Paginated research calls"| SERVER
+    ANSWERS -->|"Submission at verification time"| GRADER
+    RELEASE -.->|"Exact release binding"| ARCHIVE
+```
+
+#### Important contracts
+
+- **Synthetic research preserves truth:** workbook values stay exact. Synthetic
+  documents, distractors, and stale releases create the retrieval challenge;
+  public-source profiles affect presentation.
+- **Masking must be complete:** served inputs and unapproved duplicate
+  representations disappear from the solver workbook. Original workbooks,
+  answer keys, and research evaluation records stay private.
+- **Reward measures final outputs:** Harbor uses continuous,
+  output-group-weighted partial credit. A full pass requires every target within
+  tolerance; discrete scoring is used separately for pass@k.
+- **Publication and rollout are separate:** reconstruction proof, retrieval
+  checks, and grader smoke qualify the task. Solver rollouts happen afterward.
+
+Implementation references: [segmentation engine](xl_segment.py),
+[packaging gates](build_one.sh), [task packager](xl_output_task.py),
+[MCP builder](mcp_env/build.py), [live retrieval oracle](xl_mcp_oracle.py),
+[strict publication](scripts/harbor_publish.py), and
+[reward contract](grader/DESIGN.md).
+
 ---
 
 ## Private verification and automatic cleanup
@@ -503,6 +745,8 @@ the thing that makes the segmentation trustworthy.
 ---
 
 ## Table of contents
+
+- [System architecture](#system-architecture)
 
 1. [The problem in one page](#1-the-problem-in-one-page)
 2. [The big picture](#2-the-big-picture)
